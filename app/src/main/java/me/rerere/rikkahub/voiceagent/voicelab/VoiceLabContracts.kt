@@ -21,7 +21,19 @@ data class MobileVoiceSessionResponse(
     val inputSampleRate: Int,
     val outputSampleRate: Int,
     val liveConnectConfig: JsonObject,
-)
+) {
+    override fun toString(): String =
+        "MobileVoiceSessionResponse(" +
+            "token=[redacted], " +
+            "modelId=$modelId, " +
+            "providerModel=$providerModel, " +
+            "apiVersion=$apiVersion, " +
+            "websocketUrl=$websocketUrl, " +
+            "inputSampleRate=$inputSampleRate, " +
+            "outputSampleRate=$outputSampleRate, " +
+            "liveConnectConfig=$liveConnectConfig" +
+            ")"
+}
 
 @Serializable
 data class MobileHermesRequest(
@@ -29,7 +41,10 @@ data class MobileHermesRequest(
     val prompt: String,
     @EncodeDefault(EncodeDefault.Mode.NEVER)
     val profileId: String? = null,
-)
+) {
+    override fun toString(): String =
+        "MobileHermesRequest(callId=$callId, prompt=[redacted], profileId=$profileId)"
+}
 
 @Serializable
 data class MobileHermesResponse(
@@ -45,4 +60,11 @@ data class VoiceLabMobileCredentials(
     val hermesProfileApiKey: String,
     val cloudflareClientId: String? = null,
     val cloudflareClientSecret: String? = null,
-)
+) {
+    override fun toString(): String =
+        "VoiceLabMobileCredentials(" +
+            "hermesProfileApiKey=[redacted], " +
+            "cloudflareClientId=${cloudflareClientId?.let { "[redacted]" }}, " +
+            "cloudflareClientSecret=${cloudflareClientSecret?.let { "[redacted]" }}" +
+            ")"
+}

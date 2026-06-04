@@ -28,6 +28,14 @@ private val ERROR_SECRET_PATTERNS = listOf(
         option = RegexOption.IGNORE_CASE,
     ),
     Regex(
+        pattern = """('?(?:authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret|password)'?\s*[:=]\s*')([^']+)(')""",
+        option = RegexOption.IGNORE_CASE,
+    ),
+    Regex(
+        pattern = """\b((?:authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret|password)\s*[:=]\s*)([^\s,;}\]]+)""",
+        option = RegexOption.IGNORE_CASE,
+    ),
+    Regex(
         pattern = """\b(Bearer\s+)[A-Za-z0-9._~+/=-]+""",
         option = RegexOption.IGNORE_CASE,
     ),

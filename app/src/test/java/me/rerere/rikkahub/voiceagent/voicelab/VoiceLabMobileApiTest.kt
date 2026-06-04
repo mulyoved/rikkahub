@@ -190,7 +190,16 @@ class VoiceLabMobileApiTest {
                 request = request,
                 code = 500,
                 message = "Error",
-                body = """{"error":"failed","token":"live-token","apiKey":"server-key","detail":"Bearer header-token"}""",
+                body = """
+                {
+                  "error":"failed",
+                  "token":"live-token",
+                  "apiKey":"server-key",
+                  "single":"token='single-token'",
+                  "unquoted":"api_key=plain-key",
+                  "detail":"Bearer header-token"
+                }
+                """.trimIndent(),
             )
         }
         val api = VoiceLabMobileApi(
@@ -208,7 +217,39 @@ class VoiceLabMobileApiTest {
         assertTrue(message.contains("[redacted]"))
         assertFalse(message.contains("live-token"))
         assertFalse(message.contains("server-key"))
+        assertFalse(message.contains("single-token"))
+        assertFalse(message.contains("plain-key"))
         assertFalse(message.contains("header-token"))
+    }
+
+    @Test
+    fun `sensitive contract toString output is redacted`() {
+        val session = MobileVoiceSessionResponse(
+            token = "session-token",
+            modelId = "gemini-flash",
+            providerModel = "gemini-live",
+            apiVersion = "v1alpha",
+            websocketUrl = "wss://example.test/live",
+            inputSampleRate = 16000,
+            outputSampleRate = 24000,
+            liveConnectConfig = kotlinx.serialization.json.JsonObject(emptyMap()),
+        )
+        val hermesRequest = MobileHermesRequest(
+            callId = "call-1",
+            prompt = "private prompt",
+            profileId = "default",
+        )
+        val credentials = VoiceLabMobileCredentials(
+            hermesProfileApiKey = "profile-api-key",
+            cloudflareClientId = "cf-id",
+            cloudflareClientSecret = "cf-secret",
+        )
+
+        assertFalse(session.toString().contains("session-token"))
+        assertFalse(hermesRequest.toString().contains("private prompt"))
+        assertFalse(credentials.toString().contains("profile-api-key"))
+        assertFalse(credentials.toString().contains("cf-id"))
+        assertFalse(credentials.toString().contains("cf-secret"))
     }
 
     @Test
