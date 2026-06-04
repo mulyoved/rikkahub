@@ -88,7 +88,7 @@ class TestableGeminiLiveVoiceClient(
                     handleMessage(generation = generation, message = message)
                 },
                 onClosed = { code, reason ->
-                    emitIfCurrent(
+                    terminateCurrentSessionWithError(
                         generation = generation,
                         GeminiLiveEvent.Error(
                             message = "WebSocket closed: $code $reason",
@@ -97,7 +97,7 @@ class TestableGeminiLiveVoiceClient(
                     )
                 },
                 onFailure = { error ->
-                    emitIfCurrent(
+                    terminateCurrentSessionWithError(
                         generation = generation,
                         GeminiLiveEvent.Error(
                             message = error.message ?: error.javaClass.simpleName,
@@ -265,6 +265,20 @@ class TestableGeminiLiveVoiceClient(
                 ?.onEvent
         }
         onEvent?.invoke(event)
+    }
+
+    private fun terminateCurrentSessionWithError(generation: Long, event: GeminiLiveEvent.Error) {
+        val onEvent = synchronized(lock) {
+            val state = sessionState
+                ?.takeIf { it.generation == generation && !it.closed }
+                ?: return
+            state.closed = true
+            state.pendingContext = null
+            state.pendingOutboundMessages.clear()
+            sessionState = null
+            state.onEvent
+        }
+        onEvent(event)
     }
 
     private data class SessionState(

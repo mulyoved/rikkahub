@@ -471,7 +471,7 @@ class GeminiLiveVoiceClientTest {
     }
 
     @Test
-    fun `socket close and failure become error events`() = runBlocking {
+    fun `socket close before setup complete terminates session without flushing later sends`() = runBlocking {
         val socket = FakeGeminiSocket()
         val client = TestableGeminiLiveVoiceClient(socket = socket, codec = GeminiLiveCodec())
         val events = mutableListOf<GeminiLiveEvent>()
@@ -487,6 +487,9 @@ class GeminiLiveVoiceClientTest {
         )
 
         socket.closeFromServer(code = 1001, reason = "going away")
+        client.sendAudio("base64-audio")
+        client.sendToolResponse(callId = "call-1", answer = "42")
+        socket.receive(setupCompleteMessage)
         socket.fail(IllegalStateException("network down"))
 
         assertEquals(
@@ -495,12 +498,94 @@ class GeminiLiveVoiceClientTest {
                     message = "WebSocket closed: 1001 going away",
                     raw = "",
                 ),
+            ),
+            events,
+        )
+        assertEquals(1, socket.sentMessages.size)
+        assertTrue("setup" in socket.sentMessages.single().jsonObject())
+    }
+
+    @Test
+    fun `socket failure before setup complete terminates session without flushing later sends`() = runBlocking {
+        val socket = FakeGeminiSocket()
+        val client = TestableGeminiLiveVoiceClient(socket = socket, codec = GeminiLiveCodec())
+        val events = mutableListOf<GeminiLiveEvent>()
+
+        client.connect(
+            token = "token-1",
+            websocketUrl = "wss://example.test/live",
+            providerModel = "gemini-2.0-flash-live-001",
+            liveConnectConfig = liveConnectConfig,
+            systemInstruction = "You are Hermes.",
+            contextTurns = emptyList(),
+            onEvent = events::add,
+        )
+
+        socket.fail(IllegalStateException("network down"))
+        client.sendAudio("base64-audio")
+        client.sendToolResponse(callId = "call-1", answer = "42")
+        socket.receive(setupCompleteMessage)
+        socket.closeFromServer(code = 1001, reason = "going away")
+
+        assertEquals(
+            listOf(
                 GeminiLiveEvent.Error(
                     message = "network down",
                     raw = "",
                 ),
             ),
             events,
+        )
+        assertEquals(1, socket.sentMessages.size)
+        assertTrue("setup" in socket.sentMessages.single().jsonObject())
+    }
+
+    @Test
+    fun `socket close and failure become error events`() = runBlocking {
+        val socket = FakeGeminiSocket()
+        val client = TestableGeminiLiveVoiceClient(socket = socket, codec = GeminiLiveCodec())
+        val closeEvents = mutableListOf<GeminiLiveEvent>()
+        val failureEvents = mutableListOf<GeminiLiveEvent>()
+
+        client.connect(
+            token = "token-1",
+            websocketUrl = "wss://example.test/live",
+            providerModel = "gemini-2.0-flash-live-001",
+            liveConnectConfig = liveConnectConfig,
+            systemInstruction = "You are Hermes.",
+            contextTurns = emptyList(),
+            onEvent = closeEvents::add,
+        )
+        socket.closeFromServer(code = 1001, reason = "going away")
+
+        client.connect(
+            token = "token-2",
+            websocketUrl = "wss://example.test/live",
+            providerModel = "gemini-2.0-flash-live-001",
+            liveConnectConfig = liveConnectConfig,
+            systemInstruction = "You are Hermes.",
+            contextTurns = emptyList(),
+            onEvent = failureEvents::add,
+        )
+        socket.fail(IllegalStateException("network down"))
+
+        assertEquals(
+            listOf(
+                GeminiLiveEvent.Error(
+                    message = "WebSocket closed: 1001 going away",
+                    raw = "",
+                ),
+            ),
+            closeEvents,
+        )
+        assertEquals(
+            listOf(
+                GeminiLiveEvent.Error(
+                    message = "network down",
+                    raw = "",
+                ),
+            ),
+            failureEvents,
         )
     }
 
