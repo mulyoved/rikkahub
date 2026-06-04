@@ -81,7 +81,7 @@ class AndroidVoiceAudioEngine(context: Context) : VoiceAudioEngine {
         val job = scope.launch(start = CoroutineStart.LAZY) {
             val buffer = ByteArray(bufferSize)
             try {
-                while (isActive && isCurrentCapture(generation, recorder)) {
+                captureLoop@ while (isActive && isCurrentCapture(generation, recorder)) {
                     when (val read = recorder.read(buffer, 0, buffer.size)) {
                         in 1..buffer.size -> {
                             if (isCurrentCapture(generation, recorder)) {
@@ -90,7 +90,11 @@ class AndroidVoiceAudioEngine(context: Context) : VoiceAudioEngine {
                         }
                         0 -> Unit
                         else -> {
-                            throw IllegalStateException("AudioRecord read error: $read")
+                            if (isCurrentCapture(generation, recorder)) {
+                                throw IllegalStateException("AudioRecord read error: $read")
+                            } else {
+                                break@captureLoop
+                            }
                         }
                     }
                 }
@@ -160,7 +164,7 @@ class AndroidVoiceAudioEngine(context: Context) : VoiceAudioEngine {
             if (!isCurrentPlayback(generation, track)) {
                 return
             }
-            track.writeNonBlocking(pcm16)
+            track.writeNonBlocking(pcm16, generation)
         }
     }
 
@@ -176,25 +180,43 @@ class AndroidVoiceAudioEngine(context: Context) : VoiceAudioEngine {
             generation = playbackGeneration
         }
 
-        val wasPlaying = track.isPlaying()
-        track.pauseSafely()
-        track.flushSafely()
-        if (wasPlaying && isCurrentPlayback(generation, track)) {
-            track.playSafely()
+        synchronized(playbackWriteLock) {
+            if (isCurrentPlayback(generation, track)) {
+                val wasPlaying = track.isPlaying()
+                track.pauseSafely()
+                track.flushSafely()
+                if (wasPlaying && isCurrentPlayback(generation, track)) {
+                    track.playSafely()
+                }
+            }
         }
     }
 
     override fun release() {
-        stopCapture()
+        val job: Job?
+        val recorder: AudioRecord?
         val track: AudioTrack?
         synchronized(lock) {
+            if (released) {
+                return
+            }
             released = true
+            captureGeneration += 1
             playbackGeneration += 1
+            job = captureJob
+            captureJob = null
+            recorder = audioRecord
+            audioRecord = null
             track = audioTrack
             audioTrack = null
         }
-        track?.stopSafely()
-        track?.releaseSafely()
+        job?.cancel()
+        recorder?.stopSafely()
+        recorder?.releaseSafely()
+        synchronized(playbackWriteLock) {
+            track?.stopSafely()
+            track?.releaseSafely()
+        }
         scope.cancel()
     }
 
@@ -292,19 +314,47 @@ class AndroidVoiceAudioEngine(context: Context) : VoiceAudioEngine {
         }
     }
 
-    private fun AudioTrack.writeNonBlocking(pcm16: ByteArray) {
-        val writeResult = runCatching {
-            write(pcm16, 0, pcm16.size, AudioTrack.WRITE_NON_BLOCKING)
-        }.onFailure {
-            Log.w(TAG, "AudioTrack write failed", it)
-            removeTrack(this)
-            releaseSafely()
-        }.getOrNull() ?: return
+    private fun AudioTrack.writeNonBlocking(pcm16: ByteArray, generation: Long) {
+        var offset = 0
+        var attempts = 0
+        while (offset < pcm16.size && attempts < MAX_NON_BLOCKING_WRITE_ATTEMPTS) {
+            if (!isCurrentPlayback(generation, this)) {
+                return
+            }
 
-        if (writeResult < 0) {
-            Log.w(TAG, "AudioTrack write error: $writeResult")
-            removeTrack(this)
-            releaseSafely()
+            val remaining = pcm16.size - offset
+            val writeResult = runCatching {
+                write(pcm16, offset, remaining, AudioTrack.WRITE_NON_BLOCKING)
+            }.onFailure {
+                Log.w(TAG, "AudioTrack write failed", it)
+                removeTrack(this)
+                releaseSafely()
+            }.getOrNull() ?: return
+
+            when {
+                writeResult < 0 -> {
+                    Log.w(TAG, "AudioTrack write error: $writeResult")
+                    removeTrack(this)
+                    releaseSafely()
+                    return
+                }
+                writeResult == 0 -> {
+                    attempts += 1
+                    Thread.yield()
+                }
+                else -> {
+                    offset += writeResult.coerceAtMost(remaining)
+                    attempts += 1
+                }
+            }
+        }
+
+        if (offset < pcm16.size && isCurrentPlayback(generation, this)) {
+            Log.w(
+                TAG,
+                "AudioTrack non-blocking write incomplete: wrote=$offset requested=${pcm16.size}; " +
+                    "dropping ${pcm16.size - offset} bytes",
+            )
         }
     }
 
@@ -359,6 +409,7 @@ class AndroidVoiceAudioEngine(context: Context) : VoiceAudioEngine {
         const val PLAYBACK_SAMPLE_RATE = 24_000
         const val MIN_CAPTURE_BUFFER_BYTES = 3_200
         const val MIN_PLAYBACK_BUFFER_BYTES = 4_800
+        const val MAX_NON_BLOCKING_WRITE_ATTEMPTS = 8
 
         fun captureBufferSize(): Int {
             val bufferSize = AudioRecord.getMinBufferSize(
