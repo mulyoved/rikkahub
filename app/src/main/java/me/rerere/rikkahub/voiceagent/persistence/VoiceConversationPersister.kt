@@ -55,12 +55,13 @@ class VoiceConversationPersister {
                 }
             ),
             output = status.toOutputParts(),
+            metadata = status.toMetadata(),
         )
 
         val currentMessages = conversation.currentMessages
         val existingToolIndex = currentMessages.indexOfLast { message ->
             message.parts.any { part ->
-                part is UIMessagePart.Tool && part.toolCallId == callId
+                part is UIMessagePart.Tool && part.isHermesTool(callId)
             }
         }
         if (existingToolIndex >= 0) {
@@ -68,7 +69,7 @@ class VoiceConversationPersister {
             val existingMessage = currentMessages[existingToolIndex]
             updatedMessages[existingToolIndex] = existingMessage.copy(
                 parts = existingMessage.parts.map { part ->
-                    if (part is UIMessagePart.Tool && part.toolCallId == callId) tool else part
+                    if (part is UIMessagePart.Tool && part.isHermesTool(callId)) tool else part
                 }
             )
             return conversation.updateCurrentMessages(updatedMessages)
@@ -89,12 +90,30 @@ class VoiceConversationPersister {
     private fun VoiceToolRecordStatus.toOutputParts(): List<UIMessagePart> {
         return when (this) {
             VoiceToolRecordStatus.Pending -> emptyList()
-            is VoiceToolRecordStatus.Complete -> listOf(UIMessagePart.Text(answer))
-            is VoiceToolRecordStatus.Failed -> listOf(UIMessagePart.Text(message))
+            is VoiceToolRecordStatus.Complete -> listOf(UIMessagePart.Text(answer, metadata = toMetadata()))
+            is VoiceToolRecordStatus.Failed -> listOf(UIMessagePart.Text(message, metadata = toMetadata()))
         }
     }
 
+    private fun UIMessagePart.Tool.isHermesTool(callId: String): Boolean {
+        return toolCallId == callId && toolName == ASK_HERMES_TOOL_NAME
+    }
+
+    private fun VoiceToolRecordStatus.toMetadata() = buildJsonObject {
+        put(HERMES_TOOL_SOURCE_KEY, ASK_HERMES_TOOL_NAME)
+        put(HERMES_TOOL_STATUS_KEY, statusName)
+    }
+
+    private val VoiceToolRecordStatus.statusName: String
+        get() = when (this) {
+            VoiceToolRecordStatus.Pending -> "pending"
+            is VoiceToolRecordStatus.Complete -> "complete"
+            is VoiceToolRecordStatus.Failed -> "failed"
+        }
+
     private companion object {
         const val ASK_HERMES_TOOL_NAME = "ask_hermes"
+        const val HERMES_TOOL_SOURCE_KEY = "voice_tool_source"
+        const val HERMES_TOOL_STATUS_KEY = "voice_tool_status"
     }
 }

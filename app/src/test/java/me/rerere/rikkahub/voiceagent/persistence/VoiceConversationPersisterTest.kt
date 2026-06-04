@@ -3,6 +3,7 @@ package me.rerere.rikkahub.voiceagent.persistence
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import me.rerere.ai.core.MessageRole
+import me.rerere.ai.ui.UIMessage
 import me.rerere.ai.ui.UIMessagePart
 import me.rerere.rikkahub.data.model.Conversation
 import me.rerere.rikkahub.utils.JsonInstant
@@ -39,6 +40,7 @@ class VoiceConversationPersisterTest {
         val tool = updated.currentMessages[1].parts.single() as UIMessagePart.Tool
         assertEquals("call-1", tool.toolCallId)
         assertEquals("ask_hermes", tool.toolName)
+        assertEquals("complete", tool.metadata!!["voice_tool_status"]!!.jsonPrimitive.content)
         assertEquals("Ask Hermes this", tool.input.promptJson())
         assertTrue(tool.output.text().contains("Hermes answer"))
     }
@@ -69,6 +71,7 @@ class VoiceConversationPersisterTest {
 
         assertEquals(1, tools.size)
         assertEquals("call-1", tools.single().toolCallId)
+        assertEquals("complete", tools.single().metadata!!["voice_tool_status"]!!.jsonPrimitive.content)
         assertEquals("Updated prompt", tools.single().input.promptJson())
         assertEquals("Final answer", tools.single().output.text())
     }
@@ -109,6 +112,59 @@ class VoiceConversationPersisterTest {
     }
 
     @Test
+    fun `pending status records machine readable pending status on tool metadata`() {
+        val persister = VoiceConversationPersister()
+
+        val conversation = persister.upsertHermesTool(
+            conversation = emptyConversation(),
+            callId = "call-1",
+            prompt = "Prompt",
+            status = VoiceToolRecordStatus.Pending,
+        )
+
+        val tool = conversation.currentMessages.single().parts.single() as UIMessagePart.Tool
+        assertEquals("pending", tool.metadata!!["voice_tool_status"]!!.jsonPrimitive.content)
+        assertTrue(tool.output.isEmpty())
+    }
+
+    @Test
+    fun `upsert ignores non Hermes tool with same call id`() {
+        val persister = VoiceConversationPersister()
+        val normalTool = UIMessagePart.Tool(
+            toolCallId = "call-1",
+            toolName = "normal_tool",
+            input = """{"value":"original"}""",
+            output = listOf(UIMessagePart.Text("normal result")),
+        )
+        val conversation = emptyConversation()
+            .updateCurrentMessages(
+                listOf(
+                    UIMessage(
+                        role = MessageRole.ASSISTANT,
+                        parts = listOf(normalTool),
+                    )
+                )
+            )
+
+        val updated = persister.upsertHermesTool(
+            conversation = conversation,
+            callId = "call-1",
+            prompt = "Hermes prompt",
+            status = VoiceToolRecordStatus.Complete("Hermes answer"),
+        )
+
+        val tools = updated.currentMessages
+            .flatMap { it.parts }
+            .filterIsInstance<UIMessagePart.Tool>()
+
+        assertEquals(2, tools.size)
+        assertEquals(normalTool, tools[0])
+        assertEquals("ask_hermes", tools[1].toolName)
+        assertEquals("Hermes prompt", tools[1].input.promptJson())
+        assertEquals("Hermes answer", tools[1].output.text())
+    }
+
+    @Test
     fun `new call id after user turn appends tool message without changing old assistant`() {
         val persister = VoiceConversationPersister()
         val conversation = emptyConversation()
@@ -140,7 +196,7 @@ class VoiceConversationPersisterTest {
     }
 
     @Test
-    fun `failed status records failure text as tool output`() {
+    fun `failed status records machine readable failure status as tool output metadata`() {
         val persister = VoiceConversationPersister()
 
         val conversation = persister.upsertHermesTool(
@@ -151,7 +207,10 @@ class VoiceConversationPersisterTest {
         )
 
         val tool = conversation.currentMessages.single().parts.single() as UIMessagePart.Tool
-        assertEquals("Hermes failed", tool.output.text())
+        val output = tool.output.single() as UIMessagePart.Text
+        assertEquals("failed", tool.metadata!!["voice_tool_status"]!!.jsonPrimitive.content)
+        assertEquals("Hermes failed", output.text)
+        assertEquals("failed", output.metadata!!["voice_tool_status"]!!.jsonPrimitive.content)
     }
 
     @Test
