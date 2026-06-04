@@ -1,5 +1,8 @@
+@file:OptIn(kotlinx.serialization.ExperimentalSerializationApi::class)
+
 package me.rerere.rikkahub.voiceagent.voicelab
 
+import kotlinx.serialization.EncodeDefault
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonObject
 
@@ -24,6 +27,7 @@ data class MobileVoiceSessionResponse(
 data class MobileHermesRequest(
     val callId: String,
     val prompt: String,
+    @EncodeDefault(EncodeDefault.Mode.NEVER)
     val profileId: String? = null,
 )
 
