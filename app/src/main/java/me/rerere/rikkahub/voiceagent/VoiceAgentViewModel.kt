@@ -43,6 +43,7 @@ class VoiceAgentCoordinator(
     private val eventLock = Any()
     private val toolJobsLock = Any()
     private val toolJobs = mutableMapOf<String, ToolJobHandle>()
+    private val toolCallLocks = mutableMapOf<String, Any>()
     private val cancelledToolCallIds = mutableSetOf<String>()
     private var closing = false
     private var closed = false
@@ -229,21 +230,12 @@ class VoiceAgentCoordinator(
     }
 
     private fun registerToolHandle(callId: String, handle: ToolJobHandle): Boolean {
-        while (true) {
+        synchronized(toolCallLock(callId)) {
             val currentHandle = synchronized(toolJobsLock) {
                 if (closed || closing || callId in cancelledToolCallIds) return false
                 toolJobs[callId]
             }
-            if (currentHandle == null) {
-                synchronized(toolJobsLock) {
-                    if (closed || closing || callId in cancelledToolCallIds) return false
-                    if (toolJobs[callId] == null) {
-                        toolJobs[callId] = handle
-                        updateToolStatus(callId, VoiceToolStatus.CallingHermes(callId))
-                        return true
-                    }
-                }
-            } else {
+            if (currentHandle != null) {
                 synchronized(currentHandle.sendLock) {
                     synchronized(toolJobsLock) {
                         if (closed || closing || callId in cancelledToolCallIds) return false
@@ -255,6 +247,15 @@ class VoiceAgentCoordinator(
                         }
                     }
                 }
+            }
+            synchronized(toolJobsLock) {
+                if (closed || closing || callId in cancelledToolCallIds) return false
+                if (toolJobs[callId] !== currentHandle) {
+                    return false
+                }
+                toolJobs[callId] = handle
+                updateToolStatus(callId, VoiceToolStatus.CallingHermes(callId))
+                return true
             }
         }
     }
@@ -270,22 +271,28 @@ class VoiceAgentCoordinator(
     }
 
     private fun cancelToolCall(callId: String): Job? {
-        val handle = synchronized(toolJobsLock) {
-            toolJobs[callId] ?: run {
-                cancelledToolCallIds += callId
-                return null
+        synchronized(toolCallLock(callId)) {
+            val handle = synchronized(toolJobsLock) {
+                toolJobs[callId] ?: run {
+                    cancelledToolCallIds += callId
+                    return null
+                }
             }
-        }
-        return synchronized(handle.sendLock) {
-            synchronized(toolJobsLock) {
-                cancelledToolCallIds += callId
-                if (toolJobs[callId] === handle) {
-                    toolJobs.remove(callId)?.job
-                } else {
-                    null
+            return synchronized(handle.sendLock) {
+                synchronized(toolJobsLock) {
+                    cancelledToolCallIds += callId
+                    if (toolJobs[callId] === handle) {
+                        toolJobs.remove(callId)?.job
+                    } else {
+                        null
+                    }
                 }
             }
         }
+    }
+
+    private fun toolCallLock(callId: String): Any = synchronized(toolJobsLock) {
+        toolCallLocks.getOrPut(callId) { Any() }
     }
 
     private fun updateToolStatus(callId: String, status: VoiceToolStatus) {
