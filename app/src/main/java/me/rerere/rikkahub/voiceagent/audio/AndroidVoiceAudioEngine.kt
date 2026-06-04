@@ -90,8 +90,7 @@ class AndroidVoiceAudioEngine(context: Context) : VoiceAudioEngine {
                         }
                         0 -> Unit
                         else -> {
-                            Log.w(TAG, "AudioRecord read error: $read")
-                            break
+                            throw IllegalStateException("AudioRecord read error: $read")
                         }
                     }
                 }
