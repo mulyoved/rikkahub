@@ -39,9 +39,11 @@ class VoiceAgentCoordinator(
     private val ownsScope = scope == null
     private val coordinatorScope = scope ?: CoroutineScope(SupervisorJob() + (dispatcher ?: Dispatchers.Default))
     private val toolLaunchContext = dispatcher ?: EmptyCoroutineContext
+    private val closeLock = Any()
     private val toolJobsLock = Any()
     private val toolJobs = mutableMapOf<String, ToolJobHandle>()
     private val cancelledToolCallIds = mutableSetOf<String>()
+    private var closing = false
     private var closed = false
 
     private val _state = MutableStateFlow(VoiceAgentUiState())
@@ -86,15 +88,29 @@ class VoiceAgentCoordinator(
     }
 
     fun close() {
-        val jobs = synchronized(toolJobsLock) {
-            closed = true
-            toolJobs.values.map { it.job }
-        }
-        jobs.forEach { it.cancel() }
-        gemini.close()
-        audio.release()
-        if (ownsScope) {
-            coordinatorScope.cancel()
+        synchronized(closeLock) {
+            val handles = synchronized(toolJobsLock) {
+                if (closed) {
+                    emptyList()
+                } else {
+                    closing = true
+                    toolJobs.values.toList()
+                }
+            }
+            val jobs = handles.map { handle ->
+                synchronized(handle.sendLock) {
+                    handle.job
+                }
+            }
+            synchronized(toolJobsLock) {
+                closed = true
+            }
+            jobs.forEach { it.cancel() }
+            gemini.close()
+            audio.release()
+            if (ownsScope) {
+                coordinatorScope.cancel()
+            }
         }
     }
 
@@ -133,12 +149,13 @@ class VoiceAgentCoordinator(
             return
         }
 
+        val handle = ToolJobHandle()
         val job = coordinatorScope.launch(toolLaunchContext, start = CoroutineStart.LAZY) {
-            runHermesToolCall(callId = call.callId, prompt = call.prompt)
+            runHermesToolCall(callId = call.callId, prompt = call.prompt, handle = handle)
         }
-        val handle = ToolJobHandle(job = job)
+        handle.job = job
         val shouldStart = synchronized(toolJobsLock) {
-            if (closed || call.callId in cancelledToolCallIds) {
+            if (closed || closing || call.callId in cancelledToolCallIds) {
                 false
             } else {
                 toolJobs[call.callId] = handle
@@ -161,10 +178,9 @@ class VoiceAgentCoordinator(
         job.start()
     }
 
-    private suspend fun runHermesToolCall(callId: String, prompt: String) {
+    private suspend fun runHermesToolCall(callId: String, prompt: String, handle: ToolJobHandle) {
         try {
             val response = toolApi.askHermes(callId = callId, prompt = prompt)
-            val handle = activeToolHandle(callId) ?: return
             val coroutineContext = currentCoroutineContext()
             synchronized(handle.sendLock) {
                 if (!isToolHandleActive(callId, handle)) return
@@ -184,18 +200,14 @@ class VoiceAgentCoordinator(
         }
     }
 
-    private fun isClosed(): Boolean = synchronized(toolJobsLock) { closed }
+    private fun isClosed(): Boolean = synchronized(toolJobsLock) { closed || closing }
 
     private fun isToolResultActive(callId: String): Boolean = synchronized(toolJobsLock) {
-        !closed && callId !in cancelledToolCallIds
-    }
-
-    private fun activeToolHandle(callId: String): ToolJobHandle? = synchronized(toolJobsLock) {
-        toolJobs[callId]?.takeIf { !closed && callId !in cancelledToolCallIds }
+        !closed && !closing && callId !in cancelledToolCallIds
     }
 
     private fun isToolHandleActive(callId: String, handle: ToolJobHandle): Boolean = synchronized(toolJobsLock) {
-        !closed && callId !in cancelledToolCallIds && toolJobs[callId] === handle
+        !closed && !closing && callId !in cancelledToolCallIds && toolJobs[callId] === handle
     }
 
     private fun handleToolCallCancellation(event: GeminiLiveEvent.ToolCallCancellation) {
@@ -272,9 +284,10 @@ class VoiceAgentCoordinator(
     }
 
     private class ToolJobHandle(
-        val job: Job,
         val sendLock: Any = Any(),
-    )
+    ) {
+        lateinit var job: Job
+    }
 }
 
 class VoiceAgentViewModel : ViewModel() {

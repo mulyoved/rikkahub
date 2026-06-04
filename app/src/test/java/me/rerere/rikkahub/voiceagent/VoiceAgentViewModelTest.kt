@@ -2,6 +2,8 @@ package me.rerere.rikkahub.voiceagent
 
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.JsonObject
@@ -13,8 +15,11 @@ import me.rerere.rikkahub.voiceagent.gemini.GeminiLiveVoiceClient
 import me.rerere.rikkahub.voiceagent.telemetry.VoiceDiagnostics
 import me.rerere.rikkahub.voiceagent.voicelab.MobileHermesResponse
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 
 class VoiceAgentViewModelTest {
     @Test
@@ -484,6 +489,45 @@ class VoiceAgentViewModelTest {
     }
 
     @Test
+    fun `close waits for in flight Gemini tool response send before releasing resources`() = runTest {
+        val gemini = FakeGeminiLiveVoiceClient()
+        val blockedSend = gemini.blockToolResponse("call-close-send")
+        val toolApi = FakeVoiceToolApi()
+        val audio = FakeVoiceAudioEngine()
+        val coordinator = VoiceAgentCoordinator(
+            gemini = gemini,
+            toolApi = toolApi,
+            audio = audio,
+            scope = this,
+            dispatcher = Dispatchers.Default,
+        )
+
+        coordinator.onGeminiEvent(
+            GeminiLiveEvent.ToolCall(callId = "call-close-send", name = "ask_hermes", prompt = "close race")
+        )
+        assertEquals("call-close-send" to "close race", toolApi.awaitRequest("call-close-send"))
+
+        toolApi.complete(response(callId = "call-close-send", answer = "answer before close"))
+        assertTrue(blockedSend.started.await(500, TimeUnit.MILLISECONDS))
+
+        val closeJob = launch(Dispatchers.Default) {
+            coordinator.close()
+        }
+        assertFalse(blockedSend.release.await(50, TimeUnit.MILLISECONDS))
+        assertEquals(0, gemini.closeCalls)
+        assertEquals(0, audio.releaseCalls)
+
+        blockedSend.release.countDown()
+        withTimeout(500) {
+            closeJob.join()
+        }
+
+        assertEquals(listOf("call-close-send" to "answer before close"), gemini.toolResponses)
+        assertEquals(1, gemini.closeCalls)
+        assertEquals(1, audio.releaseCalls)
+    }
+
+    @Test
     fun `non tool lifecycle events record diagnostics without crashing`() = runTest {
         val diagnostics = VoiceDiagnostics()
         val coordinator = VoiceAgentCoordinator(
@@ -555,6 +599,16 @@ class VoiceAgentViewModelTest {
 
     private class FakeGeminiLiveVoiceClient : GeminiLiveVoiceClient {
         val toolResponses = mutableListOf<Pair<String, String>>()
+        var closeCalls = 0
+        private val blockedResponses = mutableMapOf<String, BlockedToolResponse>()
+
+        fun blockToolResponse(callId: String): BlockedToolResponse {
+            return BlockedToolResponse().also { blocked ->
+                synchronized(blockedResponses) {
+                    blockedResponses[callId] = blocked
+                }
+            }
+        }
 
         override suspend fun connect(
             token: String,
@@ -569,10 +623,22 @@ class VoiceAgentViewModelTest {
         override fun sendAudio(base64Pcm16: String) = Unit
 
         override fun sendToolResponse(callId: String, answer: String) {
+            val blocked = synchronized(blockedResponses) { blockedResponses[callId] }
+            if (blocked != null) {
+                blocked.started.countDown()
+                blocked.release.await(500, TimeUnit.MILLISECONDS)
+            }
             toolResponses += callId to answer
         }
 
-        override fun close() = Unit
+        override fun close() {
+            closeCalls += 1
+        }
+    }
+
+    private class BlockedToolResponse {
+        val started = CountDownLatch(1)
+        val release = CountDownLatch(1)
     }
 
     private class FakeVoiceToolApi : VoiceToolApi {
