@@ -614,6 +614,46 @@ class VoiceAgentViewModelTest {
     }
 
     @Test
+    fun `close does not deadlock when tool response send emits event synchronously`() = runTest {
+        val gemini = FakeGeminiLiveVoiceClient()
+        val blockedSend = gemini.blockToolResponse("call-close-reentry")
+        val toolApi = FakeVoiceToolApi()
+        val audio = FakeVoiceAudioEngine()
+        val coordinator = VoiceAgentCoordinator(
+            gemini = gemini,
+            toolApi = toolApi,
+            audio = audio,
+            scope = this,
+            dispatcher = Dispatchers.Default,
+        )
+        gemini.onBeforeToolResponseRecorded = {
+            coordinator.onGeminiEvent(GeminiLiveEvent.Error(message = "late send error", raw = "{}"))
+        }
+
+        coordinator.onGeminiEvent(
+            GeminiLiveEvent.ToolCall(callId = "call-close-reentry", name = "ask_hermes", prompt = "close race")
+        )
+        assertEquals("call-close-reentry" to "close race", toolApi.awaitRequest("call-close-reentry"))
+
+        toolApi.complete(response(callId = "call-close-reentry", answer = "answer before close"))
+        assertTrue(blockedSend.started.await(500, TimeUnit.MILLISECONDS))
+
+        val closeJob = launch(Dispatchers.Default) {
+            coordinator.close()
+        }
+        assertEquals(0, audio.releaseCalls)
+
+        blockedSend.release.countDown()
+        withTimeout(500) {
+            closeJob.join()
+        }
+
+        assertEquals(listOf("call-close-reentry" to "answer before close"), gemini.toolResponses)
+        assertEquals(1, gemini.closeCalls)
+        assertEquals(1, audio.releaseCalls)
+    }
+
+    @Test
     fun `close waits for in flight non tool event before releasing audio`() = runTest {
         val audio = FakeVoiceAudioEngine()
         val blockedPlayback = audio.blockNextPlayback()
@@ -719,6 +759,7 @@ class VoiceAgentViewModelTest {
     private class FakeGeminiLiveVoiceClient : GeminiLiveVoiceClient {
         val toolResponses = mutableListOf<Pair<String, String>>()
         var closeCalls = 0
+        var onBeforeToolResponseRecorded: (() -> Unit)? = null
         private val blockedResponses = mutableMapOf<String, MutableList<BlockedToolResponse>>()
 
         fun blockToolResponse(callId: String): BlockedToolResponse {
@@ -753,6 +794,7 @@ class VoiceAgentViewModelTest {
                 blocked.started.countDown()
                 blocked.release.await(500, TimeUnit.MILLISECONDS)
             }
+            onBeforeToolResponseRecorded?.invoke()
             toolResponses += callId to answer
         }
 

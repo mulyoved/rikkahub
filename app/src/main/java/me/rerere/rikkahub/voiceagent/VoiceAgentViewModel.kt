@@ -51,34 +51,44 @@ class VoiceAgentCoordinator(
     val state: StateFlow<VoiceAgentUiState> = _state.asStateFlow()
 
     fun onGeminiEvent(event: GeminiLiveEvent) {
-        synchronized(eventLock) {
-            onGeminiEventLocked(event)
+        when (event) {
+            is GeminiLiveEvent.ToolCall -> {
+                if (shouldIgnoreEventAfterClose(event)) return
+                handleToolCall(event)
+            }
+            is GeminiLiveEvent.ToolCalls -> {
+                if (shouldIgnoreEventAfterClose(event)) return
+                event.unsupportedCalls.forEach(::recordUnsupportedToolCall)
+                event.calls.forEach(::handleToolCall)
+            }
+            is GeminiLiveEvent.ToolCallCancellation -> {
+                if (shouldIgnoreEventAfterClose(event)) return
+                handleToolCallCancellation(event)
+            }
+            else -> synchronized(eventLock) {
+                onNonToolGeminiEvent(event)
+            }
         }
     }
 
-    private fun onGeminiEventLocked(event: GeminiLiveEvent) {
-        if (isClosed()) {
-            diagnostics.record("gemini_event_after_close", event.javaClass.simpleName)
-            return
-        }
+    private fun onNonToolGeminiEvent(event: GeminiLiveEvent) {
+        if (shouldIgnoreEventAfterClose(event)) return
         when (event) {
             GeminiLiveEvent.SetupComplete -> diagnostics.record("gemini_setup_complete")
             is GeminiLiveEvent.InputTranscript -> appendInputTranscript(event.text)
             is GeminiLiveEvent.OutputTranscript -> appendOutputTranscript(event.text)
             is GeminiLiveEvent.OutputAudio -> playOutputAudio(event.base64Pcm16)
             is GeminiLiveEvent.Interrupted -> handleInterrupted(event)
-            is GeminiLiveEvent.ToolCall -> handleToolCall(event)
-            is GeminiLiveEvent.ToolCalls -> {
-                event.unsupportedCalls.forEach(::recordUnsupportedToolCall)
-                event.calls.forEach(::handleToolCall)
-            }
-            is GeminiLiveEvent.ToolCallCancellation -> handleToolCallCancellation(event)
             is GeminiLiveEvent.SessionResumptionUpdate -> diagnostics.record(
                 name = "session_resumption_update",
                 detail = "resumable=${event.resumable}, newHandle=${event.newHandle.orEmpty()}",
             )
             is GeminiLiveEvent.Error -> _state.update { it.reduce(VoiceAgentEvent.SessionError(event.message)) }
             is GeminiLiveEvent.Ignored -> handleIgnored(event)
+            is GeminiLiveEvent.ToolCall,
+            is GeminiLiveEvent.ToolCalls,
+            is GeminiLiveEvent.ToolCallCancellation,
+                -> Unit
         }
     }
 
@@ -96,34 +106,34 @@ class VoiceAgentCoordinator(
 
     fun close() {
         synchronized(closeLock) {
-            synchronized(eventLock) {
-                val handles = synchronized(toolJobsLock) {
+            val handles = synchronized(eventLock) {
+                synchronized(toolJobsLock) {
                     if (closed || closing) return
                     closing = true
                     toolJobs.values.toList()
                 }
-                val jobs = handles.map { handle ->
-                    synchronized(handle.sendLock) {
-                        handle.job
-                    }
+            }
+            val jobs = handles.map { handle ->
+                synchronized(handle.sendLock) {
+                    handle.job
                 }
-                synchronized(toolJobsLock) {
-                    toolJobs.clear()
-                    closed = true
-                    closing = false
-                }
-                _state.update { current ->
-                    current.copy(
-                        tool = VoiceToolStatus.Idle,
-                        toolCalls = emptyMap(),
-                    )
-                }
-                jobs.forEach { it.cancel() }
-                gemini.close()
-                audio.release()
-                if (ownsScope) {
-                    coordinatorScope.cancel()
-                }
+            }
+            synchronized(toolJobsLock) {
+                toolJobs.clear()
+                closed = true
+                closing = false
+            }
+            _state.update { current ->
+                current.copy(
+                    tool = VoiceToolStatus.Idle,
+                    toolCalls = emptyMap(),
+                )
+            }
+            jobs.forEach { it.cancel() }
+            gemini.close()
+            audio.release()
+            if (ownsScope) {
+                coordinatorScope.cancel()
             }
         }
     }
@@ -207,6 +217,12 @@ class VoiceAgentCoordinator(
     }
 
     private fun isClosed(): Boolean = synchronized(toolJobsLock) { closed || closing }
+
+    private fun shouldIgnoreEventAfterClose(event: GeminiLiveEvent): Boolean {
+        if (!isClosed()) return false
+        diagnostics.record("gemini_event_after_close", event.javaClass.simpleName)
+        return true
+    }
 
     private fun isToolHandleActive(callId: String, handle: ToolJobHandle): Boolean = synchronized(toolJobsLock) {
         !closed && !closing && callId !in cancelledToolCallIds && toolJobs[callId] === handle
