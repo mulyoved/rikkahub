@@ -107,12 +107,15 @@ class VoiceAgentCoordinator(
 
     fun close() {
         synchronized(closeLock) {
-            val handles = synchronized(eventLock) {
-                synchronized(toolJobsLock) {
-                    if (closed || closing) return
-                    closing = true
-                    toolJobs.values.toList()
-                }
+            synchronized(toolJobsLock) {
+                if (closed || closing) return
+                closing = true
+            }
+            synchronized(eventLock) {
+                // Wait for any in-flight non-tool event to finish before resources are released.
+            }
+            val handles = synchronized(toolJobsLock) {
+                toolJobs.values.toList()
             }
             val jobs = handles.map { handle ->
                 synchronized(handle.sendLock) {

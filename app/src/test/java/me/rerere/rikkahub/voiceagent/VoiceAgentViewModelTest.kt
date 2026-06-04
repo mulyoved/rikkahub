@@ -687,6 +687,51 @@ class VoiceAgentViewModelTest {
     }
 
     @Test
+    fun `close suppresses Hermes result while waiting for in flight non tool event`() = runTest {
+        val gemini = FakeGeminiLiveVoiceClient()
+        val toolApi = FakeVoiceToolApi()
+        val audio = FakeVoiceAudioEngine()
+        val blockedPlayback = audio.blockNextPlayback()
+        val coordinator = VoiceAgentCoordinator(
+            gemini = gemini,
+            toolApi = toolApi,
+            audio = audio,
+            scope = this,
+            dispatcher = Dispatchers.Default,
+        )
+
+        coordinator.onGeminiEvent(
+            GeminiLiveEvent.ToolCall(callId = "call-close-wait", name = "ask_hermes", prompt = "close wait")
+        )
+        assertEquals("call-close-wait" to "close wait", toolApi.awaitRequest("call-close-wait"))
+
+        val eventJob = launch(Dispatchers.Default) {
+            coordinator.onGeminiEvent(GeminiLiveEvent.OutputAudio("blocked-close-pcm"))
+        }
+        assertTrue(blockedPlayback.started.await(500, TimeUnit.MILLISECONDS))
+
+        val closeJob = launch(Dispatchers.Default) {
+            coordinator.close()
+        }
+        toolApi.complete(response(callId = "call-close-wait", answer = "late answer"))
+        coordinator.awaitToolJobsWithTimeout()
+
+        assertEquals(emptyList<Pair<String, String>>(), gemini.toolResponses)
+        assertEquals(0, audio.releaseCalls)
+
+        blockedPlayback.release.countDown()
+        withTimeout(500) {
+            eventJob.join()
+            closeJob.join()
+        }
+
+        assertEquals(listOf("blocked-close-pcm"), audio.playedPcm16)
+        assertEquals(1, audio.releaseCalls)
+        assertEquals(VoiceToolStatus.Idle, coordinator.state.value.tool)
+        assertEquals(emptyMap<String, VoiceToolStatus>(), coordinator.state.value.toolCalls)
+    }
+
+    @Test
     fun `non tool lifecycle events record diagnostics without crashing`() = runTest {
         val diagnostics = VoiceDiagnostics()
         val coordinator = VoiceAgentCoordinator(
