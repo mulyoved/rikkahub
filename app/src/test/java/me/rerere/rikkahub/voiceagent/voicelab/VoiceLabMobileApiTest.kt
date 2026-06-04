@@ -199,6 +199,7 @@ class VoiceLabMobileApiTest {
                   "answer":"private answer",
                   "single":"token='single-token'",
                   "unquoted":"api_key=plain-key",
+                  "header":"Authorization: Bearer authorization-token",
                   "detail":"Bearer header-token"
                 }
                 """.trimIndent(),
@@ -223,7 +224,34 @@ class VoiceLabMobileApiTest {
         assertFalse(message.contains("private answer"))
         assertFalse(message.contains("single-token"))
         assertFalse(message.contains("plain-key"))
+        assertFalse(message.contains("authorization-token"))
         assertFalse(message.contains("header-token"))
+    }
+
+    @Test
+    fun `truncated response previews redact unfinished quoted secrets`() {
+        val secretPrefix = "secret-prefix"
+        val transport = transportFor { request ->
+            responseFor(
+                request = request,
+                code = 500,
+                message = "Error",
+                body = """{"token":"$secretPrefix${"x".repeat(5000)}""",
+            )
+        }
+        val api = VoiceLabMobileApi(
+            baseUrl = "https://voice-lab.example.test",
+            credentials = VoiceLabMobileCredentials(hermesProfileApiKey = "profile-api-key"),
+            transport = transport,
+        )
+
+        val error = assertThrows(IllegalStateException::class.java) {
+            runBlocking { api.createSession("gemini-flash") }
+        }
+
+        val message = error.message.orEmpty()
+        assertTrue(message.contains("[redacted]"))
+        assertFalse(message.contains(secretPrefix))
     }
 
     @Test

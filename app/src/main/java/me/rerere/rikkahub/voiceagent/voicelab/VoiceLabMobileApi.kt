@@ -24,19 +24,19 @@ private val DEV_HTTP_HOSTS = setOf("localhost", "127.0.0.1", "::1", "10.0.2.2", 
 private const val ERROR_BODY_PREVIEW_LIMIT = 2048L
 private val ERROR_SECRET_PATTERNS = listOf(
     Regex(
-        pattern = """("?(?:authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret|password|prompt|answer)"?\s*[:=]\s*")([^"]+)(")""",
+        pattern = """\b(Bearer\s+)([A-Za-z0-9._~+/=-]+)""",
         option = RegexOption.IGNORE_CASE,
     ),
     Regex(
-        pattern = """('?(?:authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret|password|prompt|answer)'?\s*[:=]\s*')([^']+)(')""",
+        pattern = """("?(?:authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret|password|prompt|answer)"?\s*[:=]\s*")([^"]*)("?|$)""",
         option = RegexOption.IGNORE_CASE,
     ),
     Regex(
-        pattern = """\b((?:authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret|password|prompt|answer)\s*[:=]\s*)([^\s,;}\]]+)""",
+        pattern = """('?(?:authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret|password|prompt|answer)'?\s*[:=]\s*')([^']*)('?|$)""",
         option = RegexOption.IGNORE_CASE,
     ),
     Regex(
-        pattern = """\b(Bearer\s+)[A-Za-z0-9._~+/=-]+""",
+        pattern = """\b((?:authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret|password|prompt|answer)\s*[:=]\s*)([^\r\n,;}\]]+)""",
         option = RegexOption.IGNORE_CASE,
     ),
 )
