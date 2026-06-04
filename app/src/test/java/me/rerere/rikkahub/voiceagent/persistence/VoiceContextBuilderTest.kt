@@ -6,7 +6,6 @@ import me.rerere.ai.ui.UIMessagePart
 import me.rerere.rikkahub.data.model.Conversation
 import me.rerere.rikkahub.data.model.MessageNode
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertTrue
 import org.junit.Test
 import kotlin.uuid.Uuid
 
@@ -17,15 +16,16 @@ class VoiceContextBuilderTest {
             (1..25).map { index -> UIMessage.user("message $index") }
         )
 
-        val context = VoiceContextBuilder.build(
+        val context = VoiceContextBuilder().build(
             assistantName = "Hermes",
             assistantPrompt = "Answer briefly.",
             conversation = conversation,
         )
 
-        assertTrue(context.systemInstruction.contains("RikkaHub voice mode"))
-        assertTrue(context.systemInstruction.contains("Hermes"))
-        assertTrue(context.systemInstruction.contains("Answer briefly."))
+        assertEquals(
+            "You are Hermes in RikkaHub voice mode.\nAnswer briefly.",
+            context.systemInstruction,
+        )
         assertEquals(20, context.turns.size)
         assertEquals("message 6", context.turns.first().text)
         assertEquals("message 25", context.turns.last().text)
@@ -41,7 +41,7 @@ class VoiceContextBuilderTest {
             )
         )
 
-        val context = VoiceContextBuilder.build(
+        val context = VoiceContextBuilder().build(
             assistantName = "Hermes",
             assistantPrompt = "Prompt",
             conversation = conversation,
@@ -72,7 +72,7 @@ class VoiceContextBuilderTest {
             )
         )
 
-        val context = VoiceContextBuilder.build(
+        val context = VoiceContextBuilder().build(
             assistantName = "Hermes",
             assistantPrompt = "Prompt",
             conversation = conversation,
@@ -107,7 +107,7 @@ class VoiceContextBuilderTest {
             )
         )
 
-        val context = VoiceContextBuilder.build(
+        val context = VoiceContextBuilder().build(
             assistantName = "Hermes",
             assistantPrompt = "Prompt",
             conversation = conversation,
@@ -115,6 +115,29 @@ class VoiceContextBuilderTest {
         )
 
         assertEquals(listOf("text 1", "text 2", "text 3"), context.turns.map { it.text })
+    }
+
+    @Test
+    fun `build trims joined text before storing turns`() {
+        val conversation = conversationWith(
+            listOf(
+                UIMessage(
+                    role = MessageRole.USER,
+                    parts = listOf(
+                        UIMessagePart.Text("  first line"),
+                        UIMessagePart.Text("second line  "),
+                    ),
+                )
+            )
+        )
+
+        val context = VoiceContextBuilder().build(
+            assistantName = "Hermes",
+            assistantPrompt = "Prompt",
+            conversation = conversation,
+        )
+
+        assertEquals("first line\nsecond line", context.turns.single().text)
     }
 
     private fun conversationWith(messages: List<UIMessage>): Conversation = Conversation.ofId(

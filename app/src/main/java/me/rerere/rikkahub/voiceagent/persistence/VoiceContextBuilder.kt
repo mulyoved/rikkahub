@@ -11,7 +11,7 @@ data class VoiceContext(
     val turns: List<GeminiContentTurn>,
 )
 
-object VoiceContextBuilder {
+class VoiceContextBuilder {
     fun build(
         assistantName: String,
         assistantPrompt: String,
@@ -32,17 +32,13 @@ object VoiceContextBuilder {
     private fun buildSystemInstruction(
         assistantName: String,
         assistantPrompt: String,
-    ): String = buildString {
-        appendLine("You are running in RikkaHub voice mode.")
-        appendLine("Assistant name: $assistantName")
-        appendLine("Assistant prompt:")
-        append(assistantPrompt)
-    }
+    ): String = "You are $assistantName in RikkaHub voice mode.\n$assistantPrompt"
 
     private fun UIMessage.toGeminiTurn(): GeminiContentTurn? {
         val text = parts
             .filterIsInstance<UIMessagePart.Text>()
             .joinToString(separator = "\n") { it.text }
+            .trim()
 
         if (text.isBlank()) return null
 
