@@ -3,6 +3,7 @@ package me.rerere.rikkahub.voiceagent
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
@@ -340,6 +341,56 @@ class VoiceAgentViewModelTest {
         assertEquals(listOf("call-replay" to "new answer"), gemini.toolResponses)
         assertEquals(
             VoiceToolStatus.HermesAnswered(callId = "call-replay", elapsedMs = 0L),
+            coordinator.state.value.tool,
+        )
+    }
+
+    @Test
+    fun `duplicate tool call id still runs latest call when old send is already in progress`() = runTest {
+        val gemini = FakeGeminiLiveVoiceClient()
+        val oldSend = gemini.blockNextToolResponse("call-replay-send")
+        val toolApi = FakeVoiceToolApi()
+        val coordinator = VoiceAgentCoordinator(
+            gemini = gemini,
+            toolApi = toolApi,
+            audio = FakeVoiceAudioEngine(),
+            scope = this,
+            dispatcher = Dispatchers.Default,
+        )
+
+        coordinator.onGeminiEvent(
+            GeminiLiveEvent.ToolCall(callId = "call-replay-send", name = "ask_hermes", prompt = "old")
+        )
+        assertEquals("call-replay-send" to "old", toolApi.awaitRequest("call-replay-send"))
+        toolApi.complete(response(callId = "call-replay-send", answer = "old answer"))
+        assertTrue(oldSend.started.await(500, TimeUnit.MILLISECONDS))
+
+        val replayJob = launch(Dispatchers.Default) {
+            coordinator.onGeminiEvent(
+                GeminiLiveEvent.ToolCall(callId = "call-replay-send", name = "ask_hermes", prompt = "new")
+            )
+        }
+        assertFalse(oldSend.release.await(50, TimeUnit.MILLISECONDS))
+
+        oldSend.release.countDown()
+        withTimeout(500) {
+            while (("call-replay-send" to "new") !in toolApi.requests) {
+                delay(10)
+            }
+        }
+        withTimeout(500) {
+            replayJob.join()
+        }
+
+        toolApi.complete(response(callId = "call-replay-send", answer = "new answer"))
+        coordinator.awaitToolJobsWithTimeout()
+
+        assertEquals(
+            setOf("call-replay-send" to "old answer", "call-replay-send" to "new answer"),
+            gemini.toolResponses.toSet(),
+        )
+        assertEquals(
+            VoiceToolStatus.HermesAnswered(callId = "call-replay-send", elapsedMs = 0L),
             coordinator.state.value.tool,
         )
     }

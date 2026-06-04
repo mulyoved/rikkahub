@@ -190,7 +190,7 @@ class VoiceAgentCoordinator(
         diagnostics.record("hermes_tool_started", "callId=${call.callId}")
         job.invokeOnCompletion {
             synchronized(toolJobsLock) {
-                if (toolJobs[call.callId] === handle) {
+                if (toolJobs[call.callId] === handle && !handle.superseded) {
                     toolJobs -= call.callId
                 }
             }
@@ -231,7 +231,7 @@ class VoiceAgentCoordinator(
     }
 
     private fun isToolHandleActive(callId: String, handle: ToolJobHandle): Boolean = synchronized(toolJobsLock) {
-        !closed && !closing && callId !in cancelledToolCallIds && toolJobs[callId] === handle
+        !closed && !closing && !handle.superseded && callId !in cancelledToolCallIds && toolJobs[callId] === handle
     }
 
     private fun registerToolHandle(callId: String, handle: ToolJobHandle): Boolean {
@@ -241,6 +241,11 @@ class VoiceAgentCoordinator(
                 toolJobs[callId]
             }
             if (currentHandle != null) {
+                synchronized(toolJobsLock) {
+                    if (closed || closing || callId in cancelledToolCallIds) return false
+                    if (toolJobs[callId] !== currentHandle) return false
+                    currentHandle.superseded = true
+                }
                 synchronized(currentHandle.sendLock) {
                     synchronized(toolJobsLock) {
                         if (closed || closing || callId in cancelledToolCallIds) return false
@@ -347,6 +352,7 @@ class VoiceAgentCoordinator(
         val sendLock: Any = Any(),
     ) {
         lateinit var job: Job
+        var superseded: Boolean = false
     }
 }
 
