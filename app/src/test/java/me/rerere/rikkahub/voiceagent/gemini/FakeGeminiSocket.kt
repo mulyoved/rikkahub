@@ -14,6 +14,7 @@ class FakeGeminiSocket : GeminiSocket {
     val openedSessions = mutableListOf<OpenedSession>()
     val sentMessages = mutableListOf<String>()
     val sendResults = ArrayDeque<Boolean>()
+    var beforeSend: ((String) -> Unit)? = null
     var closeCount = 0
         private set
 
@@ -37,6 +38,7 @@ class FakeGeminiSocket : GeminiSocket {
     }
 
     override fun send(text: String): Boolean {
+        beforeSend?.invoke(text)
         sentMessages += text
         return sendResults.removeFirstOrNull() ?: true
     }

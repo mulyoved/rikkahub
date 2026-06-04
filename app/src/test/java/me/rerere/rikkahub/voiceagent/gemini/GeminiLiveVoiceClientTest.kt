@@ -8,6 +8,7 @@ import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import me.rerere.rikkahub.utils.JsonInstant
+import java.util.concurrent.atomic.AtomicBoolean
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -309,6 +310,49 @@ class GeminiLiveVoiceClientTest {
             ),
             events,
         )
+    }
+
+    @Test
+    fun `close cannot interleave with current generation send`() = runBlocking {
+        val socket = FakeGeminiSocket()
+        val client = TestableGeminiLiveVoiceClient(socket = socket, codec = GeminiLiveCodec())
+        val closeCompletedDuringSend = AtomicBoolean(false)
+        var closeThread: Thread? = null
+
+        client.connect(
+            token = "token-1",
+            websocketUrl = "wss://example.test/live",
+            providerModel = "gemini-2.0-flash-live-001",
+            liveConnectConfig = liveConnectConfig,
+            systemInstruction = "You are Hermes.",
+            contextTurns = emptyList(),
+            onEvent = {},
+        )
+        socket.receive(setupCompleteMessage)
+        socket.beforeSend = { text ->
+            if ("realtimeInput" in text) {
+                val thread = Thread {
+                    client.close()
+                }
+                closeThread = thread
+                thread.start()
+
+                val deadline = System.nanoTime() + 1_000_000_000L
+                while (thread.state != Thread.State.BLOCKED && socket.closeCount == 0) {
+                    check(System.nanoTime() < deadline) {
+                        "Timed out waiting for close to block or complete"
+                    }
+                    Thread.yield()
+                }
+                closeCompletedDuringSend.set(socket.closeCount > 0)
+            }
+        }
+
+        client.sendAudio("base64-audio")
+        closeThread?.join(1_000)
+
+        assertFalse(closeCompletedDuringSend.get())
+        assertEquals(1, socket.closeCount)
     }
 
     @Test

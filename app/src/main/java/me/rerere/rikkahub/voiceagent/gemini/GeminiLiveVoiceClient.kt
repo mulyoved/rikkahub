@@ -223,15 +223,22 @@ class TestableGeminiLiveVoiceClient(
         text: String,
         errorMessage: String,
     ) {
-        if (!socket.send(text)) {
-            emitIfCurrent(
-                generation = generation,
-                GeminiLiveEvent.Error(
-                    message = errorMessage,
-                    raw = "",
-                ),
-            )
+        val onError = synchronized(lock) {
+            val state = sessionState
+                ?.takeIf { it.generation == generation && !it.closed }
+                ?: return
+            if (socket.send(text)) {
+                null
+            } else {
+                state.onEvent
+            }
         }
+        onError?.invoke(
+            GeminiLiveEvent.Error(
+                message = errorMessage,
+                raw = "",
+            ),
+        )
     }
 
     private fun emitIfCurrent(generation: Long, event: GeminiLiveEvent) {
