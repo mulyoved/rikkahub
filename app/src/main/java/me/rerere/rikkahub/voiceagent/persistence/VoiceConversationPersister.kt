@@ -72,16 +72,21 @@ class VoiceConversationPersister {
         val hasExistingTool = latestAssistant.parts.any {
             it is UIMessagePart.Tool && it.toolCallId == callId
         }
-        val updatedParts = if (hasExistingTool) {
-            latestAssistant.parts.map { part ->
-                if (part is UIMessagePart.Tool && part.toolCallId == callId) tool else part
-            }
-        } else {
-            latestAssistant.parts + tool
+        if (!hasExistingTool) {
+            return conversation.appendMessage(
+                UIMessage(
+                    role = MessageRole.ASSISTANT,
+                    parts = listOf(tool),
+                )
+            )
         }
 
         val updatedMessages = currentMessages.toMutableList()
-        updatedMessages[latestAssistantIndex] = latestAssistant.copy(parts = updatedParts)
+        updatedMessages[latestAssistantIndex] = latestAssistant.copy(
+            parts = latestAssistant.parts.map { part ->
+                if (part is UIMessagePart.Tool && part.toolCallId == callId) tool else part
+            }
+        )
         return conversation.updateCurrentMessages(updatedMessages)
     }
 

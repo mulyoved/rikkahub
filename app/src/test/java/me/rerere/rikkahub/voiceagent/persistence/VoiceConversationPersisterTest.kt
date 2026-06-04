@@ -74,6 +74,37 @@ class VoiceConversationPersisterTest {
     }
 
     @Test
+    fun `new call id after user turn appends tool message without changing old assistant`() {
+        val persister = VoiceConversationPersister()
+        val conversation = emptyConversation()
+            .let { persister.appendAssistantTurn(it, "Old assistant reply", interrupted = false) }
+            .let { persister.appendUserTurn(it, "New user request") }
+            .let {
+                persister.upsertHermesTool(
+                    conversation = it,
+                    callId = "call-2",
+                    prompt = "Fresh prompt",
+                    status = VoiceToolRecordStatus.Complete("Fresh answer"),
+                )
+            }
+
+        assertEquals(
+            listOf(MessageRole.ASSISTANT, MessageRole.USER, MessageRole.ASSISTANT),
+            conversation.currentMessages.map { it.role },
+        )
+        assertEquals("Old assistant reply", conversation.currentMessages[0].parts.text())
+        assertEquals("New user request", conversation.currentMessages[1].parts.text())
+
+        val oldAssistantTools = conversation.currentMessages[0].parts.filterIsInstance<UIMessagePart.Tool>()
+        assertTrue(oldAssistantTools.isEmpty())
+
+        val tool = conversation.currentMessages[2].parts.single() as UIMessagePart.Tool
+        assertEquals("call-2", tool.toolCallId)
+        assertEquals("Fresh prompt", tool.input.promptJson())
+        assertEquals("Fresh answer", tool.output.text())
+    }
+
+    @Test
     fun `failed status records failure text as tool output`() {
         val persister = VoiceConversationPersister()
 
