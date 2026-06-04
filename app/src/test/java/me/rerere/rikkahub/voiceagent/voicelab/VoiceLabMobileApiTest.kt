@@ -195,6 +195,8 @@ class VoiceLabMobileApiTest {
                   "error":"failed",
                   "token":"live-token",
                   "apiKey":"server-key",
+                  "prompt":"private prompt",
+                  "answer":"private answer",
                   "single":"token='single-token'",
                   "unquoted":"api_key=plain-key",
                   "detail":"Bearer header-token"
@@ -217,6 +219,8 @@ class VoiceLabMobileApiTest {
         assertTrue(message.contains("[redacted]"))
         assertFalse(message.contains("live-token"))
         assertFalse(message.contains("server-key"))
+        assertFalse(message.contains("private prompt"))
+        assertFalse(message.contains("private answer"))
         assertFalse(message.contains("single-token"))
         assertFalse(message.contains("plain-key"))
         assertFalse(message.contains("header-token"))
@@ -244,12 +248,20 @@ class VoiceLabMobileApiTest {
             cloudflareClientId = "cf-id",
             cloudflareClientSecret = "cf-secret",
         )
+        val hermesResponse = MobileHermesResponse(
+            callId = "call-1",
+            answer = "private answer",
+            model = "ms-agent",
+            profileId = "default",
+            profileLabel = "Default",
+        )
 
         assertFalse(session.toString().contains("session-token"))
         assertFalse(hermesRequest.toString().contains("private prompt"))
         assertFalse(credentials.toString().contains("profile-api-key"))
         assertFalse(credentials.toString().contains("cf-id"))
         assertFalse(credentials.toString().contains("cf-secret"))
+        assertFalse(hermesResponse.toString().contains("private answer"))
     }
 
     @Test

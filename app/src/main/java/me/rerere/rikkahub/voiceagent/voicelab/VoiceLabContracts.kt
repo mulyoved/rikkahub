@@ -53,7 +53,16 @@ data class MobileHermesResponse(
     val model: String,
     val profileId: String,
     val profileLabel: String,
-)
+) {
+    override fun toString(): String =
+        "MobileHermesResponse(" +
+            "callId=$callId, " +
+            "answer=[redacted], " +
+            "model=$model, " +
+            "profileId=$profileId, " +
+            "profileLabel=$profileLabel" +
+            ")"
+}
 
 @Serializable
 data class VoiceLabMobileCredentials(
