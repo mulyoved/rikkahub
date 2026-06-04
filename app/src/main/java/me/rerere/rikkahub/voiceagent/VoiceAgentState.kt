@@ -38,6 +38,7 @@ data class VoiceAgentUiState(
     val session: VoiceSessionStatus = VoiceSessionStatus.Idle,
     val audio: VoiceAudioStatus = VoiceAudioStatus.Listening,
     val tool: VoiceToolStatus = VoiceToolStatus.Idle,
+    val toolCalls: Map<String, VoiceToolStatus> = emptyMap(),
     val persistence: VoicePersistenceStatus = VoicePersistenceStatus.Idle,
     val inputTranscript: String = "",
     val outputTranscript: String = "",

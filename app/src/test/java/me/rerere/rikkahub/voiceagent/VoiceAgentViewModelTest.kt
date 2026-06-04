@@ -237,14 +237,42 @@ class VoiceAgentViewModelTest {
         )
         assertEquals("call-a" to "First", toolApi.awaitRequest("call-a"))
         assertEquals("call-b" to "Second", toolApi.awaitRequest("call-b"))
+        assertEquals(
+            mapOf(
+                "call-a" to VoiceToolStatus.CallingHermes("call-a"),
+                "call-b" to VoiceToolStatus.CallingHermes("call-b"),
+            ),
+            coordinator.state.value.toolCalls,
+        )
 
         toolApi.complete(response(callId = "call-a", answer = "First answer"))
+        withTimeout(500) {
+            while (coordinator.state.value.toolCalls["call-a"] !is VoiceToolStatus.HermesAnswered) {
+                kotlinx.coroutines.delay(10)
+            }
+        }
+        assertEquals(VoiceToolStatus.CallingHermes("call-b"), coordinator.state.value.tool)
+        assertEquals(
+            mapOf(
+                "call-a" to VoiceToolStatus.HermesAnswered(callId = "call-a", elapsedMs = 0L),
+                "call-b" to VoiceToolStatus.CallingHermes("call-b"),
+            ),
+            coordinator.state.value.toolCalls,
+        )
+
         toolApi.complete(response(callId = "call-b", answer = "Second answer"))
         coordinator.awaitToolJobs()
 
         assertEquals(
             setOf("call-a" to "First answer", "call-b" to "Second answer"),
             gemini.toolResponses.toSet(),
+        )
+        assertEquals(
+            mapOf(
+                "call-a" to VoiceToolStatus.HermesAnswered(callId = "call-a", elapsedMs = 0L),
+                "call-b" to VoiceToolStatus.HermesAnswered(callId = "call-b", elapsedMs = 0L),
+            ),
+            coordinator.state.value.toolCalls,
         )
         assertTrue(
             diagnostics.events.value.any {
