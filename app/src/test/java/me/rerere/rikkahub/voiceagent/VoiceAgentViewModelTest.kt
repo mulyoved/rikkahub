@@ -226,6 +226,61 @@ class VoiceAgentViewModelTest {
     }
 
     @Test
+    fun `tool call cancellation cancels only matching Hermes call and suppresses its response`() = runTest {
+        val gemini = FakeGeminiLiveVoiceClient()
+        val toolApi = FakeVoiceToolApi()
+        val diagnostics = VoiceDiagnostics()
+        val coordinator = VoiceAgentCoordinator(
+            gemini = gemini,
+            toolApi = toolApi,
+            audio = FakeVoiceAudioEngine(),
+            diagnostics = diagnostics,
+            scope = this,
+        )
+
+        coordinator.onGeminiEvent(
+            GeminiLiveEvent.ToolCalls(
+                listOf(
+                    GeminiLiveEvent.ToolCall(callId = "call-a", name = "ask_hermes", prompt = "First"),
+                    GeminiLiveEvent.ToolCall(callId = "call-b", name = "ask_hermes", prompt = "Second"),
+                )
+            )
+        )
+        assertEquals("call-a" to "First", toolApi.awaitRequest("call-a"))
+        assertEquals("call-b" to "Second", toolApi.awaitRequest("call-b"))
+
+        coordinator.onGeminiEvent(GeminiLiveEvent.ToolCallCancellation(listOf("call-a")))
+        toolApi.awaitCancelled("call-a")
+
+        assertEquals(VoiceToolStatus.CallingHermes("call-b"), coordinator.state.value.tool)
+        assertEquals(
+            mapOf("call-b" to VoiceToolStatus.CallingHermes("call-b")),
+            coordinator.state.value.toolCalls,
+        )
+        assertEquals(false, toolApi.wasCancelled("call-b"))
+
+        toolApi.complete(response(callId = "call-b", answer = "Second answer"))
+        coordinator.awaitToolJobs()
+        toolApi.complete(response(callId = "call-a", answer = "First late answer"))
+
+        assertEquals(listOf("call-b" to "Second answer"), gemini.toolResponses)
+        assertEquals(false, toolApi.wasCancelled("call-b"))
+        assertEquals(
+            VoiceToolStatus.HermesAnswered(callId = "call-b", elapsedMs = 0L),
+            coordinator.state.value.tool,
+        )
+        assertEquals(
+            mapOf("call-b" to VoiceToolStatus.HermesAnswered(callId = "call-b", elapsedMs = 0L)),
+            coordinator.state.value.toolCalls,
+        )
+        assertTrue(
+            diagnostics.events.value.any {
+                it.name == "tool_call_cancellation" && it.detail.contains("call-a")
+            }
+        )
+    }
+
+    @Test
     fun `batched Hermes tool calls send both responses and record per-call success diagnostics`() = runTest {
         val gemini = FakeGeminiLiveVoiceClient()
         val toolApi = FakeVoiceToolApi()
@@ -403,6 +458,29 @@ class VoiceAgentViewModelTest {
         assertEquals("answer text", coordinator.state.value.outputTranscript)
         assertEquals(VoiceAudioStatus.AssistantSpeaking, coordinator.state.value.audio)
         assertEquals(listOf("base64-pcm"), audio.playedPcm16)
+    }
+
+    @Test
+    fun `late non tool events after close do not mutate state or play audio`() = runTest {
+        val audio = FakeVoiceAudioEngine()
+        val coordinator = VoiceAgentCoordinator(
+            gemini = FakeGeminiLiveVoiceClient(),
+            toolApi = FakeVoiceToolApi(),
+            audio = audio,
+            scope = this,
+        )
+
+        coordinator.close()
+        val stateAfterClose = coordinator.state.value
+
+        coordinator.onGeminiEvent(GeminiLiveEvent.OutputAudio("late-pcm"))
+        coordinator.onGeminiEvent(GeminiLiveEvent.InputTranscript("late input"))
+        coordinator.onGeminiEvent(GeminiLiveEvent.OutputTranscript("late output"))
+        coordinator.onGeminiEvent(GeminiLiveEvent.Error(message = "late error", raw = "{}"))
+
+        assertEquals(stateAfterClose, coordinator.state.value)
+        assertEquals(emptyList<String>(), audio.playedPcm16)
+        assertEquals(1, audio.releaseCalls)
     }
 
     @Test
