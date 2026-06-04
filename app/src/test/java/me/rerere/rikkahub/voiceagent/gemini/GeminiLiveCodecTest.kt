@@ -522,7 +522,7 @@ class GeminiLiveCodecTest {
     }
 
     @Test
-    fun `parse ignores unsupported tool calls`() {
+    fun `parse preserves unsupported metadata when all tool calls are unsupported`() {
         val raw = """
             {
               "toolCall":{
@@ -537,7 +537,18 @@ class GeminiLiveCodecTest {
             }
         """.trimIndent()
 
-        assertEquals(GeminiLiveEvent.Ignored(raw), codec.parseServerMessage(raw))
+        assertEquals(
+            GeminiLiveEvent.ToolCalls(
+                calls = emptyList(),
+                unsupportedCalls = listOf(
+                    GeminiLiveEvent.UnsupportedToolCall(
+                        callId = "call-1",
+                        name = "unsupported_tool",
+                    )
+                ),
+            ),
+            codec.parseServerMessage(raw),
+        )
     }
 
     @Test

@@ -77,7 +77,7 @@ class VoiceAgentViewModelTest {
     }
 
     @Test
-    fun `ignored unsupported tool call from codec records diagnostic without Hermes response`() = runTest {
+    fun `unsupported only tool call from codec records diagnostic without Hermes response`() = runTest {
         val gemini = FakeGeminiLiveVoiceClient()
         val toolApi = FakeVoiceToolApi()
         val diagnostics = VoiceDiagnostics()
@@ -102,7 +102,18 @@ class VoiceAgentViewModelTest {
             }
         """.trimIndent()
         val event = GeminiLiveCodec().parseServerMessage(rawUnsupportedToolCall)
-        assertEquals(GeminiLiveEvent.Ignored(rawUnsupportedToolCall), event)
+        assertEquals(
+            GeminiLiveEvent.ToolCalls(
+                calls = emptyList(),
+                unsupportedCalls = listOf(
+                    GeminiLiveEvent.UnsupportedToolCall(
+                        callId = "call-ignored",
+                        name = "unsupported_tool",
+                    )
+                ),
+            ),
+            event,
+        )
 
         coordinator.onGeminiEvent(event)
         coordinator.awaitToolJobs()
@@ -297,6 +308,53 @@ class VoiceAgentViewModelTest {
     }
 
     @Test
+    fun `batched failure remains aggregate summary after another call succeeds`() = runTest {
+        val gemini = FakeGeminiLiveVoiceClient()
+        val toolApi = FakeVoiceToolApi()
+        val coordinator = VoiceAgentCoordinator(
+            gemini = gemini,
+            toolApi = toolApi,
+            audio = FakeVoiceAudioEngine(),
+            scope = this,
+        )
+
+        coordinator.onGeminiEvent(
+            GeminiLiveEvent.ToolCalls(
+                listOf(
+                    GeminiLiveEvent.ToolCall(callId = "call-fail", name = "ask_hermes", prompt = "First"),
+                    GeminiLiveEvent.ToolCall(callId = "call-ok", name = "ask_hermes", prompt = "Second"),
+                )
+            )
+        )
+        assertEquals("call-fail" to "First", toolApi.awaitRequest("call-fail"))
+        assertEquals("call-ok" to "Second", toolApi.awaitRequest("call-ok"))
+
+        toolApi.fail(callId = "call-fail", error = IllegalStateException("Hermes failed"))
+        withTimeout(500) {
+            while (coordinator.state.value.toolCalls["call-fail"] !is VoiceToolStatus.HermesFailed) {
+                kotlinx.coroutines.delay(10)
+            }
+        }
+        assertEquals(VoiceToolStatus.CallingHermes("call-ok"), coordinator.state.value.tool)
+
+        toolApi.complete(response(callId = "call-ok", answer = "Second answer"))
+        coordinator.awaitToolJobs()
+
+        assertEquals(
+            VoiceToolStatus.HermesFailed(callId = "call-fail", message = "Hermes failed"),
+            coordinator.state.value.tool,
+        )
+        assertEquals(
+            mapOf(
+                "call-fail" to VoiceToolStatus.HermesFailed(callId = "call-fail", message = "Hermes failed"),
+                "call-ok" to VoiceToolStatus.HermesAnswered(callId = "call-ok", elapsedMs = 0L),
+            ),
+            coordinator.state.value.toolCalls,
+        )
+        assertEquals(listOf("call-ok" to "Second answer"), gemini.toolResponses)
+    }
+
+    @Test
     fun `Hermes failure updates failed tool status and does not crash`() = runTest {
         val gemini = FakeGeminiLiveVoiceClient()
         val toolApi = FakeVoiceToolApi()
@@ -467,6 +525,10 @@ class VoiceAgentViewModelTest {
 
         fun fail(error: Throwable) {
             firstCall().result.completeExceptionally(error)
+        }
+
+        fun fail(callId: String, error: Throwable) {
+            call(callId).result.completeExceptionally(error)
         }
 
         suspend fun awaitCancelled(callId: String) {

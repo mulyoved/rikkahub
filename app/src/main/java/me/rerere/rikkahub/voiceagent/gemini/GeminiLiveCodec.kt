@@ -177,7 +177,9 @@ class GeminiLiveCodec(
             )
         }
         return when (calls.size) {
-            0 -> null
+            0 -> if (unsupportedCalls.isEmpty()) null else {
+                GeminiLiveEvent.ToolCalls(calls = emptyList(), unsupportedCalls = unsupportedCalls)
+            }
             1 -> if (unsupportedCalls.isEmpty()) {
                 calls.first()
             } else {

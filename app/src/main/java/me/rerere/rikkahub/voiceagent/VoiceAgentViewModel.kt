@@ -14,17 +14,11 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
-import kotlinx.serialization.json.JsonArray
-import kotlinx.serialization.json.JsonElement
-import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.JsonPrimitive
-import kotlinx.serialization.json.contentOrNull
 import me.rerere.rikkahub.voiceagent.audio.VoiceAudioEngine
 import me.rerere.rikkahub.voiceagent.gemini.GeminiLiveEvent
 import me.rerere.rikkahub.voiceagent.gemini.GeminiLiveVoiceClient
 import me.rerere.rikkahub.voiceagent.telemetry.VoiceDiagnostics
 import me.rerere.rikkahub.voiceagent.voicelab.MobileHermesResponse
-import me.rerere.rikkahub.utils.JsonInstant
 import kotlin.coroutines.EmptyCoroutineContext
 
 interface VoiceToolApi {
@@ -120,9 +114,6 @@ class VoiceAgentCoordinator(
 
     private fun handleIgnored(event: GeminiLiveEvent.Ignored) {
         diagnostics.record("gemini_event_ignored", event.raw)
-        event.raw.unsupportedToolCalls().forEach { call ->
-            recordUnsupportedToolCall(call)
-        }
     }
 
     private fun handleToolCall(call: GeminiLiveEvent.ToolCall) {
@@ -187,7 +178,9 @@ class VoiceAgentCoordinator(
             val toolCalls = current.toolCalls + (callId to status)
             val summary = when (status) {
                 is VoiceToolStatus.CallingHermes -> status
-                else -> toolCalls.values.filterIsInstance<VoiceToolStatus.CallingHermes>().firstOrNull() ?: status
+                else -> toolCalls.values.filterIsInstance<VoiceToolStatus.CallingHermes>().firstOrNull()
+                    ?: toolCalls.values.filterIsInstance<VoiceToolStatus.HermesFailed>().firstOrNull()
+                    ?: status
             }
             current.copy(
                 tool = summary,
@@ -198,38 +191,6 @@ class VoiceAgentCoordinator(
 
     private fun recordUnsupportedToolCall(call: GeminiLiveEvent.UnsupportedToolCall) {
         diagnostics.record("unsupported_tool_call", "callId=${call.callId}, name=${call.name}")
-    }
-
-    private fun String.unsupportedToolCalls(): List<GeminiLiveEvent.UnsupportedToolCall> {
-        val root = runCatching { JsonInstant.parseToJsonElement(this) }.getOrNull() as? JsonObject
-            ?: return emptyList()
-        val functionCalls = root["toolCall"]
-            ?.jsonObjectOrNull()
-            ?.get("functionCalls")
-            ?.jsonArrayOrNull()
-            ?: return emptyList()
-        return functionCalls.mapNotNull { element ->
-            val functionCall = element.jsonObjectOrNull() ?: return@mapNotNull null
-            val name = functionCall["name"]
-                ?.stringContentOrNull()
-                ?.takeIf { it.isNotBlank() && it != ASK_HERMES_TOOL }
-                ?: return@mapNotNull null
-            GeminiLiveEvent.UnsupportedToolCall(
-                callId = functionCall["id"]?.stringContentOrNull()?.takeIf { it.isNotBlank() } ?: "unknown",
-                name = name,
-            )
-        }
-    }
-
-    private fun JsonElement.jsonObjectOrNull(): JsonObject? = this as? JsonObject
-
-    private fun JsonElement.jsonArrayOrNull(): JsonArray? = this as? JsonArray
-
-    private fun JsonElement.jsonPrimitiveOrNull(): JsonPrimitive? = this as? JsonPrimitive
-
-    private fun JsonElement.stringContentOrNull(): String? {
-        val primitive = jsonPrimitiveOrNull() ?: return null
-        return primitive.takeIf { it.isString }?.contentOrNull
     }
 
     private companion object {
