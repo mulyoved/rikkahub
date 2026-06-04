@@ -233,6 +233,8 @@ class VoiceLabMobileApiTest {
                   "cloudflareClientId":"cf-config-id",
                   "cloudflareClientSecret":"cf-config-secret",
                   "hermesProfileApiKey":"hermes-profile-key",
+                  "websocketUrl":"wss://signed.example.test/live?token=url-token",
+                  "liveConnectConfig":{"sessionToken":"config-token"},
                   "prompt":"private prompt",
                   "answer":"private answer",
                   "nested":{"prompt":"before \"escaped-secret\" after"},
@@ -266,6 +268,9 @@ class VoiceLabMobileApiTest {
         assertFalse(message.contains("cf-config-id"))
         assertFalse(message.contains("cf-config-secret"))
         assertFalse(message.contains("hermes-profile-key"))
+        assertFalse(message.contains("signed.example.test"))
+        assertFalse(message.contains("url-token"))
+        assertFalse(message.contains("config-token"))
         assertFalse(message.contains("private prompt"))
         assertFalse(message.contains("private answer"))
         assertFalse(message.contains("escaped-secret"))
@@ -312,6 +317,36 @@ class VoiceLabMobileApiTest {
         assertFalse(message.contains("plain-config-secret"))
         assertFalse(message.contains("plain-client-id"))
         assertFalse(message.contains("plain-client-secret"))
+    }
+
+    @Test
+    fun `decode failure previews redact session transport fields`() {
+        val transport = transportFor { request ->
+            responseFor(
+                request = request,
+                body = """
+                {
+                  "websocketUrl":"wss://signed.example.test/live?token=url-token",
+                  "liveConnectConfig":{"sessionToken":"config-token"}
+                }
+                """.trimIndent(),
+            )
+        }
+        val api = VoiceLabMobileApi(
+            baseUrl = "https://voice-lab.example.test",
+            credentials = VoiceLabMobileCredentials(hermesProfileApiKey = "profile-api-key"),
+            transport = transport,
+        )
+
+        val error = assertThrows(IllegalStateException::class.java) {
+            runBlocking { api.createSession("gemini-flash") }
+        }
+
+        val message = error.message.orEmpty()
+        assertTrue(message.contains("[redacted]"))
+        assertFalse(message.contains("signed.example.test"))
+        assertFalse(message.contains("url-token"))
+        assertFalse(message.contains("config-token"))
     }
 
     @Test

@@ -28,6 +28,7 @@ private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
 private val DEFAULT_HTTP_CLIENT by lazy {
     OkHttpClient.Builder()
         .connectTimeout(10, TimeUnit.SECONDS)
+        .callTimeout(6, TimeUnit.MINUTES)
         .readTimeout(5, TimeUnit.MINUTES)
         .writeTimeout(2, TimeUnit.MINUTES)
         .build()
@@ -50,6 +51,11 @@ private val ERROR_SENSITIVE_KEYS = setOf(
     "password",
     "prompt",
     "answer",
+    "websocketurl",
+    "liveconnectconfig",
+    "connectconfig",
+    "providerconfig",
+    "sessionurl",
 )
 private val ERROR_SECRET_PATTERNS = listOf(
     Regex(
@@ -57,15 +63,15 @@ private val ERROR_SECRET_PATTERNS = listOf(
         option = RegexOption.IGNORE_CASE,
     ),
     Regex(
-        pattern = """("?(?:authorization|api[_-]?key|key|cf[_-]?access[_-]?client[_-]?id|cf[_-]?access[_-]?client[_-]?secret|cloudflare[_-]?client[_-]?id|cloudflare[_-]?client[_-]?secret|client[_-]?id|client[_-]?secret|access[_-]?token|refresh[_-]?token|token|secret|password|prompt|answer)"?\s*[:=]\s*")([^"]*)("?|$)""",
+        pattern = """("?(?:authorization|api[_-]?key|key|cf[_-]?access[_-]?client[_-]?id|cf[_-]?access[_-]?client[_-]?secret|cloudflare[_-]?client[_-]?id|cloudflare[_-]?client[_-]?secret|client[_-]?id|client[_-]?secret|access[_-]?token|refresh[_-]?token|token|secret|password|prompt|answer|websocket[_-]?url|live[_-]?connect[_-]?config|connect[_-]?config|provider[_-]?config|session[_-]?url)"?\s*[:=]\s*")([^"]*)("?|$)""",
         option = RegexOption.IGNORE_CASE,
     ),
     Regex(
-        pattern = """('?(?:authorization|api[_-]?key|key|cf[_-]?access[_-]?client[_-]?id|cf[_-]?access[_-]?client[_-]?secret|cloudflare[_-]?client[_-]?id|cloudflare[_-]?client[_-]?secret|client[_-]?id|client[_-]?secret|access[_-]?token|refresh[_-]?token|token|secret|password|prompt|answer)'?\s*[:=]\s*')([^']*)('?|$)""",
+        pattern = """('?(?:authorization|api[_-]?key|key|cf[_-]?access[_-]?client[_-]?id|cf[_-]?access[_-]?client[_-]?secret|cloudflare[_-]?client[_-]?id|cloudflare[_-]?client[_-]?secret|client[_-]?id|client[_-]?secret|access[_-]?token|refresh[_-]?token|token|secret|password|prompt|answer|websocket[_-]?url|live[_-]?connect[_-]?config|connect[_-]?config|provider[_-]?config|session[_-]?url)'?\s*[:=]\s*')([^']*)('?|$)""",
         option = RegexOption.IGNORE_CASE,
     ),
     Regex(
-        pattern = """\b((?:authorization|api[_-]?key|key|cf[_-]?access[_-]?client[_-]?id|cf[_-]?access[_-]?client[_-]?secret|cloudflare[_-]?client[_-]?id|cloudflare[_-]?client[_-]?secret|client[_-]?id|client[_-]?secret|access[_-]?token|refresh[_-]?token|token|secret|password|prompt|answer)\s*[:=]\s*)([^\r\n,;}\]]+)""",
+        pattern = """\b((?:authorization|api[_-]?key|key|cf[_-]?access[_-]?client[_-]?id|cf[_-]?access[_-]?client[_-]?secret|cloudflare[_-]?client[_-]?id|cloudflare[_-]?client[_-]?secret|client[_-]?id|client[_-]?secret|access[_-]?token|refresh[_-]?token|token|secret|password|prompt|answer|websocket[_-]?url|live[_-]?connect[_-]?config|connect[_-]?config|provider[_-]?config|session[_-]?url)\s*[:=]\s*)([^\r\n,;}\]]+)""",
         option = RegexOption.IGNORE_CASE,
     ),
 )
