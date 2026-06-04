@@ -9,24 +9,60 @@ import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.Response
 import okhttp3.RequestBody.Companion.toRequestBody
 
 private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
 private val DEFAULT_HTTP_CLIENT by lazy { OkHttpClient.Builder().build() }
 private val DEV_HTTP_HOSTS = setOf("localhost", "127.0.0.1", "::1", "10.0.2.2", "10.0.3.2")
 
-class VoiceLabMobileApi(
+internal fun interface VoiceLabHttpTransport {
+    fun execute(request: Request): Response
+}
+
+private class OkHttpVoiceLabTransport(
+    private val client: OkHttpClient,
+) : VoiceLabHttpTransport {
+    override fun execute(request: Request): Response = client.newCall(request).execute()
+}
+
+class VoiceLabMobileApi internal constructor(
     private val baseUrl: String,
     private val credentials: VoiceLabMobileCredentials,
-    private val httpClient: OkHttpClient = DEFAULT_HTTP_CLIENT,
+    private val transport: VoiceLabHttpTransport,
     private val json: Json = JsonInstant,
 ) {
+    constructor(
+        baseUrl: String,
+        credentials: VoiceLabMobileCredentials,
+        json: Json = JsonInstant,
+    ) : this(
+        baseUrl = baseUrl,
+        credentials = credentials,
+        transport = OkHttpVoiceLabTransport(DEFAULT_HTTP_CLIENT),
+        json = json,
+    )
+
     private val normalizedBaseUrl = baseUrl.trimEnd('/')
     private val parsedBaseUrl = normalizedBaseUrl.toHttpUrl()
 
     init {
+        require(credentials.hermesProfileApiKey.isNotBlank()) {
+            "Voice Lab Hermes profile API key must not be blank"
+        }
+        require(
+            credentials.cloudflareClientId == null &&
+                credentials.cloudflareClientSecret == null ||
+                !credentials.cloudflareClientId.isNullOrBlank() &&
+                !credentials.cloudflareClientSecret.isNullOrBlank()
+        ) {
+            "Voice Lab Cloudflare Access credentials must be provided together or omitted together"
+        }
         require(parsedBaseUrl.isHttps || parsedBaseUrl.host in DEV_HTTP_HOSTS) {
             "Voice Lab baseUrl must use HTTPS unless it targets a local development host"
+        }
+        require(parsedBaseUrl.query == null && parsedBaseUrl.fragment == null) {
+            "Voice Lab baseUrl must not include a query or fragment"
         }
     }
 
@@ -57,7 +93,7 @@ class VoiceLabMobileApi(
                 }
                 .post(json.encodeToString(body).toRequestBody(JSON_MEDIA_TYPE))
                 .build()
-            httpClient.newCall(request).execute().use { response ->
+            transport.execute(request).use { response ->
                 val responseText = response.body.string()
                 if (!response.isSuccessful) {
                     throw IllegalStateException("Voice Lab request failed ${response.code}: $responseText")

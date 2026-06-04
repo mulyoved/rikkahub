@@ -1,7 +1,6 @@
 package me.rerere.rikkahub.voiceagent.voicelab
 
 import kotlinx.coroutines.runBlocking
-import okhttp3.OkHttpClient
 import okhttp3.Protocol
 import okhttp3.Request
 import okhttp3.Response
@@ -18,32 +17,25 @@ class VoiceLabMobileApiTest {
     fun `createSession sends mobile credentials and parses response`() = runBlocking {
         var seenRequest: Request? = null
         var seenBody = ""
-        val client = OkHttpClient.Builder()
-            .addInterceptor { chain ->
-                seenRequest = chain.request()
-                seenBody = chain.request().body.bodyToUtf8()
-                Response.Builder()
-                    .request(chain.request())
-                    .protocol(Protocol.HTTP_1_1)
-                    .code(200)
-                    .message("OK")
-                    .body(
-                        """
-                        {
-                          "token":"tok",
-                          "modelId":"gemini-flash",
-                          "providerModel":"gemini-3.1-flash-live-preview",
-                          "apiVersion":"v1alpha",
-                          "websocketUrl":"wss://example.test/live",
-                          "inputSampleRate":16000,
-                          "outputSampleRate":24000,
-                          "liveConnectConfig":{"responseModalities":["AUDIO"],"inputAudioTranscription":{},"outputAudioTranscription":{},"tools":[]}
-                        }
-                        """.trimIndent().toResponseBody()
-                    )
-                    .build()
-            }
-            .build()
+        val transport = VoiceLabHttpTransport { request ->
+            seenRequest = request
+            seenBody = request.body.bodyToUtf8()
+            responseFor(
+                request = request,
+                body = """
+                {
+                  "token":"tok",
+                  "modelId":"gemini-flash",
+                  "providerModel":"gemini-3.1-flash-live-preview",
+                  "apiVersion":"v1alpha",
+                  "websocketUrl":"wss://example.test/live",
+                  "inputSampleRate":16000,
+                  "outputSampleRate":24000,
+                  "liveConnectConfig":{"responseModalities":["AUDIO"],"inputAudioTranscription":{},"outputAudioTranscription":{},"tools":[]}
+                }
+                """.trimIndent(),
+            )
+        }
 
         val api = VoiceLabMobileApi(
             baseUrl = "https://voice-lab.example.test",
@@ -52,7 +44,7 @@ class VoiceLabMobileApiTest {
                 cloudflareClientId = "cf-id",
                 cloudflareClientSecret = "cf-secret",
             ),
-            httpClient = client,
+            transport = transport,
         )
 
         val session = api.createSession("gemini-flash")
@@ -73,34 +65,27 @@ class VoiceLabMobileApiTest {
     fun `askHermes omits default profileId and parses response`() = runBlocking {
         var seenRequest: Request? = null
         var seenBody = ""
-        val client = OkHttpClient.Builder()
-            .addInterceptor { chain ->
-                seenRequest = chain.request()
-                seenBody = chain.request().body.bodyToUtf8()
-                Response.Builder()
-                    .request(chain.request())
-                    .protocol(Protocol.HTTP_1_1)
-                    .code(200)
-                    .message("OK")
-                    .body(
-                        """
-                        {
-                          "callId":"call-1",
-                          "answer":"done",
-                          "model":"ms-agent",
-                          "profileId":"default",
-                          "profileLabel":"Default"
-                        }
-                        """.trimIndent().toResponseBody()
-                    )
-                    .build()
-            }
-            .build()
+        val transport = VoiceLabHttpTransport { request ->
+            seenRequest = request
+            seenBody = request.body.bodyToUtf8()
+            responseFor(
+                request = request,
+                body = """
+                {
+                  "callId":"call-1",
+                  "answer":"done",
+                  "model":"ms-agent",
+                  "profileId":"default",
+                  "profileLabel":"Default"
+                }
+                """.trimIndent(),
+            )
+        }
 
         val api = VoiceLabMobileApi(
             baseUrl = "https://voice-lab.example.test/base",
             credentials = VoiceLabMobileCredentials(hermesProfileApiKey = "profile-api-key"),
-            httpClient = client,
+            transport = transport,
         )
 
         val response = api.askHermes(callId = "call-1", prompt = "status")
@@ -120,33 +105,26 @@ class VoiceLabMobileApiTest {
     @Test
     fun `askHermes sends explicit profileId`() = runBlocking {
         var seenBody = ""
-        val client = OkHttpClient.Builder()
-            .addInterceptor { chain ->
-                seenBody = chain.request().body.bodyToUtf8()
-                Response.Builder()
-                    .request(chain.request())
-                    .protocol(Protocol.HTTP_1_1)
-                    .code(200)
-                    .message("OK")
-                    .body(
-                        """
-                        {
-                          "callId":"call-1",
-                          "answer":"done",
-                          "model":"ms-agent",
-                          "profileId":"research",
-                          "profileLabel":"Research"
-                        }
-                        """.trimIndent().toResponseBody()
-                    )
-                    .build()
-            }
-            .build()
+        val transport = VoiceLabHttpTransport { request ->
+            seenBody = request.body.bodyToUtf8()
+            responseFor(
+                request = request,
+                body = """
+                {
+                  "callId":"call-1",
+                  "answer":"done",
+                  "model":"ms-agent",
+                  "profileId":"research",
+                  "profileLabel":"Research"
+                }
+                """.trimIndent(),
+            )
+        }
 
         val api = VoiceLabMobileApi(
             baseUrl = "https://voice-lab.example.test",
             credentials = VoiceLabMobileCredentials(hermesProfileApiKey = "profile-api-key"),
-            httpClient = client,
+            transport = transport,
         )
 
         api.askHermes(callId = "call-1", prompt = "status", profileId = "research")
@@ -156,21 +134,18 @@ class VoiceLabMobileApiTest {
 
     @Test
     fun `non successful responses include status and body`() {
-        val client = OkHttpClient.Builder()
-            .addInterceptor { chain ->
-                Response.Builder()
-                    .request(chain.request())
-                    .protocol(Protocol.HTTP_1_1)
-                    .code(503)
-                    .message("Unavailable")
-                    .body("""{"error":"down"}""".toResponseBody())
-                    .build()
-            }
-            .build()
+        val transport = VoiceLabHttpTransport { request ->
+            responseFor(
+                request = request,
+                code = 503,
+                message = "Unavailable",
+                body = """{"error":"down"}""",
+            )
+        }
         val api = VoiceLabMobileApi(
             baseUrl = "https://voice-lab.example.test",
             credentials = VoiceLabMobileCredentials(hermesProfileApiKey = "profile-api-key"),
-            httpClient = client,
+            transport = transport,
         )
 
         val error = assertThrows(IllegalStateException::class.java) {
@@ -192,7 +167,62 @@ class VoiceLabMobileApiTest {
         VoiceLabMobileApi(baseUrl = "http://127.0.0.1:8787", credentials = credentials)
         VoiceLabMobileApi(baseUrl = "http://10.0.2.2:8787", credentials = credentials)
     }
+
+    @Test
+    fun `baseUrl must not include query or fragment`() {
+        val credentials = VoiceLabMobileCredentials(hermesProfileApiKey = "profile-api-key")
+
+        assertThrows(IllegalArgumentException::class.java) {
+            VoiceLabMobileApi(baseUrl = "https://voice-lab.example.test?x=1", credentials = credentials)
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            VoiceLabMobileApi(baseUrl = "https://voice-lab.example.test#voice", credentials = credentials)
+        }
+    }
+
+    @Test
+    fun `credentials must not be blank or partial`() {
+        assertThrows(IllegalArgumentException::class.java) {
+            VoiceLabMobileApi(
+                baseUrl = "https://voice-lab.example.test",
+                credentials = VoiceLabMobileCredentials(hermesProfileApiKey = " "),
+            )
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            VoiceLabMobileApi(
+                baseUrl = "https://voice-lab.example.test",
+                credentials = VoiceLabMobileCredentials(
+                    hermesProfileApiKey = "profile-api-key",
+                    cloudflareClientId = "cf-id",
+                ),
+            )
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            VoiceLabMobileApi(
+                baseUrl = "https://voice-lab.example.test",
+                credentials = VoiceLabMobileCredentials(
+                    hermesProfileApiKey = "profile-api-key",
+                    cloudflareClientId = "",
+                    cloudflareClientSecret = "cf-secret",
+                ),
+            )
+        }
+    }
 }
+
+private fun responseFor(
+    request: Request,
+    code: Int = 200,
+    message: String = "OK",
+    body: String,
+): Response =
+    Response.Builder()
+        .request(request)
+        .protocol(Protocol.HTTP_1_1)
+        .code(code)
+        .message(message)
+        .body(body.toResponseBody())
+        .build()
 
 private fun okhttp3.RequestBody?.bodyToUtf8(): String {
     if (this == null) return ""
