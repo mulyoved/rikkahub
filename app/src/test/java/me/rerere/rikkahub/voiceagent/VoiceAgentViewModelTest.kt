@@ -686,12 +686,16 @@ class VoiceAgentViewModelTest {
     private class FakeGeminiLiveVoiceClient : GeminiLiveVoiceClient {
         val toolResponses = mutableListOf<Pair<String, String>>()
         var closeCalls = 0
-        private val blockedResponses = mutableMapOf<String, BlockedToolResponse>()
+        private val blockedResponses = mutableMapOf<String, MutableList<BlockedToolResponse>>()
 
         fun blockToolResponse(callId: String): BlockedToolResponse {
+            return blockNextToolResponse(callId)
+        }
+
+        fun blockNextToolResponse(callId: String): BlockedToolResponse {
             return BlockedToolResponse().also { blocked ->
                 synchronized(blockedResponses) {
-                    blockedResponses[callId] = blocked
+                    blockedResponses.getOrPut(callId) { mutableListOf() } += blocked
                 }
             }
         }
@@ -709,7 +713,9 @@ class VoiceAgentViewModelTest {
         override fun sendAudio(base64Pcm16: String) = Unit
 
         override fun sendToolResponse(callId: String, answer: String) {
-            val blocked = synchronized(blockedResponses) { blockedResponses[callId] }
+            val blocked = synchronized(blockedResponses) {
+                blockedResponses[callId]?.removeFirstOrNull()
+            }
             if (blocked != null) {
                 blocked.started.countDown()
                 blocked.release.await(500, TimeUnit.MILLISECONDS)

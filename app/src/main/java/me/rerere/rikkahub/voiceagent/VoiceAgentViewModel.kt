@@ -159,21 +159,11 @@ class VoiceAgentCoordinator(
             runHermesToolCall(callId = call.callId, prompt = call.prompt, handle = handle)
         }
         handle.job = job
-        var previousJob: Job? = null
-        val shouldStart = synchronized(toolJobsLock) {
-            if (closed || closing || call.callId in cancelledToolCallIds) {
-                false
-            } else {
-                previousJob = toolJobs.put(call.callId, handle)?.job
-                updateToolStatus(call.callId, VoiceToolStatus.CallingHermes(call.callId))
-                true
-            }
-        }
+        val shouldStart = registerToolHandle(callId = call.callId, handle = handle)
         if (!shouldStart) {
             job.cancel()
             return
         }
-        previousJob?.cancel()
         diagnostics.record("hermes_tool_started", "callId=${call.callId}")
         job.invokeOnCompletion {
             synchronized(toolJobsLock) {
@@ -194,13 +184,13 @@ class VoiceAgentCoordinator(
                 coroutineContext.ensureActive()
                 gemini.sendToolResponse(callId, response.answer)
             }
-            if (!isToolResultActive(callId)) return
+            if (!isToolHandleActive(callId, handle)) return
             diagnostics.record("hermes_tool_succeeded", "callId=$callId")
             updateToolStatus(callId, VoiceToolStatus.HermesAnswered(callId = callId, elapsedMs = 0L))
         } catch (error: CancellationException) {
             throw error
         } catch (error: Throwable) {
-            if (!isToolResultActive(callId)) return
+            if (!isToolHandleActive(callId, handle)) return
             val message = error.message ?: error.javaClass.simpleName
             diagnostics.record("hermes_tool_failed", "callId=$callId, message=$message")
             updateToolStatus(callId, VoiceToolStatus.HermesFailed(callId = callId, message = message))
@@ -209,12 +199,39 @@ class VoiceAgentCoordinator(
 
     private fun isClosed(): Boolean = synchronized(toolJobsLock) { closed || closing }
 
-    private fun isToolResultActive(callId: String): Boolean = synchronized(toolJobsLock) {
-        !closed && !closing && callId !in cancelledToolCallIds
-    }
-
     private fun isToolHandleActive(callId: String, handle: ToolJobHandle): Boolean = synchronized(toolJobsLock) {
         !closed && !closing && callId !in cancelledToolCallIds && toolJobs[callId] === handle
+    }
+
+    private fun registerToolHandle(callId: String, handle: ToolJobHandle): Boolean {
+        while (true) {
+            val currentHandle = synchronized(toolJobsLock) {
+                if (closed || closing || callId in cancelledToolCallIds) return false
+                toolJobs[callId]
+            }
+            if (currentHandle == null) {
+                synchronized(toolJobsLock) {
+                    if (closed || closing || callId in cancelledToolCallIds) return false
+                    if (toolJobs[callId] == null) {
+                        toolJobs[callId] = handle
+                        updateToolStatus(callId, VoiceToolStatus.CallingHermes(callId))
+                        return true
+                    }
+                }
+            } else {
+                synchronized(currentHandle.sendLock) {
+                    synchronized(toolJobsLock) {
+                        if (closed || closing || callId in cancelledToolCallIds) return false
+                        if (toolJobs[callId] === currentHandle) {
+                            toolJobs[callId] = handle
+                            updateToolStatus(callId, VoiceToolStatus.CallingHermes(callId))
+                            currentHandle.job.cancel()
+                            return true
+                        }
+                    }
+                }
+            }
+        }
     }
 
     private fun handleToolCallCancellation(event: GeminiLiveEvent.ToolCallCancellation) {
