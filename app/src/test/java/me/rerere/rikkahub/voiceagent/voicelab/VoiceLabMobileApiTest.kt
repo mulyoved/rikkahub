@@ -17,7 +17,7 @@ class VoiceLabMobileApiTest {
     fun `createSession sends mobile credentials and parses response`() = runBlocking {
         var seenRequest: Request? = null
         var seenBody = ""
-        val transport = VoiceLabHttpTransport { request ->
+        val transport = transportFor { request ->
             seenRequest = request
             seenBody = request.body.bodyToUtf8()
             responseFor(
@@ -65,7 +65,7 @@ class VoiceLabMobileApiTest {
     fun `askHermes omits default profileId and parses response`() = runBlocking {
         var seenRequest: Request? = null
         var seenBody = ""
-        val transport = VoiceLabHttpTransport { request ->
+        val transport = transportFor { request ->
             seenRequest = request
             seenBody = request.body.bodyToUtf8()
             responseFor(
@@ -105,7 +105,7 @@ class VoiceLabMobileApiTest {
     @Test
     fun `askHermes sends explicit profileId`() = runBlocking {
         var seenBody = ""
-        val transport = VoiceLabHttpTransport { request ->
+        val transport = transportFor { request ->
             seenBody = request.body.bodyToUtf8()
             responseFor(
                 request = request,
@@ -134,7 +134,7 @@ class VoiceLabMobileApiTest {
 
     @Test
     fun `non successful responses include status and body`() {
-        val transport = VoiceLabHttpTransport { request ->
+        val transport = transportFor { request ->
             responseFor(
                 request = request,
                 code = 503,
@@ -154,6 +154,33 @@ class VoiceLabMobileApiTest {
 
         assertTrue(error.message.orEmpty().contains("503"))
         assertTrue(error.message.orEmpty().contains("down"))
+    }
+
+    @Test
+    fun `non successful response bodies are bounded`() {
+        val responseBody = "x".repeat(5000)
+        val transport = transportFor { request ->
+            responseFor(
+                request = request,
+                code = 500,
+                message = "Error",
+                body = responseBody,
+            )
+        }
+        val api = VoiceLabMobileApi(
+            baseUrl = "https://voice-lab.example.test",
+            credentials = VoiceLabMobileCredentials(hermesProfileApiKey = "profile-api-key"),
+            transport = transport,
+        )
+
+        val error = assertThrows(IllegalStateException::class.java) {
+            runBlocking { api.createSession("gemini-flash") }
+        }
+
+        val message = error.message.orEmpty()
+        assertTrue(message.contains("500"))
+        assertTrue(message.contains("[truncated]"))
+        assertFalse(message.contains(responseBody))
     }
 
     @Test
@@ -209,6 +236,11 @@ class VoiceLabMobileApiTest {
         }
     }
 }
+
+private fun transportFor(handler: (Request) -> Response): VoiceLabHttpTransport =
+    object : VoiceLabHttpTransport {
+        override suspend fun execute(request: Request): Response = handler(request)
+    }
 
 private fun responseFor(
     request: Request,
