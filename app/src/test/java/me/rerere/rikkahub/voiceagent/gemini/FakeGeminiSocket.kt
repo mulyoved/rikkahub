@@ -1,10 +1,17 @@
 package me.rerere.rikkahub.voiceagent.gemini
 
 class FakeGeminiSocket : GeminiSocket {
+    data class OpenedSession(
+        val onMessage: (String) -> Unit,
+        val onClosed: (Int, String) -> Unit,
+        val onFailure: (Throwable) -> Unit,
+    )
+
     var openedUrl: String? = null
         private set
     var openedToken: String? = null
         private set
+    val openedSessions = mutableListOf<OpenedSession>()
     val sentMessages = mutableListOf<String>()
     val sendResults = ArrayDeque<Boolean>()
     var closeCount = 0
@@ -23,6 +30,7 @@ class FakeGeminiSocket : GeminiSocket {
     ) {
         openedUrl = url
         openedToken = token
+        openedSessions += OpenedSession(onMessage, onClosed, onFailure)
         this.onMessage = onMessage
         this.onClosed = onClosed
         this.onFailure = onFailure
@@ -39,6 +47,10 @@ class FakeGeminiSocket : GeminiSocket {
 
     fun receive(text: String) {
         onMessage?.invoke(text)
+    }
+
+    fun receiveFromSession(index: Int, text: String) {
+        openedSessions[index].onMessage(text)
     }
 
     fun closeFromServer(code: Int = 1000, reason: String = "done") {

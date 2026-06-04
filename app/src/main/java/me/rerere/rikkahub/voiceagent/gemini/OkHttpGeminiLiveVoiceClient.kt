@@ -55,6 +55,8 @@ class OkHttpGeminiSocket(
 ) : GeminiSocket {
     private val lock = Any()
     private var webSocket: WebSocket? = null
+    private var generation = 0L
+    private var closed = true
 
     override fun open(
         url: String,
@@ -63,7 +65,11 @@ class OkHttpGeminiSocket(
         onClosed: (Int, String) -> Unit,
         onFailure: (Throwable) -> Unit,
     ) {
+        val openGeneration: Long
         val previousWebSocket = synchronized(lock) {
+            generation += 1
+            openGeneration = generation
+            closed = false
             val current = webSocket
             webSocket = null
             current
@@ -77,13 +83,13 @@ class OkHttpGeminiSocket(
             request,
             object : WebSocketListener() {
                 override fun onMessage(webSocket: WebSocket, text: String) {
-                    if (isCurrent(webSocket)) {
+                    if (isCurrent(webSocket, openGeneration)) {
                         onMessage(text)
                     }
                 }
 
                 override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
-                    val notifyClosed = clearIfCurrent(webSocket)
+                    val notifyClosed = clearIfCurrent(webSocket, openGeneration)
                     webSocket.close(code, reason)
                     if (notifyClosed) {
                         onClosed(code, reason)
@@ -91,20 +97,28 @@ class OkHttpGeminiSocket(
                 }
 
                 override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                    if (clearIfCurrent(webSocket)) {
+                    if (clearIfCurrent(webSocket, openGeneration)) {
                         onClosed(code, reason)
                     }
                 }
 
                 override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                    if (clearIfCurrent(webSocket)) {
+                    if (clearIfCurrent(webSocket, openGeneration)) {
                         onFailure(t)
                     }
                 }
             },
         )
-        synchronized(lock) {
-            webSocket = newWebSocket
+        val closeNewWebSocket = synchronized(lock) {
+            if (generation == openGeneration && !closed) {
+                webSocket = newWebSocket
+                false
+            } else {
+                true
+            }
+        }
+        if (closeNewWebSocket) {
+            newWebSocket.close(1000, "replaced")
         }
     }
 
@@ -114,6 +128,8 @@ class OkHttpGeminiSocket(
 
     override fun close() {
         val current = synchronized(lock) {
+            generation += 1
+            closed = true
             val current = webSocket
             webSocket = null
             current
@@ -121,12 +137,12 @@ class OkHttpGeminiSocket(
         current?.close(1000, null)
     }
 
-    private fun isCurrent(candidate: WebSocket): Boolean = synchronized(lock) {
-        webSocket === candidate
+    private fun isCurrent(candidate: WebSocket, candidateGeneration: Long): Boolean = synchronized(lock) {
+        !closed && generation == candidateGeneration && webSocket === candidate
     }
 
-    private fun clearIfCurrent(candidate: WebSocket): Boolean = synchronized(lock) {
-        if (webSocket === candidate) {
+    private fun clearIfCurrent(candidate: WebSocket, candidateGeneration: Long): Boolean = synchronized(lock) {
+        if (!closed && generation == candidateGeneration && webSocket === candidate) {
             webSocket = null
             true
         } else {

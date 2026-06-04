@@ -14,6 +14,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class GeminiLiveVoiceClientTest {
+    private val setupCompleteMessage = """{"setupComplete":{}}"""
     private val liveConnectConfig = JsonObject(
         mapOf(
             "responseModalities" to JsonArray(listOf(JsonPrimitive("AUDIO"))),
@@ -41,9 +42,15 @@ class GeminiLiveVoiceClientTest {
 
         assertEquals("wss://example.test/live", socket.openedUrl)
         assertEquals("token-1", socket.openedToken)
-        assertEquals(2, socket.sentMessages.size)
+        assertEquals(1, socket.sentMessages.size)
         assertTrue("setup" in socket.sentMessages[0].jsonObject())
+
+        socket.receive(setupCompleteMessage)
+
+        assertEquals(2, socket.sentMessages.size)
         assertTrue("clientContent" in socket.sentMessages[1].jsonObject())
+        assertEquals(listOf(GeminiLiveEvent.SetupComplete), events)
+        events.clear()
 
         socket.receive(
             """
@@ -165,8 +172,11 @@ class GeminiLiveVoiceClientTest {
             onEvent = events::add,
         )
 
+        socket.receive(setupCompleteMessage)
+
         assertEquals(
             listOf(
+                GeminiLiveEvent.SetupComplete,
                 GeminiLiveEvent.Error(
                     message = "Failed to send Gemini context message",
                     raw = "",
@@ -177,13 +187,55 @@ class GeminiLiveVoiceClientTest {
     }
 
     @Test
-    fun `send audio uses realtime input audio shape`() {
+    fun `early audio and tool response wait for setup complete and flush after context`() = runBlocking {
+        val socket = FakeGeminiSocket()
+        val client = TestableGeminiLiveVoiceClient(socket = socket, codec = GeminiLiveCodec())
+        val events = mutableListOf<GeminiLiveEvent>()
+
+        client.connect(
+            token = "token-1",
+            websocketUrl = "wss://example.test/live",
+            providerModel = "gemini-2.0-flash-live-001",
+            liveConnectConfig = liveConnectConfig,
+            systemInstruction = "You are Hermes.",
+            contextTurns = listOf(GeminiContentTurn(role = "user", text = "Hello")),
+            onEvent = events::add,
+        )
+
+        client.sendAudio("base64-audio")
+        client.sendToolResponse(callId = "call-1", answer = "42")
+
+        assertEquals(1, socket.sentMessages.size)
+        assertTrue("setup" in socket.sentMessages[0].jsonObject())
+
+        socket.receive(setupCompleteMessage)
+
+        assertEquals(4, socket.sentMessages.size)
+        assertTrue("clientContent" in socket.sentMessages[1].jsonObject())
+        assertTrue("realtimeInput" in socket.sentMessages[2].jsonObject())
+        assertTrue("toolResponse" in socket.sentMessages[3].jsonObject())
+        assertEquals(listOf(GeminiLiveEvent.SetupComplete), events)
+    }
+
+    @Test
+    fun `send audio uses realtime input audio shape after setup complete`() = runBlocking {
         val socket = FakeGeminiSocket()
         val client = TestableGeminiLiveVoiceClient(socket = socket, codec = GeminiLiveCodec())
 
+        client.connect(
+            token = "token-1",
+            websocketUrl = "wss://example.test/live",
+            providerModel = "gemini-2.0-flash-live-001",
+            liveConnectConfig = liveConnectConfig,
+            systemInstruction = "You are Hermes.",
+            contextTurns = emptyList(),
+            onEvent = {},
+        )
+        socket.receive(setupCompleteMessage)
+
         client.sendAudio("base64-audio")
 
-        val audio = socket.sentMessages.single()
+        val audio = socket.sentMessages.last()
             .jsonObject()["realtimeInput"]!!
             .jsonObject["audio"]!!
             .jsonObject
@@ -210,6 +262,8 @@ class GeminiLiveVoiceClientTest {
             onEvent = events::add,
         )
 
+        socket.receive(setupCompleteMessage)
+        events.clear()
         client.sendAudio("base64-audio")
 
         assertEquals(
@@ -242,6 +296,8 @@ class GeminiLiveVoiceClientTest {
             onEvent = events::add,
         )
 
+        socket.receive(setupCompleteMessage)
+        events.clear()
         client.sendToolResponse(callId = "call-1", answer = "42")
 
         assertEquals(
@@ -253,6 +309,80 @@ class GeminiLiveVoiceClientTest {
             ),
             events,
         )
+    }
+
+    @Test
+    fun `queued send failure after setup complete emits message specific error`() = runBlocking {
+        val socket = FakeGeminiSocket().apply {
+            sendResults += true
+            sendResults += true
+            sendResults += false
+        }
+        val client = TestableGeminiLiveVoiceClient(socket = socket, codec = GeminiLiveCodec())
+        val events = mutableListOf<GeminiLiveEvent>()
+
+        client.connect(
+            token = "token-1",
+            websocketUrl = "wss://example.test/live",
+            providerModel = "gemini-2.0-flash-live-001",
+            liveConnectConfig = liveConnectConfig,
+            systemInstruction = "You are Hermes.",
+            contextTurns = listOf(GeminiContentTurn(role = "user", text = "Hello")),
+            onEvent = events::add,
+        )
+        client.sendAudio("base64-audio")
+
+        socket.receive(setupCompleteMessage)
+
+        assertEquals(
+            listOf(
+                GeminiLiveEvent.SetupComplete,
+                GeminiLiveEvent.Error(
+                    message = "Failed to send Gemini audio message",
+                    raw = "",
+                ),
+            ),
+            events,
+        )
+    }
+
+    @Test
+    fun `stale socket message after reconnect is ignored`() = runBlocking {
+        val socket = FakeGeminiSocket()
+        val client = TestableGeminiLiveVoiceClient(socket = socket, codec = GeminiLiveCodec())
+        val firstEvents = mutableListOf<GeminiLiveEvent>()
+        val secondEvents = mutableListOf<GeminiLiveEvent>()
+
+        client.connect(
+            token = "token-1",
+            websocketUrl = "wss://example.test/live",
+            providerModel = "gemini-2.0-flash-live-001",
+            liveConnectConfig = liveConnectConfig,
+            systemInstruction = "You are Hermes.",
+            contextTurns = listOf(GeminiContentTurn(role = "user", text = "First")),
+            onEvent = firstEvents::add,
+        )
+        client.connect(
+            token = "token-2",
+            websocketUrl = "wss://example.test/live",
+            providerModel = "gemini-2.0-flash-live-001",
+            liveConnectConfig = liveConnectConfig,
+            systemInstruction = "You are Hermes.",
+            contextTurns = listOf(GeminiContentTurn(role = "user", text = "Second")),
+            onEvent = secondEvents::add,
+        )
+
+        socket.receiveFromSession(0, setupCompleteMessage)
+
+        assertTrue(firstEvents.isEmpty())
+        assertTrue(secondEvents.isEmpty())
+        assertEquals(2, socket.sentMessages.size)
+
+        socket.receiveFromSession(1, setupCompleteMessage)
+
+        assertEquals(listOf(GeminiLiveEvent.SetupComplete), secondEvents)
+        assertEquals(3, socket.sentMessages.size)
+        assertTrue("clientContent" in socket.sentMessages[2].jsonObject())
     }
 
     @Test
