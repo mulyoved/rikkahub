@@ -10,8 +10,10 @@ import android.media.AudioRecord
 import android.media.AudioTrack
 import android.media.MediaRecorder
 import android.util.Base64
+import android.util.Log
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
@@ -19,14 +21,17 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
-class AndroidVoiceAudioEngine(
-    private val context: Context,
-) : VoiceAudioEngine {
+class AndroidVoiceAudioEngine(context: Context) : VoiceAudioEngine {
+    private val context = context.applicationContext
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val lock = Any()
+    private val playbackWriteLock = Any()
     private var captureJob: Job? = null
     private var audioRecord: AudioRecord? = null
     private var audioTrack: AudioTrack? = null
+    private var captureGeneration = 0L
+    private var playbackGeneration = 0L
+    private var released = false
 
     override fun startCapture(onPcm16: (ByteArray) -> Unit) {
         if (
@@ -38,49 +43,80 @@ class AndroidVoiceAudioEngine(
 
         stopCapture()
 
-        val job = scope.launch {
-            val bufferSize = captureBufferSize()
-            val recorder = AudioRecord(
+        val generation = synchronized(lock) {
+            check(!released) { "Voice audio engine is released" }
+            captureGeneration += 1
+            captureGeneration
+        }
+        val bufferSize = captureBufferSize()
+        val recorder = runCatching {
+            AudioRecord(
                 MediaRecorder.AudioSource.VOICE_COMMUNICATION,
                 CAPTURE_SAMPLE_RATE,
                 AudioFormat.CHANNEL_IN_MONO,
                 AudioFormat.ENCODING_PCM_16BIT,
                 bufferSize * 2,
             )
+        }.getOrElse {
+            throw IllegalStateException("AudioRecord creation failed", it)
+        }
 
-            if (recorder.state != AudioRecord.STATE_INITIALIZED) {
-                recorder.releaseSafely()
-                throw IllegalStateException("AudioRecord initialization failed")
-            }
+        if (recorder.state != AudioRecord.STATE_INITIALIZED) {
+            recorder.releaseSafely()
+            throw IllegalStateException("AudioRecord initialization failed")
+        }
 
-            synchronized(lock) {
-                if (!isActive) {
-                    recorder.releaseSafely()
-                    return@launch
-                }
-                audioRecord = recorder
-            }
+        try {
+            recorder.startRecording()
+        } catch (e: RuntimeException) {
+            recorder.releaseSafely()
+            throw IllegalStateException("AudioRecord start failed", e)
+        }
 
+        if (recorder.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
+            recorder.releaseSafely()
+            throw IllegalStateException("AudioRecord start failed")
+        }
+
+        val job = scope.launch(start = CoroutineStart.LAZY) {
+            val buffer = ByteArray(bufferSize)
             try {
-                recorder.startRecording()
-                val buffer = ByteArray(bufferSize)
-                while (isActive) {
-                    val read = recorder.read(buffer, 0, buffer.size)
-                    when {
-                        read > 0 -> onPcm16(buffer.copyOf(read))
-                        read < 0 -> throw IllegalStateException("AudioRecord read error: $read")
+                while (isActive && isCurrentCapture(generation, recorder)) {
+                    when (val read = recorder.read(buffer, 0, buffer.size)) {
+                        in 1..buffer.size -> {
+                            if (isCurrentCapture(generation, recorder)) {
+                                onPcm16(buffer.copyOf(read))
+                            }
+                        }
+                        0 -> Unit
+                        else -> {
+                            Log.w(TAG, "AudioRecord read error: $read")
+                            break
+                        }
                     }
                 }
             } finally {
-                if (clearRecorder(recorder)) {
-                    recorder.stopSafely()
-                    recorder.releaseSafely()
-                }
+                clearRecorder(generation, recorder)
+                recorder.stopSafely()
+                recorder.releaseSafely()
             }
         }
 
+        var shouldStart = false
         synchronized(lock) {
-            captureJob = job
+            if (!released && generation == captureGeneration) {
+                audioRecord = recorder
+                captureJob = job
+                shouldStart = true
+            }
+        }
+
+        if (shouldStart) {
+            job.start()
+        } else {
+            job.cancel()
+            recorder.stopSafely()
+            recorder.releaseSafely()
         }
     }
 
@@ -88,6 +124,7 @@ class AndroidVoiceAudioEngine(
         val job: Job?
         val recorder: AudioRecord?
         synchronized(lock) {
+            captureGeneration += 1
             job = captureJob
             captureJob = null
             recorder = audioRecord
@@ -99,25 +136,52 @@ class AndroidVoiceAudioEngine(
     }
 
     override fun playPcm16(base64Pcm16: String) {
-        val pcm16 = Base64.decode(base64Pcm16, Base64.NO_WRAP)
-        synchronized(lock) {
-            val track = audioTrack ?: createAudioTrack().also { audioTrack = it }
-            if (track.playState != AudioTrack.PLAYSTATE_PLAYING) {
-                track.play()
+        val pcm16 = runCatching { Base64.decode(base64Pcm16, Base64.NO_WRAP) }
+            .onFailure { Log.w(TAG, "Dropping malformed playback chunk", it) }
+            .getOrNull()
+            ?: return
+        if (pcm16.isEmpty()) {
+            return
+        }
+
+        val generation = synchronized(lock) {
+            if (released) {
+                return
             }
-            track.write(pcm16, 0, pcm16.size)
+            playbackGeneration
+        }
+        val track = getOrCreatePlaybackTrack(generation) ?: return
+        synchronized(playbackWriteLock) {
+            if (!isCurrentPlayback(generation, track)) {
+                return
+            }
+            if (!track.playSafely()) {
+                return
+            }
+            if (!isCurrentPlayback(generation, track)) {
+                return
+            }
+            track.writeNonBlocking(pcm16)
         }
     }
 
     override fun suppressPlayback() {
+        val track: AudioTrack
+        val generation: Long
         synchronized(lock) {
-            val track = audioTrack ?: return
-            val wasPlaying = track.playState == AudioTrack.PLAYSTATE_PLAYING
-            track.pauseSafely()
-            track.flushSafely()
-            if (wasPlaying) {
-                track.playSafely()
+            if (released) {
+                return
             }
+            playbackGeneration += 1
+            track = audioTrack ?: return
+            generation = playbackGeneration
+        }
+
+        val wasPlaying = track.isPlaying()
+        track.pauseSafely()
+        track.flushSafely()
+        if (wasPlaying && isCurrentPlayback(generation, track)) {
+            track.playSafely()
         }
     }
 
@@ -125,6 +189,8 @@ class AndroidVoiceAudioEngine(
         stopCapture()
         val track: AudioTrack?
         synchronized(lock) {
+            released = true
+            playbackGeneration += 1
             track = audioTrack
             audioTrack = null
         }
@@ -133,16 +199,61 @@ class AndroidVoiceAudioEngine(
         scope.cancel()
     }
 
-    private fun clearRecorder(recorder: AudioRecord): Boolean = synchronized(lock) {
-        if (audioRecord === recorder) {
-            audioRecord = null
-            true
-        } else {
-            false
+    private fun clearRecorder(generation: Long, recorder: AudioRecord) {
+        synchronized(lock) {
+            if (captureGeneration == generation && audioRecord === recorder) {
+                captureJob = null
+                audioRecord = null
+            }
         }
     }
 
-    private fun createAudioTrack(): AudioTrack {
+    private fun isCurrentCapture(generation: Long, recorder: AudioRecord): Boolean = synchronized(lock) {
+        captureGeneration == generation && audioRecord === recorder
+    }
+
+    private fun isCurrentPlayback(generation: Long, track: AudioTrack): Boolean = synchronized(lock) {
+        playbackGeneration == generation && audioTrack === track
+    }
+
+    private fun getOrCreatePlaybackTrack(generation: Long): AudioTrack? {
+        val existingTrack = synchronized(lock) { audioTrack }
+        if (existingTrack != null) {
+            return currentPlaybackTrack(existingTrack, generation)
+        }
+
+        val newTrack = createAudioTrackOrNull() ?: return null
+        var selectedTrack: AudioTrack? = null
+        var shouldReleaseNewTrack = false
+        synchronized(lock) {
+            val currentTrack = audioTrack
+            if (released || playbackGeneration != generation) {
+                shouldReleaseNewTrack = true
+            } else if (currentTrack == null) {
+                audioTrack = newTrack
+                selectedTrack = newTrack
+            } else {
+                selectedTrack = currentTrack
+                shouldReleaseNewTrack = true
+            }
+        }
+
+        if (shouldReleaseNewTrack) {
+            newTrack.releaseSafely()
+        }
+        return currentPlaybackTrack(selectedTrack ?: return null, generation)
+    }
+
+    private fun currentPlaybackTrack(track: AudioTrack, generation: Long): AudioTrack? = synchronized(lock) {
+        if (!released && playbackGeneration == generation && audioTrack === track) {
+            track
+        } else {
+            null
+        }
+    }
+
+    private fun createAudioTrackOrNull(): AudioTrack? {
+        val bufferSize = playbackBufferSizeOrNull() ?: return null
         val attributes = AudioAttributes.Builder()
             .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
             .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
@@ -152,13 +263,67 @@ class AndroidVoiceAudioEngine(
             .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
             .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
             .build()
-        return AudioTrack(
-            attributes,
-            format,
-            playbackBufferSize(),
-            AudioTrack.MODE_STREAM,
-            AudioManager.AUDIO_SESSION_ID_GENERATE,
-        )
+        val track = runCatching {
+            AudioTrack(
+                attributes,
+                format,
+                bufferSize,
+                AudioTrack.MODE_STREAM,
+                AudioManager.AUDIO_SESSION_ID_GENERATE,
+            )
+        }.onFailure {
+            Log.w(TAG, "AudioTrack creation failed", it)
+        }.getOrNull() ?: return null
+
+        if (track.state != AudioTrack.STATE_INITIALIZED) {
+            Log.w(TAG, "AudioTrack initialization failed: state=${track.state}")
+            track.releaseSafely()
+            return null
+        }
+
+        return track
+    }
+
+    private fun removeTrack(track: AudioTrack) {
+        synchronized(lock) {
+            if (audioTrack === track) {
+                playbackGeneration += 1
+                audioTrack = null
+            }
+        }
+    }
+
+    private fun AudioTrack.writeNonBlocking(pcm16: ByteArray) {
+        val writeResult = runCatching {
+            write(pcm16, 0, pcm16.size, AudioTrack.WRITE_NON_BLOCKING)
+        }.onFailure {
+            Log.w(TAG, "AudioTrack write failed", it)
+            removeTrack(this)
+            releaseSafely()
+        }.getOrNull() ?: return
+
+        if (writeResult < 0) {
+            Log.w(TAG, "AudioTrack write error: $writeResult")
+            removeTrack(this)
+            releaseSafely()
+        }
+    }
+
+    private fun AudioTrack.isPlaying(): Boolean {
+        return runCatching { playState == AudioTrack.PLAYSTATE_PLAYING }.getOrDefault(false)
+    }
+
+    private fun AudioTrack.playSafely(): Boolean {
+        return runCatching {
+            if (playState != AudioTrack.PLAYSTATE_PLAYING) {
+                play()
+            }
+            true
+        }.onFailure {
+            Log.w(TAG, "AudioTrack play failed", it)
+            removeTrack(this)
+            releaseSafely()
+        }.getOrDefault(false)
     }
 
     private fun AudioRecord.stopSafely() {
@@ -171,10 +336,6 @@ class AndroidVoiceAudioEngine(
 
     private fun AudioRecord.releaseSafely() {
         runCatching { release() }
-    }
-
-    private fun AudioTrack.playSafely() {
-        runCatching { play() }
     }
 
     private fun AudioTrack.pauseSafely() {
@@ -194,25 +355,35 @@ class AndroidVoiceAudioEngine(
     }
 
     private companion object {
+        const val TAG = "AndroidVoiceAudioEngine"
         const val CAPTURE_SAMPLE_RATE = 16_000
         const val PLAYBACK_SAMPLE_RATE = 24_000
         const val MIN_CAPTURE_BUFFER_BYTES = 3_200
         const val MIN_PLAYBACK_BUFFER_BYTES = 4_800
 
         fun captureBufferSize(): Int {
-            return AudioRecord.getMinBufferSize(
+            val bufferSize = AudioRecord.getMinBufferSize(
                 CAPTURE_SAMPLE_RATE,
                 AudioFormat.CHANNEL_IN_MONO,
                 AudioFormat.ENCODING_PCM_16BIT,
-            ).coerceAtLeast(MIN_CAPTURE_BUFFER_BYTES)
+            )
+            if (bufferSize <= 0) {
+                throw IllegalStateException("AudioRecord min buffer size failed: $bufferSize")
+            }
+            return bufferSize.coerceAtLeast(MIN_CAPTURE_BUFFER_BYTES)
         }
 
-        fun playbackBufferSize(): Int {
-            return AudioTrack.getMinBufferSize(
+        fun playbackBufferSizeOrNull(): Int? {
+            val bufferSize = AudioTrack.getMinBufferSize(
                 PLAYBACK_SAMPLE_RATE,
                 AudioFormat.CHANNEL_OUT_MONO,
                 AudioFormat.ENCODING_PCM_16BIT,
-            ).coerceAtLeast(MIN_PLAYBACK_BUFFER_BYTES)
+            )
+            if (bufferSize <= 0) {
+                Log.w(TAG, "AudioTrack min buffer size failed: $bufferSize")
+                return null
+            }
+            return bufferSize.coerceAtLeast(MIN_PLAYBACK_BUFFER_BYTES)
         }
     }
 }
