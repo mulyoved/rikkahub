@@ -53,6 +53,7 @@ class OkHttpGeminiLiveVoiceClient(
 class OkHttpGeminiSocket(
     private val httpClient: OkHttpClient,
 ) : GeminiSocket {
+    private val lock = Any()
     private var webSocket: WebSocket? = null
 
     override fun open(
@@ -62,34 +63,75 @@ class OkHttpGeminiSocket(
         onClosed: (Int, String) -> Unit,
         onFailure: (Throwable) -> Unit,
     ) {
+        val previousWebSocket = synchronized(lock) {
+            val current = webSocket
+            webSocket = null
+            current
+        }
+        previousWebSocket?.close(1000, "replaced")
+
         val request = Request.Builder()
             .url(geminiLiveUrlWithAccessToken(url = url, token = token))
             .build()
-        webSocket = httpClient.newWebSocket(
+        val newWebSocket = httpClient.newWebSocket(
             request,
             object : WebSocketListener() {
                 override fun onMessage(webSocket: WebSocket, text: String) {
-                    onMessage(text)
+                    if (isCurrent(webSocket)) {
+                        onMessage(text)
+                    }
+                }
+
+                override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                    val notifyClosed = clearIfCurrent(webSocket)
+                    webSocket.close(code, reason)
+                    if (notifyClosed) {
+                        onClosed(code, reason)
+                    }
                 }
 
                 override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                    this@OkHttpGeminiSocket.webSocket = null
-                    onClosed(code, reason)
+                    if (clearIfCurrent(webSocket)) {
+                        onClosed(code, reason)
+                    }
                 }
 
                 override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                    this@OkHttpGeminiSocket.webSocket = null
-                    onFailure(t)
+                    if (clearIfCurrent(webSocket)) {
+                        onFailure(t)
+                    }
                 }
             },
         )
+        synchronized(lock) {
+            webSocket = newWebSocket
+        }
     }
 
-    override fun send(text: String): Boolean = webSocket?.send(text) == true
+    override fun send(text: String): Boolean = synchronized(lock) {
+        webSocket
+    }?.send(text) == true
 
     override fun close() {
-        webSocket?.close(1000, null)
-        webSocket = null
+        val current = synchronized(lock) {
+            val current = webSocket
+            webSocket = null
+            current
+        }
+        current?.close(1000, null)
+    }
+
+    private fun isCurrent(candidate: WebSocket): Boolean = synchronized(lock) {
+        webSocket === candidate
+    }
+
+    private fun clearIfCurrent(candidate: WebSocket): Boolean = synchronized(lock) {
+        if (webSocket === candidate) {
+            webSocket = null
+            true
+        } else {
+            false
+        }
     }
 }
 

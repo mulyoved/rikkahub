@@ -118,6 +118,65 @@ class GeminiLiveVoiceClientTest {
     }
 
     @Test
+    fun `connect emits error when setup send fails`() = runBlocking {
+        val socket = FakeGeminiSocket().apply {
+            sendResults += false
+        }
+        val client = TestableGeminiLiveVoiceClient(socket = socket, codec = GeminiLiveCodec())
+        val events = mutableListOf<GeminiLiveEvent>()
+
+        client.connect(
+            token = "token-1",
+            websocketUrl = "wss://example.test/live",
+            providerModel = "gemini-2.0-flash-live-001",
+            liveConnectConfig = liveConnectConfig,
+            systemInstruction = "You are Hermes.",
+            contextTurns = emptyList(),
+            onEvent = events::add,
+        )
+
+        assertEquals(
+            listOf(
+                GeminiLiveEvent.Error(
+                    message = "Failed to send Gemini setup message",
+                    raw = "",
+                )
+            ),
+            events,
+        )
+    }
+
+    @Test
+    fun `connect emits error when context send fails`() = runBlocking {
+        val socket = FakeGeminiSocket().apply {
+            sendResults += true
+            sendResults += false
+        }
+        val client = TestableGeminiLiveVoiceClient(socket = socket, codec = GeminiLiveCodec())
+        val events = mutableListOf<GeminiLiveEvent>()
+
+        client.connect(
+            token = "token-1",
+            websocketUrl = "wss://example.test/live",
+            providerModel = "gemini-2.0-flash-live-001",
+            liveConnectConfig = liveConnectConfig,
+            systemInstruction = "You are Hermes.",
+            contextTurns = listOf(GeminiContentTurn(role = "user", text = "Hello")),
+            onEvent = events::add,
+        )
+
+        assertEquals(
+            listOf(
+                GeminiLiveEvent.Error(
+                    message = "Failed to send Gemini context message",
+                    raw = "",
+                )
+            ),
+            events,
+        )
+    }
+
+    @Test
     fun `send audio uses realtime input audio shape`() {
         val socket = FakeGeminiSocket()
         val client = TestableGeminiLiveVoiceClient(socket = socket, codec = GeminiLiveCodec())
@@ -130,6 +189,70 @@ class GeminiLiveVoiceClientTest {
             .jsonObject
         assertEquals("audio/pcm;rate=16000", audio["mimeType"]!!.jsonPrimitive.content)
         assertEquals("base64-audio", audio["data"]!!.jsonPrimitive.content)
+    }
+
+    @Test
+    fun `send audio emits error when send fails after connect`() = runBlocking {
+        val socket = FakeGeminiSocket().apply {
+            sendResults += true
+            sendResults += false
+        }
+        val client = TestableGeminiLiveVoiceClient(socket = socket, codec = GeminiLiveCodec())
+        val events = mutableListOf<GeminiLiveEvent>()
+
+        client.connect(
+            token = "token-1",
+            websocketUrl = "wss://example.test/live",
+            providerModel = "gemini-2.0-flash-live-001",
+            liveConnectConfig = liveConnectConfig,
+            systemInstruction = "You are Hermes.",
+            contextTurns = emptyList(),
+            onEvent = events::add,
+        )
+
+        client.sendAudio("base64-audio")
+
+        assertEquals(
+            listOf(
+                GeminiLiveEvent.Error(
+                    message = "Failed to send Gemini audio message",
+                    raw = "",
+                )
+            ),
+            events,
+        )
+    }
+
+    @Test
+    fun `send tool response emits error when send fails after connect`() = runBlocking {
+        val socket = FakeGeminiSocket().apply {
+            sendResults += true
+            sendResults += false
+        }
+        val client = TestableGeminiLiveVoiceClient(socket = socket, codec = GeminiLiveCodec())
+        val events = mutableListOf<GeminiLiveEvent>()
+
+        client.connect(
+            token = "token-1",
+            websocketUrl = "wss://example.test/live",
+            providerModel = "gemini-2.0-flash-live-001",
+            liveConnectConfig = liveConnectConfig,
+            systemInstruction = "You are Hermes.",
+            contextTurns = emptyList(),
+            onEvent = events::add,
+        )
+
+        client.sendToolResponse(callId = "call-1", answer = "42")
+
+        assertEquals(
+            listOf(
+                GeminiLiveEvent.Error(
+                    message = "Failed to send Gemini tool response message",
+                    raw = "",
+                )
+            ),
+            events,
+        )
     }
 
     @Test

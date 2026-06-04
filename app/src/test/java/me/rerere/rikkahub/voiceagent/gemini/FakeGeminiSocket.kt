@@ -6,6 +6,7 @@ class FakeGeminiSocket : GeminiSocket {
     var openedToken: String? = null
         private set
     val sentMessages = mutableListOf<String>()
+    val sendResults = ArrayDeque<Boolean>()
     var closeCount = 0
         private set
 
@@ -29,7 +30,7 @@ class FakeGeminiSocket : GeminiSocket {
 
     override fun send(text: String): Boolean {
         sentMessages += text
-        return true
+        return sendResults.removeFirstOrNull() ?: true
     }
 
     override fun close() {
