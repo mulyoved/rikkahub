@@ -99,8 +99,8 @@ class AndroidVoiceAudioEngine(context: Context) : VoiceAudioEngine {
                     }
                 }
             } finally {
-                clearRecorder(generation, recorder)
                 stopAndReleaseRecorder(recorder)
+                clearRecorder(recorder)
             }
         }
 
@@ -270,6 +270,23 @@ class AndroidVoiceAudioEngine(context: Context) : VoiceAudioEngine {
         }
     }
 
+    private fun clearRecorder(recorder: AudioRecord) {
+        synchronized(lock) {
+            if (audioRecord === recorder) {
+                captureJob = null
+                audioRecord = null
+            }
+        }
+    }
+
+    private fun invalidateCapture(generation: Long, recorder: AudioRecord) {
+        synchronized(lock) {
+            if (captureGeneration == generation && audioRecord === recorder) {
+                captureGeneration += 1
+            }
+        }
+    }
+
     private fun isCurrentCapture(generation: Long, recorder: AudioRecord): Boolean = synchronized(lock) {
         captureGeneration == generation && audioRecord === recorder
     }
@@ -284,9 +301,9 @@ class AndroidVoiceAudioEngine(context: Context) : VoiceAudioEngine {
             if (isCurrentCapture(generation, recorder)) {
                 try {
                     onPcm16(buffer)
-                } catch (e: Throwable) {
+                } catch (e: Exception) {
                     Log.w(TAG, "Stopping capture after PCM callback failure", e)
-                    clearRecorder(generation, recorder)
+                    invalidateCapture(generation, recorder)
                 }
             }
         }
