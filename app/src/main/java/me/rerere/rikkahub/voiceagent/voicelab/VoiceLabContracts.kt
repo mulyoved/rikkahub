@@ -28,10 +28,10 @@ data class MobileVoiceSessionResponse(
             "modelId=$modelId, " +
             "providerModel=$providerModel, " +
             "apiVersion=$apiVersion, " +
-            "websocketUrl=$websocketUrl, " +
+            "websocketUrl=[redacted], " +
             "inputSampleRate=$inputSampleRate, " +
             "outputSampleRate=$outputSampleRate, " +
-            "liveConnectConfig=$liveConnectConfig" +
+            "liveConnectConfig=[redacted]" +
             ")"
 }
 

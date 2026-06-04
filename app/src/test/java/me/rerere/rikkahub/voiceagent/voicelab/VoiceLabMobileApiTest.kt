@@ -157,6 +157,38 @@ class VoiceLabMobileApiTest {
     }
 
     @Test
+    fun `successful response decode failures are sanitized`() {
+        val transport = transportFor { request ->
+            responseFor(
+                request = request,
+                body = """
+                {
+                  "token":"decode-token",
+                  "prompt":"decode-prompt",
+                  "answer":"decode-answer"
+                }
+                """.trimIndent(),
+            )
+        }
+        val api = VoiceLabMobileApi(
+            baseUrl = "https://voice-lab.example.test",
+            credentials = VoiceLabMobileCredentials(hermesProfileApiKey = "profile-api-key"),
+            transport = transport,
+        )
+
+        val error = assertThrows(IllegalStateException::class.java) {
+            runBlocking { api.createSession("gemini-flash") }
+        }
+
+        val message = error.message.orEmpty()
+        assertTrue(message.contains("Voice Lab response decode failed"))
+        assertTrue(message.contains("[redacted]"))
+        assertFalse(message.contains("decode-token"))
+        assertFalse(message.contains("decode-prompt"))
+        assertFalse(message.contains("decode-answer"))
+    }
+
+    @Test
     fun `non successful response bodies are bounded`() {
         val responseBody = "x".repeat(5000)
         val transport = transportFor { request ->
@@ -196,12 +228,15 @@ class VoiceLabMobileApiTest {
                   "key":"plain-key-field",
                   "token":"live-token",
                   "apiKey":"server-key",
+                  "CF-Access-Client-Id":"cf-header-id",
                   "CF-Access-Client-Secret":"cf-header-secret",
+                  "cloudflareClientId":"cf-config-id",
                   "cloudflareClientSecret":"cf-config-secret",
                   "hermesProfileApiKey":"hermes-profile-key",
                   "prompt":"private prompt",
                   "answer":"private answer",
                   "nested":{"prompt":"before \"escaped-secret\" after"},
+                  "embedded":"{\"prompt\":\"embedded-prompt\",\"token\":\"embedded-token\"}",
                   "single":"token='single-token'",
                   "unquoted":"api_key=plain-key",
                   "header":"Authorization: Bearer authorization-token",
@@ -226,12 +261,16 @@ class VoiceLabMobileApiTest {
         assertFalse(message.contains("plain-key-field"))
         assertFalse(message.contains("live-token"))
         assertFalse(message.contains("server-key"))
+        assertFalse(message.contains("cf-header-id"))
         assertFalse(message.contains("cf-header-secret"))
+        assertFalse(message.contains("cf-config-id"))
         assertFalse(message.contains("cf-config-secret"))
         assertFalse(message.contains("hermes-profile-key"))
         assertFalse(message.contains("private prompt"))
         assertFalse(message.contains("private answer"))
         assertFalse(message.contains("escaped-secret"))
+        assertFalse(message.contains("embedded-prompt"))
+        assertFalse(message.contains("embedded-token"))
         assertFalse(message.contains("single-token"))
         assertFalse(message.contains("plain-key"))
         assertFalse(message.contains("authorization-token"))
@@ -295,6 +334,8 @@ class VoiceLabMobileApiTest {
         )
 
         assertFalse(session.toString().contains("session-token"))
+        assertFalse(session.toString().contains("wss://example.test/live"))
+        assertTrue(session.toString().contains("liveConnectConfig=[redacted]"))
         assertFalse(hermesRequest.toString().contains("private prompt"))
         assertFalse(credentials.toString().contains("profile-api-key"))
         assertFalse(credentials.toString().contains("cf-id"))

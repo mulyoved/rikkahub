@@ -9,6 +9,7 @@ import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.contentOrNull
 import me.rerere.rikkahub.utils.JsonInstant
 import okhttp3.Call
 import okhttp3.Callback
@@ -19,18 +20,27 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import java.io.IOException
+import java.util.concurrent.TimeUnit
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
 private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
-private val DEFAULT_HTTP_CLIENT by lazy { OkHttpClient.Builder().build() }
+private val DEFAULT_HTTP_CLIENT by lazy {
+    OkHttpClient.Builder()
+        .connectTimeout(10, TimeUnit.SECONDS)
+        .readTimeout(5, TimeUnit.MINUTES)
+        .writeTimeout(2, TimeUnit.MINUTES)
+        .build()
+}
 private val DEV_HTTP_HOSTS = setOf("localhost", "127.0.0.1", "::1", "10.0.2.2", "10.0.3.2")
 private const val ERROR_BODY_PREVIEW_LIMIT = 2048L
 private val ERROR_SENSITIVE_KEYS = setOf(
     "authorization",
     "apikey",
     "key",
+    "cfaccessclientid",
     "cfaccessclientsecret",
+    "cloudflareclientid",
     "cloudflareclientsecret",
     "hermesprofileapikey",
     "accesstoken",
@@ -167,20 +177,37 @@ class VoiceLabMobileApi internal constructor(
                     )
                 }
                 val responseText = response.body.string()
-                json.decodeFromString<Res>(responseText)
+                runCatching {
+                    json.decodeFromString<Res>(responseText)
+                }.getOrElse { error ->
+                    val errorType = error::class.simpleName ?: "unknown"
+                    throw IllegalStateException(
+                        "Voice Lab response decode failed ($errorType): ${responseText.toSanitizedPreview()}"
+                    )
+                }
             }
         }
 }
 
-private fun Response.toErrorPreview(): String {
-    val preview = peekBody(ERROR_BODY_PREVIEW_LIMIT + 1).string()
+private fun Response.toErrorPreview(): String =
+    peekBody(ERROR_BODY_PREVIEW_LIMIT + 1).string().toSanitizedPreview(
+        wasTruncated = (body.contentLength() > ERROR_BODY_PREVIEW_LIMIT).takeIf { body.contentLength() >= 0 }
+    )
+
+private fun String.toSanitizedPreview(wasTruncated: Boolean? = null): String {
+    val preview = if (length > ERROR_BODY_PREVIEW_LIMIT) {
+        take((ERROR_BODY_PREVIEW_LIMIT + 1).toInt())
+    } else {
+        this
+    }
     val redacted = preview.redactSensitivePreview()
     val bounded = if (redacted.length <= ERROR_BODY_PREVIEW_LIMIT) {
         redacted
     } else {
         redacted.take(ERROR_BODY_PREVIEW_LIMIT.toInt()) + "... [truncated]"
     }
-    return if (preview.length > ERROR_BODY_PREVIEW_LIMIT && !bounded.endsWith("[truncated]")) {
+    val truncated = wasTruncated ?: (length > ERROR_BODY_PREVIEW_LIMIT)
+    return if (truncated && !bounded.endsWith("[truncated]")) {
         "$bounded... [truncated]"
     } else {
         bounded
@@ -215,8 +242,19 @@ private fun JsonElement.redactSensitiveJson(): JsonElement =
         )
 
         is JsonArray -> JsonArray(map { it.redactSensitiveJson() })
-        else -> this
+        is JsonPrimitive -> if (contentOrNull?.trimStart()?.firstOrNull() in setOf('{', '[')) {
+            JsonPrimitive(contentOrNull?.redactEmbeddedSensitiveJson().orEmpty())
+        } else {
+            this
+        }
     }
 
 private fun String.isSensitiveErrorKey(): Boolean =
     lowercase().filterNot { it == '_' || it == '-' || it == ' ' } in ERROR_SENSITIVE_KEYS
+
+private fun String.redactEmbeddedSensitiveJson(): String {
+    val redactedJson = runCatching {
+        JsonInstant.encodeToString(JsonInstant.parseToJsonElement(this).redactSensitiveJson())
+    }.getOrNull()
+    return redactedJson ?: this
+}
