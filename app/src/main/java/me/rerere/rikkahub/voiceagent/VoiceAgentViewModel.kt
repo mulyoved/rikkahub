@@ -206,17 +206,19 @@ class VoiceAgentCoordinator(
                 if (!isToolHandleActive(callId, handle)) return
                 coroutineContext.ensureActive()
                 gemini.sendToolResponse(callId, response.answer)
+                if (!isToolHandleActive(callId, handle)) return
+                diagnostics.record("hermes_tool_succeeded", "callId=$callId")
+                updateToolStatus(callId, VoiceToolStatus.HermesAnswered(callId = callId, elapsedMs = 0L))
             }
-            if (!isToolHandleActive(callId, handle)) return
-            diagnostics.record("hermes_tool_succeeded", "callId=$callId")
-            updateToolStatus(callId, VoiceToolStatus.HermesAnswered(callId = callId, elapsedMs = 0L))
         } catch (error: CancellationException) {
             throw error
         } catch (error: Throwable) {
-            if (!isToolHandleActive(callId, handle)) return
             val message = error.message ?: error.javaClass.simpleName
-            diagnostics.record("hermes_tool_failed", "callId=$callId, message=$message")
-            updateToolStatus(callId, VoiceToolStatus.HermesFailed(callId = callId, message = message))
+            synchronized(handle.sendLock) {
+                if (!isToolHandleActive(callId, handle)) return
+                diagnostics.record("hermes_tool_failed", "callId=$callId, message=$message")
+                updateToolStatus(callId, VoiceToolStatus.HermesFailed(callId = callId, message = message))
+            }
         }
     }
 
