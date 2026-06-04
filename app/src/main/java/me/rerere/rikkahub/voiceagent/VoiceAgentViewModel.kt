@@ -203,14 +203,27 @@ class VoiceAgentCoordinator(
             name = "tool_call_cancellation",
             detail = event.callIds.joinToString(","),
         )
-        val jobsToCancel = synchronized(toolJobsLock) {
-            cancelledToolCallIds += event.callIds
-            event.callIds.mapNotNull { callId -> toolJobs.remove(callId) }
-        }
+        val jobsToCancel = event.callIds.mapNotNull(::cancelToolCall)
         removeToolStatuses(event.callIds)
-        jobsToCancel.forEach { handle ->
-            synchronized(handle.sendLock) {
-                handle.job.cancel()
+        jobsToCancel.forEach { it.cancel() }
+    }
+
+    private fun cancelToolCall(callId: String): Job? {
+        val handle = synchronized(toolJobsLock) { toolJobs[callId] }
+        if (handle == null) {
+            synchronized(toolJobsLock) {
+                cancelledToolCallIds += callId
+            }
+            return null
+        }
+        return synchronized(handle.sendLock) {
+            synchronized(toolJobsLock) {
+                cancelledToolCallIds += callId
+                if (toolJobs[callId] === handle) {
+                    toolJobs.remove(callId)?.job
+                } else {
+                    null
+                }
             }
         }
     }
