@@ -193,6 +193,7 @@ class VoiceLabMobileApiTest {
                 body = """
                 {
                   "error":"failed",
+                  "key":"plain-key-field",
                   "token":"live-token",
                   "apiKey":"server-key",
                   "prompt":"private prompt",
@@ -218,6 +219,7 @@ class VoiceLabMobileApiTest {
         val message = error.message.orEmpty()
         assertTrue(message.contains("failed"))
         assertTrue(message.contains("[redacted]"))
+        assertFalse(message.contains("plain-key-field"))
         assertFalse(message.contains("live-token"))
         assertFalse(message.contains("server-key"))
         assertFalse(message.contains("private prompt"))
