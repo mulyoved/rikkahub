@@ -21,37 +21,50 @@ class GeminiLiveCodec(
         providerModel: String,
         liveConnectConfig: JsonObject,
         systemInstruction: String,
-    ): String = json.encodeToString(
-        buildJsonObject {
-            putJsonObject("setup") {
-                put("model", "models/$providerModel")
-                putJsonObject("generationConfig") {
+    ): String {
+        val generationConfig = liveConnectConfig["generationConfig"]?.jsonObjectOrNull() ?: JsonObject(emptyMap())
+        val responseModalities = liveConnectConfig["responseModalities"]
+            ?: generationConfig["responseModalities"]
+            ?: JsonArray(emptyList())
+
+        return json.encodeToString(
+            buildJsonObject {
+                putJsonObject("setup") {
+                    liveConnectConfig.forEach { (key, value) ->
+                        if (key != "responseModalities") {
+                            put(key, value)
+                        }
+                    }
+                    put("model", "models/$providerModel")
                     put(
-                        "responseModalities",
-                        liveConnectConfig["responseModalities"] ?: JsonArray(emptyList()),
+                        "generationConfig",
+                        buildJsonObject {
+                            generationConfig.forEach { (key, value) -> put(key, value) }
+                            put("responseModalities", responseModalities)
+                        },
                     )
-                }
-                put(
-                    "inputAudioTranscription",
-                    liveConnectConfig["inputAudioTranscription"] ?: JsonObject(emptyMap()),
-                )
-                put(
-                    "outputAudioTranscription",
-                    liveConnectConfig["outputAudioTranscription"] ?: JsonObject(emptyMap()),
-                )
-                put("tools", liveConnectConfig["tools"] ?: JsonArray(emptyList()))
-                putJsonObject("systemInstruction") {
-                    putJsonArray("parts") {
-                        add(
-                            buildJsonObject {
-                                put("text", systemInstruction)
-                            }
-                        )
+                    put(
+                        "inputAudioTranscription",
+                        liveConnectConfig["inputAudioTranscription"] ?: JsonObject(emptyMap()),
+                    )
+                    put(
+                        "outputAudioTranscription",
+                        liveConnectConfig["outputAudioTranscription"] ?: JsonObject(emptyMap()),
+                    )
+                    put("tools", liveConnectConfig["tools"] ?: JsonArray(emptyList()))
+                    putJsonObject("systemInstruction") {
+                        putJsonArray("parts") {
+                            add(
+                                buildJsonObject {
+                                    put("text", systemInstruction)
+                                }
+                            )
+                        }
                     }
                 }
             }
-        }
-    )
+        )
+    }
 
     fun clientContentMessage(turns: List<GeminiContentTurn>): String = json.encodeToString(
         buildJsonObject {
@@ -148,6 +161,7 @@ class GeminiLiveCodec(
                     ?: return@firstNotNullOfOrNull null
                 val name = functionCall["name"]?.jsonPrimitiveOrNull()?.contentOrNull?.takeIf { it.isNotBlank() }
                     ?: return@firstNotNullOfOrNull null
+                if (name != ASK_HERMES_TOOL_NAME) return@firstNotNullOfOrNull null
                 val prompt = functionCall["args"]
                     ?.jsonObjectOrNull()
                     ?.get("prompt")

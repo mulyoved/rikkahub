@@ -72,6 +72,61 @@ class GeminiLiveCodecTest {
     }
 
     @Test
+    fun `setup message preserves unknown setup fields and generation config fields`() {
+        val liveConnectConfig = JsonObject(
+            mapOf(
+                "model" to JsonPrimitive("models/input-model"),
+                "responseModalities" to JsonArray(listOf(JsonPrimitive("TEXT"))),
+                "generationConfig" to JsonObject(
+                    mapOf(
+                        "temperature" to JsonPrimitive(0.7),
+                        "candidateCount" to JsonPrimitive(2),
+                        "responseModalities" to JsonArray(listOf(JsonPrimitive("AUDIO"))),
+                    )
+                ),
+                "sessionResumption" to JsonObject(
+                    mapOf("handle" to JsonPrimitive("resume-token"))
+                ),
+                "systemInstruction" to JsonObject(
+                    mapOf(
+                        "parts" to JsonArray(
+                            listOf(
+                                JsonObject(mapOf("text" to JsonPrimitive("input instruction")))
+                            )
+                        )
+                    )
+                ),
+            )
+        )
+
+        val message = codec.setupMessage(
+            providerModel = "gemini-2.0-flash-live-001",
+            liveConnectConfig = liveConnectConfig,
+            systemInstruction = "Local instruction.",
+        ).jsonObject()
+
+        val setup = message["setup"]!!.jsonObject
+        val generationConfig = setup["generationConfig"]!!.jsonObject
+        assertEquals("models/gemini-2.0-flash-live-001", setup["model"]!!.jsonPrimitive.content)
+        assertEquals(liveConnectConfig["sessionResumption"], setup["sessionResumption"])
+        assertEquals(JsonPrimitive(0.7), generationConfig["temperature"])
+        assertEquals(JsonPrimitive(2), generationConfig["candidateCount"])
+        assertEquals(
+            listOf("TEXT"),
+            generationConfig["responseModalities"]!!.jsonArray.map { it.jsonPrimitive.content },
+        )
+        assertFalse("responseModalities" in setup)
+        assertEquals(
+            "Local instruction.",
+            setup["systemInstruction"]!!
+                .jsonObject["parts"]!!
+                .jsonArray[0]
+                .jsonObject["text"]!!
+                .jsonPrimitive.content,
+        )
+    }
+
+    @Test
     fun `client content message emits incomplete text turns`() {
         val message = codec.clientContentMessage(
             listOf(
@@ -254,6 +309,56 @@ class GeminiLiveCodecTest {
                 """.trimIndent()
             ),
         )
+    }
+
+    @Test
+    fun `parse skips unsupported tool calls and returns first ask hermes call`() {
+        assertEquals(
+            GeminiLiveEvent.ToolCall(
+                callId = "call-2",
+                name = "ask_hermes",
+                prompt = "Use this prompt",
+            ),
+            codec.parseServerMessage(
+                """
+                {
+                  "toolCall":{
+                    "functionCalls":[
+                      {
+                        "id":"call-1",
+                        "name":"unsupported_tool",
+                        "args":{"prompt":"Do not use this prompt"}
+                      },
+                      {
+                        "id":"call-2",
+                        "name":"ask_hermes",
+                        "args":{"prompt":"Use this prompt"}
+                      }
+                    ]
+                  }
+                }
+                """.trimIndent()
+            ),
+        )
+    }
+
+    @Test
+    fun `parse ignores unsupported tool calls`() {
+        val raw = """
+            {
+              "toolCall":{
+                "functionCalls":[
+                  {
+                    "id":"call-1",
+                    "name":"unsupported_tool",
+                    "args":{"prompt":"Do not use this prompt"}
+                  }
+                ]
+              }
+            }
+        """.trimIndent()
+
+        assertEquals(GeminiLiveEvent.Ignored(raw), codec.parseServerMessage(raw))
     }
 
     @Test
