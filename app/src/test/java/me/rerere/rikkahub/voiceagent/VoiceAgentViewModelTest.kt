@@ -44,7 +44,7 @@ class VoiceAgentViewModelTest {
         assertEquals(VoiceToolStatus.CallingHermes("call-1"), coordinator.state.value.tool)
 
         toolApi.complete(response(callId = "call-1", answer = "Hermes answer"))
-        coordinator.awaitToolJobs()
+        coordinator.awaitToolJobsWithTimeout()
 
         assertEquals(listOf("call-1" to "Hermes answer"), gemini.toolResponses)
         assertEquals(VoiceToolStatus.HermesAnswered(callId = "call-1", elapsedMs = 0L), coordinator.state.value.tool)
@@ -68,7 +68,7 @@ class VoiceAgentViewModelTest {
                 listOf(GeminiLiveEvent.ToolCall(callId = "call-2", name = "unsupported_tool", prompt = "ignored"))
             )
         )
-        coordinator.awaitToolJobs()
+        coordinator.awaitToolJobsWithTimeout()
 
         assertEquals(emptyList<Pair<String, String>>(), toolApi.requests)
         assertEquals(emptyList<Pair<String, String>>(), gemini.toolResponses)
@@ -116,7 +116,7 @@ class VoiceAgentViewModelTest {
         )
 
         coordinator.onGeminiEvent(event)
-        coordinator.awaitToolJobs()
+        coordinator.awaitToolJobsWithTimeout()
 
         assertEquals(emptyList<Pair<String, String>>(), toolApi.requests)
         assertEquals(emptyList<Pair<String, String>>(), gemini.toolResponses)
@@ -183,7 +183,7 @@ class VoiceAgentViewModelTest {
         coordinator.onGeminiEvent(event)
         assertEquals("call-supported" to "Use this prompt", toolApi.awaitRequest("call-supported"))
         toolApi.complete(response(callId = "call-supported", answer = "Supported answer"))
-        coordinator.awaitToolJobs()
+        coordinator.awaitToolJobsWithTimeout()
 
         assertEquals(listOf("call-supported" to "Supported answer"), gemini.toolResponses)
         assertTrue(
@@ -219,7 +219,7 @@ class VoiceAgentViewModelTest {
             toolApi.awaitCancelled("call-close")
         }
         toolApi.complete(response(callId = "call-close", answer = "late answer"))
-        coordinator.awaitToolJobs()
+        coordinator.awaitToolJobsWithTimeout()
 
         assertEquals(emptyList<Pair<String, String>>(), gemini.toolResponses)
         assertEquals(1, audio.releaseCalls)
@@ -260,7 +260,7 @@ class VoiceAgentViewModelTest {
         assertEquals(false, toolApi.wasCancelled("call-b"))
 
         toolApi.complete(response(callId = "call-b", answer = "Second answer"))
-        coordinator.awaitToolJobs()
+        coordinator.awaitToolJobsWithTimeout()
         toolApi.complete(response(callId = "call-a", answer = "First late answer"))
 
         assertEquals(listOf("call-b" to "Second answer"), gemini.toolResponses)
@@ -327,7 +327,7 @@ class VoiceAgentViewModelTest {
         )
 
         toolApi.complete(response(callId = "call-b", answer = "Second answer"))
-        coordinator.awaitToolJobs()
+        coordinator.awaitToolJobsWithTimeout()
 
         assertEquals(
             setOf("call-a" to "First answer", "call-b" to "Second answer"),
@@ -393,7 +393,7 @@ class VoiceAgentViewModelTest {
         assertEquals(VoiceToolStatus.CallingHermes("call-ok"), coordinator.state.value.tool)
 
         toolApi.complete(response(callId = "call-ok", answer = "Second answer"))
-        coordinator.awaitToolJobs()
+        coordinator.awaitToolJobsWithTimeout()
 
         assertEquals(
             VoiceToolStatus.HermesFailed(callId = "call-fail", message = "Hermes failed"),
@@ -426,7 +426,7 @@ class VoiceAgentViewModelTest {
         assertEquals("call-3" to "fail", toolApi.awaitRequest("call-3"))
 
         toolApi.fail(IllegalStateException("Hermes offline"))
-        coordinator.awaitToolJobs()
+        coordinator.awaitToolJobsWithTimeout()
 
         assertEquals(
             VoiceToolStatus.HermesFailed(callId = "call-3", message = "Hermes offline"),
@@ -544,6 +544,12 @@ class VoiceAgentViewModelTest {
         profileId = "profile",
         profileLabel = "Profile",
     )
+
+    private suspend fun VoiceAgentCoordinator.awaitToolJobsWithTimeout() {
+        withTimeout(500) {
+            awaitToolJobs()
+        }
+    }
 
     private fun runTest(block: suspend CoroutineScope.() -> Unit) = runBlocking(block = block)
 

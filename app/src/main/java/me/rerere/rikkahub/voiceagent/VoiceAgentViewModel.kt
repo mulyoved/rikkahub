@@ -4,10 +4,13 @@ import androidx.lifecycle.ViewModel
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -130,19 +133,23 @@ class VoiceAgentCoordinator(
             return
         }
 
-        if (isClosed()) return
-        diagnostics.record("hermes_tool_started", "callId=${call.callId}")
-        updateToolStatus(call.callId, VoiceToolStatus.CallingHermes(call.callId))
-        val job = coordinatorScope.launch(toolLaunchContext) {
+        val job = coordinatorScope.launch(toolLaunchContext, start = CoroutineStart.LAZY) {
             runHermesToolCall(callId = call.callId, prompt = call.prompt)
         }
-        synchronized(toolJobsLock) {
-            if (closed) {
-                job.cancel()
+        val shouldStart = synchronized(toolJobsLock) {
+            if (closed || call.callId in cancelledToolCallIds) {
+                false
             } else {
                 toolJobs[call.callId] = job
+                updateToolStatus(call.callId, VoiceToolStatus.CallingHermes(call.callId))
+                true
             }
         }
+        if (!shouldStart) {
+            job.cancel()
+            return
+        }
+        diagnostics.record("hermes_tool_started", "callId=${call.callId}")
         job.invokeOnCompletion {
             synchronized(toolJobsLock) {
                 if (toolJobs[call.callId] === job) {
@@ -150,24 +157,18 @@ class VoiceAgentCoordinator(
                 }
             }
         }
+        job.start()
     }
 
     private suspend fun runHermesToolCall(callId: String, prompt: String) {
         try {
             val response = toolApi.askHermes(callId = callId, prompt = prompt)
-            val sent = synchronized(toolJobsLock) {
-                if (closed || callId in cancelledToolCallIds) {
-                    false
-                } else {
-                    gemini.sendToolResponse(callId, response.answer)
-                    true
-                }
-            }
-            if (!sent) return
+            if (!isToolResultActive(callId)) return
+            currentCoroutineContext().ensureActive()
+            gemini.sendToolResponse(callId, response.answer)
+            if (!isToolResultActive(callId)) return
             diagnostics.record("hermes_tool_succeeded", "callId=$callId")
-            if (isToolResultActive(callId)) {
-                updateToolStatus(callId, VoiceToolStatus.HermesAnswered(callId = callId, elapsedMs = 0L))
-            }
+            updateToolStatus(callId, VoiceToolStatus.HermesAnswered(callId = callId, elapsedMs = 0L))
         } catch (error: CancellationException) {
             throw error
         } catch (error: Throwable) {
