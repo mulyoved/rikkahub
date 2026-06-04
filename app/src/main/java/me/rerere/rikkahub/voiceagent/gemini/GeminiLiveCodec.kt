@@ -9,7 +9,6 @@ import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
-import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
 import kotlinx.serialization.json.putJsonObject
@@ -128,7 +127,7 @@ class GeminiLiveCodec(
         root.toolCallCancellation()?.let { return it }
 
         val serverContent = root["serverContent"] as? JsonObject
-        if (serverContent?.get("interrupted")?.jsonPrimitive?.booleanOrNull == true) {
+        if (serverContent?.get("interrupted")?.jsonPrimitiveOrNull()?.booleanOrNull == true) {
             return GeminiLiveEvent.Interrupted()
         }
         serverContent?.transcript("inputTranscription")?.let { return GeminiLiveEvent.InputTranscript(it) }
@@ -146,15 +145,21 @@ class GeminiLiveCodec(
             ?.firstOrNull()
             ?.jsonObjectOrNull()
             ?: return null
+        val callId = functionCall["id"]?.jsonPrimitiveOrNull()?.contentOrNull?.takeIf { it.isNotBlank() }
+            ?: return null
+        val name = functionCall["name"]?.jsonPrimitiveOrNull()?.contentOrNull?.takeIf { it.isNotBlank() }
+            ?: return null
+        val prompt = functionCall["args"]
+            ?.jsonObjectOrNull()
+            ?.get("prompt")
+            ?.jsonPrimitiveOrNull()
+            ?.contentOrNull
+            ?.takeIf { it.isNotBlank() }
+            ?: return null
         return GeminiLiveEvent.ToolCall(
-            callId = functionCall["id"]?.jsonPrimitiveOrNull()?.contentOrNull.orEmpty(),
-            name = functionCall["name"]?.jsonPrimitiveOrNull()?.contentOrNull.orEmpty(),
-            prompt = functionCall["args"]
-                ?.jsonObjectOrNull()
-                ?.get("prompt")
-                ?.jsonPrimitiveOrNull()
-                ?.contentOrNull
-                .orEmpty(),
+            callId = callId,
+            name = name,
+            prompt = prompt,
         )
     }
 
@@ -181,9 +186,15 @@ class GeminiLiveCodec(
             ?.get("parts")
             ?.jsonArrayOrNull()
             ?.firstNotNullOfOrNull { part ->
-                part.jsonObjectOrNull()
+                val inlineData = part.jsonObjectOrNull()
                     ?.get("inlineData")
                     ?.jsonObjectOrNull()
+                val mimeType = inlineData
+                    ?.get("mimeType")
+                    ?.jsonPrimitiveOrNull()
+                    ?.contentOrNull
+                inlineData
+                    ?.takeIf { mimeType?.startsWith("audio/pcm") == true }
                     ?.get("data")
                     ?.jsonPrimitiveOrNull()
                     ?.contentOrNull

@@ -162,12 +162,36 @@ class GeminiLiveCodecTest {
     }
 
     @Test
+    fun `parse server ignores non audio inline data`() {
+        val raw = """
+            {
+              "serverContent":{
+                "modelTurn":{
+                  "parts":[
+                    {"inlineData":{"mimeType":"image/png","data":"base64-image"}}
+                  ]
+                }
+              }
+            }
+        """.trimIndent()
+
+        assertEquals(GeminiLiveEvent.Ignored(raw), codec.parseServerMessage(raw))
+    }
+
+    @Test
     fun `parse server interrupted boolean`() {
         assertEquals(
             GeminiLiveEvent.Interrupted(),
             codec.parseServerMessage("""{"serverContent":{"interrupted":true}}"""),
         )
         assertTrue(codec.parseServerMessage("""{"serverContent":{"interrupted":false}}""") is GeminiLiveEvent.Ignored)
+    }
+
+    @Test
+    fun `parse server ignores malformed interrupted shape`() {
+        val raw = """{"serverContent":{"interrupted":{"value":true}}}"""
+
+        assertEquals(GeminiLiveEvent.Ignored(raw), codec.parseServerMessage(raw))
     }
 
     @Test
@@ -199,6 +223,44 @@ class GeminiLiveCodecTest {
                 """.trimIndent()
             ),
         )
+    }
+
+    @Test
+    fun `parse ignores tool call with missing required fields`() {
+        val raw = """
+            {
+              "toolCall":{
+                "functionCalls":[
+                  {
+                    "id":"call-1",
+                    "name":"ask_hermes",
+                    "args":{}
+                  }
+                ]
+              }
+            }
+        """.trimIndent()
+
+        assertEquals(GeminiLiveEvent.Ignored(raw), codec.parseServerMessage(raw))
+    }
+
+    @Test
+    fun `parse ignores tool call with blank required fields`() {
+        val raw = """
+            {
+              "toolCall":{
+                "functionCalls":[
+                  {
+                    "id":" ",
+                    "name":"ask_hermes",
+                    "args":{"prompt":"What should I say?"}
+                  }
+                ]
+              }
+            }
+        """.trimIndent()
+
+        assertEquals(GeminiLiveEvent.Ignored(raw), codec.parseServerMessage(raw))
     }
 
     @Test
