@@ -183,15 +183,15 @@ class GeminiLiveCodecTest {
     }
 
     @Test
-    fun `realtime audio message emits pcm media chunk`() {
+    fun `realtime audio message emits pcm audio input`() {
         val message = codec.realtimeAudioMessage("base64-audio").jsonObject()
 
-        val chunk = message["realtimeInput"]!!
-            .jsonObject["mediaChunks"]!!
-            .jsonArray[0]
+        val audio = message["realtimeInput"]!!
+            .jsonObject["audio"]!!
             .jsonObject
-        assertEquals("audio/pcm;rate=16000", chunk["mimeType"]!!.jsonPrimitive.content)
-        assertEquals("base64-audio", chunk["data"]!!.jsonPrimitive.content)
+        assertEquals("audio/pcm;rate=16000", audio["mimeType"]!!.jsonPrimitive.content)
+        assertEquals("base64-audio", audio["data"]!!.jsonPrimitive.content)
+        assertFalse("mediaChunks" in message["realtimeInput"]!!.jsonObject)
     }
 
     @Test
@@ -228,6 +228,13 @@ class GeminiLiveCodecTest {
     }
 
     @Test
+    fun `parse server ignores non string transcription text`() {
+        val raw = """{"serverContent":{"inputTranscription":{"text":123}}}"""
+
+        assertEquals(GeminiLiveEvent.Ignored(raw), codec.parseServerMessage(raw))
+    }
+
+    @Test
     fun `parse server output audio inline data`() {
         val event = codec.parseServerMessage(
             """
@@ -246,6 +253,40 @@ class GeminiLiveCodecTest {
         assertEquals(GeminiLiveEvent.OutputAudio(base64Pcm16 = "base64-pcm"), event)
         event as GeminiLiveEvent.OutputAudio
         assertEquals("base64-pcm", event.base64Pcm16)
+    }
+
+    @Test
+    fun `parse server ignores non string audio data`() {
+        val raw = """
+            {
+              "serverContent":{
+                "modelTurn":{
+                  "parts":[
+                    {"inlineData":{"mimeType":"audio/pcm;rate=24000","data":123}}
+                  ]
+                }
+              }
+            }
+        """.trimIndent()
+
+        assertEquals(GeminiLiveEvent.Ignored(raw), codec.parseServerMessage(raw))
+    }
+
+    @Test
+    fun `parse server ignores non string audio mime type`() {
+        val raw = """
+            {
+              "serverContent":{
+                "modelTurn":{
+                  "parts":[
+                    {"inlineData":{"mimeType":true,"data":"base64-pcm"}}
+                  ]
+                }
+              }
+            }
+        """.trimIndent()
+
+        assertEquals(GeminiLiveEvent.Ignored(raw), codec.parseServerMessage(raw))
     }
 
     @Test
@@ -334,6 +375,46 @@ class GeminiLiveCodecTest {
                         "id":"call-2",
                         "name":"ask_hermes",
                         "args":{"prompt":"Use this prompt"}
+                      }
+                    ]
+                  }
+                }
+                """.trimIndent()
+            ),
+        )
+    }
+
+    @Test
+    fun `parse multiple ask hermes tool calls in one frame`() {
+        assertEquals(
+            GeminiLiveEvent.ToolCalls(
+                listOf(
+                    GeminiLiveEvent.ToolCall(
+                        callId = "call-1",
+                        name = "ask_hermes",
+                        prompt = "First prompt",
+                    ),
+                    GeminiLiveEvent.ToolCall(
+                        callId = "call-2",
+                        name = "ask_hermes",
+                        prompt = "Second prompt",
+                    ),
+                )
+            ),
+            codec.parseServerMessage(
+                """
+                {
+                  "toolCall":{
+                    "functionCalls":[
+                      {
+                        "id":"call-1",
+                        "name":"ask_hermes",
+                        "args":{"prompt":"First prompt"}
+                      },
+                      {
+                        "id":"call-2",
+                        "name":"ask_hermes",
+                        "args":{"prompt":"Second prompt"}
                       }
                     ]
                   }
@@ -483,6 +564,42 @@ class GeminiLiveCodecTest {
             GeminiLiveEvent.ToolCallCancellation(listOf("call-1", "call-2")),
             codec.parseServerMessage("""{"toolCallCancellation":{"ids":["call-1","call-2"]}}"""),
         )
+    }
+
+    @Test
+    fun `parse ignores cancellation with no valid string ids`() {
+        val raw = """{"toolCallCancellation":{"ids":[123,true,null," ",""]}}"""
+
+        assertEquals(GeminiLiveEvent.Ignored(raw), codec.parseServerMessage(raw))
+    }
+
+    @Test
+    fun `parse session resumption update`() {
+        assertEquals(
+            GeminiLiveEvent.SessionResumptionUpdate(
+                newHandle = "resume-token",
+                resumable = true,
+            ),
+            codec.parseServerMessage(
+                """{"sessionResumptionUpdate":{"newHandle":"resume-token","resumable":true}}"""
+            ),
+        )
+        assertEquals(
+            GeminiLiveEvent.SessionResumptionUpdate(
+                newHandle = null,
+                resumable = false,
+            ),
+            codec.parseServerMessage("""{"sessionResumptionUpdate":{"resumable":false}}"""),
+        )
+    }
+
+    @Test
+    fun `parse ignores malformed session resumption update`() {
+        val nonBooleanResumable = """{"sessionResumptionUpdate":{"newHandle":"resume-token","resumable":"true"}}"""
+        val nonStringHandle = """{"sessionResumptionUpdate":{"newHandle":123,"resumable":true}}"""
+
+        assertEquals(GeminiLiveEvent.Ignored(nonBooleanResumable), codec.parseServerMessage(nonBooleanResumable))
+        assertEquals(GeminiLiveEvent.Ignored(nonStringHandle), codec.parseServerMessage(nonStringHandle))
     }
 
     @Test

@@ -25,8 +25,17 @@ sealed interface GeminiLiveEvent {
         val prompt: String,
     ) : GeminiLiveEvent
 
+    data class ToolCalls(
+        val calls: List<ToolCall>,
+    ) : GeminiLiveEvent
+
     data class ToolCallCancellation(
         val callIds: List<String>,
+    ) : GeminiLiveEvent
+
+    data class SessionResumptionUpdate(
+        val newHandle: String?,
+        val resumable: Boolean,
     ) : GeminiLiveEvent
 
     data class Error(

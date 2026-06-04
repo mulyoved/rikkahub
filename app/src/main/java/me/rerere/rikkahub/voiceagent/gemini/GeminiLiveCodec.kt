@@ -87,13 +87,9 @@ class GeminiLiveCodec(
     fun realtimeAudioMessage(base64Pcm16: String): String = json.encodeToString(
         buildJsonObject {
             putJsonObject("realtimeInput") {
-                putJsonArray("mediaChunks") {
-                    add(
-                        buildJsonObject {
-                            put("mimeType", "audio/pcm;rate=16000")
-                            put("data", base64Pcm16)
-                        }
-                    )
+                putJsonObject("audio") {
+                    put("mimeType", "audio/pcm;rate=16000")
+                    put("data", base64Pcm16)
                 }
             }
         }
@@ -130,7 +126,11 @@ class GeminiLiveCodec(
             return GeminiLiveEvent.SetupComplete
         }
 
-        root.firstToolCall()?.let { return it }
+        if ("sessionResumptionUpdate" in root) {
+            return root.sessionResumptionUpdate(text)
+        }
+
+        root.toolCallEvent()?.let { return it }
         root.toolCallCancellation()?.let { return it }
 
         val serverContent = root["serverContent"] as? JsonObject
@@ -144,30 +144,36 @@ class GeminiLiveCodec(
         return GeminiLiveEvent.Ignored(text)
     }
 
-    private fun JsonObject.firstToolCall(): GeminiLiveEvent.ToolCall? {
-        return this["toolCall"]
+    private fun JsonObject.toolCallEvent(): GeminiLiveEvent? {
+        val calls = this["toolCall"]
             ?.jsonObjectOrNull()
             ?.get("functionCalls")
             ?.jsonArrayOrNull()
-            ?.firstNotNullOfOrNull { functionCallElement ->
-                val functionCall = functionCallElement.jsonObjectOrNull() ?: return@firstNotNullOfOrNull null
+            ?.mapNotNull { functionCallElement ->
+                val functionCall = functionCallElement.jsonObjectOrNull() ?: return@mapNotNull null
                 val callId = functionCall["id"]?.stringContentOrNull()?.takeIf { it.isNotBlank() }
-                    ?: return@firstNotNullOfOrNull null
+                    ?: return@mapNotNull null
                 val name = functionCall["name"]?.stringContentOrNull()?.takeIf { it.isNotBlank() }
-                    ?: return@firstNotNullOfOrNull null
-                if (name != ASK_HERMES_TOOL_NAME) return@firstNotNullOfOrNull null
+                    ?: return@mapNotNull null
+                if (name != ASK_HERMES_TOOL_NAME) return@mapNotNull null
                 val prompt = functionCall["args"]
                     ?.jsonObjectOrNull()
                     ?.get("prompt")
                     ?.stringContentOrNull()
                     ?.takeIf { it.isNotBlank() }
-                    ?: return@firstNotNullOfOrNull null
+                    ?: return@mapNotNull null
                 GeminiLiveEvent.ToolCall(
                     callId = callId,
                     name = name,
                     prompt = prompt,
                 )
             }
+            ?: return null
+        return when (calls.size) {
+            0 -> null
+            1 -> calls.first()
+            else -> GeminiLiveEvent.ToolCalls(calls)
+        }
     }
 
     private fun JsonObject.toolCallCancellation(): GeminiLiveEvent.ToolCallCancellation? {
@@ -175,17 +181,34 @@ class GeminiLiveCodec(
             ?.jsonObjectOrNull()
             ?.get("ids")
             ?.jsonArrayOrNull()
-            ?.mapNotNull { it.jsonPrimitiveOrNull()?.contentOrNull }
+            ?.mapNotNull { it.stringContentOrNull()?.takeIf { id -> id.isNotBlank() } }
             ?: return null
+        if (ids.isEmpty()) return null
         return GeminiLiveEvent.ToolCallCancellation(ids)
+    }
+
+    private fun JsonObject.sessionResumptionUpdate(raw: String): GeminiLiveEvent {
+        val update = this["sessionResumptionUpdate"]?.jsonObjectOrNull()
+            ?: return GeminiLiveEvent.Ignored(raw)
+        val resumable = update["resumable"]?.booleanContentOrNull()
+            ?: return GeminiLiveEvent.Ignored(raw)
+        val newHandle = if ("newHandle" in update) {
+            update["newHandle"]?.stringContentOrNull()
+                ?: return GeminiLiveEvent.Ignored(raw)
+        } else {
+            null
+        }
+        return GeminiLiveEvent.SessionResumptionUpdate(
+            newHandle = newHandle,
+            resumable = resumable,
+        )
     }
 
     private fun JsonObject.transcript(key: String): String? =
         this[key]
             ?.jsonObjectOrNull()
             ?.get("text")
-            ?.jsonPrimitiveOrNull()
-            ?.contentOrNull
+            ?.stringContentOrNull()
 
     private fun JsonObject.outputAudio(): String? =
         this["modelTurn"]
@@ -198,13 +221,11 @@ class GeminiLiveCodec(
                     ?.jsonObjectOrNull()
                 val mimeType = inlineData
                     ?.get("mimeType")
-                    ?.jsonPrimitiveOrNull()
-                    ?.contentOrNull
+                    ?.stringContentOrNull()
                 inlineData
                     ?.takeIf { mimeType?.startsWith("audio/pcm") == true }
                     ?.get("data")
-                    ?.jsonPrimitiveOrNull()
-                    ?.contentOrNull
+                    ?.stringContentOrNull()
             }
 
     private fun JsonElement.jsonObjectOrNull(): JsonObject? = this as? JsonObject
@@ -216,6 +237,11 @@ class GeminiLiveCodec(
     private fun JsonElement.stringContentOrNull(): String? {
         val primitive = jsonPrimitiveOrNull() ?: return null
         return primitive.takeIf { it.isString }?.contentOrNull
+    }
+
+    private fun JsonElement.booleanContentOrNull(): Boolean? {
+        val primitive = jsonPrimitiveOrNull() ?: return null
+        return primitive.takeUnless { it.isString }?.booleanOrNull
     }
 
     private companion object {
