@@ -142,22 +142,23 @@ class GeminiLiveCodecTest {
 
     @Test
     fun `parse server output audio inline data`() {
-        assertEquals(
-            GeminiLiveEvent.OutputAudio("base64-pcm"),
-            codec.parseServerMessage(
-                """
-                {
-                  "serverContent":{
-                    "modelTurn":{
-                      "parts":[
-                        {"inlineData":{"mimeType":"audio/pcm;rate=24000","data":"base64-pcm"}}
-                      ]
-                    }
-                  }
+        val event = codec.parseServerMessage(
+            """
+            {
+              "serverContent":{
+                "modelTurn":{
+                  "parts":[
+                    {"inlineData":{"mimeType":"audio/pcm;rate=24000","data":"base64-pcm"}}
+                  ]
                 }
-                """.trimIndent()
-            ),
+              }
+            }
+            """.trimIndent()
         )
+
+        assertEquals(GeminiLiveEvent.OutputAudio(base64Pcm16 = "base64-pcm"), event)
+        event as GeminiLiveEvent.OutputAudio
+        assertEquals("base64-pcm", event.base64Pcm16)
     }
 
     @Test

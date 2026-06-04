@@ -12,7 +12,7 @@ sealed interface GeminiLiveEvent {
     ) : GeminiLiveEvent
 
     data class OutputAudio(
-        val data: String,
+        val base64Pcm16: String,
     ) : GeminiLiveEvent
 
     data class Interrupted(
