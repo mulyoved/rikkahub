@@ -323,12 +323,22 @@ class GeminiLiveCodecTest {
     }
 
     @Test
-    fun `parse first tool call function`() {
+    fun `parse mixed tool call function with unsupported metadata`() {
         assertEquals(
-            GeminiLiveEvent.ToolCall(
-                callId = "call-1",
-                name = "ask_hermes",
-                prompt = "What should I say?",
+            GeminiLiveEvent.ToolCalls(
+                calls = listOf(
+                    GeminiLiveEvent.ToolCall(
+                        callId = "call-1",
+                        name = "ask_hermes",
+                        prompt = "What should I say?",
+                    )
+                ),
+                unsupportedCalls = listOf(
+                    GeminiLiveEvent.UnsupportedToolCall(
+                        callId = "call-2",
+                        name = "ignored",
+                    )
+                ),
             ),
             codec.parseServerMessage(
                 """
@@ -471,12 +481,22 @@ class GeminiLiveCodecTest {
     }
 
     @Test
-    fun `parse skips unsupported tool calls and returns first ask hermes call`() {
+    fun `parse preserves unsupported metadata when mixed tool calls include ask hermes`() {
         assertEquals(
-            GeminiLiveEvent.ToolCall(
-                callId = "call-2",
-                name = "ask_hermes",
-                prompt = "Use this prompt",
+            GeminiLiveEvent.ToolCalls(
+                calls = listOf(
+                    GeminiLiveEvent.ToolCall(
+                        callId = "call-2",
+                        name = "ask_hermes",
+                        prompt = "Use this prompt",
+                    )
+                ),
+                unsupportedCalls = listOf(
+                    GeminiLiveEvent.UnsupportedToolCall(
+                        callId = "call-1",
+                        name = "unsupported_tool",
+                    )
+                ),
             ),
             codec.parseServerMessage(
                 """

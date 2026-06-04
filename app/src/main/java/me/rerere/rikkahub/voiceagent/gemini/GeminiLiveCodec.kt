@@ -145,34 +145,45 @@ class GeminiLiveCodec(
     }
 
     private fun JsonObject.toolCallEvent(): GeminiLiveEvent? {
-        val calls = this["toolCall"]
+        val functionCalls = this["toolCall"]
             ?.jsonObjectOrNull()
             ?.get("functionCalls")
             ?.jsonArrayOrNull()
-            ?.mapNotNull { functionCallElement ->
-                val functionCall = functionCallElement.jsonObjectOrNull() ?: return@mapNotNull null
-                val callId = functionCall["id"]?.stringContentOrNull()?.takeIf { it.isNotBlank() }
-                    ?: return@mapNotNull null
-                val name = functionCall["name"]?.stringContentOrNull()?.takeIf { it.isNotBlank() }
-                    ?: return@mapNotNull null
-                if (name != ASK_HERMES_TOOL_NAME) return@mapNotNull null
-                val prompt = functionCall["args"]
+            ?: return null
+        val unsupportedCalls = mutableListOf<GeminiLiveEvent.UnsupportedToolCall>()
+        val calls = functionCalls.mapNotNull { functionCallElement ->
+            val functionCall = functionCallElement.jsonObjectOrNull() ?: return@mapNotNull null
+            val callId = functionCall["id"]?.stringContentOrNull()?.takeIf { it.isNotBlank() }
+                ?: return@mapNotNull null
+            val name = functionCall["name"]?.stringContentOrNull()?.takeIf { it.isNotBlank() }
+                ?: return@mapNotNull null
+            if (name != ASK_HERMES_TOOL_NAME) {
+                unsupportedCalls += GeminiLiveEvent.UnsupportedToolCall(
+                    callId = callId,
+                    name = name,
+                )
+                return@mapNotNull null
+            }
+            val prompt = functionCall["args"]
                     ?.jsonObjectOrNull()
                     ?.get("prompt")
                     ?.stringContentOrNull()
                     ?.takeIf { it.isNotBlank() }
                     ?: return@mapNotNull null
-                GeminiLiveEvent.ToolCall(
-                    callId = callId,
-                    name = name,
-                    prompt = prompt,
-                )
-            }
-            ?: return null
+            GeminiLiveEvent.ToolCall(
+                callId = callId,
+                name = name,
+                prompt = prompt,
+            )
+        }
         return when (calls.size) {
             0 -> null
-            1 -> calls.first()
-            else -> GeminiLiveEvent.ToolCalls(calls)
+            1 -> if (unsupportedCalls.isEmpty()) {
+                calls.first()
+            } else {
+                GeminiLiveEvent.ToolCalls(calls = calls, unsupportedCalls = unsupportedCalls)
+            }
+            else -> GeminiLiveEvent.ToolCalls(calls = calls, unsupportedCalls = unsupportedCalls)
         }
     }
 

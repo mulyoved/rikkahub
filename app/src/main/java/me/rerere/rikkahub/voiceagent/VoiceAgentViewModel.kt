@@ -57,7 +57,10 @@ class VoiceAgentCoordinator(
             is GeminiLiveEvent.OutputAudio -> playOutputAudio(event.base64Pcm16)
             is GeminiLiveEvent.Interrupted -> handleInterrupted(event)
             is GeminiLiveEvent.ToolCall -> handleToolCall(event)
-            is GeminiLiveEvent.ToolCalls -> event.calls.forEach(::handleToolCall)
+            is GeminiLiveEvent.ToolCalls -> {
+                event.unsupportedCalls.forEach(::recordUnsupportedToolCall)
+                event.calls.forEach(::handleToolCall)
+            }
             is GeminiLiveEvent.ToolCallCancellation -> diagnostics.record(
                 name = "tool_call_cancellation",
                 detail = event.callIds.joinToString(","),
@@ -118,14 +121,19 @@ class VoiceAgentCoordinator(
     private fun handleIgnored(event: GeminiLiveEvent.Ignored) {
         diagnostics.record("gemini_event_ignored", event.raw)
         event.raw.unsupportedToolCalls().forEach { call ->
-            diagnostics.record("unsupported_tool_call", "callId=${call.callId}, name=${call.name}")
+            recordUnsupportedToolCall(call)
         }
     }
 
     private fun handleToolCall(call: GeminiLiveEvent.ToolCall) {
         diagnostics.record("tool_call_received", "callId=${call.callId}, name=${call.name}")
         if (call.name != ASK_HERMES_TOOL) {
-            diagnostics.record("unsupported_tool_call", "callId=${call.callId}, name=${call.name}")
+            recordUnsupportedToolCall(
+                GeminiLiveEvent.UnsupportedToolCall(
+                    callId = call.callId,
+                    name = call.name,
+                )
+            )
             return
         }
 
@@ -174,7 +182,11 @@ class VoiceAgentCoordinator(
 
     private fun isClosed(): Boolean = synchronized(toolJobsLock) { closed }
 
-    private fun String.unsupportedToolCalls(): List<UnsupportedToolCall> {
+    private fun recordUnsupportedToolCall(call: GeminiLiveEvent.UnsupportedToolCall) {
+        diagnostics.record("unsupported_tool_call", "callId=${call.callId}, name=${call.name}")
+    }
+
+    private fun String.unsupportedToolCalls(): List<GeminiLiveEvent.UnsupportedToolCall> {
         val root = runCatching { JsonInstant.parseToJsonElement(this) }.getOrNull() as? JsonObject
             ?: return emptyList()
         val functionCalls = root["toolCall"]
@@ -188,7 +200,7 @@ class VoiceAgentCoordinator(
                 ?.stringContentOrNull()
                 ?.takeIf { it.isNotBlank() && it != ASK_HERMES_TOOL }
                 ?: return@mapNotNull null
-            UnsupportedToolCall(
+            GeminiLiveEvent.UnsupportedToolCall(
                 callId = functionCall["id"]?.stringContentOrNull()?.takeIf { it.isNotBlank() } ?: "unknown",
                 name = name,
             )
@@ -205,11 +217,6 @@ class VoiceAgentCoordinator(
         val primitive = jsonPrimitiveOrNull() ?: return null
         return primitive.takeIf { it.isString }?.contentOrNull
     }
-
-    private data class UnsupportedToolCall(
-        val callId: String,
-        val name: String,
-    )
 
     private companion object {
         const val ASK_HERMES_TOOL = "ask_hermes"

@@ -25,8 +25,14 @@ sealed interface GeminiLiveEvent {
         val prompt: String,
     ) : GeminiLiveEvent
 
+    data class UnsupportedToolCall(
+        val callId: String,
+        val name: String,
+    )
+
     data class ToolCalls(
         val calls: List<ToolCall>,
+        val unsupportedCalls: List<UnsupportedToolCall> = emptyList(),
     ) : GeminiLiveEvent
 
     data class ToolCallCancellation(

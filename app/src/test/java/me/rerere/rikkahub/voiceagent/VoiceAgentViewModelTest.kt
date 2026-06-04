@@ -120,6 +120,71 @@ class VoiceAgentViewModelTest {
     }
 
     @Test
+    fun `mixed tool call from codec sends Hermes call and records unsupported diagnostic`() = runTest {
+        val gemini = FakeGeminiLiveVoiceClient()
+        val toolApi = FakeVoiceToolApi()
+        val diagnostics = VoiceDiagnostics()
+        val coordinator = VoiceAgentCoordinator(
+            gemini = gemini,
+            toolApi = toolApi,
+            audio = FakeVoiceAudioEngine(),
+            diagnostics = diagnostics,
+            scope = this,
+        )
+        val rawMixedToolCall = """
+            {
+              "toolCall":{
+                "functionCalls":[
+                  {
+                    "id":"call-unsupported",
+                    "name":"unsupported_tool",
+                    "args":{"prompt":"Do not use this prompt"}
+                  },
+                  {
+                    "id":"call-supported",
+                    "name":"ask_hermes",
+                    "args":{"prompt":"Use this prompt"}
+                  }
+                ]
+              }
+            }
+        """.trimIndent()
+        val event = GeminiLiveCodec().parseServerMessage(rawMixedToolCall)
+        assertEquals(
+            GeminiLiveEvent.ToolCalls(
+                calls = listOf(
+                    GeminiLiveEvent.ToolCall(
+                        callId = "call-supported",
+                        name = "ask_hermes",
+                        prompt = "Use this prompt",
+                    )
+                ),
+                unsupportedCalls = listOf(
+                    GeminiLiveEvent.UnsupportedToolCall(
+                        callId = "call-unsupported",
+                        name = "unsupported_tool",
+                    )
+                ),
+            ),
+            event,
+        )
+
+        coordinator.onGeminiEvent(event)
+        assertEquals("call-supported" to "Use this prompt", toolApi.awaitRequest("call-supported"))
+        toolApi.complete(response(callId = "call-supported", answer = "Supported answer"))
+        coordinator.awaitToolJobs()
+
+        assertEquals(listOf("call-supported" to "Supported answer"), gemini.toolResponses)
+        assertTrue(
+            diagnostics.events.value.any {
+                it.name == "unsupported_tool_call" &&
+                    it.detail.contains("call-unsupported") &&
+                    it.detail.contains("unsupported_tool")
+            }
+        )
+    }
+
+    @Test
     fun `close cancels in-flight Hermes call from external scope and prevents Gemini response`() = runTest {
         val gemini = FakeGeminiLiveVoiceClient()
         val toolApi = FakeVoiceToolApi()
@@ -189,6 +254,16 @@ class VoiceAgentViewModelTest {
         assertTrue(
             diagnostics.events.value.any {
                 it.name == "hermes_tool_succeeded" && it.detail.contains("callId=call-b")
+            }
+        )
+        assertTrue(
+            diagnostics.events.value.any {
+                it.name == "hermes_tool_started" && it.detail.contains("callId=call-a")
+            }
+        )
+        assertTrue(
+            diagnostics.events.value.any {
+                it.name == "hermes_tool_started" && it.detail.contains("callId=call-b")
             }
         )
     }
@@ -295,10 +370,13 @@ class VoiceAgentViewModelTest {
         }
 
         suspend fun awaitRequest(callId: String? = null): Pair<String, String> {
-            if (callId == null) {
-                return firstCall().request.await()
+            return withTimeout(500) {
+                if (callId == null) {
+                    firstCall().request.await()
+                } else {
+                    call(callId).request.await()
+                }
             }
-            return call(callId).request.await()
         }
 
         fun complete(response: MobileHermesResponse) {
@@ -310,7 +388,9 @@ class VoiceAgentViewModelTest {
         }
 
         suspend fun awaitCancelled(callId: String) {
-            call(callId).cancelled.await()
+            withTimeout(500) {
+                call(callId).cancelled.await()
+            }
         }
 
         fun wasCancelled(callId: String): Boolean = call(callId).cancelled.isCompleted
