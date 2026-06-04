@@ -286,6 +286,65 @@ class VoiceAgentViewModelTest {
     }
 
     @Test
+    fun `tool call cancellation received before tool call prevents Hermes request`() = runTest {
+        val gemini = FakeGeminiLiveVoiceClient()
+        val toolApi = FakeVoiceToolApi()
+        val coordinator = VoiceAgentCoordinator(
+            gemini = gemini,
+            toolApi = toolApi,
+            audio = FakeVoiceAudioEngine(),
+            scope = this,
+        )
+
+        coordinator.onGeminiEvent(GeminiLiveEvent.ToolCallCancellation(listOf("call-before-start")))
+        coordinator.onGeminiEvent(
+            GeminiLiveEvent.ToolCall(
+                callId = "call-before-start",
+                name = "ask_hermes",
+                prompt = "do not start",
+            )
+        )
+        coordinator.awaitToolJobsWithTimeout()
+
+        assertEquals(emptyList<Pair<String, String>>(), toolApi.requests)
+        assertEquals(emptyList<Pair<String, String>>(), gemini.toolResponses)
+        assertEquals(VoiceToolStatus.Idle, coordinator.state.value.tool)
+        assertEquals(emptyMap<String, VoiceToolStatus>(), coordinator.state.value.toolCalls)
+    }
+
+    @Test
+    fun `duplicate tool call id cancels replaced Hermes job and only latest response is sent`() = runTest {
+        val gemini = FakeGeminiLiveVoiceClient()
+        val toolApi = FakeVoiceToolApi()
+        val coordinator = VoiceAgentCoordinator(
+            gemini = gemini,
+            toolApi = toolApi,
+            audio = FakeVoiceAudioEngine(),
+            scope = this,
+        )
+
+        coordinator.onGeminiEvent(
+            GeminiLiveEvent.ToolCall(callId = "call-replay", name = "ask_hermes", prompt = "old")
+        )
+        assertEquals("call-replay" to "old", toolApi.awaitRequest("call-replay"))
+
+        coordinator.onGeminiEvent(
+            GeminiLiveEvent.ToolCall(callId = "call-replay", name = "ask_hermes", prompt = "new")
+        )
+        toolApi.awaitCancelled("call-replay")
+        assertEquals("call-replay" to "new", toolApi.awaitRequest("call-replay"))
+
+        toolApi.complete(response(callId = "call-replay", answer = "new answer"))
+        coordinator.awaitToolJobsWithTimeout()
+
+        assertEquals(listOf("call-replay" to "new answer"), gemini.toolResponses)
+        assertEquals(
+            VoiceToolStatus.HermesAnswered(callId = "call-replay", elapsedMs = 0L),
+            coordinator.state.value.tool,
+        )
+    }
+
+    @Test
     fun `batched Hermes tool calls send both responses and record per-call success diagnostics`() = runTest {
         val gemini = FakeGeminiLiveVoiceClient()
         val toolApi = FakeVoiceToolApi()
@@ -489,6 +548,33 @@ class VoiceAgentViewModelTest {
     }
 
     @Test
+    fun `close is idempotent and clears active tool state`() = runTest {
+        val gemini = FakeGeminiLiveVoiceClient()
+        val toolApi = FakeVoiceToolApi()
+        val audio = FakeVoiceAudioEngine()
+        val coordinator = VoiceAgentCoordinator(
+            gemini = gemini,
+            toolApi = toolApi,
+            audio = audio,
+            scope = this,
+        )
+
+        coordinator.onGeminiEvent(
+            GeminiLiveEvent.ToolCall(callId = "call-close-idempotent", name = "ask_hermes", prompt = "close")
+        )
+        assertEquals("call-close-idempotent" to "close", toolApi.awaitRequest("call-close-idempotent"))
+
+        coordinator.close()
+        toolApi.awaitCancelled("call-close-idempotent")
+        coordinator.close()
+
+        assertEquals(1, gemini.closeCalls)
+        assertEquals(1, audio.releaseCalls)
+        assertEquals(VoiceToolStatus.Idle, coordinator.state.value.tool)
+        assertEquals(emptyMap<String, VoiceToolStatus>(), coordinator.state.value.toolCalls)
+    }
+
+    @Test
     fun `close waits for in flight Gemini tool response send before releasing resources`() = runTest {
         val gemini = FakeGeminiLiveVoiceClient()
         val blockedSend = gemini.blockToolResponse("call-close-send")
@@ -643,12 +729,10 @@ class VoiceAgentViewModelTest {
 
     private class FakeVoiceToolApi : VoiceToolApi {
         val requests = mutableListOf<Pair<String, String>>()
-        private val calls = mutableMapOf<String, PendingHermesCall>()
+        private val calls = mutableMapOf<String, MutableList<PendingHermesCall>>()
 
         override suspend fun askHermes(callId: String, prompt: String): MobileHermesResponse {
-            val call = synchronized(calls) {
-                calls.getOrPut(callId) { PendingHermesCall() }
-            }
+            val call = nextCallForRequest(callId)
             requests += callId to prompt
             call.request.complete(callId to prompt)
             return try {
@@ -689,12 +773,22 @@ class VoiceAgentViewModelTest {
 
         fun wasCancelled(callId: String): Boolean = call(callId).cancelled.isCompleted
 
+        private fun nextCallForRequest(callId: String): PendingHermesCall = synchronized(calls) {
+            val callList = calls.getOrPut(callId) { mutableListOf() }
+            callList.firstOrNull { !it.request.isCompleted }
+                ?: PendingHermesCall().also(callList::add)
+        }
+
         private fun call(callId: String): PendingHermesCall = synchronized(calls) {
-            calls.getOrPut(callId) { PendingHermesCall() }
+            val callList = calls.getOrPut(callId) { mutableListOf() }
+            callList.firstOrNull { !it.result.isCompleted && !it.cancelled.isCompleted }
+                ?: callList.lastOrNull()
+                ?: PendingHermesCall().also(callList::add)
         }
 
         private fun firstCall(): PendingHermesCall = synchronized(calls) {
-            calls.values.firstOrNull() ?: PendingHermesCall().also { calls[""] = it }
+            calls.values.flatten().firstOrNull { !it.result.isCompleted && !it.cancelled.isCompleted }
+                ?: PendingHermesCall().also { calls.getOrPut("") { mutableListOf() } += it }
         }
     }
 

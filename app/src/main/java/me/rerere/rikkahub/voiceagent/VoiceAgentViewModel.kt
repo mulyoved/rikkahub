@@ -90,12 +90,9 @@ class VoiceAgentCoordinator(
     fun close() {
         synchronized(closeLock) {
             val handles = synchronized(toolJobsLock) {
-                if (closed) {
-                    emptyList()
-                } else {
-                    closing = true
-                    toolJobs.values.toList()
-                }
+                if (closed || closing) return
+                closing = true
+                toolJobs.values.toList()
             }
             val jobs = handles.map { handle ->
                 synchronized(handle.sendLock) {
@@ -103,7 +100,15 @@ class VoiceAgentCoordinator(
                 }
             }
             synchronized(toolJobsLock) {
+                toolJobs.clear()
                 closed = true
+                closing = false
+            }
+            _state.update { current ->
+                current.copy(
+                    tool = VoiceToolStatus.Idle,
+                    toolCalls = emptyMap(),
+                )
             }
             jobs.forEach { it.cancel() }
             gemini.close()
@@ -154,11 +159,12 @@ class VoiceAgentCoordinator(
             runHermesToolCall(callId = call.callId, prompt = call.prompt, handle = handle)
         }
         handle.job = job
+        var previousJob: Job? = null
         val shouldStart = synchronized(toolJobsLock) {
             if (closed || closing || call.callId in cancelledToolCallIds) {
                 false
             } else {
-                toolJobs[call.callId] = handle
+                previousJob = toolJobs.put(call.callId, handle)?.job
                 updateToolStatus(call.callId, VoiceToolStatus.CallingHermes(call.callId))
                 true
             }
@@ -167,6 +173,7 @@ class VoiceAgentCoordinator(
             job.cancel()
             return
         }
+        previousJob?.cancel()
         diagnostics.record("hermes_tool_started", "callId=${call.callId}")
         job.invokeOnCompletion {
             synchronized(toolJobsLock) {
@@ -221,12 +228,11 @@ class VoiceAgentCoordinator(
     }
 
     private fun cancelToolCall(callId: String): Job? {
-        val handle = synchronized(toolJobsLock) { toolJobs[callId] }
-        if (handle == null) {
-            synchronized(toolJobsLock) {
+        val handle = synchronized(toolJobsLock) {
+            toolJobs[callId] ?: run {
                 cancelledToolCallIds += callId
+                return null
             }
-            return null
         }
         return synchronized(handle.sendLock) {
             synchronized(toolJobsLock) {
