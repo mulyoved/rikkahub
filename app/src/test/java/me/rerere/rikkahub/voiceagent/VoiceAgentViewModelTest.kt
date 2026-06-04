@@ -319,6 +319,60 @@ class VoiceAgentViewModelTest {
         assertEquals(listOf("base64-pcm"), audio.playedPcm16)
     }
 
+    @Test
+    fun `non tool lifecycle events record diagnostics without crashing`() = runTest {
+        val diagnostics = VoiceDiagnostics()
+        val coordinator = VoiceAgentCoordinator(
+            gemini = FakeGeminiLiveVoiceClient(),
+            toolApi = FakeVoiceToolApi(),
+            audio = FakeVoiceAudioEngine(),
+            diagnostics = diagnostics,
+            scope = this,
+        )
+
+        coordinator.onGeminiEvent(GeminiLiveEvent.SetupComplete)
+        coordinator.onGeminiEvent(GeminiLiveEvent.ToolCallCancellation(listOf("call-1", "call-2")))
+        coordinator.onGeminiEvent(
+            GeminiLiveEvent.SessionResumptionUpdate(
+                newHandle = "resume-handle",
+                resumable = true,
+            )
+        )
+        coordinator.onGeminiEvent(GeminiLiveEvent.Ignored("""{"serverContent":{}}"""))
+
+        assertTrue(diagnostics.events.value.any { it.name == "gemini_setup_complete" })
+        assertTrue(
+            diagnostics.events.value.any {
+                it.name == "tool_call_cancellation" &&
+                    it.detail.contains("call-1") &&
+                    it.detail.contains("call-2")
+            }
+        )
+        assertTrue(
+            diagnostics.events.value.any {
+                it.name == "session_resumption_update" &&
+                    it.detail.contains("resumable=true") &&
+                    it.detail.contains("resume-handle")
+            }
+        )
+        assertTrue(diagnostics.events.value.any { it.name == "gemini_event_ignored" })
+    }
+
+    @Test
+    fun `Gemini error updates session error state`() = runTest {
+        val coordinator = VoiceAgentCoordinator(
+            gemini = FakeGeminiLiveVoiceClient(),
+            toolApi = FakeVoiceToolApi(),
+            audio = FakeVoiceAudioEngine(),
+            scope = this,
+        )
+
+        coordinator.onGeminiEvent(GeminiLiveEvent.Error(message = "Gemini failed", raw = "{}"))
+
+        assertEquals(VoiceSessionStatus.Error("Gemini failed"), coordinator.state.value.session)
+        assertEquals("Gemini failed", coordinator.state.value.error)
+    }
+
     private fun response(callId: String, answer: String): MobileHermesResponse = MobileHermesResponse(
         callId = callId,
         answer = answer,
