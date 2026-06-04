@@ -127,6 +127,38 @@ class GeminiLiveCodecTest {
     }
 
     @Test
+    fun `setup message omits optional live connect fields when config omits them`() {
+        val liveConnectConfig = JsonObject(
+            mapOf(
+                "sessionToken" to JsonPrimitive("config-token"),
+            )
+        )
+
+        val message = codec.setupMessage(
+            providerModel = "gemini-2.0-flash-live-001",
+            liveConnectConfig = liveConnectConfig,
+            systemInstruction = "Local instruction.",
+        ).jsonObject()
+
+        val setup = message["setup"]!!.jsonObject
+        assertEquals("models/gemini-2.0-flash-live-001", setup["model"]!!.jsonPrimitive.content)
+        assertEquals(JsonPrimitive("config-token"), setup["sessionToken"])
+        assertFalse("responseModalities" in setup)
+        assertFalse("generationConfig" in setup)
+        assertFalse("inputAudioTranscription" in setup)
+        assertFalse("outputAudioTranscription" in setup)
+        assertFalse("tools" in setup)
+        assertEquals(
+            "Local instruction.",
+            setup["systemInstruction"]!!
+                .jsonObject["parts"]!!
+                .jsonArray[0]
+                .jsonObject["text"]!!
+                .jsonPrimitive.content,
+        )
+    }
+
+    @Test
     fun `client content message emits incomplete text turns`() {
         val message = codec.clientContentMessage(
             listOf(
@@ -300,6 +332,52 @@ class GeminiLiveCodecTest {
                       },
                       {
                         "id":"call-2",
+                        "name":"ask_hermes",
+                        "args":{"prompt":"Use this prompt"}
+                      }
+                    ]
+                  }
+                }
+                """.trimIndent()
+            ),
+        )
+    }
+
+    @Test
+    fun `parse skips tool calls with non string required fields`() {
+        assertEquals(
+            GeminiLiveEvent.ToolCall(
+                callId = "call-valid",
+                name = "ask_hermes",
+                prompt = "Use this prompt",
+            ),
+            codec.parseServerMessage(
+                """
+                {
+                  "toolCall":{
+                    "functionCalls":[
+                      {
+                        "id":123,
+                        "name":"ask_hermes",
+                        "args":{"prompt":"Numeric id should not be actionable"}
+                      },
+                      {
+                        "id":"call-non-string-name",
+                        "name":true,
+                        "args":{"prompt":"Boolean name should not be actionable"}
+                      },
+                      {
+                        "id":"call-non-string-prompt",
+                        "name":"ask_hermes",
+                        "args":{"prompt":false}
+                      },
+                      {
+                        "id":"call-null-prompt",
+                        "name":"ask_hermes",
+                        "args":{"prompt":null}
+                      },
+                      {
+                        "id":"call-valid",
                         "name":"ask_hermes",
                         "args":{"prompt":"Use this prompt"}
                       }

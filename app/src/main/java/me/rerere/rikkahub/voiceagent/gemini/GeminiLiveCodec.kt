@@ -22,36 +22,30 @@ class GeminiLiveCodec(
         liveConnectConfig: JsonObject,
         systemInstruction: String,
     ): String {
-        val generationConfig = liveConnectConfig["generationConfig"]?.jsonObjectOrNull() ?: JsonObject(emptyMap())
-        val responseModalities = liveConnectConfig["responseModalities"]
-            ?: generationConfig["responseModalities"]
-            ?: JsonArray(emptyList())
+        val generationConfigElement = liveConnectConfig["generationConfig"]
+        val generationConfig = generationConfigElement?.jsonObjectOrNull()
+        val topLevelResponseModalities = liveConnectConfig["responseModalities"]
 
         return json.encodeToString(
             buildJsonObject {
                 putJsonObject("setup") {
                     liveConnectConfig.forEach { (key, value) ->
-                        if (key != "responseModalities") {
+                        if (key != "responseModalities" && key != "generationConfig") {
                             put(key, value)
                         }
                     }
                     put("model", "models/$providerModel")
-                    put(
-                        "generationConfig",
-                        buildJsonObject {
-                            generationConfig.forEach { (key, value) -> put(key, value) }
-                            put("responseModalities", responseModalities)
-                        },
-                    )
-                    put(
-                        "inputAudioTranscription",
-                        liveConnectConfig["inputAudioTranscription"] ?: JsonObject(emptyMap()),
-                    )
-                    put(
-                        "outputAudioTranscription",
-                        liveConnectConfig["outputAudioTranscription"] ?: JsonObject(emptyMap()),
-                    )
-                    put("tools", liveConnectConfig["tools"] ?: JsonArray(emptyList()))
+                    if (generationConfig != null || topLevelResponseModalities != null) {
+                        put(
+                            "generationConfig",
+                            buildJsonObject {
+                                generationConfig?.forEach { (key, value) -> put(key, value) }
+                                topLevelResponseModalities?.let { put("responseModalities", it) }
+                            },
+                        )
+                    } else if (generationConfigElement != null) {
+                        put("generationConfig", generationConfigElement)
+                    }
                     putJsonObject("systemInstruction") {
                         putJsonArray("parts") {
                             add(
@@ -157,16 +151,15 @@ class GeminiLiveCodec(
             ?.jsonArrayOrNull()
             ?.firstNotNullOfOrNull { functionCallElement ->
                 val functionCall = functionCallElement.jsonObjectOrNull() ?: return@firstNotNullOfOrNull null
-                val callId = functionCall["id"]?.jsonPrimitiveOrNull()?.contentOrNull?.takeIf { it.isNotBlank() }
+                val callId = functionCall["id"]?.stringContentOrNull()?.takeIf { it.isNotBlank() }
                     ?: return@firstNotNullOfOrNull null
-                val name = functionCall["name"]?.jsonPrimitiveOrNull()?.contentOrNull?.takeIf { it.isNotBlank() }
+                val name = functionCall["name"]?.stringContentOrNull()?.takeIf { it.isNotBlank() }
                     ?: return@firstNotNullOfOrNull null
                 if (name != ASK_HERMES_TOOL_NAME) return@firstNotNullOfOrNull null
                 val prompt = functionCall["args"]
                     ?.jsonObjectOrNull()
                     ?.get("prompt")
-                    ?.jsonPrimitiveOrNull()
-                    ?.contentOrNull
+                    ?.stringContentOrNull()
                     ?.takeIf { it.isNotBlank() }
                     ?: return@firstNotNullOfOrNull null
                 GeminiLiveEvent.ToolCall(
@@ -219,6 +212,11 @@ class GeminiLiveCodec(
     private fun JsonElement.jsonArrayOrNull(): JsonArray? = this as? JsonArray
 
     private fun JsonElement.jsonPrimitiveOrNull(): JsonPrimitive? = this as? JsonPrimitive
+
+    private fun JsonElement.stringContentOrNull(): String? {
+        val primitive = jsonPrimitiveOrNull() ?: return null
+        return primitive.takeIf { it.isString }?.contentOrNull
+    }
 
     private companion object {
         const val ASK_HERMES_TOOL_NAME = "ask_hermes"
