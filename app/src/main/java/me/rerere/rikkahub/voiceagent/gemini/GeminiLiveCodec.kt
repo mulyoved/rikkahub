@@ -138,29 +138,29 @@ class GeminiLiveCodec(
     }
 
     private fun JsonObject.firstToolCall(): GeminiLiveEvent.ToolCall? {
-        val functionCall = this["toolCall"]
+        return this["toolCall"]
             ?.jsonObjectOrNull()
             ?.get("functionCalls")
             ?.jsonArrayOrNull()
-            ?.firstOrNull()
-            ?.jsonObjectOrNull()
-            ?: return null
-        val callId = functionCall["id"]?.jsonPrimitiveOrNull()?.contentOrNull?.takeIf { it.isNotBlank() }
-            ?: return null
-        val name = functionCall["name"]?.jsonPrimitiveOrNull()?.contentOrNull?.takeIf { it.isNotBlank() }
-            ?: return null
-        val prompt = functionCall["args"]
-            ?.jsonObjectOrNull()
-            ?.get("prompt")
-            ?.jsonPrimitiveOrNull()
-            ?.contentOrNull
-            ?.takeIf { it.isNotBlank() }
-            ?: return null
-        return GeminiLiveEvent.ToolCall(
-            callId = callId,
-            name = name,
-            prompt = prompt,
-        )
+            ?.firstNotNullOfOrNull { functionCallElement ->
+                val functionCall = functionCallElement.jsonObjectOrNull() ?: return@firstNotNullOfOrNull null
+                val callId = functionCall["id"]?.jsonPrimitiveOrNull()?.contentOrNull?.takeIf { it.isNotBlank() }
+                    ?: return@firstNotNullOfOrNull null
+                val name = functionCall["name"]?.jsonPrimitiveOrNull()?.contentOrNull?.takeIf { it.isNotBlank() }
+                    ?: return@firstNotNullOfOrNull null
+                val prompt = functionCall["args"]
+                    ?.jsonObjectOrNull()
+                    ?.get("prompt")
+                    ?.jsonPrimitiveOrNull()
+                    ?.contentOrNull
+                    ?.takeIf { it.isNotBlank() }
+                    ?: return@firstNotNullOfOrNull null
+                GeminiLiveEvent.ToolCall(
+                    callId = callId,
+                    name = name,
+                    prompt = prompt,
+                )
+            }
     }
 
     private fun JsonObject.toolCallCancellation(): GeminiLiveEvent.ToolCallCancellation? {

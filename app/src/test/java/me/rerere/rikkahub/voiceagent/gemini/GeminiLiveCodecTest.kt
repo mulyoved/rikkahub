@@ -226,6 +226,37 @@ class GeminiLiveCodecTest {
     }
 
     @Test
+    fun `parse skips malformed tool calls and returns first valid function call`() {
+        assertEquals(
+            GeminiLiveEvent.ToolCall(
+                callId = "call-2",
+                name = "ask_hermes",
+                prompt = "Use this prompt",
+            ),
+            codec.parseServerMessage(
+                """
+                {
+                  "toolCall":{
+                    "functionCalls":[
+                      {
+                        "id":"call-1",
+                        "name":"ask_hermes",
+                        "args":{}
+                      },
+                      {
+                        "id":"call-2",
+                        "name":"ask_hermes",
+                        "args":{"prompt":"Use this prompt"}
+                      }
+                    ]
+                  }
+                }
+                """.trimIndent()
+            ),
+        )
+    }
+
+    @Test
     fun `parse ignores tool call with missing required fields`() {
         val raw = """
             {
