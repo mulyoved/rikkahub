@@ -614,6 +614,39 @@ class VoiceAgentViewModelTest {
     }
 
     @Test
+    fun `close waits for in flight non tool event before releasing audio`() = runTest {
+        val audio = FakeVoiceAudioEngine()
+        val blockedPlayback = audio.blockNextPlayback()
+        val coordinator = VoiceAgentCoordinator(
+            gemini = FakeGeminiLiveVoiceClient(),
+            toolApi = FakeVoiceToolApi(),
+            audio = audio,
+            scope = this,
+            dispatcher = Dispatchers.Default,
+        )
+
+        val eventJob = launch(Dispatchers.Default) {
+            coordinator.onGeminiEvent(GeminiLiveEvent.OutputAudio("blocked-pcm"))
+        }
+        assertTrue(blockedPlayback.started.await(500, TimeUnit.MILLISECONDS))
+
+        val closeJob = launch(Dispatchers.Default) {
+            coordinator.close()
+        }
+        assertFalse(blockedPlayback.release.await(50, TimeUnit.MILLISECONDS))
+        assertEquals(0, audio.releaseCalls)
+
+        blockedPlayback.release.countDown()
+        withTimeout(500) {
+            eventJob.join()
+            closeJob.join()
+        }
+
+        assertEquals(listOf("blocked-pcm"), audio.playedPcm16)
+        assertEquals(1, audio.releaseCalls)
+    }
+
+    @Test
     fun `non tool lifecycle events record diagnostics without crashing`() = runTest {
         val diagnostics = VoiceDiagnostics()
         val coordinator = VoiceAgentCoordinator(
@@ -808,12 +841,18 @@ class VoiceAgentViewModelTest {
         val playedPcm16 = mutableListOf<String>()
         var suppressPlaybackCalls = 0
         var releaseCalls = 0
+        private val blockedPlaybacks = mutableListOf<BlockedPlayback>()
 
         override fun startCapture(onPcm16: (ByteArray) -> Unit) = Unit
 
         override fun stopCapture() = Unit
 
         override fun playPcm16(base64Pcm16: String) {
+            val blocked = synchronized(blockedPlaybacks) { blockedPlaybacks.removeFirstOrNull() }
+            if (blocked != null) {
+                blocked.started.countDown()
+                blocked.release.await(500, TimeUnit.MILLISECONDS)
+            }
             playedPcm16 += base64Pcm16
         }
 
@@ -824,5 +863,18 @@ class VoiceAgentViewModelTest {
         override fun release() {
             releaseCalls += 1
         }
+
+        fun blockNextPlayback(): BlockedPlayback {
+            return BlockedPlayback().also { blocked ->
+                synchronized(blockedPlaybacks) {
+                    blockedPlaybacks += blocked
+                }
+            }
+        }
+    }
+
+    private class BlockedPlayback {
+        val started = CountDownLatch(1)
+        val release = CountDownLatch(1)
     }
 }

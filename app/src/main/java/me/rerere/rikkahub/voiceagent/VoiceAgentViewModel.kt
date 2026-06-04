@@ -40,6 +40,7 @@ class VoiceAgentCoordinator(
     private val coordinatorScope = scope ?: CoroutineScope(SupervisorJob() + (dispatcher ?: Dispatchers.Default))
     private val toolLaunchContext = dispatcher ?: EmptyCoroutineContext
     private val closeLock = Any()
+    private val eventLock = Any()
     private val toolJobsLock = Any()
     private val toolJobs = mutableMapOf<String, ToolJobHandle>()
     private val cancelledToolCallIds = mutableSetOf<String>()
@@ -50,6 +51,12 @@ class VoiceAgentCoordinator(
     val state: StateFlow<VoiceAgentUiState> = _state.asStateFlow()
 
     fun onGeminiEvent(event: GeminiLiveEvent) {
+        synchronized(eventLock) {
+            onGeminiEventLocked(event)
+        }
+    }
+
+    private fun onGeminiEventLocked(event: GeminiLiveEvent) {
         if (isClosed()) {
             diagnostics.record("gemini_event_after_close", event.javaClass.simpleName)
             return
@@ -89,32 +96,34 @@ class VoiceAgentCoordinator(
 
     fun close() {
         synchronized(closeLock) {
-            val handles = synchronized(toolJobsLock) {
-                if (closed || closing) return
-                closing = true
-                toolJobs.values.toList()
-            }
-            val jobs = handles.map { handle ->
-                synchronized(handle.sendLock) {
-                    handle.job
+            synchronized(eventLock) {
+                val handles = synchronized(toolJobsLock) {
+                    if (closed || closing) return
+                    closing = true
+                    toolJobs.values.toList()
                 }
-            }
-            synchronized(toolJobsLock) {
-                toolJobs.clear()
-                closed = true
-                closing = false
-            }
-            _state.update { current ->
-                current.copy(
-                    tool = VoiceToolStatus.Idle,
-                    toolCalls = emptyMap(),
-                )
-            }
-            jobs.forEach { it.cancel() }
-            gemini.close()
-            audio.release()
-            if (ownsScope) {
-                coordinatorScope.cancel()
+                val jobs = handles.map { handle ->
+                    synchronized(handle.sendLock) {
+                        handle.job
+                    }
+                }
+                synchronized(toolJobsLock) {
+                    toolJobs.clear()
+                    closed = true
+                    closing = false
+                }
+                _state.update { current ->
+                    current.copy(
+                        tool = VoiceToolStatus.Idle,
+                        toolCalls = emptyMap(),
+                    )
+                }
+                jobs.forEach { it.cancel() }
+                gemini.close()
+                audio.release()
+                if (ownsScope) {
+                    coordinatorScope.cancel()
+                }
             }
         }
     }
