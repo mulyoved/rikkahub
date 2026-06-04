@@ -8,6 +8,8 @@ import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import me.rerere.rikkahub.utils.JsonInstant
+import okhttp3.Interceptor
+import okhttp3.OkHttpClient
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -522,6 +524,27 @@ class GeminiLiveVoiceClientTest {
         assertEquals("sse", url.queryParameter("alt"))
         assertEquals("token value", url.queryParameter("access_token"))
         assertEquals(2, url.querySize)
+    }
+
+    @Test
+    fun `okhttp socket client strips application and network interceptors`() {
+        val appInterceptor = Interceptor { chain ->
+            chain.proceed(chain.request())
+        }
+        val networkInterceptor = Interceptor { chain ->
+            chain.proceed(chain.request())
+        }
+        val baseClient = OkHttpClient.Builder()
+            .addInterceptor(appInterceptor)
+            .addNetworkInterceptor(networkInterceptor)
+            .build()
+
+        val isolatedClient = isolatedGeminiWebSocketClient(baseClient)
+
+        assertEquals(listOf(appInterceptor), baseClient.interceptors)
+        assertEquals(listOf(networkInterceptor), baseClient.networkInterceptors)
+        assertTrue(isolatedClient.interceptors.isEmpty())
+        assertTrue(isolatedClient.networkInterceptors.isEmpty())
     }
 
     private fun String.jsonObject(): JsonObject = JsonInstant.parseToJsonElement(this).jsonObject

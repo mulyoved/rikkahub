@@ -106,13 +106,13 @@ class TestableGeminiLiveVoiceClient(
                     )
                 },
             )
-            sendOrGetErrorCallback(
+            sendOrGetPendingError(
                 generation = generation,
                 text = setupMessage,
                 errorMessage = "Failed to send Gemini setup message",
             )
         }
-        setupError?.emit()
+        setupError?.emitIfCurrent()
     }
 
     override fun sendAudio(base64Pcm16: String) {
@@ -229,29 +229,33 @@ class TestableGeminiLiveVoiceClient(
         text: String,
         errorMessage: String,
     ) {
-        sendOrGetErrorCallback(
+        sendOrGetPendingError(
             generation = generation,
             text = text,
             errorMessage = errorMessage,
-        )?.emit()
+        )?.emitIfCurrent()
     }
 
-    private fun sendOrGetErrorCallback(
+    private fun sendOrGetPendingError(
         generation: Long,
         text: String,
         errorMessage: String,
     ): PendingError? {
-        val onError = synchronized(lock) {
+        val sendFailed = synchronized(lock) {
             val state = sessionState
                 ?.takeIf { it.generation == generation && !it.closed }
                 ?: return null
             if (socket.send(text)) {
-                null
+                false
             } else {
-                state.onEvent
+                true
             }
         }
-        return onError?.let { PendingError(onEvent = it, message = errorMessage) }
+        return if (sendFailed) {
+            PendingError(generation = generation, message = errorMessage)
+        } else {
+            null
+        }
     }
 
     private fun emitIfCurrent(generation: Long, event: GeminiLiveEvent) {
@@ -279,16 +283,17 @@ class TestableGeminiLiveVoiceClient(
     )
 
     private data class PendingError(
-        val onEvent: (GeminiLiveEvent) -> Unit,
+        val generation: Long,
         val message: String,
-    ) {
-        fun emit() {
-            onEvent(
-                GeminiLiveEvent.Error(
-                    message = message,
-                    raw = "",
-                ),
-            )
-        }
+    )
+
+    private fun PendingError.emitIfCurrent() {
+        emitIfCurrent(
+            generation = generation,
+            GeminiLiveEvent.Error(
+                message = message,
+                raw = "",
+            ),
+        )
     }
 }

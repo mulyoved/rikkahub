@@ -51,8 +51,9 @@ class OkHttpGeminiLiveVoiceClient(
 }
 
 class OkHttpGeminiSocket(
-    private val httpClient: OkHttpClient,
+    httpClient: OkHttpClient,
 ) : GeminiSocket {
+    private val webSocketClient = isolatedGeminiWebSocketClient(httpClient)
     private val lock = Any()
     private var webSocket: WebSocket? = null
     private var generation = 0L
@@ -79,7 +80,7 @@ class OkHttpGeminiSocket(
         val request = Request.Builder()
             .url(geminiLiveUrlWithAccessToken(url = url, token = token))
             .build()
-        val newWebSocket = httpClient.newWebSocket(
+        val newWebSocket = webSocketClient.newWebSocket(
             request,
             object : WebSocketListener() {
                 override fun onMessage(webSocket: WebSocket, text: String) {
@@ -158,5 +159,14 @@ internal fun geminiLiveUrlWithAccessToken(url: String, token: String): HttpUrl {
         .url
         .newBuilder()
         .setQueryParameter("access_token", token)
+        .build()
+}
+
+internal fun isolatedGeminiWebSocketClient(httpClient: OkHttpClient): OkHttpClient {
+    return httpClient.newBuilder()
+        .apply {
+            interceptors().clear()
+            networkInterceptors().clear()
+        }
         .build()
 }
