@@ -9,6 +9,8 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import me.rerere.rikkahub.utils.JsonInstant
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -313,10 +315,50 @@ class GeminiLiveVoiceClientTest {
     }
 
     @Test
+    fun `close cannot interleave before connect opens and sends setup`() = runBlocking {
+        val closeStarted = CountDownLatch(1)
+        val closeCompleted = CountDownLatch(1)
+        lateinit var client: TestableGeminiLiveVoiceClient
+        var closeThread: Thread? = null
+        val socket = FakeGeminiSocket().apply {
+            beforeOpen = {
+                closeThread = Thread {
+                    closeStarted.countDown()
+                    client.close()
+                    closeCompleted.countDown()
+                }.also { it.start() }
+
+                assertTrue(closeStarted.await(1, TimeUnit.SECONDS))
+                assertFalse(closeCompleted.await(100, TimeUnit.MILLISECONDS))
+            }
+        }
+        client = TestableGeminiLiveVoiceClient(socket = socket, codec = GeminiLiveCodec())
+
+        client.connect(
+            token = "token-1",
+            websocketUrl = "wss://example.test/live",
+            providerModel = "gemini-2.0-flash-live-001",
+            liveConnectConfig = liveConnectConfig,
+            systemInstruction = "You are Hermes.",
+            contextTurns = emptyList(),
+            onEvent = {},
+        )
+        closeThread?.join(1_000)
+
+        assertTrue(closeCompleted.await(1, TimeUnit.SECONDS))
+        assertEquals(1, socket.openedSessions.size)
+        assertEquals(1, socket.sentMessages.size)
+        assertTrue("setup" in socket.sentMessages.single().jsonObject())
+        assertEquals(1, socket.closeCount)
+    }
+
+    @Test
     fun `close cannot interleave with current generation send`() = runBlocking {
         val socket = FakeGeminiSocket()
         val client = TestableGeminiLiveVoiceClient(socket = socket, codec = GeminiLiveCodec())
         val closeCompletedDuringSend = AtomicBoolean(false)
+        val closeStarted = CountDownLatch(1)
+        val closeCompleted = CountDownLatch(1)
         var closeThread: Thread? = null
 
         client.connect(
@@ -332,19 +374,15 @@ class GeminiLiveVoiceClientTest {
         socket.beforeSend = { text ->
             if ("realtimeInput" in text) {
                 val thread = Thread {
+                    closeStarted.countDown()
                     client.close()
+                    closeCompleted.countDown()
                 }
                 closeThread = thread
                 thread.start()
 
-                val deadline = System.nanoTime() + 1_000_000_000L
-                while (thread.state != Thread.State.BLOCKED && socket.closeCount == 0) {
-                    check(System.nanoTime() < deadline) {
-                        "Timed out waiting for close to block or complete"
-                    }
-                    Thread.yield()
-                }
-                closeCompletedDuringSend.set(socket.closeCount > 0)
+                assertTrue(closeStarted.await(1, TimeUnit.SECONDS))
+                closeCompletedDuringSend.set(closeCompleted.await(100, TimeUnit.MILLISECONDS))
             }
         }
 
@@ -352,6 +390,7 @@ class GeminiLiveVoiceClientTest {
         closeThread?.join(1_000)
 
         assertFalse(closeCompletedDuringSend.get())
+        assertTrue(closeCompleted.await(1, TimeUnit.SECONDS))
         assertEquals(1, socket.closeCount)
     }
 

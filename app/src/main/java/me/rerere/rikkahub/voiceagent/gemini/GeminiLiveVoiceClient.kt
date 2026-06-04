@@ -39,6 +39,7 @@ class TestableGeminiLiveVoiceClient(
     private val codec: GeminiLiveCodec = GeminiLiveCodec(),
 ) : GeminiLiveVoiceClient {
     private val lock = Any()
+    private val lifecycleLock = Any()
     private var nextGeneration = 0L
     private var sessionState: SessionState? = null
 
@@ -64,51 +65,54 @@ class TestableGeminiLiveVoiceClient(
                     errorMessage = "Failed to send Gemini context message",
                 )
             }
-        val generation = synchronized(lock) {
-            sessionState?.closed = true
-            val newGeneration = nextGeneration + 1
-            nextGeneration = newGeneration
-            sessionState = SessionState(
-                generation = newGeneration,
-                onEvent = onEvent,
-                setupComplete = false,
-                flushingSetupComplete = false,
-                pendingContext = pendingContext,
-                pendingOutboundMessages = mutableListOf(),
-                closed = false,
+        val setupError = synchronized(lifecycleLock) {
+            val generation = synchronized(lock) {
+                sessionState?.closed = true
+                val newGeneration = nextGeneration + 1
+                nextGeneration = newGeneration
+                sessionState = SessionState(
+                    generation = newGeneration,
+                    onEvent = onEvent,
+                    setupComplete = false,
+                    flushingSetupComplete = false,
+                    pendingContext = pendingContext,
+                    pendingOutboundMessages = mutableListOf(),
+                    closed = false,
+                )
+                newGeneration
+            }
+            socket.open(
+                url = websocketUrl,
+                token = token,
+                onMessage = { message ->
+                    handleMessage(generation = generation, message = message)
+                },
+                onClosed = { code, reason ->
+                    emitIfCurrent(
+                        generation = generation,
+                        GeminiLiveEvent.Error(
+                            message = "WebSocket closed: $code $reason",
+                            raw = "",
+                        ),
+                    )
+                },
+                onFailure = { error ->
+                    emitIfCurrent(
+                        generation = generation,
+                        GeminiLiveEvent.Error(
+                            message = error.message ?: error.javaClass.simpleName,
+                            raw = "",
+                        ),
+                    )
+                },
             )
-            newGeneration
+            sendOrGetErrorCallback(
+                generation = generation,
+                text = setupMessage,
+                errorMessage = "Failed to send Gemini setup message",
+            )
         }
-        socket.open(
-            url = websocketUrl,
-            token = token,
-            onMessage = { message ->
-                handleMessage(generation = generation, message = message)
-            },
-            onClosed = { code, reason ->
-                emitIfCurrent(
-                    generation = generation,
-                    GeminiLiveEvent.Error(
-                        message = "WebSocket closed: $code $reason",
-                        raw = "",
-                    ),
-                )
-            },
-            onFailure = { error ->
-                emitIfCurrent(
-                    generation = generation,
-                    GeminiLiveEvent.Error(
-                        message = error.message ?: error.javaClass.simpleName,
-                        raw = "",
-                    ),
-                )
-            },
-        )
-        sendOrEmitError(
-            generation = generation,
-            text = setupMessage,
-            errorMessage = "Failed to send Gemini setup message",
-        )
+        setupError?.emit()
     }
 
     override fun sendAudio(base64Pcm16: String) {
@@ -126,15 +130,17 @@ class TestableGeminiLiveVoiceClient(
     }
 
     override fun close() {
-        synchronized(lock) {
-            sessionState?.let { state ->
-                state.closed = true
-                state.pendingContext = null
-                state.pendingOutboundMessages.clear()
+        synchronized(lifecycleLock) {
+            synchronized(lock) {
+                sessionState?.let { state ->
+                    state.closed = true
+                    state.pendingContext = null
+                    state.pendingOutboundMessages.clear()
+                }
+                sessionState = null
             }
-            sessionState = null
+            socket.close()
         }
-        socket.close()
     }
 
     private fun handleMessage(generation: Long, message: String) {
@@ -223,22 +229,29 @@ class TestableGeminiLiveVoiceClient(
         text: String,
         errorMessage: String,
     ) {
+        sendOrGetErrorCallback(
+            generation = generation,
+            text = text,
+            errorMessage = errorMessage,
+        )?.emit()
+    }
+
+    private fun sendOrGetErrorCallback(
+        generation: Long,
+        text: String,
+        errorMessage: String,
+    ): PendingError? {
         val onError = synchronized(lock) {
             val state = sessionState
                 ?.takeIf { it.generation == generation && !it.closed }
-                ?: return
+                ?: return null
             if (socket.send(text)) {
                 null
             } else {
                 state.onEvent
             }
         }
-        onError?.invoke(
-            GeminiLiveEvent.Error(
-                message = errorMessage,
-                raw = "",
-            ),
-        )
+        return onError?.let { PendingError(onEvent = it, message = errorMessage) }
     }
 
     private fun emitIfCurrent(generation: Long, event: GeminiLiveEvent) {
@@ -264,4 +277,18 @@ class TestableGeminiLiveVoiceClient(
         val text: String,
         val errorMessage: String,
     )
+
+    private data class PendingError(
+        val onEvent: (GeminiLiveEvent) -> Unit,
+        val message: String,
+    ) {
+        fun emit() {
+            onEvent(
+                GeminiLiveEvent.Error(
+                    message = message,
+                    raw = "",
+                ),
+            )
+        }
+    }
 }

@@ -14,6 +14,7 @@ class FakeGeminiSocket : GeminiSocket {
     val openedSessions = mutableListOf<OpenedSession>()
     val sentMessages = mutableListOf<String>()
     val sendResults = ArrayDeque<Boolean>()
+    var beforeOpen: (() -> Unit)? = null
     var beforeSend: ((String) -> Unit)? = null
     var closeCount = 0
         private set
@@ -29,6 +30,7 @@ class FakeGeminiSocket : GeminiSocket {
         onClosed: (Int, String) -> Unit,
         onFailure: (Throwable) -> Unit,
     ) {
+        beforeOpen?.invoke()
         openedUrl = url
         openedToken = token
         openedSessions += OpenedSession(onMessage, onClosed, onFailure)
