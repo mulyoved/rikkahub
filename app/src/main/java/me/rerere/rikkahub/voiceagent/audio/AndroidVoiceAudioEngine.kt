@@ -282,7 +282,12 @@ class AndroidVoiceAudioEngine(context: Context) : VoiceAudioEngine {
     ) {
         synchronized(captureCallbackLock) {
             if (isCurrentCapture(generation, recorder)) {
-                onPcm16(buffer)
+                try {
+                    onPcm16(buffer)
+                } catch (e: Throwable) {
+                    Log.w(TAG, "Stopping capture after PCM callback failure", e)
+                    clearRecorder(generation, recorder)
+                }
             }
         }
     }
