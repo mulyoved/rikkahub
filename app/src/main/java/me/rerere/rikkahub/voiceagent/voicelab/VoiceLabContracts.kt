@@ -36,6 +36,7 @@ data class MobileHermesResponse(
     val profileLabel: String,
 )
 
+@Serializable
 data class VoiceLabMobileCredentials(
     val hermesProfileApiKey: String,
     val cloudflareClientId: String? = null,
