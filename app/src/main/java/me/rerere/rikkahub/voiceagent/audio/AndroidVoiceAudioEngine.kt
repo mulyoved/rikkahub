@@ -25,6 +25,8 @@ class AndroidVoiceAudioEngine(context: Context) : VoiceAudioEngine {
     private val context = context.applicationContext
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val lock = Any()
+    private val captureCallbackLock = Any()
+    private val captureRecordLock = Any()
     private val playbackWriteLock = Any()
     private var captureJob: Job? = null
     private var audioRecord: AudioRecord? = null
@@ -66,60 +68,99 @@ class AndroidVoiceAudioEngine(context: Context) : VoiceAudioEngine {
             throw IllegalStateException("AudioRecord initialization failed")
         }
 
-        try {
-            recorder.startRecording()
-        } catch (e: RuntimeException) {
-            recorder.releaseSafely()
-            throw IllegalStateException("AudioRecord start failed", e)
-        }
-
-        if (recorder.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
-            recorder.releaseSafely()
-            throw IllegalStateException("AudioRecord start failed")
-        }
-
         val job = scope.launch(start = CoroutineStart.LAZY) {
             val buffer = ByteArray(bufferSize)
             try {
                 captureLoop@ while (isActive && isCurrentCapture(generation, recorder)) {
-                    when (val read = recorder.read(buffer, 0, buffer.size)) {
+                    val read = try {
+                        recorder.read(buffer, 0, buffer.size)
+                    } catch (e: RuntimeException) {
+                        if (isCurrentCapture(generation, recorder)) {
+                            Log.w(TAG, "AudioRecord read failed", e)
+                        }
+                        break@captureLoop
+                    }
+
+                    when (read) {
                         in 1..buffer.size -> {
-                            if (isCurrentCapture(generation, recorder)) {
-                                onPcm16(buffer.copyOf(read))
-                            }
+                            deliverCaptureBuffer(generation, recorder, buffer.copyOf(read), onPcm16)
                         }
                         0 -> Unit
                         else -> {
                             if (isCurrentCapture(generation, recorder)) {
-                                throw IllegalStateException("AudioRecord read error: $read")
-                            } else {
-                                break@captureLoop
+                                try {
+                                    throw IllegalStateException("AudioRecord read error: $read")
+                                } catch (e: IllegalStateException) {
+                                    Log.w(TAG, "Stopping capture after AudioRecord read failure", e)
+                                }
                             }
+                            break@captureLoop
                         }
                     }
                 }
             } finally {
                 clearRecorder(generation, recorder)
-                recorder.stopSafely()
-                recorder.releaseSafely()
+                stopAndReleaseRecorder(recorder)
             }
         }
 
-        var shouldStart = false
+        var published = false
         synchronized(lock) {
             if (!released && generation == captureGeneration) {
                 audioRecord = recorder
                 captureJob = job
-                shouldStart = true
+                published = true
             }
         }
 
-        if (shouldStart) {
-            job.start()
-        } else {
+        if (!published || !isCurrentCapture(generation, recorder)) {
             job.cancel()
-            recorder.stopSafely()
-            recorder.releaseSafely()
+            releaseRecorder(recorder)
+            return
+        }
+
+        synchronized(captureRecordLock) {
+            if (!isCurrentCapture(generation, recorder)) {
+                job.cancel()
+                recorder.releaseSafely()
+                return
+            }
+
+            try {
+                recorder.startRecording()
+            } catch (e: RuntimeException) {
+                val stillCurrent = isCurrentCapture(generation, recorder)
+                if (stillCurrent) {
+                    clearRecorder(generation, recorder)
+                }
+                job.cancel()
+                recorder.releaseSafely()
+                if (stillCurrent) {
+                    throw IllegalStateException("AudioRecord start failed", e)
+                }
+                return
+            }
+
+            if (recorder.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
+                val stillCurrent = isCurrentCapture(generation, recorder)
+                if (stillCurrent) {
+                    clearRecorder(generation, recorder)
+                }
+                job.cancel()
+                recorder.releaseSafely()
+                if (stillCurrent) {
+                    throw IllegalStateException("AudioRecord start failed")
+                }
+                return
+            }
+
+            if (isCurrentCapture(generation, recorder)) {
+                job.start()
+            } else {
+                job.cancel()
+                recorder.stopSafely()
+                recorder.releaseSafely()
+            }
         }
     }
 
@@ -134,8 +175,8 @@ class AndroidVoiceAudioEngine(context: Context) : VoiceAudioEngine {
             audioRecord = null
         }
         job?.cancel()
-        recorder?.stopSafely()
-        recorder?.releaseSafely()
+        recorder?.let(::stopAndReleaseRecorder)
+        waitForCaptureCallbacks()
     }
 
     override fun playPcm16(base64Pcm16: String) {
@@ -211,12 +252,12 @@ class AndroidVoiceAudioEngine(context: Context) : VoiceAudioEngine {
             audioTrack = null
         }
         job?.cancel()
-        recorder?.stopSafely()
-        recorder?.releaseSafely()
+        recorder?.let(::stopAndReleaseRecorder)
         synchronized(playbackWriteLock) {
             track?.stopSafely()
             track?.releaseSafely()
         }
+        waitForCaptureCallbacks()
         scope.cancel()
     }
 
@@ -231,6 +272,38 @@ class AndroidVoiceAudioEngine(context: Context) : VoiceAudioEngine {
 
     private fun isCurrentCapture(generation: Long, recorder: AudioRecord): Boolean = synchronized(lock) {
         captureGeneration == generation && audioRecord === recorder
+    }
+
+    private fun deliverCaptureBuffer(
+        generation: Long,
+        recorder: AudioRecord,
+        buffer: ByteArray,
+        onPcm16: (ByteArray) -> Unit,
+    ) {
+        synchronized(captureCallbackLock) {
+            if (isCurrentCapture(generation, recorder)) {
+                onPcm16(buffer)
+            }
+        }
+    }
+
+    private fun waitForCaptureCallbacks() {
+        synchronized(captureCallbackLock) {
+            // Wait for any in-flight capture callback that passed its final generation check.
+        }
+    }
+
+    private fun stopAndReleaseRecorder(recorder: AudioRecord) {
+        synchronized(captureRecordLock) {
+            recorder.stopSafely()
+            recorder.releaseSafely()
+        }
+    }
+
+    private fun releaseRecorder(recorder: AudioRecord) {
+        synchronized(captureRecordLock) {
+            recorder.releaseSafely()
+        }
     }
 
     private fun isCurrentPlayback(generation: Long, track: AudioTrack): Boolean = synchronized(lock) {
