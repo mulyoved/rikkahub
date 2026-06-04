@@ -58,36 +58,28 @@ class VoiceConversationPersister {
         )
 
         val currentMessages = conversation.currentMessages
-        val latestAssistantIndex = currentMessages.indexOfLast { it.role == MessageRole.ASSISTANT }
-        if (latestAssistantIndex < 0) {
-            return conversation.appendMessage(
-                UIMessage(
-                    role = MessageRole.ASSISTANT,
-                    parts = listOf(tool),
-                )
-            )
-        }
-
-        val latestAssistant = currentMessages[latestAssistantIndex]
-        val hasExistingTool = latestAssistant.parts.any {
-            it is UIMessagePart.Tool && it.toolCallId == callId
-        }
-        if (!hasExistingTool) {
-            return conversation.appendMessage(
-                UIMessage(
-                    role = MessageRole.ASSISTANT,
-                    parts = listOf(tool),
-                )
-            )
-        }
-
-        val updatedMessages = currentMessages.toMutableList()
-        updatedMessages[latestAssistantIndex] = latestAssistant.copy(
-            parts = latestAssistant.parts.map { part ->
-                if (part is UIMessagePart.Tool && part.toolCallId == callId) tool else part
+        val existingToolIndex = currentMessages.indexOfLast { message ->
+            message.parts.any { part ->
+                part is UIMessagePart.Tool && part.toolCallId == callId
             }
+        }
+        if (existingToolIndex >= 0) {
+            val updatedMessages = currentMessages.toMutableList()
+            val existingMessage = currentMessages[existingToolIndex]
+            updatedMessages[existingToolIndex] = existingMessage.copy(
+                parts = existingMessage.parts.map { part ->
+                    if (part is UIMessagePart.Tool && part.toolCallId == callId) tool else part
+                }
+            )
+            return conversation.updateCurrentMessages(updatedMessages)
+        }
+
+        return conversation.appendMessage(
+            UIMessage(
+                role = MessageRole.ASSISTANT,
+                parts = listOf(tool),
+            )
         )
-        return conversation.updateCurrentMessages(updatedMessages)
     }
 
     private fun Conversation.appendMessage(message: UIMessage): Conversation {

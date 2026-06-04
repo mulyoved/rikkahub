@@ -24,8 +24,8 @@ object VoiceContextBuilder {
                 assistantPrompt = assistantPrompt,
             ),
             turns = conversation.currentMessages
-                .takeLast(maxTurns)
-                .mapNotNull { message -> message.toGeminiTurn() },
+                .mapNotNull { message -> message.toGeminiTurn() }
+                .takeLast(maxTurns),
         )
     }
 

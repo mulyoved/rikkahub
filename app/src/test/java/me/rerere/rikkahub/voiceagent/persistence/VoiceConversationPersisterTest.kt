@@ -74,6 +74,41 @@ class VoiceConversationPersisterTest {
     }
 
     @Test
+    fun `complete upsert updates pending tool before newer assistant turn without appending duplicate`() {
+        val persister = VoiceConversationPersister()
+        val conversation = emptyConversation()
+            .let {
+                persister.upsertHermesTool(
+                    conversation = it,
+                    callId = "call-1",
+                    prompt = "Original prompt",
+                    status = VoiceToolRecordStatus.Pending,
+                )
+            }
+            .let { persister.appendAssistantTurn(it, "Assistant reply", interrupted = false) }
+            .let {
+                persister.upsertHermesTool(
+                    conversation = it,
+                    callId = "call-1",
+                    prompt = "Updated prompt",
+                    status = VoiceToolRecordStatus.Complete("Final answer"),
+                )
+            }
+
+        assertEquals(2, conversation.currentMessages.size)
+        assertEquals("Assistant reply", conversation.currentMessages[1].parts.text())
+
+        val tools = conversation.currentMessages
+            .flatMap { it.parts }
+            .filterIsInstance<UIMessagePart.Tool>()
+
+        assertEquals(1, tools.size)
+        assertEquals("call-1", tools.single().toolCallId)
+        assertEquals("Updated prompt", tools.single().input.promptJson())
+        assertEquals("Final answer", tools.single().output.text())
+    }
+
+    @Test
     fun `new call id after user turn appends tool message without changing old assistant`() {
         val persister = VoiceConversationPersister()
         val conversation = emptyConversation()

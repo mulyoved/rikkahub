@@ -81,6 +81,42 @@ class VoiceContextBuilderTest {
         assertEquals(listOf("included", "also included"), context.turns.map { it.text })
     }
 
+    @Test
+    fun `build applies max turns after filtering blank and non text messages`() {
+        val skippedToolMessage = UIMessage(
+            role = MessageRole.ASSISTANT,
+            parts = listOf(
+                UIMessagePart.Tool(
+                    toolCallId = "call-1",
+                    toolName = "ask_hermes",
+                    input = "{}",
+                    output = emptyList(),
+                )
+            ),
+        )
+        val blankMessage = UIMessage(role = MessageRole.USER, parts = listOf(UIMessagePart.Text("   ")))
+        val conversation = conversationWith(
+            listOf(
+                UIMessage.user("text 1"),
+                skippedToolMessage,
+                UIMessage.assistant("text 2"),
+                blankMessage,
+                UIMessage.user("text 3"),
+                skippedToolMessage,
+                blankMessage,
+            )
+        )
+
+        val context = VoiceContextBuilder.build(
+            assistantName = "Hermes",
+            assistantPrompt = "Prompt",
+            conversation = conversation,
+            maxTurns = 3,
+        )
+
+        assertEquals(listOf("text 1", "text 2", "text 3"), context.turns.map { it.text })
+    }
+
     private fun conversationWith(messages: List<UIMessage>): Conversation = Conversation.ofId(
         id = Uuid.random(),
         messages = messages.map(MessageNode::of),
