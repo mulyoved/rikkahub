@@ -21,7 +21,17 @@ import kotlin.coroutines.resumeWithException
 private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
 private val DEFAULT_HTTP_CLIENT by lazy { OkHttpClient.Builder().build() }
 private val DEV_HTTP_HOSTS = setOf("localhost", "127.0.0.1", "::1", "10.0.2.2", "10.0.3.2")
-private const val ERROR_BODY_PREVIEW_LIMIT = 4096
+private const val ERROR_BODY_PREVIEW_LIMIT = 2048L
+private val ERROR_SECRET_PATTERNS = listOf(
+    Regex(
+        pattern = """("?(?:authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret|password)"?\s*[:=]\s*")([^"]+)(")""",
+        option = RegexOption.IGNORE_CASE,
+    ),
+    Regex(
+        pattern = """\b(Bearer\s+)[A-Za-z0-9._~+/=-]+""",
+        option = RegexOption.IGNORE_CASE,
+    ),
+)
 
 internal fun interface VoiceLabHttpTransport {
     suspend fun execute(request: Request): Response
@@ -91,6 +101,9 @@ class VoiceLabMobileApi internal constructor(
         require(parsedBaseUrl.query == null && parsedBaseUrl.fragment == null) {
             "Voice Lab baseUrl must not include a query or fragment"
         }
+        require(parsedBaseUrl.username.isEmpty() && parsedBaseUrl.password.isEmpty()) {
+            "Voice Lab baseUrl must not include username or password credentials"
+        }
     }
 
     suspend fun createSession(modelId: String): MobileVoiceSessionResponse =
@@ -121,20 +134,31 @@ class VoiceLabMobileApi internal constructor(
                 .post(json.encodeToString(body).toRequestBody(JSON_MEDIA_TYPE))
                 .build()
             transport.execute(request).use { response ->
-                val responseText = response.body.string()
                 if (!response.isSuccessful) {
                     throw IllegalStateException(
-                        "Voice Lab request failed ${response.code}: ${responseText.toErrorPreview()}"
+                        "Voice Lab request failed ${response.code}: ${response.toErrorPreview()}"
                     )
                 }
+                val responseText = response.body.string()
                 json.decodeFromString<Res>(responseText)
             }
         }
 }
 
-private fun String.toErrorPreview(): String =
-    if (length <= ERROR_BODY_PREVIEW_LIMIT) {
-        this
+private fun Response.toErrorPreview(): String {
+    val preview = peekBody(ERROR_BODY_PREVIEW_LIMIT + 1).string()
+    val bounded = if (preview.length <= ERROR_BODY_PREVIEW_LIMIT) {
+        preview
     } else {
-        take(ERROR_BODY_PREVIEW_LIMIT) + "... [truncated]"
+        preview.take(ERROR_BODY_PREVIEW_LIMIT.toInt()) + "... [truncated]"
     }
+    return ERROR_SECRET_PATTERNS.fold(bounded) { value, pattern ->
+        pattern.replace(value) { match ->
+            when (match.groupValues.size) {
+                4 -> match.groupValues[1] + "[redacted]" + match.groupValues[3]
+                3 -> match.groupValues[1] + "[redacted]"
+                else -> "[redacted]"
+            }
+        }
+    }
+}

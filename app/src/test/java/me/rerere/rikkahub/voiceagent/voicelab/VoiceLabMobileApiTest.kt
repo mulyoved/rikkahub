@@ -184,6 +184,34 @@ class VoiceLabMobileApiTest {
     }
 
     @Test
+    fun `non successful response previews redact obvious secrets`() {
+        val transport = transportFor { request ->
+            responseFor(
+                request = request,
+                code = 500,
+                message = "Error",
+                body = """{"error":"failed","token":"live-token","apiKey":"server-key","detail":"Bearer header-token"}""",
+            )
+        }
+        val api = VoiceLabMobileApi(
+            baseUrl = "https://voice-lab.example.test",
+            credentials = VoiceLabMobileCredentials(hermesProfileApiKey = "profile-api-key"),
+            transport = transport,
+        )
+
+        val error = assertThrows(IllegalStateException::class.java) {
+            runBlocking { api.createSession("gemini-flash") }
+        }
+
+        val message = error.message.orEmpty()
+        assertTrue(message.contains("failed"))
+        assertTrue(message.contains("[redacted]"))
+        assertFalse(message.contains("live-token"))
+        assertFalse(message.contains("server-key"))
+        assertFalse(message.contains("header-token"))
+    }
+
+    @Test
     fun `baseUrl must be https unless it is a local development host`() {
         val credentials = VoiceLabMobileCredentials(hermesProfileApiKey = "profile-api-key")
 
@@ -204,6 +232,9 @@ class VoiceLabMobileApiTest {
         }
         assertThrows(IllegalArgumentException::class.java) {
             VoiceLabMobileApi(baseUrl = "https://voice-lab.example.test#voice", credentials = credentials)
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            VoiceLabMobileApi(baseUrl = "https://user:pass@voice-lab.example.test", credentials = credentials)
         }
     }
 
