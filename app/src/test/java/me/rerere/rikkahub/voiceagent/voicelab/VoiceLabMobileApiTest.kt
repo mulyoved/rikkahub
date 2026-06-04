@@ -196,8 +196,12 @@ class VoiceLabMobileApiTest {
                   "key":"plain-key-field",
                   "token":"live-token",
                   "apiKey":"server-key",
+                  "CF-Access-Client-Secret":"cf-header-secret",
+                  "cloudflareClientSecret":"cf-config-secret",
+                  "hermesProfileApiKey":"hermes-profile-key",
                   "prompt":"private prompt",
                   "answer":"private answer",
+                  "nested":{"prompt":"before \"escaped-secret\" after"},
                   "single":"token='single-token'",
                   "unquoted":"api_key=plain-key",
                   "header":"Authorization: Bearer authorization-token",
@@ -222,8 +226,12 @@ class VoiceLabMobileApiTest {
         assertFalse(message.contains("plain-key-field"))
         assertFalse(message.contains("live-token"))
         assertFalse(message.contains("server-key"))
+        assertFalse(message.contains("cf-header-secret"))
+        assertFalse(message.contains("cf-config-secret"))
+        assertFalse(message.contains("hermes-profile-key"))
         assertFalse(message.contains("private prompt"))
         assertFalse(message.contains("private answer"))
+        assertFalse(message.contains("escaped-secret"))
         assertFalse(message.contains("single-token"))
         assertFalse(message.contains("plain-key"))
         assertFalse(message.contains("authorization-token"))

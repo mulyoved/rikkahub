@@ -5,6 +5,10 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import me.rerere.rikkahub.utils.JsonInstant
 import okhttp3.Call
 import okhttp3.Callback
@@ -22,6 +26,21 @@ private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
 private val DEFAULT_HTTP_CLIENT by lazy { OkHttpClient.Builder().build() }
 private val DEV_HTTP_HOSTS = setOf("localhost", "127.0.0.1", "::1", "10.0.2.2", "10.0.3.2")
 private const val ERROR_BODY_PREVIEW_LIMIT = 2048L
+private val ERROR_SENSITIVE_KEYS = setOf(
+    "authorization",
+    "apikey",
+    "key",
+    "cfaccessclientsecret",
+    "cloudflareclientsecret",
+    "hermesprofileapikey",
+    "accesstoken",
+    "refreshtoken",
+    "token",
+    "secret",
+    "password",
+    "prompt",
+    "answer",
+)
 private val ERROR_SECRET_PATTERNS = listOf(
     Regex(
         pattern = """\b(Bearer\s+)([A-Za-z0-9._~+/=-]+)""",
@@ -155,12 +174,24 @@ class VoiceLabMobileApi internal constructor(
 
 private fun Response.toErrorPreview(): String {
     val preview = peekBody(ERROR_BODY_PREVIEW_LIMIT + 1).string()
-    val bounded = if (preview.length <= ERROR_BODY_PREVIEW_LIMIT) {
-        preview
+    val redacted = preview.redactSensitivePreview()
+    val bounded = if (redacted.length <= ERROR_BODY_PREVIEW_LIMIT) {
+        redacted
     } else {
-        preview.take(ERROR_BODY_PREVIEW_LIMIT.toInt()) + "... [truncated]"
+        redacted.take(ERROR_BODY_PREVIEW_LIMIT.toInt()) + "... [truncated]"
     }
-    return ERROR_SECRET_PATTERNS.fold(bounded) { value, pattern ->
+    return if (preview.length > ERROR_BODY_PREVIEW_LIMIT && !bounded.endsWith("[truncated]")) {
+        "$bounded... [truncated]"
+    } else {
+        bounded
+    }
+}
+
+private fun String.redactSensitivePreview(): String {
+    val jsonRedacted = runCatching {
+        JsonInstant.encodeToString(JsonInstant.parseToJsonElement(this).redactSensitiveJson())
+    }.getOrNull()
+    return ERROR_SECRET_PATTERNS.fold(jsonRedacted ?: this) { value, pattern ->
         pattern.replace(value) { match ->
             when (match.groupValues.size) {
                 4 -> match.groupValues[1] + "[redacted]" + match.groupValues[3]
@@ -170,3 +201,22 @@ private fun Response.toErrorPreview(): String {
         }
     }
 }
+
+private fun JsonElement.redactSensitiveJson(): JsonElement =
+    when (this) {
+        is JsonObject -> JsonObject(
+            mapValues { (key, value) ->
+                if (key.isSensitiveErrorKey()) {
+                    JsonPrimitive("[redacted]")
+                } else {
+                    value.redactSensitiveJson()
+                }
+            }
+        )
+
+        is JsonArray -> JsonArray(map { it.redactSensitiveJson() })
+        else -> this
+    }
+
+private fun String.isSensitiveErrorKey(): Boolean =
+    lowercase().filterNot { it == '_' || it == '-' || it == ' ' } in ERROR_SENSITIVE_KEYS
