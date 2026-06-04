@@ -1,6 +1,7 @@
 package me.rerere.rikkahub.voiceagent.persistence
 
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import me.rerere.ai.core.MessageRole
 import me.rerere.ai.ui.UIMessage
@@ -61,7 +62,7 @@ class VoiceConversationPersister {
         val currentMessages = conversation.currentMessages
         val existingToolIndex = currentMessages.indexOfLast { message ->
             message.parts.any { part ->
-                part is UIMessagePart.Tool && part.isHermesTool(callId)
+                part is UIMessagePart.Tool && part.isPendingHermesTool(callId)
             }
         }
         if (existingToolIndex >= 0) {
@@ -69,7 +70,7 @@ class VoiceConversationPersister {
             val existingMessage = currentMessages[existingToolIndex]
             updatedMessages[existingToolIndex] = existingMessage.copy(
                 parts = existingMessage.parts.map { part ->
-                    if (part is UIMessagePart.Tool && part.isHermesTool(callId)) tool else part
+                    if (part is UIMessagePart.Tool && part.isPendingHermesTool(callId)) tool else part
                 }
             )
             return conversation.updateCurrentMessages(updatedMessages)
@@ -97,6 +98,11 @@ class VoiceConversationPersister {
 
     private fun UIMessagePart.Tool.isHermesTool(callId: String): Boolean {
         return toolCallId == callId && toolName == ASK_HERMES_TOOL_NAME
+    }
+
+    private fun UIMessagePart.Tool.isPendingHermesTool(callId: String): Boolean {
+        return isHermesTool(callId) &&
+            metadata?.get(HERMES_TOOL_STATUS_KEY)?.jsonPrimitive?.content == VoiceToolRecordStatus.Pending.statusName
     }
 
     private fun VoiceToolRecordStatus.toMetadata() = buildJsonObject {

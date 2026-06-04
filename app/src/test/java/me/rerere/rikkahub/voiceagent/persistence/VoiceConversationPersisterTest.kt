@@ -43,6 +43,11 @@ class VoiceConversationPersisterTest {
         assertEquals("complete", tool.metadata!!["voice_tool_status"]!!.jsonPrimitive.content)
         assertEquals("Ask Hermes this", tool.input.promptJson())
         assertTrue(tool.output.text().contains("Hermes answer"))
+        val toolOutput = tool.output.single() as UIMessagePart.Text
+        assertEquals("complete", toolOutput.metadata!!["voice_tool_status"]!!.jsonPrimitive.content)
+
+        val assistantReply = updated.currentMessages[2].parts.single() as UIMessagePart.Text
+        assertEquals("complete", assistantReply.metadata!!["voice_status"]!!.jsonPrimitive.content)
     }
 
     @Test
@@ -125,6 +130,46 @@ class VoiceConversationPersisterTest {
         val tool = conversation.currentMessages.single().parts.single() as UIMessagePart.Tool
         assertEquals("pending", tool.metadata!!["voice_tool_status"]!!.jsonPrimitive.content)
         assertTrue(tool.output.isEmpty())
+    }
+
+    @Test
+    fun `pending upsert with reused call id appends after completed Hermes record`() {
+        val persister = VoiceConversationPersister()
+        val conversation = emptyConversation()
+            .let {
+                persister.upsertHermesTool(
+                    conversation = it,
+                    callId = "call-1",
+                    prompt = "Original prompt",
+                    status = VoiceToolRecordStatus.Complete("Original answer"),
+                )
+            }
+            .let { persister.appendAssistantTurn(it, "Later assistant reply", interrupted = false) }
+            .let {
+                persister.upsertHermesTool(
+                    conversation = it,
+                    callId = "call-1",
+                    prompt = "Reused prompt",
+                    status = VoiceToolRecordStatus.Pending,
+                )
+            }
+
+        assertEquals(3, conversation.currentMessages.size)
+
+        val tools = conversation.currentMessages
+            .flatMap { it.parts }
+            .filterIsInstance<UIMessagePart.Tool>()
+
+        assertEquals(2, tools.size)
+        assertEquals("call-1", tools[0].toolCallId)
+        assertEquals("Original prompt", tools[0].input.promptJson())
+        assertEquals("Original answer", tools[0].output.text())
+        assertEquals("complete", tools[0].metadata!!["voice_tool_status"]!!.jsonPrimitive.content)
+
+        assertEquals("call-1", tools[1].toolCallId)
+        assertEquals("Reused prompt", tools[1].input.promptJson())
+        assertEquals("pending", tools[1].metadata!!["voice_tool_status"]!!.jsonPrimitive.content)
+        assertTrue(tools[1].output.isEmpty())
     }
 
     @Test
