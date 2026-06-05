@@ -122,6 +122,7 @@ class VoiceAgentCoordinator(
     private val persistenceScope = CoroutineScope(SupervisorJob() + (dispatcher ?: Dispatchers.IO))
     private val persistenceJobs = mutableSetOf<Job>()
     private var lastPersistenceJob: Job? = null
+    private var activeSessionId = 0L
     private val toolJobs = mutableMapOf<String, ToolJobHandle>()
     private val toolCallLocks = mutableMapOf<String, Any>()
     private val cancelledToolCallIds = mutableSetOf<String>()
@@ -141,6 +142,19 @@ class VoiceAgentCoordinator(
 
     fun updateAudioStatus(status: VoiceAudioStatus) {
         _state.update { it.copy(audio = status) }
+    }
+
+    fun nextSessionId(): Long = synchronized(toolJobsLock) {
+        activeSessionId += 1
+        activeSessionId
+    }
+
+    fun onGeminiEvent(sessionId: Long, event: GeminiLiveEvent) {
+        if (!isActiveSession(sessionId)) {
+            diagnostics.record("stale_gemini_event", event.javaClass.simpleName)
+            return
+        }
+        onGeminiEvent(event)
     }
 
     fun suppressPlayback() {
@@ -276,6 +290,7 @@ class VoiceAgentCoordinator(
     }
 
     fun prepareForReconnect() {
+        nextSessionId()
         val handles = synchronized(toolJobsLock) {
             toolJobs.values.toList()
         }
@@ -386,6 +401,10 @@ class VoiceAgentCoordinator(
             synchronized(handle.sendLock) {
                 if (!isToolHandleActive(callId, handle)) return
                 coroutineContext.ensureActive()
+                synchronized(toolJobsLock) {
+                    if (!isToolHandleActive(callId, handle)) return
+                    handle.sendStarted = true
+                }
                 val sent = gemini.sendToolResponse(callId, response.answer)
                 if (!isToolHandleActive(callId, handle)) return
                 if (sent) {
@@ -426,6 +445,10 @@ class VoiceAgentCoordinator(
 
     private fun isClosed(): Boolean = synchronized(toolJobsLock) { closed || closing }
 
+    private fun isActiveSession(sessionId: Long): Boolean = synchronized(toolJobsLock) {
+        !closed && !closing && activeSessionId == sessionId
+    }
+
     private fun shouldIgnoreEventAfterClose(event: GeminiLiveEvent): Boolean {
         if (!isClosed()) return false
         diagnostics.record("gemini_event_after_close", event.javaClass.simpleName)
@@ -443,6 +466,15 @@ class VoiceAgentCoordinator(
                 toolJobs[callId]
             }
             if (currentHandle != null) {
+                val currentSendStarted = synchronized(toolJobsLock) {
+                    if (closed || closing || callId in cancelledToolCallIds) return false
+                    if (toolJobs[callId] !== currentHandle) return false
+                    currentHandle.sendStarted
+                }
+                if (currentSendStarted) {
+                    diagnostics.record("duplicate_tool_call_after_send_started", "callId=$callId")
+                    return false
+                }
                 synchronized(toolJobsLock) {
                     if (closed || closing || callId in cancelledToolCallIds) return false
                     if (toolJobs[callId] !== currentHandle) return false
@@ -624,6 +656,7 @@ class VoiceAgentCoordinator(
     ) {
         lateinit var job: Job
         var superseded: Boolean = false
+        var sendStarted: Boolean = false
     }
 }
 
@@ -649,6 +682,7 @@ class VoiceAgentViewModel(
     )
     private var startJob: Job? = null
     private var muted = false
+    private var sessionId = 0L
 
     val state: StateFlow<VoiceAgentUiState> = coordinator.state
     private val conversation = conversationStore.conversation
@@ -656,6 +690,8 @@ class VoiceAgentViewModel(
 
     fun start() {
         if (startJob?.isActive == true) return
+        val currentSessionId = coordinator.nextSessionId()
+        sessionId = currentSessionId
         startJob = lifecycleScope.launch {
             try {
                 coordinator.updateSessionStatus(VoiceSessionStatus.PreparingContext)
@@ -670,7 +706,7 @@ class VoiceAgentViewModel(
                     liveConnectConfig = session.liveConnectConfig,
                     systemInstruction = voiceContext.systemInstruction,
                     contextTurns = voiceContext.turns,
-                    onEvent = coordinator::onGeminiEvent,
+                    onEvent = { event -> coordinator.onGeminiEvent(currentSessionId, event) },
                 )
                 coordinator.updateSessionStatus(VoiceSessionStatus.Connected)
                 if (!muted) {

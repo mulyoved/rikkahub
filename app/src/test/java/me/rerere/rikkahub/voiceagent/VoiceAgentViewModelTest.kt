@@ -357,7 +357,7 @@ class VoiceAgentViewModelTest {
     }
 
     @Test
-    fun `duplicate tool call id still runs latest call when old send is already in progress`() = runTest {
+    fun `duplicate tool call id is ignored when old send is already in progress`() = runTest {
         val gemini = FakeGeminiLiveVoiceClient()
         val oldSend = gemini.blockNextToolResponse("call-replay-send")
         val toolApi = FakeVoiceToolApi()
@@ -381,24 +381,17 @@ class VoiceAgentViewModelTest {
                 GeminiLiveEvent.ToolCall(callId = "call-replay-send", name = "ask_hermes", prompt = "new")
             )
         }
-        assertFalse(oldSend.release.await(50, TimeUnit.MILLISECONDS))
-
-        oldSend.release.countDown()
-        withTimeout(500) {
-            while (("call-replay-send" to "new") !in toolApi.requests) {
-                delay(10)
-            }
-        }
         withTimeout(500) {
             replayJob.join()
         }
+        assertFalse(("call-replay-send" to "new") in toolApi.requests)
 
-        toolApi.complete(response(callId = "call-replay-send", answer = "new answer"))
+        oldSend.release.countDown()
         coordinator.awaitToolJobsWithTimeout()
 
         assertEquals(
-            setOf("call-replay-send" to "old answer", "call-replay-send" to "new answer"),
-            gemini.toolResponses.toSet(),
+            listOf("call-replay-send" to "old answer"),
+            gemini.toolResponses,
         )
         assertEquals(
             VoiceToolStatus.HermesAnswered(callId = "call-replay-send", elapsedMs = 0L),
@@ -1029,6 +1022,39 @@ class VoiceAgentViewModelTest {
         assertEquals(VoiceSessionStatus.Ended, vm.state.value.session)
     }
 
+    @Test
+    fun `ViewModel ignores delayed Gemini callbacks from previous session after reconnect`() = runTest {
+        val sessionApi = FakeVoiceSessionApi()
+        val gemini = FakeGeminiLiveVoiceClient()
+        val audio = FakeVoiceAudioEngine()
+        val toolApi = FakeVoiceToolApi()
+        val vm = VoiceAgentViewModel(
+            modelId = "gemini-flash",
+            sessionApi = sessionApi,
+            toolApi = toolApi,
+            gemini = gemini,
+            audio = audio,
+            conversationStore = FakeVoiceConversationStore(),
+            contextProvider = FakeVoiceAgentContextProvider(
+                VoiceContext(systemInstruction = "system", turns = emptyList())
+            ),
+            scope = this,
+        )
+
+        vm.start()
+        gemini.awaitConnectCount(1)
+        val oldCallback = gemini.eventHandlers.single()
+
+        vm.reconnect()
+        gemini.awaitConnectCount(2)
+
+        oldCallback(GeminiLiveEvent.ToolCall(callId = "stale-call", name = "ask_hermes", prompt = "stale"))
+        delay(50)
+
+        assertEquals(emptyList<Pair<String, String>>(), toolApi.requests)
+        assertEquals(VoiceToolStatus.Idle, vm.state.value.tool)
+    }
+
     private fun response(callId: String, answer: String): MobileHermesResponse = MobileHermesResponse(
         callId = callId,
         answer = answer,
@@ -1059,6 +1085,7 @@ class VoiceAgentViewModelTest {
         var connectedProviderModel: String? = null
         var connectedSystemInstruction: String? = null
         var connectedContextTurns: List<GeminiContentTurn> = emptyList()
+        val eventHandlers = mutableListOf<(GeminiLiveEvent) -> Unit>()
         private val connected = CompletableDeferred<Unit>()
         private val blockedResponses = mutableMapOf<String, MutableList<BlockedToolResponse>>()
 
@@ -1088,6 +1115,7 @@ class VoiceAgentViewModelTest {
             connectedProviderModel = providerModel
             connectedSystemInstruction = systemInstruction
             connectedContextTurns = contextTurns
+            eventHandlers += onEvent
             connected.complete(Unit)
         }
 
@@ -1098,6 +1126,14 @@ class VoiceAgentViewModelTest {
         suspend fun awaitConnect() {
             withTimeout(500) {
                 connected.await()
+            }
+        }
+
+        suspend fun awaitConnectCount(count: Int) {
+            withTimeout(500) {
+                while (eventHandlers.size < count) {
+                    delay(10)
+                }
             }
         }
 
