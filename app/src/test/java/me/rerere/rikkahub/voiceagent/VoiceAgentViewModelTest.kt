@@ -1599,6 +1599,51 @@ class VoiceAgentViewModelTest {
     }
 
     @Test
+    fun `ViewModel end persists pending tool as failed before Gemini close gap`() = runTest {
+        val sessionApi = FakeVoiceSessionApi()
+        val conversationStore = FakeVoiceConversationStore()
+        val gemini = FakeGeminiLiveVoiceClient()
+        val toolApi = FakeVoiceToolApi()
+        val vm = VoiceAgentViewModel(
+            modelId = "gemini-flash",
+            sessionApi = sessionApi,
+            toolApi = toolApi,
+            gemini = gemini,
+            audio = FakeVoiceAudioEngine(),
+            conversationStore = conversationStore,
+            contextProvider = FakeVoiceAgentContextProvider(
+                VoiceContext(systemInstruction = "system", turns = emptyList())
+            ),
+            scope = CoroutineScope(coroutineContext + Dispatchers.Default),
+        )
+
+        vm.start()
+        gemini.awaitConnectCount(1)
+        val oldCallback = gemini.eventHandlers.single()
+        oldCallback(GeminiLiveEvent.ToolCall(callId = "call-vm-end-pending", name = "ask_hermes", prompt = "end"))
+        assertEquals("call-vm-end-pending" to "end", toolApi.awaitRequest("call-vm-end-pending"))
+        val closeHookCalled = CountDownLatch(1)
+        gemini.onClose = {
+            toolApi.complete(response(callId = "call-vm-end-pending", answer = "late answer"))
+            closeHookCalled.countDown()
+        }
+
+        vm.end()
+        assertTrue(closeHookCalled.await(500, TimeUnit.MILLISECONDS))
+        conversationStore.awaitUpdateCount(2)
+
+        val toolStatuses = conversationStore.updatesSnapshot()
+            .flatMap { it.currentMessages }
+            .flatMap { it.parts }
+            .filterIsInstance<UIMessagePart.Tool>()
+            .filter { it.toolCallId == "call-vm-end-pending" }
+            .mapNotNull { it.metadata?.get("voice_tool_status")?.jsonPrimitive?.content }
+
+        assertTrue(toolStatuses.toString(), "complete" !in toolStatuses)
+        assertTrue(toolStatuses.toString(), "failed" in toolStatuses)
+    }
+
+    @Test
     fun `ViewModel end immediately invalidates previous Gemini callback`() = runTest {
         val sessionApi = FakeVoiceSessionApi()
         val gemini = FakeGeminiLiveVoiceClient()

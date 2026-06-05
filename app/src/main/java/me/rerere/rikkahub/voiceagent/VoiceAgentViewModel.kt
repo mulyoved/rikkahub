@@ -239,12 +239,10 @@ class VoiceAgentCoordinator(
         when (event) {
             GeminiLiveEvent.SetupComplete -> diagnostics.record("gemini_setup_complete")
             is GeminiLiveEvent.InputTranscript -> {
-                if (shouldIgnoreStaleSession(sessionId, event)) return
-                appendInputTranscript(event.text)
+                appendInputTranscript(event.text, sessionId = sessionId)
             }
             is GeminiLiveEvent.OutputTranscript -> {
-                if (shouldIgnoreStaleSession(sessionId, event)) return
-                appendOutputTranscript(event.text)
+                appendOutputTranscript(event.text, sessionId = sessionId)
             }
             is GeminiLiveEvent.OutputAudio -> playOutputAudio(event.base64Pcm16, sessionId = sessionId)
             is GeminiLiveEvent.Interrupted -> handleInterrupted(event)
@@ -377,33 +375,58 @@ class VoiceAgentCoordinator(
         }
     }
 
-    private fun appendInputTranscript(text: String) {
-        if (activeTranscriptSpeaker != TranscriptSpeaker.User) {
-            inputTurnTranscript = ""
-            inputTurnId = nextTranscriptTurnId(TranscriptSpeaker.User)
+    fun prepareForSessionEnd() {
+        diagnostics.record("prepare_for_session_end")
+        invalidateActiveSession(staleToolSendFailureMessage = TOOL_CALL_CANCELED_BY_SESSION_END)
+        val handles = synchronized(toolJobsLock) {
+            removeAllToolHandlesForCleanup(staleSendingFailureMessage = TOOL_CALL_CANCELED_BY_SESSION_END)
         }
-        activeTranscriptSpeaker = TranscriptSpeaker.User
-        inputTurnTranscript += text
-        synchronized(playbackSuppressionLock) {
-            outputAudioSuppressed = false
+        (handles.cancelableHandles + handles.sendingHandles).forEach {
+            persistToolCanceled(it, TOOL_CALL_CANCELED_BY_SESSION_END)
         }
-        _state.update { it.copy(inputTranscript = it.inputTranscript + text) }
-        val transcript = inputTurnTranscript
-        val turnId = inputTurnId
-        persistConversation { conversation ->
-            persister.upsertUserTranscriptTurn(conversation = conversation, text = transcript, turnId = turnId)
+        val jobs = handles.cancelableHandles.map { it.job }
+        jobs.forEach { it.cancel() }
+        _state.update {
+            it.copy(
+                tool = VoiceToolStatus.Idle,
+                toolCalls = emptyMap(),
+            )
         }
     }
 
-    private fun appendOutputTranscript(text: String) {
-        if (activeTranscriptSpeaker != TranscriptSpeaker.Assistant) {
-            outputTurnTranscript = ""
-            outputTurnId = nextTranscriptTurnId(TranscriptSpeaker.Assistant)
+    private fun appendInputTranscript(text: String, sessionId: Long?) {
+        synchronized(toolJobsLock) {
+            if (shouldIgnoreStaleSession(sessionId, GeminiLiveEvent.InputTranscript(text))) return
+            if (activeTranscriptSpeaker != TranscriptSpeaker.User) {
+                inputTurnTranscript = ""
+                inputTurnId = nextTranscriptTurnId(TranscriptSpeaker.User)
+            }
+            activeTranscriptSpeaker = TranscriptSpeaker.User
+            inputTurnTranscript += text
+            synchronized(playbackSuppressionLock) {
+                outputAudioSuppressed = false
+            }
+            _state.update { it.copy(inputTranscript = it.inputTranscript + text) }
+            val transcript = inputTurnTranscript
+            val turnId = inputTurnId
+            persistConversation { conversation ->
+                persister.upsertUserTranscriptTurn(conversation = conversation, text = transcript, turnId = turnId)
+            }
         }
-        activeTranscriptSpeaker = TranscriptSpeaker.Assistant
-        outputTurnTranscript += text
-        _state.update { it.copy(outputTranscript = it.outputTranscript + text) }
-        persistAssistantTranscript()
+    }
+
+    private fun appendOutputTranscript(text: String, sessionId: Long?) {
+        synchronized(toolJobsLock) {
+            if (shouldIgnoreStaleSession(sessionId, GeminiLiveEvent.OutputTranscript(text))) return
+            if (activeTranscriptSpeaker != TranscriptSpeaker.Assistant) {
+                outputTurnTranscript = ""
+                outputTurnId = nextTranscriptTurnId(TranscriptSpeaker.Assistant)
+            }
+            activeTranscriptSpeaker = TranscriptSpeaker.Assistant
+            outputTurnTranscript += text
+            _state.update { it.copy(outputTranscript = it.outputTranscript + text) }
+            persistAssistantTranscript()
+        }
     }
 
     private fun playOutputAudio(base64Pcm16: String, sessionId: Long?) {
@@ -992,7 +1015,8 @@ class VoiceAgentViewModel(
         if (ended) return
         ended = true
         val previousJob = startJob
-        invalidateActiveSessionForCapture()
+        invalidateAudioSessions()
+        coordinator.prepareForSessionEnd()
         audio.stopCapture()
         audio.suppressPlayback()
         gemini.close()
