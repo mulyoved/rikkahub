@@ -41,8 +41,8 @@ class OkHttpGeminiLiveVoiceClient(
         delegate.sendAudio(base64Pcm16)
     }
 
-    override fun sendToolResponse(callId: String, answer: String) {
-        delegate.sendToolResponse(callId = callId, answer = answer)
+    override fun sendToolResponse(callId: String, answer: String): Boolean {
+        return delegate.sendToolResponse(callId = callId, answer = answer)
     }
 
     override fun close() {

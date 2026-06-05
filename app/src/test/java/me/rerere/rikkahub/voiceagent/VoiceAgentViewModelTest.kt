@@ -554,6 +554,37 @@ class VoiceAgentViewModelTest {
     }
 
     @Test
+    fun `failed Gemini tool response send marks Hermes tool failed instead of answered`() = runTest {
+        val gemini = FakeGeminiLiveVoiceClient().apply {
+            failToolResponses += "call-send-fails"
+        }
+        val toolApi = FakeVoiceToolApi()
+        val coordinator = VoiceAgentCoordinator(
+            gemini = gemini,
+            toolApi = toolApi,
+            audio = FakeVoiceAudioEngine(),
+            scope = this,
+        )
+
+        coordinator.onGeminiEvent(
+            GeminiLiveEvent.ToolCall(callId = "call-send-fails", name = "ask_hermes", prompt = "send fails")
+        )
+        assertEquals("call-send-fails" to "send fails", toolApi.awaitRequest("call-send-fails"))
+
+        toolApi.complete(response(callId = "call-send-fails", answer = "answer"))
+        coordinator.awaitToolJobsWithTimeout()
+
+        assertEquals(emptyList<Pair<String, String>>(), gemini.toolResponses)
+        assertEquals(
+            VoiceToolStatus.HermesFailed(
+                callId = "call-send-fails",
+                message = "Failed to send Gemini tool response message",
+            ),
+            coordinator.state.value.tool,
+        )
+    }
+
+    @Test
     fun `transcripts and output audio update state and playback`() = runTest {
         val audio = FakeVoiceAudioEngine()
         val coordinator = VoiceAgentCoordinator(
@@ -854,6 +885,7 @@ class VoiceAgentViewModelTest {
 
     private class FakeGeminiLiveVoiceClient : GeminiLiveVoiceClient {
         val toolResponses = mutableListOf<Pair<String, String>>()
+        val failToolResponses = mutableSetOf<String>()
         var closeCalls = 0
         var onBeforeToolResponseRecorded: (() -> Unit)? = null
         private val blockedResponses = mutableMapOf<String, MutableList<BlockedToolResponse>>()
@@ -882,7 +914,7 @@ class VoiceAgentViewModelTest {
 
         override fun sendAudio(base64Pcm16: String) = Unit
 
-        override fun sendToolResponse(callId: String, answer: String) {
+        override fun sendToolResponse(callId: String, answer: String): Boolean {
             val blocked = synchronized(blockedResponses) {
                 blockedResponses[callId]?.removeFirstOrNull()
             }
@@ -891,7 +923,11 @@ class VoiceAgentViewModelTest {
                 blocked.release.await(500, TimeUnit.MILLISECONDS)
             }
             onBeforeToolResponseRecorded?.invoke()
+            if (callId in failToolResponses) {
+                return false
+            }
             toolResponses += callId to answer
+            return true
         }
 
         override fun close() {

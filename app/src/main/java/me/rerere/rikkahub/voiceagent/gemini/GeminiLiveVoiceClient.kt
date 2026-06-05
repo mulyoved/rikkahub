@@ -15,7 +15,7 @@ interface GeminiLiveVoiceClient {
 
     fun sendAudio(base64Pcm16: String)
 
-    fun sendToolResponse(callId: String, answer: String)
+    fun sendToolResponse(callId: String, answer: String): Boolean
 
     fun close()
 }
@@ -122,8 +122,8 @@ class TestableGeminiLiveVoiceClient(
         )
     }
 
-    override fun sendToolResponse(callId: String, answer: String) {
-        sendPostSetupMessage(
+    override fun sendToolResponse(callId: String, answer: String): Boolean {
+        return sendPostSetupMessage(
             text = codec.toolResponseMessage(callId = callId, answer = answer),
             errorMessage = "Failed to send Gemini tool response message",
         )
@@ -205,19 +205,19 @@ class TestableGeminiLiveVoiceClient(
         }
     }
 
-    private fun sendPostSetupMessage(text: String, errorMessage: String) {
+    private fun sendPostSetupMessage(text: String, errorMessage: String): Boolean {
         val generation = synchronized(lock) {
-            val state = sessionState?.takeUnless { it.closed } ?: return
+            val state = sessionState?.takeUnless { it.closed } ?: return false
             if (!state.setupComplete || state.flushingSetupComplete) {
                 state.pendingOutboundMessages += PendingMessage(
                     text = text,
                     errorMessage = errorMessage,
                 )
-                return
+                return true
             }
             state.generation
         }
-        sendOrEmitError(
+        return sendOrEmitError(
             generation = generation,
             text = text,
             errorMessage = errorMessage,
@@ -228,12 +228,14 @@ class TestableGeminiLiveVoiceClient(
         generation: Long,
         text: String,
         errorMessage: String,
-    ) {
-        sendOrGetPendingError(
+    ): Boolean {
+        val error = sendOrGetPendingError(
             generation = generation,
             text = text,
             errorMessage = errorMessage,
-        )?.emitIfCurrent()
+        )
+        error?.emitIfCurrent()
+        return error == null
     }
 
     private fun sendOrGetPendingError(
