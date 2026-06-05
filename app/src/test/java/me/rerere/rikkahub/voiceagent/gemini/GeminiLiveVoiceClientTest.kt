@@ -13,6 +13,7 @@ import okhttp3.OkHttpClient
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import kotlin.concurrent.thread
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -374,7 +375,7 @@ class GeminiLiveVoiceClientTest {
     }
 
     @Test
-    fun `close cannot interleave with current generation send`() = runBlocking {
+    fun `close can complete while current generation send is blocked`() = runBlocking {
         val socket = FakeGeminiSocket()
         val client = TestableGeminiLiveVoiceClient(socket = socket, codec = GeminiLiveCodec())
         val closeCompletedDuringSend = AtomicBoolean(false)
@@ -410,7 +411,7 @@ class GeminiLiveVoiceClientTest {
         client.sendAudio("base64-audio")
         closeThread?.join(1_000)
 
-        assertFalse(closeCompletedDuringSend.get())
+        assertTrue(closeCompletedDuringSend.get())
         assertTrue(closeCompleted.await(1, TimeUnit.SECONDS))
         assertEquals(1, socket.closeCount)
     }
@@ -487,6 +488,43 @@ class GeminiLiveVoiceClientTest {
         assertEquals(listOf(GeminiLiveEvent.SetupComplete), secondEvents)
         assertEquals(3, socket.sentMessages.size)
         assertTrue("clientContent" in socket.sentMessages[2].jsonObject())
+    }
+
+    @Test
+    fun `close does not wait for blocked socket send`() = runBlocking {
+        val socket = FakeGeminiSocket()
+        val client = TestableGeminiLiveVoiceClient(socket = socket, codec = GeminiLiveCodec())
+
+        client.connect(
+            token = "token-1",
+            websocketUrl = "wss://example.test/live",
+            providerModel = "gemini-2.0-flash-live-001",
+            liveConnectConfig = liveConnectConfig,
+            systemInstruction = "You are Hermes.",
+            contextTurns = emptyList(),
+            onEvent = {},
+        )
+        socket.receive(setupCompleteMessage)
+
+        val sendStarted = CountDownLatch(1)
+        val releaseSend = CountDownLatch(1)
+        socket.beforeSend = { text ->
+            if ("toolResponse" in text) {
+                sendStarted.countDown()
+                releaseSend.await(500, TimeUnit.MILLISECONDS)
+            }
+        }
+        val sendThread = thread {
+            client.sendToolResponse(callId = "call-1", answer = "42")
+        }
+        assertTrue(sendStarted.await(500, TimeUnit.MILLISECONDS))
+
+        client.close()
+
+        assertEquals(1, socket.closeCount)
+        releaseSend.countDown()
+        sendThread.join(500)
+        assertFalse(sendThread.isAlive)
     }
 
     @Test

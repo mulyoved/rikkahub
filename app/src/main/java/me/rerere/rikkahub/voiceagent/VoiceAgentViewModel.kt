@@ -188,7 +188,7 @@ class VoiceAgentCoordinator(
                     diagnostics.record("stale_gemini_event", event.javaClass.simpleName)
                     return
                 }
-                onNonToolGeminiEvent(event)
+                onNonToolGeminiEvent(event = event, sessionId = sessionId)
             }
         }
     }
@@ -222,18 +222,18 @@ class VoiceAgentCoordinator(
                 handleToolCallCancellation(event = event, sessionId = null)
             }
             else -> synchronized(eventLock) {
-                onNonToolGeminiEvent(event)
+                onNonToolGeminiEvent(event = event, sessionId = null)
             }
         }
     }
 
-    private fun onNonToolGeminiEvent(event: GeminiLiveEvent) {
+    private fun onNonToolGeminiEvent(event: GeminiLiveEvent, sessionId: Long?) {
         if (shouldIgnoreEventAfterClose(event)) return
         when (event) {
             GeminiLiveEvent.SetupComplete -> diagnostics.record("gemini_setup_complete")
             is GeminiLiveEvent.InputTranscript -> appendInputTranscript(event.text)
             is GeminiLiveEvent.OutputTranscript -> appendOutputTranscript(event.text)
-            is GeminiLiveEvent.OutputAudio -> playOutputAudio(event.base64Pcm16)
+            is GeminiLiveEvent.OutputAudio -> playOutputAudio(event.base64Pcm16, sessionId = sessionId)
             is GeminiLiveEvent.Interrupted -> handleInterrupted(event)
             is GeminiLiveEvent.SessionResumptionUpdate -> diagnostics.record(
                 name = "session_resumption_update",
@@ -290,7 +290,7 @@ class VoiceAgentCoordinator(
         }
     }
 
-    fun close() {
+    fun close(waitForStartedSends: Boolean = true) {
         synchronized(closeLock) {
             val cleanup = synchronized(toolJobsLock) {
                 if (closed || closing) return
@@ -305,9 +305,11 @@ class VoiceAgentCoordinator(
             synchronized(eventLock) {
                 // Wait for any in-flight non-tool event to finish before resources are released.
             }
-            cleanup.sendingHandles.forEach { handle ->
-                synchronized(handle.sendLock) {
-                    // Wait for any already-started Gemini tool response write to return.
+            if (waitForStartedSends) {
+                cleanup.sendingHandles.forEach { handle ->
+                    synchronized(handle.sendLock) {
+                        // Wait for any already-started Gemini tool response write to return.
+                    }
                 }
             }
             synchronized(toolJobsLock) {
@@ -379,12 +381,16 @@ class VoiceAgentCoordinator(
         persistAssistantTranscript()
     }
 
-    private fun playOutputAudio(base64Pcm16: String) {
+    private fun playOutputAudio(base64Pcm16: String, sessionId: Long?) {
         if (synchronized(playbackSuppressionLock) { outputAudioSuppressed }) {
             diagnostics.record("output_audio_suppressed_after_interruption")
             return
         }
         audio.playPcm16(base64Pcm16)
+        if (sessionId != null && !isActiveSession(sessionId)) {
+            diagnostics.record("stale_output_audio_state_suppressed")
+            return
+        }
         synchronized(playbackSuppressionLock) {
             if (outputAudioSuppressed) {
                 diagnostics.record("output_audio_state_suppressed_after_interruption")
@@ -810,6 +816,7 @@ class VoiceAgentViewModel(
         scope = lifecycleScope,
     )
     private var startJob: Job? = null
+    private val captureSendLock = Any()
     private var muted = false
     private var sessionId = 0L
     private var ended = false
@@ -893,7 +900,7 @@ class VoiceAgentViewModel(
     fun reconnect() {
         if (ended) return
         val previousJob = startJob
-        coordinator.invalidateActiveSession()
+        invalidateActiveSessionForCapture()
         val reconnectJob = lifecycleScope.launch {
             previousJob?.cancelAndJoin()
             if (ended) return@launch
@@ -912,7 +919,7 @@ class VoiceAgentViewModel(
         if (ended) return
         ended = true
         val previousJob = startJob
-        coordinator.invalidateActiveSession()
+        invalidateActiveSessionForCapture()
         lifecycleScope.launch {
             previousJob?.cancelAndJoin()
             coordinator.updateSessionStatus(VoiceSessionStatus.Ending)
@@ -925,22 +932,30 @@ class VoiceAgentViewModel(
         if (!ended) {
             ended = true
         }
-        coordinator.invalidateActiveSession()
+        invalidateActiveSessionForCapture()
         startJob?.cancel()
         coordinator.updateSessionStatus(VoiceSessionStatus.Ending)
-        coordinator.close()
+        coordinator.close(waitForStartedSends = false)
         coordinator.launchPersistenceDrain()
     }
 
     private fun startCapture(currentSessionId: Long) {
         audio.startCapture { pcm16 ->
-            if (!coordinator.isActiveSession(currentSessionId)) {
-                return@startCapture
+            synchronized(captureSendLock) {
+                if (!coordinator.isActiveSession(currentSessionId)) {
+                    return@startCapture
+                }
+                gemini.sendAudio(Base64.getEncoder().encodeToString(pcm16))
+                coordinator.updateAudioStatus(VoiceAudioStatus.UserSpeaking)
             }
-            gemini.sendAudio(Base64.getEncoder().encodeToString(pcm16))
-            coordinator.updateAudioStatus(VoiceAudioStatus.UserSpeaking)
         }
         coordinator.updateAudioStatus(VoiceAudioStatus.Listening)
+    }
+
+    private fun invalidateActiveSessionForCapture() {
+        synchronized(captureSendLock) {
+            coordinator.invalidateActiveSession()
+        }
     }
 
     override fun onCleared() {

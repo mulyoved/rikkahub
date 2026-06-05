@@ -262,20 +262,23 @@ class TestableGeminiLiveVoiceClient(
         text: String,
         errorMessage: String,
     ): SendResult {
-        val sendFailed = synchronized(lock) {
-            val state = sessionState
+        synchronized(lock) {
+            sessionState
                 ?.takeIf { it.generation == generation && !it.closed }
                 ?: return SendResult.Stale
-            if (socket.send(text)) {
-                false
-            } else {
-                true
-            }
         }
-        return if (sendFailed) {
+        val sent = socket.send(text)
+        if (sent) {
+            return SendResult.Sent
+        }
+        val stillCurrent = synchronized(lock) {
+            sessionState
+                ?.takeIf { it.generation == generation && !it.closed } != null
+        }
+        return if (stillCurrent) {
             SendResult.Failed(PendingError(generation = generation, message = errorMessage))
         } else {
-            SendResult.Sent
+            SendResult.Stale
         }
     }
 

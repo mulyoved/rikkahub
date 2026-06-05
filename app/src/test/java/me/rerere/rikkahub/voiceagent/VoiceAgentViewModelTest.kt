@@ -1490,6 +1490,7 @@ class VoiceAgentViewModelTest {
         withTimeout(500) {
             eventJob.join()
         }
+        assertFalse(vm.state.value.audio == VoiceAudioStatus.AssistantSpeaking)
     }
 
     @Test
