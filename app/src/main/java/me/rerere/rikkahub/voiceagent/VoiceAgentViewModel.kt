@@ -1034,6 +1034,7 @@ class VoiceAgentViewModel(
         }
         invalidateAudioSessions()
         startJob?.cancel()
+        coordinator.prepareForSessionEnd()
         audio.stopCapture()
         audio.suppressPlayback()
         coordinator.updateSessionStatus(VoiceSessionStatus.Ending)

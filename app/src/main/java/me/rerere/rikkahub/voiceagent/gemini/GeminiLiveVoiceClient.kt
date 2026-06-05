@@ -45,6 +45,7 @@ class TestableGeminiLiveVoiceClient(
     private val codec: GeminiLiveCodec = GeminiLiveCodec(),
 ) : GeminiLiveVoiceClient {
     private val lock = Any()
+    private val outboundSendLock = Any()
     private val lifecycleLock = Any()
     private var nextGeneration = 0L
     private var sessionState: SessionState? = null
@@ -136,16 +137,18 @@ class TestableGeminiLiveVoiceClient(
     }
 
     override fun sendAudio(base64Pcm16: String, sessionId: Long?): Boolean {
-        synchronized(lock) {
-            if (sessionId != null && outboundSessionId != sessionId) {
-                return false
+        synchronized(outboundSendLock) {
+            synchronized(lock) {
+                if (sessionId != null && outboundSessionId != sessionId) {
+                    return false
+                }
             }
+            return sendPostSetupMessage(
+                text = codec.realtimeAudioMessage(base64Pcm16),
+                errorMessage = "Failed to send Gemini audio message",
+                queueBeforeSetup = true,
+            )
         }
-        return sendPostSetupMessage(
-            text = codec.realtimeAudioMessage(base64Pcm16),
-            errorMessage = "Failed to send Gemini audio message",
-            queueBeforeSetup = true,
-        )
     }
 
     override fun activateOutboundSession(sessionId: Long) {
@@ -155,8 +158,10 @@ class TestableGeminiLiveVoiceClient(
     }
 
     override fun invalidateOutboundSession() {
-        synchronized(lock) {
-            outboundSessionId = null
+        synchronized(outboundSendLock) {
+            synchronized(lock) {
+                outboundSessionId = null
+            }
         }
     }
 
