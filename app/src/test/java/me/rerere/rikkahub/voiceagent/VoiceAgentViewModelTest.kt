@@ -780,6 +780,39 @@ class VoiceAgentViewModelTest {
     }
 
     @Test
+    fun `public interrupt suppresses playback while output audio write is in flight`() = runTest {
+        val audio = FakeVoiceAudioEngine()
+        val blockedPlayback = audio.blockNextPlayback()
+        val coordinator = VoiceAgentCoordinator(
+            gemini = FakeGeminiLiveVoiceClient(),
+            toolApi = FakeVoiceToolApi(),
+            audio = audio,
+            scope = this,
+            dispatcher = Dispatchers.Default,
+        )
+
+        val eventJob = launch(Dispatchers.Default) {
+            coordinator.onGeminiEvent(GeminiLiveEvent.OutputAudio("blocked-interrupt-pcm"))
+        }
+        assertTrue(blockedPlayback.started.await(500, TimeUnit.MILLISECONDS))
+
+        val interruptJob = launch(Dispatchers.Default) {
+            coordinator.suppressPlayback()
+        }
+
+        withTimeout(500) {
+            interruptJob.join()
+        }
+        assertEquals(1, audio.suppressPlaybackCalls)
+        assertEquals(VoiceAudioStatus.PlaybackSuppressed, coordinator.state.value.audio)
+
+        blockedPlayback.release.countDown()
+        withTimeout(500) {
+            eventJob.join()
+        }
+    }
+
+    @Test
     fun `close suppresses Hermes result while waiting for in flight non tool event`() = runTest {
         val gemini = FakeGeminiLiveVoiceClient()
         val toolApi = FakeVoiceToolApi()
@@ -910,6 +943,29 @@ class VoiceAgentViewModelTest {
     }
 
     @Test
+    fun `coordinator snapshots transcript text before delayed persistence writes`() = runTest {
+        val conversationStore = FakeVoiceConversationStore()
+        val firstUpdate = conversationStore.blockNextUpdate()
+        val coordinator = VoiceAgentCoordinator(
+            gemini = FakeGeminiLiveVoiceClient(),
+            toolApi = FakeVoiceToolApi(),
+            audio = FakeVoiceAudioEngine(),
+            conversationStore = conversationStore,
+            scope = this,
+        )
+
+        coordinator.onGeminiEvent(GeminiLiveEvent.InputTranscript("hel"))
+        assertTrue(firstUpdate.started.await(500, TimeUnit.MILLISECONDS))
+        coordinator.onGeminiEvent(GeminiLiveEvent.InputTranscript("lo"))
+
+        firstUpdate.release.countDown()
+        conversationStore.awaitUpdateCount(2)
+
+        assertEquals("hel", conversationStore.updateAt(0).currentMessages.single().parts.text())
+        assertEquals("hello", conversationStore.updateAt(1).currentMessages.single().parts.text())
+    }
+
+    @Test
     fun `reconnect cleanup cancels in flight Hermes call and suppresses stale response`() = runTest {
         val gemini = FakeGeminiLiveVoiceClient()
         val toolApi = FakeVoiceToolApi()
@@ -986,6 +1042,9 @@ class VoiceAgentViewModelTest {
             awaitToolJobs()
         }
     }
+
+    private fun List<UIMessagePart>.text(): String =
+        filterIsInstance<UIMessagePart.Text>().joinToString("") { it.text }
 
     private fun runTest(block: suspend CoroutineScope.() -> Unit) = runBlocking(block = block)
 
@@ -1195,16 +1254,34 @@ class VoiceAgentViewModelTest {
 
     private class FakeVoiceConversationStore : VoiceConversationStore {
         private val updates = mutableListOf<Conversation>()
+        private val blockedUpdates = mutableListOf<BlockedUpdate>()
         override val conversation: StateFlow<Conversation> = MutableStateFlow(
             Conversation.ofId(id = Uuid.random())
         )
 
         override suspend fun update(transform: (Conversation) -> Conversation) {
+            val blocked = synchronized(blockedUpdates) { blockedUpdates.removeFirstOrNull() }
+            if (blocked != null) {
+                blocked.started.countDown()
+                blocked.release.await(500, TimeUnit.MILLISECONDS)
+            }
             val flow = conversation as MutableStateFlow<Conversation>
             flow.value = transform(flow.value)
             synchronized(updates) {
                 updates += flow.value
             }
+        }
+
+        fun blockNextUpdate(): BlockedUpdate {
+            return BlockedUpdate().also { blocked ->
+                synchronized(blockedUpdates) {
+                    blockedUpdates += blocked
+                }
+            }
+        }
+
+        fun updateAt(index: Int): Conversation = synchronized(updates) {
+            updates[index]
         }
 
         suspend fun awaitUpdateCount(count: Int) {
@@ -1214,6 +1291,11 @@ class VoiceAgentViewModelTest {
                 }
             }
         }
+    }
+
+    private class BlockedUpdate {
+        val started = CountDownLatch(1)
+        val release = CountDownLatch(1)
     }
 
     private class FakeVoiceSessionApi : VoiceSessionApi {
