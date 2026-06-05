@@ -273,24 +273,20 @@ class VoiceAgentCoordinator(
 
     fun close() {
         synchronized(closeLock) {
-            val handles = synchronized(toolJobsLock) {
+            val cleanup = synchronized(toolJobsLock) {
                 if (closed || closing) return
                 closing = true
-                val activeHandles = toolJobs.values.toList()
-                toolJobs.clear()
-                toolCallLocks.clear()
-                cancelledToolCallIds.clear()
-                activeHandles
+                removeAllToolHandlesForCleanup()
             }
-            handles.forEach {
+            cleanup.cancelableHandles.forEach {
                 persistToolCanceled(it, TOOL_CALL_CANCELED_BY_SESSION_END)
             }
-            val jobs = handles.map { it.job }
+            val jobs = cleanup.cancelableHandles.map { it.job }
             jobs.forEach { it.cancel() }
             synchronized(eventLock) {
                 // Wait for any in-flight non-tool event to finish before resources are released.
             }
-            handles.forEach { handle ->
+            cleanup.sendingHandles.forEach { handle ->
                 synchronized(handle.sendLock) {
                     // Wait for any already-started Gemini tool response write to return.
                 }
@@ -319,17 +315,18 @@ class VoiceAgentCoordinator(
             nextSessionId()
         }
         val handles = synchronized(toolJobsLock) {
-            val activeHandles = toolJobs.values.toList()
-            toolJobs.clear()
-            toolCallLocks.clear()
-            cancelledToolCallIds.clear()
-            activeHandles
+            removeAllToolHandlesForCleanup()
         }
-        handles.forEach {
+        handles.cancelableHandles.forEach {
             persistToolCanceled(it, TOOL_CALL_CANCELED_BY_RECONNECT)
         }
-        val jobs = handles.map { it.job }
+        val jobs = handles.cancelableHandles.map { it.job }
         jobs.forEach { it.cancel() }
+        handles.sendingHandles.forEach { handle ->
+            synchronized(handle.sendLock) {
+                // Send already started; let the send result persist the terminal tool record.
+            }
+        }
         synchronized(playbackSuppressionLock) {
             outputAudioSuppressed = false
         }
@@ -443,7 +440,7 @@ class VoiceAgentCoordinator(
                     handle.sendStarted = true
                 }
                 val sent = gemini.sendToolResponse(callId, response.answer)
-                if (!isToolHandleActive(callId, handle)) return
+                val activeAfterSend = isToolHandleActive(callId, handle)
                 if (sent) {
                     diagnostics.record("hermes_tool_succeeded", "callId=$callId")
                     persistToolStatus(
@@ -451,7 +448,9 @@ class VoiceAgentCoordinator(
                         prompt = prompt,
                         status = VoiceToolRecordStatus.Complete(response.answer),
                     )
-                    updateToolStatus(callId, VoiceToolStatus.HermesAnswered(callId = callId, elapsedMs = 0L))
+                    if (activeAfterSend) {
+                        updateToolStatus(callId, VoiceToolStatus.HermesAnswered(callId = callId, elapsedMs = 0L))
+                    }
                 } else {
                     val message = "Failed to send Gemini tool response message"
                     diagnostics.record("hermes_tool_failed", "callId=$callId, message=$message")
@@ -460,7 +459,9 @@ class VoiceAgentCoordinator(
                         prompt = prompt,
                         status = VoiceToolRecordStatus.Failed(message),
                     )
-                    updateToolStatus(callId, VoiceToolStatus.HermesFailed(callId = callId, message = message))
+                    if (activeAfterSend) {
+                        updateToolStatus(callId, VoiceToolStatus.HermesFailed(callId = callId, message = message))
+                    }
                 }
             }
         } catch (error: CancellationException) {
@@ -468,14 +469,17 @@ class VoiceAgentCoordinator(
         } catch (error: Throwable) {
             val message = error.message ?: error.javaClass.simpleName
             synchronized(handle.sendLock) {
-                if (!isToolHandleActive(callId, handle)) return
+                val active = isToolHandleActive(callId, handle)
+                if (!active && !hasToolResponseSendStarted(handle)) return
                 diagnostics.record("hermes_tool_failed", "callId=$callId, message=$message")
                 persistToolStatus(
                     callId = callId,
                     prompt = prompt,
                     status = VoiceToolRecordStatus.Failed(message),
                 )
-                updateToolStatus(callId, VoiceToolStatus.HermesFailed(callId = callId, message = message))
+                if (active) {
+                    updateToolStatus(callId, VoiceToolStatus.HermesFailed(callId = callId, message = message))
+                }
             }
         }
     }
@@ -564,14 +568,19 @@ class VoiceAgentCoordinator(
             detail = event.callIds.joinToString(","),
         )
         val handlesToCancel = event.callIds.mapNotNull(::cancelToolCall)
-        handlesToCancel.forEach {
+        handlesToCancel.flatMap { it.cancelableHandles }.forEach {
             persistToolCanceled(it, TOOL_CALL_CANCELED_BY_GEMINI)
         }
         removeToolStatuses(event.callIds)
-        handlesToCancel.forEach { it.job.cancel() }
+        handlesToCancel.flatMap { it.cancelableHandles }.forEach { it.job.cancel() }
+        handlesToCancel.flatMap { it.sendingHandles }.forEach { handle ->
+            synchronized(handle.sendLock) {
+                // Send already started; let the send result persist the terminal tool record.
+            }
+        }
     }
 
-    private fun cancelToolCall(callId: String): ToolJobHandle? {
+    private fun cancelToolCall(callId: String): ToolCleanup? {
         synchronized(toolCallLock(callId)) {
             return synchronized(toolJobsLock) {
                 cancelledToolCallIds += callId
@@ -582,9 +591,39 @@ class VoiceAgentCoordinator(
                 if (handle != null) {
                     handle.superseded = true
                 }
-                handle
+                handle?.toCleanup()
             }
         }
+    }
+
+    private fun removeAllToolHandlesForCleanup(): ToolCleanup {
+        val cleanup = toolJobs.values.toList().toCleanup()
+        toolJobs.clear()
+        toolCallLocks.clear()
+        cancelledToolCallIds.clear()
+        return cleanup
+    }
+
+    private fun List<ToolJobHandle>.toCleanup(): ToolCleanup {
+        forEach { it.superseded = true }
+        val (sendingHandles, cancelableHandles) = partition { it.sendStarted }
+        return ToolCleanup(
+            cancelableHandles = cancelableHandles,
+            sendingHandles = sendingHandles,
+        )
+    }
+
+    private fun ToolJobHandle.toCleanup(): ToolCleanup {
+        superseded = true
+        return if (sendStarted) {
+            ToolCleanup(cancelableHandles = emptyList(), sendingHandles = listOf(this))
+        } else {
+            ToolCleanup(cancelableHandles = listOf(this), sendingHandles = emptyList())
+        }
+    }
+
+    private fun hasToolResponseSendStarted(handle: ToolJobHandle): Boolean = synchronized(toolJobsLock) {
+        handle.sendStarted
     }
 
     private fun toolCallLock(callId: String): Any = synchronized(toolJobsLock) {
@@ -731,6 +770,11 @@ class VoiceAgentCoordinator(
         var superseded: Boolean = false
         var sendStarted: Boolean = false
     }
+
+    private data class ToolCleanup(
+        val cancelableHandles: List<ToolJobHandle>,
+        val sendingHandles: List<ToolJobHandle>,
+    )
 }
 
 class VoiceAgentViewModel(

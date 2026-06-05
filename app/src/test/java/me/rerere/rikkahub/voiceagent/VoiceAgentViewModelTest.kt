@@ -1048,6 +1048,129 @@ class VoiceAgentViewModelTest {
     }
 
     @Test
+    fun `close after Gemini tool response send starts persists Hermes record as complete`() = runTest {
+        val conversationStore = FakeVoiceConversationStore()
+        val gemini = FakeGeminiLiveVoiceClient()
+        val blockedSend = gemini.blockToolResponse("call-close-sending-persist")
+        val toolApi = FakeVoiceToolApi()
+        val coordinator = VoiceAgentCoordinator(
+            gemini = gemini,
+            toolApi = toolApi,
+            audio = FakeVoiceAudioEngine(),
+            conversationStore = conversationStore,
+            scope = this,
+            dispatcher = Dispatchers.Default,
+        )
+
+        coordinator.onGeminiEvent(
+            GeminiLiveEvent.ToolCall(callId = "call-close-sending-persist", name = "ask_hermes", prompt = "close")
+        )
+        assertEquals("call-close-sending-persist" to "close", toolApi.awaitRequest("call-close-sending-persist"))
+        toolApi.complete(response(callId = "call-close-sending-persist", answer = "sent answer"))
+        assertTrue(blockedSend.started.await(500, TimeUnit.MILLISECONDS))
+
+        val closeJob = launch(Dispatchers.Default) {
+            coordinator.close()
+        }
+        assertFalse(blockedSend.release.await(50, TimeUnit.MILLISECONDS))
+        blockedSend.release.countDown()
+        withTimeout(500) {
+            closeJob.join()
+        }
+        coordinator.awaitPersistenceJobsWithTimeout()
+
+        val tool = conversationStore.conversation.value.currentMessages
+            .flatMap { it.parts }
+            .filterIsInstance<UIMessagePart.Tool>()
+            .single()
+        assertEquals("call-close-sending-persist", tool.toolCallId)
+        assertEquals("complete", tool.metadata?.get("voice_tool_status")?.jsonPrimitive?.content)
+        assertEquals("sent answer", tool.output.text())
+    }
+
+    @Test
+    fun `reconnect after Gemini tool response send starts persists Hermes record as complete`() = runTest {
+        val conversationStore = FakeVoiceConversationStore()
+        val gemini = FakeGeminiLiveVoiceClient()
+        val blockedSend = gemini.blockToolResponse("call-reconnect-sending-persist")
+        val toolApi = FakeVoiceToolApi()
+        val coordinator = VoiceAgentCoordinator(
+            gemini = gemini,
+            toolApi = toolApi,
+            audio = FakeVoiceAudioEngine(),
+            conversationStore = conversationStore,
+            scope = this,
+            dispatcher = Dispatchers.Default,
+        )
+
+        coordinator.onGeminiEvent(
+            GeminiLiveEvent.ToolCall(callId = "call-reconnect-sending-persist", name = "ask_hermes", prompt = "old")
+        )
+        assertEquals("call-reconnect-sending-persist" to "old", toolApi.awaitRequest("call-reconnect-sending-persist"))
+        toolApi.complete(response(callId = "call-reconnect-sending-persist", answer = "sent answer"))
+        assertTrue(blockedSend.started.await(500, TimeUnit.MILLISECONDS))
+
+        val reconnectJob = launch(Dispatchers.Default) {
+            coordinator.prepareForReconnect()
+        }
+        assertFalse(blockedSend.release.await(50, TimeUnit.MILLISECONDS))
+        blockedSend.release.countDown()
+        withTimeout(500) {
+            reconnectJob.join()
+        }
+        coordinator.awaitPersistenceJobsWithTimeout()
+
+        val tool = conversationStore.conversation.value.currentMessages
+            .flatMap { it.parts }
+            .filterIsInstance<UIMessagePart.Tool>()
+            .single()
+        assertEquals("call-reconnect-sending-persist", tool.toolCallId)
+        assertEquals("complete", tool.metadata?.get("voice_tool_status")?.jsonPrimitive?.content)
+        assertEquals("sent answer", tool.output.text())
+    }
+
+    @Test
+    fun `Gemini cancellation after tool response send starts persists Hermes record as complete`() = runTest {
+        val conversationStore = FakeVoiceConversationStore()
+        val gemini = FakeGeminiLiveVoiceClient()
+        val blockedSend = gemini.blockToolResponse("call-cancel-sending-persist")
+        val toolApi = FakeVoiceToolApi()
+        val coordinator = VoiceAgentCoordinator(
+            gemini = gemini,
+            toolApi = toolApi,
+            audio = FakeVoiceAudioEngine(),
+            conversationStore = conversationStore,
+            scope = this,
+            dispatcher = Dispatchers.Default,
+        )
+
+        coordinator.onGeminiEvent(
+            GeminiLiveEvent.ToolCall(callId = "call-cancel-sending-persist", name = "ask_hermes", prompt = "cancel")
+        )
+        assertEquals("call-cancel-sending-persist" to "cancel", toolApi.awaitRequest("call-cancel-sending-persist"))
+        toolApi.complete(response(callId = "call-cancel-sending-persist", answer = "sent answer"))
+        assertTrue(blockedSend.started.await(500, TimeUnit.MILLISECONDS))
+
+        val cancelJob = launch(Dispatchers.Default) {
+            coordinator.onGeminiEvent(GeminiLiveEvent.ToolCallCancellation(listOf("call-cancel-sending-persist")))
+        }
+        assertFalse(blockedSend.release.await(50, TimeUnit.MILLISECONDS))
+        blockedSend.release.countDown()
+        withTimeout(500) {
+            cancelJob.join()
+        }
+        coordinator.awaitPersistenceJobsWithTimeout()
+
+        val tool = conversationStore.conversation.value.currentMessages
+            .flatMap { it.parts }
+            .filterIsInstance<UIMessagePart.Tool>()
+            .single()
+        assertEquals("call-cancel-sending-persist", tool.toolCallId)
+        assertEquals("complete", tool.metadata?.get("voice_tool_status")?.jsonPrimitive?.content)
+        assertEquals("sent answer", tool.output.text())
+    }
+
+    @Test
     fun `coordinator snapshots transcript text before delayed persistence writes`() = runTest {
         val conversationStore = FakeVoiceConversationStore()
         val firstUpdate = conversationStore.blockNextUpdate()
