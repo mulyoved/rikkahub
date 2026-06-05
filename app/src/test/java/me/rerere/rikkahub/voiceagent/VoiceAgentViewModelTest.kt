@@ -803,6 +803,7 @@ class VoiceAgentViewModelTest {
         withTimeout(500) {
             eventJob.join()
         }
+        assertEquals(VoiceAudioStatus.PlaybackSuppressed, coordinator.state.value.audio)
     }
 
     @Test
@@ -1016,9 +1017,77 @@ class VoiceAgentViewModelTest {
         assertEquals(listOf(Base64.getEncoder().encodeToString(byteArrayOf(1, 2, 3))), gemini.audioMessages)
 
         vm.end()
+        withTimeout(500) {
+            while (gemini.closeCalls < 1) {
+                delay(10)
+            }
+        }
 
         assertEquals(1, gemini.closeCalls)
         assertEquals(1, audio.releaseCalls)
+        assertEquals(VoiceSessionStatus.Ended, vm.state.value.session)
+    }
+
+    @Test
+    fun `ViewModel reconnect cancels delayed old start before opening new Gemini session`() = runTest {
+        val sessionApi = FakeVoiceSessionApi()
+        val blockedSession = sessionApi.blockNextSession()
+        val gemini = FakeGeminiLiveVoiceClient()
+        val vm = VoiceAgentViewModel(
+            modelId = "gemini-flash",
+            sessionApi = sessionApi,
+            toolApi = FakeVoiceToolApi(),
+            gemini = gemini,
+            audio = FakeVoiceAudioEngine(),
+            conversationStore = FakeVoiceConversationStore(),
+            contextProvider = FakeVoiceAgentContextProvider(
+                VoiceContext(systemInstruction = "system", turns = emptyList())
+            ),
+            scope = this,
+        )
+
+        vm.start()
+        withTimeout(500) {
+            blockedSession.started.await()
+        }
+
+        vm.reconnect()
+        gemini.awaitConnectCount(1)
+
+        assertEquals(2, sessionApi.createdSessions.size)
+        assertEquals(1, gemini.eventHandlers.size)
+        assertEquals(VoiceSessionStatus.Connected, vm.state.value.session)
+    }
+
+    @Test
+    fun `ViewModel end is terminal and later start does not reopen session`() = runTest {
+        val gemini = FakeGeminiLiveVoiceClient()
+        val vm = VoiceAgentViewModel(
+            modelId = "gemini-flash",
+            sessionApi = FakeVoiceSessionApi(),
+            toolApi = FakeVoiceToolApi(),
+            gemini = gemini,
+            audio = FakeVoiceAudioEngine(),
+            conversationStore = FakeVoiceConversationStore(),
+            contextProvider = FakeVoiceAgentContextProvider(
+                VoiceContext(systemInstruction = "system", turns = emptyList())
+            ),
+            scope = this,
+        )
+
+        vm.start()
+        gemini.awaitConnectCount(1)
+        vm.end()
+        withTimeout(500) {
+            while (gemini.closeCalls < 1) {
+                delay(10)
+            }
+        }
+
+        vm.start()
+        delay(50)
+
+        assertEquals(1, gemini.eventHandlers.size)
         assertEquals(VoiceSessionStatus.Ended, vm.state.value.session)
     }
 
@@ -1336,9 +1405,17 @@ class VoiceAgentViewModelTest {
 
     private class FakeVoiceSessionApi : VoiceSessionApi {
         val createdSessions = mutableListOf<String>()
+        private val blockedSessions = mutableListOf<BlockedSession>()
 
         override suspend fun createSession(modelId: String): MobileVoiceSessionResponse {
             createdSessions += modelId
+            val blocked = synchronized(blockedSessions) {
+                blockedSessions.removeFirstOrNull()
+            }
+            blocked?.let {
+                it.started.complete(Unit)
+                it.release.await()
+            }
             return MobileVoiceSessionResponse(
                 token = "token-1",
                 modelId = modelId,
@@ -1350,6 +1427,19 @@ class VoiceAgentViewModelTest {
                 liveConnectConfig = buildJsonObject {},
             )
         }
+
+        fun blockNextSession(): BlockedSession {
+            return BlockedSession().also { blocked ->
+                synchronized(blockedSessions) {
+                    blockedSessions += blocked
+                }
+            }
+        }
+    }
+
+    private class BlockedSession {
+        val started = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
     }
 
     private class FakeVoiceAgentContextProvider(

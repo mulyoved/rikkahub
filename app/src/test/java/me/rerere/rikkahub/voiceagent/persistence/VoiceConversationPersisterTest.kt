@@ -85,10 +85,10 @@ class VoiceConversationPersisterTest {
     fun `voice transcript upsert keeps streaming fragments in one visible turn`() {
         val persister = VoiceConversationPersister()
         val conversation = emptyConversation()
-            .let { persister.upsertUserTranscriptTurn(it, "hel") }
-            .let { persister.upsertUserTranscriptTurn(it, "hello") }
-            .let { persister.upsertAssistantTranscriptTurn(it, "h", interrupted = false) }
-            .let { persister.upsertAssistantTranscriptTurn(it, "hi", interrupted = true) }
+            .let { persister.upsertUserTranscriptTurn(it, "hel", turnId = "user-1") }
+            .let { persister.upsertUserTranscriptTurn(it, "hello", turnId = "user-1") }
+            .let { persister.upsertAssistantTranscriptTurn(it, "h", interrupted = false, turnId = "assistant-1") }
+            .let { persister.upsertAssistantTranscriptTurn(it, "hi", interrupted = true, turnId = "assistant-1") }
 
         assertEquals(
             listOf(MessageRole.USER, MessageRole.ASSISTANT),
@@ -98,6 +98,27 @@ class VoiceConversationPersisterTest {
         assertEquals("hi", conversation.currentMessages[1].parts.text())
         val assistantText = conversation.currentMessages[1].parts.single() as UIMessagePart.Text
         assertEquals("interrupted", assistantText.metadata!!["voice_status"]!!.jsonPrimitive.content)
+    }
+
+    @Test
+    fun `voice transcript upsert replaces matching turn even when tool record interleaves`() {
+        val persister = VoiceConversationPersister()
+        val conversation = emptyConversation()
+            .let { persister.upsertUserTranscriptTurn(it, "hel", turnId = "user-1") }
+            .let {
+                persister.upsertHermesTool(
+                    conversation = it,
+                    callId = "call-1",
+                    prompt = "Prompt",
+                    status = VoiceToolRecordStatus.Pending,
+                )
+            }
+            .let { persister.upsertUserTranscriptTurn(it, "hello", turnId = "user-1") }
+
+        assertEquals(2, conversation.currentMessages.size)
+        assertEquals("hello", conversation.currentMessages[0].parts.text())
+        val tool = conversation.currentMessages[1].parts.single() as UIMessagePart.Tool
+        assertEquals("call-1", tool.toolCallId)
     }
 
     @Test

@@ -11,6 +11,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -132,6 +133,9 @@ class VoiceAgentCoordinator(
     private var activeTranscriptSpeaker: TranscriptSpeaker? = null
     private var inputTurnTranscript = ""
     private var outputTurnTranscript = ""
+    private var transcriptTurnSequence = 0L
+    private var inputTurnId = ""
+    private var outputTurnId = ""
 
     private val _state = MutableStateFlow(VoiceAgentUiState())
     val state: StateFlow<VoiceAgentUiState> = _state.asStateFlow()
@@ -319,6 +323,7 @@ class VoiceAgentCoordinator(
     private fun appendInputTranscript(text: String) {
         if (activeTranscriptSpeaker != TranscriptSpeaker.User) {
             inputTurnTranscript = ""
+            inputTurnId = nextTranscriptTurnId(TranscriptSpeaker.User)
         }
         activeTranscriptSpeaker = TranscriptSpeaker.User
         inputTurnTranscript += text
@@ -327,14 +332,16 @@ class VoiceAgentCoordinator(
         }
         _state.update { it.copy(inputTranscript = it.inputTranscript + text) }
         val transcript = inputTurnTranscript
+        val turnId = inputTurnId
         persistConversation { conversation ->
-            persister.upsertUserTranscriptTurn(conversation = conversation, text = transcript)
+            persister.upsertUserTranscriptTurn(conversation = conversation, text = transcript, turnId = turnId)
         }
     }
 
     private fun appendOutputTranscript(text: String) {
         if (activeTranscriptSpeaker != TranscriptSpeaker.Assistant) {
             outputTurnTranscript = ""
+            outputTurnId = nextTranscriptTurnId(TranscriptSpeaker.Assistant)
         }
         activeTranscriptSpeaker = TranscriptSpeaker.Assistant
         outputTurnTranscript += text
@@ -348,6 +355,10 @@ class VoiceAgentCoordinator(
             return
         }
         audio.playPcm16(base64Pcm16)
+        if (synchronized(playbackSuppressionLock) { outputAudioSuppressed }) {
+            diagnostics.record("output_audio_state_suppressed_after_interruption")
+            return
+        }
         _state.update { it.copy(audio = VoiceAudioStatus.AssistantSpeaking) }
     }
 
@@ -445,7 +456,7 @@ class VoiceAgentCoordinator(
 
     private fun isClosed(): Boolean = synchronized(toolJobsLock) { closed || closing }
 
-    private fun isActiveSession(sessionId: Long): Boolean = synchronized(toolJobsLock) {
+    fun isActiveSession(sessionId: Long): Boolean = synchronized(toolJobsLock) {
         !closed && !closing && activeSessionId == sessionId
     }
 
@@ -591,14 +602,21 @@ class VoiceAgentCoordinator(
 
     private fun persistAssistantTranscript() {
         val transcript = outputTurnTranscript
+        val turnId = outputTurnId
         val interrupted = synchronized(playbackSuppressionLock) { outputAudioSuppressed }
         persistConversation { conversation ->
             persister.upsertAssistantTranscriptTurn(
                 conversation = conversation,
                 text = transcript,
                 interrupted = interrupted,
+                turnId = turnId,
             )
         }
+    }
+
+    private fun nextTranscriptTurnId(speaker: TranscriptSpeaker): String {
+        transcriptTurnSequence += 1
+        return "${speaker.name.lowercase()}-$transcriptTurnSequence"
     }
 
     private fun persistConversation(transform: (Conversation) -> Conversation) {
@@ -683,76 +701,111 @@ class VoiceAgentViewModel(
     private var startJob: Job? = null
     private var muted = false
     private var sessionId = 0L
+    private var ended = false
 
     val state: StateFlow<VoiceAgentUiState> = coordinator.state
     private val conversation = conversationStore.conversation
     private val contextProvider = contextProvider
 
     fun start() {
-        if (startJob?.isActive == true) return
+        if (ended || startJob?.isActive == true) return
         val currentSessionId = coordinator.nextSessionId()
         sessionId = currentSessionId
-        startJob = lifecycleScope.launch {
-            try {
-                coordinator.updateSessionStatus(VoiceSessionStatus.PreparingContext)
-                val voiceContext = contextProvider.build(conversation.value)
-                coordinator.updateSessionStatus(VoiceSessionStatus.RequestingToken)
-                val session = sessionApi.createSession(modelId = modelId)
-                coordinator.updateSessionStatus(VoiceSessionStatus.ConnectingGemini)
-                gemini.connect(
-                    token = session.token,
-                    websocketUrl = session.websocketUrl,
-                    providerModel = session.providerModel,
-                    liveConnectConfig = session.liveConnectConfig,
-                    systemInstruction = voiceContext.systemInstruction,
-                    contextTurns = voiceContext.turns,
-                    onEvent = { event -> coordinator.onGeminiEvent(currentSessionId, event) },
-                )
-                coordinator.updateSessionStatus(VoiceSessionStatus.Connected)
-                if (!muted) {
-                    startCapture()
-                }
-            } catch (error: CancellationException) {
-                throw error
-            } catch (error: Throwable) {
+        val job = lifecycleScope.launch {
+            runSession(currentSessionId)
+        }
+        startJob = job
+    }
+
+    private suspend fun runSession(currentSessionId: Long) {
+        val sessionJob = currentCoroutineContext()[Job]
+        startJob = sessionJob
+        try {
+            coordinator.updateSessionStatus(VoiceSessionStatus.PreparingContext)
+            val voiceContext = contextProvider.build(conversation.value)
+            ensureActiveSession(currentSessionId)
+            coordinator.updateSessionStatus(VoiceSessionStatus.RequestingToken)
+            val session = sessionApi.createSession(modelId = modelId)
+            ensureActiveSession(currentSessionId)
+            coordinator.updateSessionStatus(VoiceSessionStatus.ConnectingGemini)
+            gemini.connect(
+                token = session.token,
+                websocketUrl = session.websocketUrl,
+                providerModel = session.providerModel,
+                liveConnectConfig = session.liveConnectConfig,
+                systemInstruction = voiceContext.systemInstruction,
+                contextTurns = voiceContext.turns,
+                onEvent = { event -> coordinator.onGeminiEvent(currentSessionId, event) },
+            )
+            ensureActiveSession(currentSessionId)
+            coordinator.updateSessionStatus(VoiceSessionStatus.Connected)
+            if (!muted) {
+                startCapture()
+            }
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Throwable) {
+            if (coordinator.isActiveSession(currentSessionId)) {
                 coordinator.updateSessionStatus(
                     VoiceSessionStatus.Error(error.message ?: error.javaClass.simpleName)
                 )
             }
+        } finally {
+            if (startJob === sessionJob) {
+                startJob = null
+            }
         }
     }
 
+    private suspend fun ensureActiveSession(sessionId: Long) {
+        currentCoroutineContext().ensureActive()
+        check(coordinator.isActiveSession(sessionId)) { "Voice Agent session is stale" }
+    }
+
     fun interrupt() {
-        coordinator.suppressPlayback()
+        if (!ended) {
+            coordinator.suppressPlayback()
+        }
     }
 
     fun setMuted(value: Boolean) {
-        if (muted == value) return
+        if (ended || muted == value) return
         muted = value
         if (muted) {
             audio.stopCapture()
             coordinator.updateAudioStatus(VoiceAudioStatus.Muted)
         } else if (state.value.session == VoiceSessionStatus.Connected) {
             startCapture()
-        } else {
-            coordinator.updateAudioStatus(VoiceAudioStatus.Listening)
         }
     }
 
     fun reconnect() {
-        startJob?.cancel()
-        audio.stopCapture()
-        coordinator.prepareForReconnect()
-        gemini.close()
-        coordinator.updateSessionStatus(VoiceSessionStatus.Reconnecting)
-        start()
+        if (ended) return
+        val previousJob = startJob
+        val reconnectJob = lifecycleScope.launch {
+            previousJob?.cancelAndJoin()
+            if (ended) return@launch
+            audio.stopCapture()
+            coordinator.prepareForReconnect()
+            gemini.close()
+            coordinator.updateSessionStatus(VoiceSessionStatus.Reconnecting)
+            val currentSessionId = coordinator.nextSessionId()
+            sessionId = currentSessionId
+            runSession(currentSessionId)
+        }
+        startJob = reconnectJob
     }
 
     fun end() {
-        startJob?.cancel()
-        coordinator.updateSessionStatus(VoiceSessionStatus.Ending)
-        coordinator.close()
-        coordinator.launchPersistenceDrain()
+        if (ended) return
+        ended = true
+        val previousJob = startJob
+        lifecycleScope.launch {
+            previousJob?.cancelAndJoin()
+            coordinator.updateSessionStatus(VoiceSessionStatus.Ending)
+            coordinator.close()
+            coordinator.launchPersistenceDrain()
+        }
     }
 
     private fun startCapture() {

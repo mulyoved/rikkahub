@@ -44,6 +44,7 @@ class VoiceConversationPersister {
     fun upsertUserTranscriptTurn(
         conversation: Conversation,
         text: String,
+        turnId: String,
     ): Conversation = upsertTranscriptTurn(
         conversation = conversation,
         message = UIMessage(
@@ -51,17 +52,19 @@ class VoiceConversationPersister {
             parts = listOf(
                 UIMessagePart.Text(
                     text = text,
-                    metadata = voiceTranscriptMetadata(role = VOICE_TRANSCRIPT_USER_ROLE),
+                    metadata = voiceTranscriptMetadata(role = VOICE_TRANSCRIPT_USER_ROLE, turnId = turnId),
                 )
             ),
         ),
         transcriptRole = VOICE_TRANSCRIPT_USER_ROLE,
+        turnId = turnId,
     )
 
     fun upsertAssistantTranscriptTurn(
         conversation: Conversation,
         text: String,
         interrupted: Boolean,
+        turnId: String,
     ): Conversation = upsertTranscriptTurn(
         conversation = conversation,
         message = UIMessage(
@@ -71,12 +74,14 @@ class VoiceConversationPersister {
                     text = text,
                     metadata = voiceTranscriptMetadata(
                         role = VOICE_TRANSCRIPT_ASSISTANT_ROLE,
+                        turnId = turnId,
                         status = if (interrupted) "interrupted" else "complete",
                     ),
                 )
             ),
         ),
         transcriptRole = VOICE_TRANSCRIPT_ASSISTANT_ROLE,
+        turnId = turnId,
     )
 
     fun upsertHermesTool(
@@ -126,16 +131,20 @@ class VoiceConversationPersister {
         conversation: Conversation,
         message: UIMessage,
         transcriptRole: String,
+        turnId: String,
     ): Conversation {
         if (message.parts.filterIsInstance<UIMessagePart.Text>().joinToString("") { it.text }.isBlank()) {
             return conversation
         }
 
         val currentMessages = conversation.currentMessages
-        val lastMessage = currentMessages.lastOrNull()
-        if (lastMessage?.isVoiceTranscript(transcriptRole) == true) {
+        val existingIndex = currentMessages.indexOfLast { it.isVoiceTranscript(transcriptRole, turnId) }
+        if (existingIndex >= 0) {
+            val updatedMessages = currentMessages.toMutableList()
+            val existingMessage = currentMessages[existingIndex]
+            updatedMessages[existingIndex] = message.copy(id = existingMessage.id)
             return conversation.updateCurrentMessages(
-                currentMessages.dropLast(1) + message.copy(id = lastMessage.id)
+                updatedMessages
             )
         }
 
@@ -168,15 +177,17 @@ class VoiceConversationPersister {
         put(HERMES_TOOL_STATUS_KEY, statusName)
     }
 
-    private fun voiceTranscriptMetadata(role: String, status: String? = null) = buildJsonObject {
+    private fun voiceTranscriptMetadata(role: String, turnId: String, status: String? = null) = buildJsonObject {
         put(VOICE_TRANSCRIPT_ROLE_KEY, role)
+        put(VOICE_TRANSCRIPT_TURN_ID_KEY, turnId)
         status?.let { put("voice_status", it) }
     }
 
-    private fun UIMessage.isVoiceTranscript(transcriptRole: String): Boolean {
+    private fun UIMessage.isVoiceTranscript(transcriptRole: String, turnId: String): Boolean {
         return parts.any { part ->
             part is UIMessagePart.Text &&
-                part.metadata?.get(VOICE_TRANSCRIPT_ROLE_KEY)?.jsonPrimitive?.content == transcriptRole
+                part.metadata?.get(VOICE_TRANSCRIPT_ROLE_KEY)?.jsonPrimitive?.content == transcriptRole &&
+                part.metadata?.get(VOICE_TRANSCRIPT_TURN_ID_KEY)?.jsonPrimitive?.content == turnId
         }
     }
 
@@ -192,6 +203,7 @@ class VoiceConversationPersister {
         const val HERMES_TOOL_SOURCE_KEY = "voice_tool_source"
         const val HERMES_TOOL_STATUS_KEY = "voice_tool_status"
         const val VOICE_TRANSCRIPT_ROLE_KEY = "voice_transcript_role"
+        const val VOICE_TRANSCRIPT_TURN_ID_KEY = "voice_transcript_turn_id"
         const val VOICE_TRANSCRIPT_USER_ROLE = "user"
         const val VOICE_TRANSCRIPT_ASSISTANT_ROLE = "assistant"
     }
