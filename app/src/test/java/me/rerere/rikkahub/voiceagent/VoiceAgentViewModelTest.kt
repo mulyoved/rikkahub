@@ -54,8 +54,8 @@ class VoiceAgentViewModelTest {
         assertEquals("call-1" to "Look this up", toolApi.awaitRequest("call-1"))
 
         coordinator.onGeminiEvent(GeminiLiveEvent.Interrupted())
-        assertEquals(1, audio.suppressPlaybackCalls)
         assertEquals(VoiceAudioStatus.PlaybackSuppressed, coordinator.state.value.audio)
+        audio.awaitSuppressPlaybackCalls(1)
         assertEquals(VoiceToolStatus.CallingHermes("call-1"), coordinator.state.value.tool)
         coordinator.onGeminiEvent(GeminiLiveEvent.OutputAudio("late-audio"))
         assertEquals(emptyList<String>(), audio.playedPcm16)
@@ -807,6 +807,26 @@ class VoiceAgentViewModelTest {
     }
 
     @Test
+    fun `public interrupt updates state before blocking audio suppression returns`() = runTest {
+        val audio = FakeVoiceAudioEngine()
+        val blockedSuppression = audio.blockNextSuppression()
+        val coordinator = VoiceAgentCoordinator(
+            gemini = FakeGeminiLiveVoiceClient(),
+            toolApi = FakeVoiceToolApi(),
+            audio = audio,
+            scope = this,
+            dispatcher = Dispatchers.Default,
+        )
+
+        coordinator.suppressPlayback()
+
+        assertEquals(VoiceAudioStatus.PlaybackSuppressed, coordinator.state.value.audio)
+        assertTrue(blockedSuppression.started.await(500, TimeUnit.MILLISECONDS))
+
+        blockedSuppression.release.countDown()
+    }
+
+    @Test
     fun `close suppresses Hermes result while waiting for in flight non tool event`() = runTest {
         val gemini = FakeGeminiLiveVoiceClient()
         val toolApi = FakeVoiceToolApi()
@@ -1311,6 +1331,7 @@ class VoiceAgentViewModelTest {
         var stopCaptureCalls = 0
         private var captureCallback: ((ByteArray) -> Unit)? = null
         private val blockedPlaybacks = mutableListOf<BlockedPlayback>()
+        private val blockedSuppressions = mutableListOf<BlockedPlayback>()
 
         override fun startCapture(onPcm16: (ByteArray) -> Unit) {
             startCaptureCalls += 1
@@ -1332,6 +1353,11 @@ class VoiceAgentViewModelTest {
         }
 
         override fun suppressPlayback() {
+            val blocked = synchronized(blockedSuppressions) { blockedSuppressions.removeFirstOrNull() }
+            if (blocked != null) {
+                blocked.started.countDown()
+                blocked.release.await(500, TimeUnit.MILLISECONDS)
+            }
             suppressPlaybackCalls += 1
         }
 
@@ -1343,6 +1369,22 @@ class VoiceAgentViewModelTest {
             return BlockedPlayback().also { blocked ->
                 synchronized(blockedPlaybacks) {
                     blockedPlaybacks += blocked
+                }
+            }
+        }
+
+        fun blockNextSuppression(): BlockedPlayback {
+            return BlockedPlayback().also { blocked ->
+                synchronized(blockedSuppressions) {
+                    blockedSuppressions += blocked
+                }
+            }
+        }
+
+        suspend fun awaitSuppressPlaybackCalls(count: Int) {
+            withTimeout(500) {
+                while (suppressPlaybackCalls < count) {
+                    delay(10)
                 }
             }
         }

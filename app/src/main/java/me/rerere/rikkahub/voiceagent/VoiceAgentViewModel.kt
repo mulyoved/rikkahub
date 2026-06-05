@@ -167,9 +167,11 @@ class VoiceAgentCoordinator(
             if (outputTurnTranscript.isNotBlank()) {
                 persistAssistantTranscript()
             }
+            _state.update { it.reduce(VoiceAgentEvent.UserInterrupted) }
         }
-        audio.suppressPlayback()
-        _state.update { it.reduce(VoiceAgentEvent.UserInterrupted) }
+        coordinatorScope.launch(toolLaunchContext) {
+            audio.suppressPlayback()
+        }
     }
 
     fun onGeminiEvent(event: GeminiLiveEvent) {
@@ -355,11 +357,13 @@ class VoiceAgentCoordinator(
             return
         }
         audio.playPcm16(base64Pcm16)
-        if (synchronized(playbackSuppressionLock) { outputAudioSuppressed }) {
-            diagnostics.record("output_audio_state_suppressed_after_interruption")
-            return
+        synchronized(playbackSuppressionLock) {
+            if (outputAudioSuppressed) {
+                diagnostics.record("output_audio_state_suppressed_after_interruption")
+                return
+            }
+            _state.update { it.copy(audio = VoiceAudioStatus.AssistantSpeaking) }
         }
-        _state.update { it.copy(audio = VoiceAudioStatus.AssistantSpeaking) }
     }
 
     private fun handleInterrupted(event: GeminiLiveEvent.Interrupted) {
@@ -808,6 +812,16 @@ class VoiceAgentViewModel(
         }
     }
 
+    private fun closeNow() {
+        if (!ended) {
+            ended = true
+        }
+        startJob?.cancel()
+        coordinator.updateSessionStatus(VoiceSessionStatus.Ending)
+        coordinator.close()
+        coordinator.launchPersistenceDrain()
+    }
+
     private fun startCapture() {
         audio.startCapture { pcm16 ->
             gemini.sendAudio(Base64.getEncoder().encodeToString(pcm16))
@@ -817,7 +831,7 @@ class VoiceAgentViewModel(
     }
 
     override fun onCleared() {
-        end()
+        closeNow()
         super.onCleared()
     }
 }
