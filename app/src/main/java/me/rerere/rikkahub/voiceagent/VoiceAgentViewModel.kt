@@ -168,9 +168,7 @@ class VoiceAgentCoordinator(
     }
 
     fun invalidateActiveSession() {
-        synchronized(eventLock) {
-            nextSessionId()
-        }
+        nextSessionId()
     }
 
     fun onGeminiEvent(sessionId: Long, event: GeminiLiveEvent) {

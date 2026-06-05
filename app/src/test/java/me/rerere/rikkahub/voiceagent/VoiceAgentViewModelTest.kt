@@ -1417,6 +1417,47 @@ class VoiceAgentViewModelTest {
     }
 
     @Test
+    fun `ViewModel reconnect invalidates previous Gemini callback while output audio is blocked`() = runTest {
+        val sessionApi = FakeVoiceSessionApi()
+        val gemini = FakeGeminiLiveVoiceClient()
+        val audio = FakeVoiceAudioEngine()
+        val blockedPlayback = audio.blockNextPlayback()
+        val toolApi = FakeVoiceToolApi()
+        val vm = VoiceAgentViewModel(
+            modelId = "gemini-flash",
+            sessionApi = sessionApi,
+            toolApi = toolApi,
+            gemini = gemini,
+            audio = audio,
+            conversationStore = FakeVoiceConversationStore(),
+            contextProvider = FakeVoiceAgentContextProvider(
+                VoiceContext(systemInstruction = "system", turns = emptyList())
+            ),
+            scope = this,
+        )
+
+        vm.start()
+        gemini.awaitConnectCount(1)
+        val oldCallback = gemini.eventHandlers.single()
+        val eventJob = launch(Dispatchers.Default) {
+            oldCallback(GeminiLiveEvent.OutputAudio("blocked-audio"))
+        }
+        assertTrue(blockedPlayback.started.await(500, TimeUnit.MILLISECONDS))
+
+        vm.reconnect()
+        oldCallback(GeminiLiveEvent.ToolCall(callId = "stale-blocked-reconnect", name = "ask_hermes", prompt = "stale"))
+        delay(50)
+
+        assertEquals(emptyList<Pair<String, String>>(), toolApi.requests)
+        assertEquals(VoiceToolStatus.Idle, vm.state.value.tool)
+
+        blockedPlayback.release.countDown()
+        withTimeout(500) {
+            eventJob.join()
+        }
+    }
+
+    @Test
     fun `ViewModel end immediately invalidates previous Gemini callback`() = runTest {
         val sessionApi = FakeVoiceSessionApi()
         val gemini = FakeGeminiLiveVoiceClient()
