@@ -1385,6 +1385,68 @@ class VoiceAgentViewModelTest {
         assertEquals(VoiceToolStatus.Idle, vm.state.value.tool)
     }
 
+    @Test
+    fun `ViewModel reconnect immediately invalidates previous Gemini callback`() = runTest {
+        val sessionApi = FakeVoiceSessionApi()
+        val gemini = FakeGeminiLiveVoiceClient()
+        gemini.blockNextConnectCompletion()
+        val toolApi = FakeVoiceToolApi()
+        val vm = VoiceAgentViewModel(
+            modelId = "gemini-flash",
+            sessionApi = sessionApi,
+            toolApi = toolApi,
+            gemini = gemini,
+            audio = FakeVoiceAudioEngine(),
+            conversationStore = FakeVoiceConversationStore(),
+            contextProvider = FakeVoiceAgentContextProvider(
+                VoiceContext(systemInstruction = "system", turns = emptyList())
+            ),
+            scope = this,
+        )
+
+        vm.start()
+        gemini.awaitConnectCount(1)
+        val oldCallback = gemini.eventHandlers.single()
+
+        vm.reconnect()
+        oldCallback(GeminiLiveEvent.ToolCall(callId = "stale-reconnect", name = "ask_hermes", prompt = "stale"))
+        delay(50)
+
+        assertEquals(emptyList<Pair<String, String>>(), toolApi.requests)
+        assertEquals(VoiceToolStatus.Idle, vm.state.value.tool)
+    }
+
+    @Test
+    fun `ViewModel end immediately invalidates previous Gemini callback`() = runTest {
+        val sessionApi = FakeVoiceSessionApi()
+        val gemini = FakeGeminiLiveVoiceClient()
+        gemini.blockNextConnectCompletion()
+        val toolApi = FakeVoiceToolApi()
+        val vm = VoiceAgentViewModel(
+            modelId = "gemini-flash",
+            sessionApi = sessionApi,
+            toolApi = toolApi,
+            gemini = gemini,
+            audio = FakeVoiceAudioEngine(),
+            conversationStore = FakeVoiceConversationStore(),
+            contextProvider = FakeVoiceAgentContextProvider(
+                VoiceContext(systemInstruction = "system", turns = emptyList())
+            ),
+            scope = this,
+        )
+
+        vm.start()
+        gemini.awaitConnectCount(1)
+        val oldCallback = gemini.eventHandlers.single()
+
+        vm.end()
+        oldCallback(GeminiLiveEvent.ToolCall(callId = "stale-end", name = "ask_hermes", prompt = "stale"))
+        delay(50)
+
+        assertEquals(emptyList<Pair<String, String>>(), toolApi.requests)
+        assertEquals(VoiceToolStatus.Idle, vm.state.value.tool)
+    }
+
     private fun response(callId: String, answer: String): MobileHermesResponse = MobileHermesResponse(
         callId = callId,
         answer = answer,
@@ -1424,6 +1486,7 @@ class VoiceAgentViewModelTest {
         val eventHandlers = mutableListOf<(GeminiLiveEvent) -> Unit>()
         private val connected = CompletableDeferred<Unit>()
         private val blockedResponses = mutableMapOf<String, MutableList<BlockedToolResponse>>()
+        private val blockedConnectCompletions = mutableListOf<BlockedConnect>()
 
         fun blockToolResponse(callId: String): BlockedToolResponse {
             return blockNextToolResponse(callId)
@@ -1433,6 +1496,14 @@ class VoiceAgentViewModelTest {
             return BlockedToolResponse().also { blocked ->
                 synchronized(blockedResponses) {
                     blockedResponses.getOrPut(callId) { mutableListOf() } += blocked
+                }
+            }
+        }
+
+        fun blockNextConnectCompletion(): BlockedConnect {
+            return BlockedConnect().also { blocked ->
+                synchronized(blockedConnectCompletions) {
+                    blockedConnectCompletions += blocked
                 }
             }
         }
@@ -1453,6 +1524,10 @@ class VoiceAgentViewModelTest {
             connectedContextTurns = contextTurns
             eventHandlers += onEvent
             connected.complete(Unit)
+            val blocked = synchronized(blockedConnectCompletions) {
+                blockedConnectCompletions.removeFirstOrNull()
+            }
+            blocked?.release?.await()
         }
 
         override fun sendAudio(base64Pcm16: String) {
@@ -1497,6 +1572,10 @@ class VoiceAgentViewModelTest {
     private class BlockedToolResponse {
         val started = CountDownLatch(1)
         val release = CountDownLatch(1)
+    }
+
+    private class BlockedConnect {
+        val release = CompletableDeferred<Unit>()
     }
 
     private class FakeVoiceToolApi : VoiceToolApi {

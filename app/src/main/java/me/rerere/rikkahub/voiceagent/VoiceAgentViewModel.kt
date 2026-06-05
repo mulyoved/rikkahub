@@ -37,6 +37,7 @@ import me.rerere.rikkahub.voiceagent.voicelab.MobileHermesResponse
 import me.rerere.rikkahub.voiceagent.voicelab.MobileVoiceSessionResponse
 import me.rerere.rikkahub.voiceagent.voicelab.VoiceLabMobileApi
 import java.util.Base64
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.EmptyCoroutineContext
 import kotlin.uuid.Uuid
 
@@ -66,17 +67,30 @@ class VoiceLabHermesToolApi(
 interface VoiceConversationStore {
     val conversation: StateFlow<Conversation>
     suspend fun update(transform: (Conversation) -> Conversation)
+    fun close() = Unit
 }
 
 class ChatServiceVoiceConversationStore(
     private val conversationId: Uuid,
     private val chatService: ChatService,
 ) : VoiceConversationStore {
+    private val closed = AtomicBoolean(false)
+
+    init {
+        chatService.addConversationReference(conversationId)
+    }
+
     override val conversation: StateFlow<Conversation> = chatService.getConversationFlow(conversationId)
 
     override suspend fun update(transform: (Conversation) -> Conversation) {
-        val updatedConversation = transform(conversation.value)
+        val updatedConversation = transform(chatService.getConversationFlow(conversationId).value)
         chatService.saveConversation(conversationId = conversationId, conversation = updatedConversation)
+    }
+
+    override fun close() {
+        if (closed.compareAndSet(false, true)) {
+            chatService.removeConversationReference(conversationId)
+        }
     }
 }
 
@@ -151,6 +165,12 @@ class VoiceAgentCoordinator(
     fun nextSessionId(): Long = synchronized(toolJobsLock) {
         activeSessionId += 1
         activeSessionId
+    }
+
+    fun invalidateActiveSession() {
+        synchronized(eventLock) {
+            nextSessionId()
+        }
     }
 
     fun onGeminiEvent(sessionId: Long, event: GeminiLiveEvent) {
@@ -261,6 +281,7 @@ class VoiceAgentCoordinator(
     }
 
     fun stopPersistenceScope() {
+        conversationStore?.close()
         persistenceScope.cancel()
     }
 
@@ -311,9 +332,7 @@ class VoiceAgentCoordinator(
     }
 
     fun prepareForReconnect() {
-        synchronized(eventLock) {
-            nextSessionId()
-        }
+        invalidateActiveSession()
         val handles = synchronized(toolJobsLock) {
             removeAllToolHandlesForCleanup()
         }
@@ -881,6 +900,7 @@ class VoiceAgentViewModel(
     fun reconnect() {
         if (ended) return
         val previousJob = startJob
+        coordinator.invalidateActiveSession()
         val reconnectJob = lifecycleScope.launch {
             previousJob?.cancelAndJoin()
             if (ended) return@launch
@@ -899,6 +919,7 @@ class VoiceAgentViewModel(
         if (ended) return
         ended = true
         val previousJob = startJob
+        coordinator.invalidateActiveSession()
         lifecycleScope.launch {
             previousJob?.cancelAndJoin()
             coordinator.updateSessionStatus(VoiceSessionStatus.Ending)
@@ -911,6 +932,7 @@ class VoiceAgentViewModel(
         if (!ended) {
             ended = true
         }
+        coordinator.invalidateActiveSession()
         startJob?.cancel()
         coordinator.updateSessionStatus(VoiceSessionStatus.Ending)
         coordinator.close()
