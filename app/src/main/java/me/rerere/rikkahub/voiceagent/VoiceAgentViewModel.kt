@@ -301,7 +301,9 @@ class VoiceAgentCoordinator(
             val cleanup = synchronized(toolJobsLock) {
                 if (closed || closing) return
                 closing = true
-                removeAllToolHandlesForCleanup()
+                removeAllToolHandlesForCleanup(
+                    staleSendingFailureMessage = if (waitForStartedSends) null else TOOL_CALL_CANCELED_BY_SESSION_END,
+                )
             }
             val handlesToPersistCanceled = if (waitForStartedSends) {
                 cleanup.cancelableHandles
@@ -345,9 +347,9 @@ class VoiceAgentCoordinator(
     fun prepareForReconnect() {
         invalidateActiveSession()
         val handles = synchronized(toolJobsLock) {
-            removeAllToolHandlesForCleanup()
+            removeAllToolHandlesForCleanup(staleSendingFailureMessage = TOOL_CALL_CANCELED_BY_RECONNECT)
         }
-        handles.cancelableHandles.forEach {
+        (handles.cancelableHandles + handles.sendingHandles).forEach {
             persistToolCanceled(it, TOOL_CALL_CANCELED_BY_RECONNECT)
         }
         val jobs = handles.cancelableHandles.map { it.job }
@@ -471,24 +473,39 @@ class VoiceAgentCoordinator(
                 }
                 val sent = gemini.sendToolResponse(callId, response.answer)
                 val activeAfterSend = isToolHandleActive(callId, handle)
+                val staleSendingFailureMessage = if (activeAfterSend) null else staleSendingFailureMessage(handle)
                 if (sent) {
-                    diagnostics.record("hermes_tool_succeeded", "callId=$callId")
-                    persistToolStatus(
-                        callId = callId,
-                        prompt = prompt,
-                        status = VoiceToolRecordStatus.Complete(response.answer),
-                    )
+                    if (staleSendingFailureMessage == null) {
+                        diagnostics.record("hermes_tool_succeeded", "callId=$callId")
+                        persistToolStatus(
+                            callId = callId,
+                            prompt = prompt,
+                            status = VoiceToolRecordStatus.Complete(response.answer),
+                        )
+                    } else {
+                        diagnostics.record(
+                            "stale_hermes_tool_send_completed",
+                            "callId=$callId, message=$staleSendingFailureMessage",
+                        )
+                    }
                     if (activeAfterSend) {
                         updateToolStatus(callId, VoiceToolStatus.HermesAnswered(callId = callId, elapsedMs = 0L))
                     }
                 } else {
                     val message = "Failed to send Gemini tool response message"
-                    diagnostics.record("hermes_tool_failed", "callId=$callId, message=$message")
-                    persistToolStatus(
-                        callId = callId,
-                        prompt = prompt,
-                        status = VoiceToolRecordStatus.Failed(message),
-                    )
+                    if (staleSendingFailureMessage == null) {
+                        diagnostics.record("hermes_tool_failed", "callId=$callId, message=$message")
+                        persistToolStatus(
+                            callId = callId,
+                            prompt = prompt,
+                            status = VoiceToolRecordStatus.Failed(message),
+                        )
+                    } else {
+                        diagnostics.record(
+                            "stale_hermes_tool_send_failed",
+                            "callId=$callId, message=$staleSendingFailureMessage",
+                        )
+                    }
                     if (activeAfterSend) {
                         updateToolStatus(callId, VoiceToolStatus.HermesFailed(callId = callId, message = message))
                     }
@@ -631,8 +648,13 @@ class VoiceAgentCoordinator(
         }
     }
 
-    private fun removeAllToolHandlesForCleanup(): ToolCleanup {
+    private fun removeAllToolHandlesForCleanup(staleSendingFailureMessage: String? = null): ToolCleanup {
         val cleanup = toolJobs.values.toList().toCleanup()
+        if (staleSendingFailureMessage != null) {
+            cleanup.sendingHandles.forEach {
+                it.staleSendingFailureMessage = staleSendingFailureMessage
+            }
+        }
         toolJobs.clear()
         toolCallLocks.clear()
         cancelledToolCallIds.clear()
@@ -659,6 +681,10 @@ class VoiceAgentCoordinator(
 
     private fun hasToolResponseSendStarted(handle: ToolJobHandle): Boolean = synchronized(toolJobsLock) {
         handle.sendStarted
+    }
+
+    private fun staleSendingFailureMessage(handle: ToolJobHandle): String? = synchronized(toolJobsLock) {
+        handle.staleSendingFailureMessage
     }
 
     private fun toolCallLock(callId: String): Any = synchronized(toolJobsLock) {
@@ -804,6 +830,7 @@ class VoiceAgentCoordinator(
         lateinit var job: Job
         var superseded: Boolean = false
         var sendStarted: Boolean = false
+        var staleSendingFailureMessage: String? = null
         val key: ToolCallKey get() = ToolCallKey(sessionId = sessionId, callId = callId)
     }
 
