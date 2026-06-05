@@ -421,7 +421,6 @@ class VoiceAgentCoordinator(
             return
         }
         diagnostics.record("hermes_tool_started", "callId=${call.callId}")
-        persistToolStatus(callId = call.callId, prompt = call.prompt, status = VoiceToolRecordStatus.Pending)
         job.invokeOnCompletion {
             synchronized(toolJobsLock) {
                 if (toolJobs[call.callId] === handle && !handle.superseded) {
@@ -506,15 +505,7 @@ class VoiceAgentCoordinator(
         synchronized(toolCallLock(callId)) {
             val currentHandle = synchronized(toolJobsLock) {
                 if (!canAcceptToolHandle(callId, handle)) return false
-                val currentHandle = toolJobs[callId]
-                if (currentHandle != null) {
-                    if (currentHandle.sendStarted) {
-                        diagnostics.record("duplicate_tool_call_after_send_started", "callId=$callId")
-                        return false
-                    }
-                    currentHandle.superseded = true
-                }
-                currentHandle
+                toolJobs[callId]
             }
             if (currentHandle != null) {
                 synchronized(currentHandle.sendLock) {
@@ -526,6 +517,11 @@ class VoiceAgentCoordinator(
                             return false
                         }
                         currentHandle.superseded = true
+                        persistToolStatus(
+                            callId = handle.callId,
+                            prompt = handle.prompt,
+                            status = VoiceToolRecordStatus.Pending,
+                        )
                         toolJobs[callId] = handle
                         updateToolStatus(callId, VoiceToolStatus.CallingHermes(callId))
                         currentHandle.job.cancel()
@@ -537,6 +533,11 @@ class VoiceAgentCoordinator(
                 if (!canAcceptToolHandle(callId, handle)) return false
                 toolJobs[callId]
                     ?.let { return false }
+                persistToolStatus(
+                    callId = handle.callId,
+                    prompt = handle.prompt,
+                    status = VoiceToolRecordStatus.Pending,
+                )
                 toolJobs[callId] = handle
                 updateToolStatus(callId, VoiceToolStatus.CallingHermes(callId))
                 return true
