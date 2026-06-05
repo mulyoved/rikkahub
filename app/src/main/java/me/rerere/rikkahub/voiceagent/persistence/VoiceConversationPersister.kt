@@ -41,6 +41,44 @@ class VoiceConversationPersister {
         )
     }
 
+    fun upsertUserTranscriptTurn(
+        conversation: Conversation,
+        text: String,
+    ): Conversation = upsertTranscriptTurn(
+        conversation = conversation,
+        message = UIMessage(
+            role = MessageRole.USER,
+            parts = listOf(
+                UIMessagePart.Text(
+                    text = text,
+                    metadata = voiceTranscriptMetadata(role = VOICE_TRANSCRIPT_USER_ROLE),
+                )
+            ),
+        ),
+        transcriptRole = VOICE_TRANSCRIPT_USER_ROLE,
+    )
+
+    fun upsertAssistantTranscriptTurn(
+        conversation: Conversation,
+        text: String,
+        interrupted: Boolean,
+    ): Conversation = upsertTranscriptTurn(
+        conversation = conversation,
+        message = UIMessage(
+            role = MessageRole.ASSISTANT,
+            parts = listOf(
+                UIMessagePart.Text(
+                    text = text,
+                    metadata = voiceTranscriptMetadata(
+                        role = VOICE_TRANSCRIPT_ASSISTANT_ROLE,
+                        status = if (interrupted) "interrupted" else "complete",
+                    ),
+                )
+            ),
+        ),
+        transcriptRole = VOICE_TRANSCRIPT_ASSISTANT_ROLE,
+    )
+
     fun upsertHermesTool(
         conversation: Conversation,
         callId: String,
@@ -84,6 +122,26 @@ class VoiceConversationPersister {
         )
     }
 
+    private fun upsertTranscriptTurn(
+        conversation: Conversation,
+        message: UIMessage,
+        transcriptRole: String,
+    ): Conversation {
+        if (message.parts.filterIsInstance<UIMessagePart.Text>().joinToString("") { it.text }.isBlank()) {
+            return conversation
+        }
+
+        val currentMessages = conversation.currentMessages
+        val lastMessage = currentMessages.lastOrNull()
+        if (lastMessage?.isVoiceTranscript(transcriptRole) == true) {
+            return conversation.updateCurrentMessages(
+                currentMessages.dropLast(1) + message.copy(id = lastMessage.id)
+            )
+        }
+
+        return conversation.appendMessage(message)
+    }
+
     private fun Conversation.appendMessage(message: UIMessage): Conversation {
         return updateCurrentMessages(currentMessages + message)
     }
@@ -110,6 +168,18 @@ class VoiceConversationPersister {
         put(HERMES_TOOL_STATUS_KEY, statusName)
     }
 
+    private fun voiceTranscriptMetadata(role: String, status: String? = null) = buildJsonObject {
+        put(VOICE_TRANSCRIPT_ROLE_KEY, role)
+        status?.let { put("voice_status", it) }
+    }
+
+    private fun UIMessage.isVoiceTranscript(transcriptRole: String): Boolean {
+        return parts.any { part ->
+            part is UIMessagePart.Text &&
+                part.metadata?.get(VOICE_TRANSCRIPT_ROLE_KEY)?.jsonPrimitive?.content == transcriptRole
+        }
+    }
+
     private val VoiceToolRecordStatus.statusName: String
         get() = when (this) {
             VoiceToolRecordStatus.Pending -> "pending"
@@ -121,5 +191,8 @@ class VoiceConversationPersister {
         const val ASK_HERMES_TOOL_NAME = "ask_hermes"
         const val HERMES_TOOL_SOURCE_KEY = "voice_tool_source"
         const val HERMES_TOOL_STATUS_KEY = "voice_tool_status"
+        const val VOICE_TRANSCRIPT_ROLE_KEY = "voice_transcript_role"
+        const val VOICE_TRANSCRIPT_USER_ROLE = "user"
+        const val VOICE_TRANSCRIPT_ASSISTANT_ROLE = "assistant"
     }
 }

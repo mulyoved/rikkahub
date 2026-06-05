@@ -82,6 +82,25 @@ class VoiceConversationPersisterTest {
     }
 
     @Test
+    fun `voice transcript upsert keeps streaming fragments in one visible turn`() {
+        val persister = VoiceConversationPersister()
+        val conversation = emptyConversation()
+            .let { persister.upsertUserTranscriptTurn(it, "hel") }
+            .let { persister.upsertUserTranscriptTurn(it, "hello") }
+            .let { persister.upsertAssistantTranscriptTurn(it, "h", interrupted = false) }
+            .let { persister.upsertAssistantTranscriptTurn(it, "hi", interrupted = true) }
+
+        assertEquals(
+            listOf(MessageRole.USER, MessageRole.ASSISTANT),
+            conversation.currentMessages.map { it.role },
+        )
+        assertEquals("hello", conversation.currentMessages[0].parts.text())
+        assertEquals("hi", conversation.currentMessages[1].parts.text())
+        val assistantText = conversation.currentMessages[1].parts.single() as UIMessagePart.Text
+        assertEquals("interrupted", assistantText.metadata!!["voice_status"]!!.jsonPrimitive.content)
+    }
+
+    @Test
     fun `complete upsert updates pending tool before newer assistant turn without appending duplicate`() {
         val persister = VoiceConversationPersister()
         val conversation = emptyConversation()

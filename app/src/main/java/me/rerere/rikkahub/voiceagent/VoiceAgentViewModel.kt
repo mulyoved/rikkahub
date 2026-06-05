@@ -116,13 +116,20 @@ class VoiceAgentCoordinator(
     private val closeLock = Any()
     private val eventLock = Any()
     private val toolJobsLock = Any()
+    private val persistenceJobsLock = Any()
     private val persistenceLock = Mutex()
+    private val persistenceScope = CoroutineScope(SupervisorJob() + (dispatcher ?: Dispatchers.IO))
+    private val persistenceJobs = mutableSetOf<Job>()
+    private var lastPersistenceJob: Job? = null
     private val toolJobs = mutableMapOf<String, ToolJobHandle>()
     private val toolCallLocks = mutableMapOf<String, Any>()
     private val cancelledToolCallIds = mutableSetOf<String>()
     private var closing = false
     private var closed = false
     private var outputAudioSuppressed = false
+    private var activeTranscriptSpeaker: TranscriptSpeaker? = null
+    private var inputTurnTranscript = ""
+    private var outputTurnTranscript = ""
 
     private val _state = MutableStateFlow(VoiceAgentUiState())
     val state: StateFlow<VoiceAgentUiState> = _state.asStateFlow()
@@ -136,9 +143,14 @@ class VoiceAgentCoordinator(
     }
 
     fun suppressPlayback() {
-        outputAudioSuppressed = true
-        audio.suppressPlayback()
-        _state.update { it.reduce(VoiceAgentEvent.UserInterrupted) }
+        synchronized(eventLock) {
+            outputAudioSuppressed = true
+            audio.suppressPlayback()
+            if (outputTurnTranscript.isNotBlank()) {
+                persistAssistantTranscript()
+            }
+            _state.update { it.reduce(VoiceAgentEvent.UserInterrupted) }
+        }
     }
 
     fun onGeminiEvent(event: GeminiLiveEvent) {
@@ -195,6 +207,28 @@ class VoiceAgentCoordinator(
         }
     }
 
+    suspend fun awaitPersistenceJobs() {
+        while (true) {
+            val jobs = synchronized(persistenceJobsLock) {
+                if (persistenceJobs.isEmpty()) {
+                    return
+                }
+                persistenceJobs.toList()
+            }
+            jobs.joinAll()
+        }
+    }
+
+    suspend fun closeAndDrain() {
+        close()
+        awaitPersistenceJobs()
+        persistenceScope.cancel()
+    }
+
+    fun stopPersistenceScope() {
+        persistenceScope.cancel()
+    }
+
     fun close() {
         synchronized(closeLock) {
             synchronized(toolJobsLock) {
@@ -233,19 +267,53 @@ class VoiceAgentCoordinator(
         }
     }
 
+    fun prepareForReconnect() {
+        val handles = synchronized(toolJobsLock) {
+            toolJobs.values.toList()
+        }
+        val jobs = handles.map { handle ->
+            synchronized(handle.sendLock) {
+                handle.job
+            }
+        }
+        synchronized(toolJobsLock) {
+            toolJobs.clear()
+            toolCallLocks.clear()
+            cancelledToolCallIds.clear()
+        }
+        jobs.forEach { it.cancel() }
+        synchronized(eventLock) {
+            outputAudioSuppressed = false
+        }
+        _state.update {
+            it.copy(
+                tool = VoiceToolStatus.Idle,
+                toolCalls = emptyMap(),
+            )
+        }
+    }
+
     private fun appendInputTranscript(text: String) {
+        if (activeTranscriptSpeaker != TranscriptSpeaker.User) {
+            inputTurnTranscript = ""
+        }
+        activeTranscriptSpeaker = TranscriptSpeaker.User
+        inputTurnTranscript += text
         outputAudioSuppressed = false
         _state.update { it.copy(inputTranscript = it.inputTranscript + text) }
         persistConversation { conversation ->
-            persister.appendUserTurn(conversation = conversation, text = text)
+            persister.upsertUserTranscriptTurn(conversation = conversation, text = inputTurnTranscript)
         }
     }
 
     private fun appendOutputTranscript(text: String) {
-        _state.update { it.copy(outputTranscript = it.outputTranscript + text) }
-        persistConversation { conversation ->
-            persister.appendAssistantTurn(conversation = conversation, text = text, interrupted = outputAudioSuppressed)
+        if (activeTranscriptSpeaker != TranscriptSpeaker.Assistant) {
+            outputTurnTranscript = ""
         }
+        activeTranscriptSpeaker = TranscriptSpeaker.Assistant
+        outputTurnTranscript += text
+        _state.update { it.copy(outputTranscript = it.outputTranscript + text) }
+        persistAssistantTranscript()
     }
 
     private fun playOutputAudio(base64Pcm16: String) {
@@ -478,26 +546,64 @@ class VoiceAgentCoordinator(
         }
     }
 
+    private fun persistAssistantTranscript() {
+        persistConversation { conversation ->
+            persister.upsertAssistantTranscriptTurn(
+                conversation = conversation,
+                text = outputTurnTranscript,
+                interrupted = outputAudioSuppressed,
+            )
+        }
+    }
+
     private fun persistConversation(transform: (Conversation) -> Conversation) {
         val store = conversationStore ?: return
-        coordinatorScope.launch(toolLaunchContext) {
-            _state.update { it.copy(persistence = VoicePersistenceStatus.Saving) }
-            runCatching {
-                persistenceLock.withLock {
-                    store.update(transform)
-                }
-            }.onSuccess {
-                _state.update { it.copy(persistence = VoicePersistenceStatus.Saved) }
-            }.onFailure { error ->
-                val message = error.message ?: error.javaClass.simpleName
-                diagnostics.record("conversation_persist_failed", message)
-                _state.update { it.copy(persistence = VoicePersistenceStatus.SaveFailed(message)) }
+        lateinit var job: Job
+        synchronized(persistenceJobsLock) {
+            val previousJob = lastPersistenceJob
+            job = persistenceScope.launch(start = CoroutineStart.LAZY) {
+                previousJob?.join()
+                persistConversationNow(store = store, transform = transform)
             }
+            persistenceJobs += job
+            lastPersistenceJob = job
+        }
+        job.invokeOnCompletion {
+            synchronized(persistenceJobsLock) {
+                persistenceJobs -= job
+                if (lastPersistenceJob === job) {
+                    lastPersistenceJob = null
+                }
+            }
+        }
+        job.start()
+    }
+
+    private suspend fun persistConversationNow(
+        store: VoiceConversationStore,
+        transform: (Conversation) -> Conversation,
+    ) {
+        runCatching {
+            _state.update { it.copy(persistence = VoicePersistenceStatus.Saving) }
+            persistenceLock.withLock {
+                store.update(transform)
+            }
+        }.onSuccess {
+            _state.update { it.copy(persistence = VoicePersistenceStatus.Saved) }
+        }.onFailure { error ->
+            val message = error.message ?: error.javaClass.simpleName
+            diagnostics.record("conversation_persist_failed", message)
+            _state.update { it.copy(persistence = VoicePersistenceStatus.SaveFailed(message)) }
         }
     }
 
     private companion object {
         const val ASK_HERMES_TOOL = "ask_hermes"
+    }
+
+    private enum class TranscriptSpeaker {
+        User,
+        Assistant,
     }
 
     private class ToolJobHandle(
@@ -587,6 +693,7 @@ class VoiceAgentViewModel(
     fun reconnect() {
         startJob?.cancel()
         audio.stopCapture()
+        coordinator.prepareForReconnect()
         gemini.close()
         coordinator.updateSessionStatus(VoiceSessionStatus.Reconnecting)
         start()
@@ -596,6 +703,10 @@ class VoiceAgentViewModel(
         startJob?.cancel()
         coordinator.updateSessionStatus(VoiceSessionStatus.Ending)
         coordinator.close()
+        lifecycleScope.launch {
+            coordinator.awaitPersistenceJobs()
+            coordinator.stopPersistenceScope()
+        }
     }
 
     private fun startCapture() {

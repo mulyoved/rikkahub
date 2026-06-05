@@ -106,11 +106,16 @@ class TestableGeminiLiveVoiceClient(
                     )
                 },
             )
-            sendOrGetPendingError(
+            when (val result = sendOrGetPendingError(
                 generation = generation,
                 text = setupMessage,
                 errorMessage = "Failed to send Gemini setup message",
-            )
+            )) {
+                is SendResult.Failed -> result.error
+                SendResult.Sent,
+                SendResult.Stale,
+                    -> null
+            }
         }
         setupError?.emitIfCurrent()
     }
@@ -238,24 +243,29 @@ class TestableGeminiLiveVoiceClient(
         text: String,
         errorMessage: String,
     ): Boolean {
-        val error = sendOrGetPendingError(
+        return when (val result = sendOrGetPendingError(
             generation = generation,
             text = text,
             errorMessage = errorMessage,
-        )
-        error?.emitIfCurrent()
-        return error == null
+        )) {
+            is SendResult.Failed -> {
+                result.error.emitIfCurrent()
+                false
+            }
+            SendResult.Sent -> true
+            SendResult.Stale -> false
+        }
     }
 
     private fun sendOrGetPendingError(
         generation: Long,
         text: String,
         errorMessage: String,
-    ): PendingError? {
+    ): SendResult {
         val sendFailed = synchronized(lock) {
             val state = sessionState
                 ?.takeIf { it.generation == generation && !it.closed }
-                ?: return null
+                ?: return SendResult.Stale
             if (socket.send(text)) {
                 false
             } else {
@@ -263,9 +273,9 @@ class TestableGeminiLiveVoiceClient(
             }
         }
         return if (sendFailed) {
-            PendingError(generation = generation, message = errorMessage)
+            SendResult.Failed(PendingError(generation = generation, message = errorMessage))
         } else {
-            null
+            SendResult.Sent
         }
     }
 
@@ -311,6 +321,12 @@ class TestableGeminiLiveVoiceClient(
         val generation: Long,
         val message: String,
     )
+
+    private sealed interface SendResult {
+        data object Sent : SendResult
+        data object Stale : SendResult
+        data class Failed(val error: PendingError) : SendResult
+    }
 
     private fun PendingError.emitIfCurrent() {
         emitIfCurrent(

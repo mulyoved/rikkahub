@@ -316,6 +316,26 @@ class GeminiLiveVoiceClientTest {
     }
 
     @Test
+    fun `send tool response returns false after session closes`() = runBlocking {
+        val socket = FakeGeminiSocket()
+        val client = TestableGeminiLiveVoiceClient(socket = socket, codec = GeminiLiveCodec())
+
+        client.connect(
+            token = "token-1",
+            websocketUrl = "wss://example.test/live",
+            providerModel = "gemini-2.0-flash-live-001",
+            liveConnectConfig = liveConnectConfig,
+            systemInstruction = "You are Hermes.",
+            contextTurns = emptyList(),
+            onEvent = {},
+        )
+        socket.receive(setupCompleteMessage)
+        client.close()
+
+        assertFalse(client.sendToolResponse(callId = "call-closed", answer = "42"))
+    }
+
+    @Test
     fun `close cannot interleave before connect opens and sends setup`() = runBlocking {
         val closeStarted = CountDownLatch(1)
         val closeCompleted = CountDownLatch(1)

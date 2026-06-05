@@ -879,7 +879,7 @@ class VoiceAgentViewModelTest {
     }
 
     @Test
-    fun `coordinator persists transcripts and Hermes tool records`() = runTest {
+    fun `coordinator persists transcript fragments as turns and Hermes tool records`() = runTest {
         val conversationStore = FakeVoiceConversationStore()
         val toolApi = FakeVoiceToolApi()
         val coordinator = VoiceAgentCoordinator(
@@ -890,13 +890,15 @@ class VoiceAgentViewModelTest {
             scope = this,
         )
 
-        coordinator.onGeminiEvent(GeminiLiveEvent.InputTranscript("hello"))
-        coordinator.onGeminiEvent(GeminiLiveEvent.OutputTranscript("hi"))
+        coordinator.onGeminiEvent(GeminiLiveEvent.InputTranscript("hel"))
+        coordinator.onGeminiEvent(GeminiLiveEvent.InputTranscript("lo"))
+        coordinator.onGeminiEvent(GeminiLiveEvent.OutputTranscript("h"))
+        coordinator.onGeminiEvent(GeminiLiveEvent.OutputTranscript("i"))
         coordinator.onGeminiEvent(GeminiLiveEvent.ToolCall(callId = "call-persist", name = "ask_hermes", prompt = "look up"))
         assertEquals("call-persist" to "look up", toolApi.awaitRequest("call-persist"))
         toolApi.complete(response(callId = "call-persist", answer = "tool answer"))
         coordinator.awaitToolJobsWithTimeout()
-        conversationStore.awaitUpdateCount(4)
+        conversationStore.awaitUpdateCount(6)
 
         val messages = conversationStore.conversation.value.currentMessages
         assertEquals(3, messages.size)
@@ -905,6 +907,28 @@ class VoiceAgentViewModelTest {
         val tool = messages[2].parts.filterIsInstance<UIMessagePart.Tool>().single()
         assertEquals("call-persist", tool.toolCallId)
         assertTrue(tool.output.filterIsInstance<UIMessagePart.Text>().any { it.text == "tool answer" })
+    }
+
+    @Test
+    fun `reconnect cleanup cancels in flight Hermes call and suppresses stale response`() = runTest {
+        val gemini = FakeGeminiLiveVoiceClient()
+        val toolApi = FakeVoiceToolApi()
+        val coordinator = VoiceAgentCoordinator(
+            gemini = gemini,
+            toolApi = toolApi,
+            audio = FakeVoiceAudioEngine(),
+            scope = this,
+        )
+
+        coordinator.onGeminiEvent(GeminiLiveEvent.ToolCall(callId = "call-reconnect", name = "ask_hermes", prompt = "old"))
+        assertEquals("call-reconnect" to "old", toolApi.awaitRequest("call-reconnect"))
+
+        coordinator.prepareForReconnect()
+        toolApi.complete(response(callId = "call-reconnect", answer = "old answer"))
+        coordinator.awaitToolJobsWithTimeout()
+
+        assertEquals(emptyList<Pair<String, String>>(), gemini.toolResponses)
+        assertEquals(VoiceToolStatus.Idle, coordinator.state.value.tool)
     }
 
     @Test
