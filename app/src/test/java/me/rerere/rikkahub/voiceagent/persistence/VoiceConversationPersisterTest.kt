@@ -213,6 +213,36 @@ class VoiceConversationPersisterTest {
     }
 
     @Test
+    fun `terminal upsert with reused call id replaces latest Hermes terminal record`() {
+        val persister = VoiceConversationPersister()
+        val conversation = emptyConversation()
+            .let {
+                persister.upsertHermesTool(
+                    conversation = it,
+                    callId = "call-1",
+                    prompt = "Original prompt",
+                    status = VoiceToolRecordStatus.Failed("Tool call canceled by session end"),
+                )
+            }
+            .let {
+                persister.upsertHermesTool(
+                    conversation = it,
+                    callId = "call-1",
+                    prompt = "Original prompt",
+                    status = VoiceToolRecordStatus.Complete("Late answer"),
+                )
+            }
+
+        val tools = conversation.currentMessages
+            .flatMap { it.parts }
+            .filterIsInstance<UIMessagePart.Tool>()
+
+        assertEquals(1, tools.size)
+        assertEquals("complete", tools.single().metadata!!["voice_tool_status"]!!.jsonPrimitive.content)
+        assertEquals("Late answer", tools.single().output.text())
+    }
+
+    @Test
     fun `upsert ignores non Hermes tool with same call id`() {
         val persister = VoiceConversationPersister()
         val normalTool = UIMessagePart.Tool(

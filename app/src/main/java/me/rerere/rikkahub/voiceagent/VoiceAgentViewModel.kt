@@ -140,7 +140,7 @@ class VoiceAgentCoordinator(
     private var activeSessionId = 0L
     private val toolJobs = mutableMapOf<String, ToolJobHandle>()
     private val toolCallLocks = mutableMapOf<String, Any>()
-    private val cancelledToolCallIds = mutableSetOf<String>()
+    private val cancelledToolCallIds = mutableSetOf<ToolCallKey>()
     private var closing = false
     private var closed = false
     private var outputAudioSuppressed = false
@@ -297,7 +297,12 @@ class VoiceAgentCoordinator(
                 closing = true
                 removeAllToolHandlesForCleanup()
             }
-            cleanup.cancelableHandles.forEach {
+            val handlesToPersistCanceled = if (waitForStartedSends) {
+                cleanup.cancelableHandles
+            } else {
+                cleanup.cancelableHandles + cleanup.sendingHandles
+            }
+            handlesToPersistCanceled.forEach {
                 persistToolCanceled(it, TOOL_CALL_CANCELED_BY_SESSION_END)
             }
             val jobs = cleanup.cancelableHandles.map { it.job }
@@ -519,7 +524,7 @@ class VoiceAgentCoordinator(
             !closing &&
             isHandleSessionActive(handle) &&
             !handle.superseded &&
-            callId !in cancelledToolCallIds &&
+            handle.key !in cancelledToolCallIds &&
             toolJobs[callId] === handle
     }
 
@@ -568,7 +573,7 @@ class VoiceAgentCoordinator(
     }
 
     private fun canAcceptToolHandle(callId: String, handle: ToolJobHandle): Boolean {
-        return !closed && !closing && isHandleSessionActive(handle) && callId !in cancelledToolCallIds
+        return !closed && !closing && isHandleSessionActive(handle) && handle.key !in cancelledToolCallIds
     }
 
     private fun isHandleSessionActive(handle: ToolJobHandle): Boolean {
@@ -585,26 +590,25 @@ class VoiceAgentCoordinator(
             name = "tool_call_cancellation",
             detail = event.callIds.joinToString(","),
         )
-        val handlesToCancel = event.callIds.mapNotNull(::cancelToolCall)
+        val handlesToCancel = event.callIds.mapNotNull { cancelToolCall(callId = it, sessionId = sessionId) }
         handlesToCancel.flatMap { it.cancelableHandles }.forEach {
             persistToolCanceled(it, TOOL_CALL_CANCELED_BY_GEMINI)
         }
         removeToolStatuses(event.callIds)
         handlesToCancel.flatMap { it.cancelableHandles }.forEach { it.job.cancel() }
-        handlesToCancel.flatMap { it.sendingHandles }.forEach { handle ->
-            synchronized(handle.sendLock) {
-                // Send already started; let the send result persist the terminal tool record.
-            }
-        }
     }
 
-    private fun cancelToolCall(callId: String): ToolCleanup? {
+    private fun cancelToolCall(callId: String, sessionId: Long?): ToolCleanup? {
         synchronized(toolCallLock(callId)) {
             return synchronized(toolJobsLock) {
-                cancelledToolCallIds += callId
-                toolJobs[callId] ?: run {
+                if (sessionId != null && activeSessionId != sessionId) {
+                    diagnostics.record("stale_gemini_event", GeminiLiveEvent.ToolCallCancellation::class.java.simpleName)
                     return null
                 }
+                val cancellationKey = ToolCallKey(sessionId = sessionId, callId = callId)
+                cancelledToolCallIds += cancellationKey
+                val activeHandle = toolJobs[callId] ?: return null
+                if (activeHandle.sessionId != sessionId) return null
                 val handle = toolJobs.remove(callId)
                 if (handle != null) {
                     handle.superseded = true
@@ -787,11 +791,17 @@ class VoiceAgentCoordinator(
         lateinit var job: Job
         var superseded: Boolean = false
         var sendStarted: Boolean = false
+        val key: ToolCallKey get() = ToolCallKey(sessionId = sessionId, callId = callId)
     }
 
     private data class ToolCleanup(
         val cancelableHandles: List<ToolJobHandle>,
         val sendingHandles: List<ToolJobHandle>,
+    )
+
+    private data class ToolCallKey(
+        val sessionId: Long?,
+        val callId: String,
     )
 }
 
@@ -816,7 +826,6 @@ class VoiceAgentViewModel(
         scope = lifecycleScope,
     )
     private var startJob: Job? = null
-    private val captureSendLock = Any()
     private var muted = false
     private var sessionId = 0L
     private var ended = false
@@ -901,10 +910,12 @@ class VoiceAgentViewModel(
         if (ended) return
         val previousJob = startJob
         invalidateActiveSessionForCapture()
+        audio.stopCapture()
+        audio.suppressPlayback()
+        gemini.close()
         val reconnectJob = lifecycleScope.launch {
             previousJob?.cancelAndJoin()
             if (ended) return@launch
-            audio.stopCapture()
             coordinator.prepareForReconnect()
             gemini.close()
             coordinator.updateSessionStatus(VoiceSessionStatus.Reconnecting)
@@ -920,6 +931,9 @@ class VoiceAgentViewModel(
         ended = true
         val previousJob = startJob
         invalidateActiveSessionForCapture()
+        audio.stopCapture()
+        audio.suppressPlayback()
+        gemini.close()
         lifecycleScope.launch {
             previousJob?.cancelAndJoin()
             coordinator.updateSessionStatus(VoiceSessionStatus.Ending)
@@ -934,6 +948,9 @@ class VoiceAgentViewModel(
         }
         invalidateActiveSessionForCapture()
         startJob?.cancel()
+        audio.stopCapture()
+        audio.suppressPlayback()
+        gemini.close()
         coordinator.updateSessionStatus(VoiceSessionStatus.Ending)
         coordinator.close(waitForStartedSends = false)
         coordinator.launchPersistenceDrain()
@@ -941,11 +958,11 @@ class VoiceAgentViewModel(
 
     private fun startCapture(currentSessionId: Long) {
         audio.startCapture { pcm16 ->
-            synchronized(captureSendLock) {
-                if (!coordinator.isActiveSession(currentSessionId)) {
-                    return@startCapture
-                }
-                gemini.sendAudio(Base64.getEncoder().encodeToString(pcm16))
+            if (!coordinator.isActiveSession(currentSessionId)) {
+                return@startCapture
+            }
+            gemini.sendAudio(Base64.getEncoder().encodeToString(pcm16))
+            if (coordinator.isActiveSession(currentSessionId)) {
                 coordinator.updateAudioStatus(VoiceAudioStatus.UserSpeaking)
             }
         }
@@ -953,9 +970,7 @@ class VoiceAgentViewModel(
     }
 
     private fun invalidateActiveSessionForCapture() {
-        synchronized(captureSendLock) {
-            coordinator.invalidateActiveSession()
-        }
+        coordinator.invalidateActiveSession()
     }
 
     override fun onCleared() {

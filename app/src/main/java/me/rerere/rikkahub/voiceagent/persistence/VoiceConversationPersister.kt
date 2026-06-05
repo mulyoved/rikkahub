@@ -105,7 +105,9 @@ class VoiceConversationPersister {
         val currentMessages = conversation.currentMessages
         val existingToolIndex = currentMessages.indexOfLast { message ->
             message.parts.any { part ->
-                part is UIMessagePart.Tool && part.isPendingHermesTool(callId)
+                part is UIMessagePart.Tool &&
+                    part.isHermesTool(callId) &&
+                    (status !is VoiceToolRecordStatus.Pending || part.isPendingHermesTool(callId))
             }
         }
         if (existingToolIndex >= 0) {
@@ -113,7 +115,15 @@ class VoiceConversationPersister {
             val existingMessage = currentMessages[existingToolIndex]
             updatedMessages[existingToolIndex] = existingMessage.copy(
                 parts = existingMessage.parts.map { part ->
-                    if (part is UIMessagePart.Tool && part.isPendingHermesTool(callId)) tool else part
+                    if (
+                        part is UIMessagePart.Tool &&
+                        part.isHermesTool(callId) &&
+                        (status !is VoiceToolRecordStatus.Pending || part.isPendingHermesTool(callId))
+                    ) {
+                        tool
+                    } else {
+                        part
+                    }
                 }
             )
             return conversation.updateCurrentMessages(updatedMessages)
