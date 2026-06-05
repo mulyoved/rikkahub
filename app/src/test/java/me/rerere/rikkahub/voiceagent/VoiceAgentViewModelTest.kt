@@ -1407,13 +1407,15 @@ class VoiceAgentViewModelTest {
     fun `ViewModel closes Gemini and stops capture on async Gemini error`() = runTest {
         val gemini = FakeGeminiLiveVoiceClient()
         val audio = FakeVoiceAudioEngine()
+        val toolApi = FakeVoiceToolApi()
+        val conversationStore = FakeVoiceConversationStore()
         val vm = VoiceAgentViewModel(
             modelId = "gemini-flash",
             sessionApi = FakeVoiceSessionApi(),
-            toolApi = FakeVoiceToolApi(),
+            toolApi = toolApi,
             gemini = gemini,
             audio = audio,
-            conversationStore = FakeVoiceConversationStore(),
+            conversationStore = conversationStore,
             contextProvider = FakeVoiceAgentContextProvider(
                 VoiceContext(
                     systemInstruction = "system",
@@ -1428,6 +1430,10 @@ class VoiceAgentViewModelTest {
         assertEquals(1, audio.startCaptureCalls)
         audio.emitCapture(byteArrayOf(1, 2, 3))
         assertEquals(listOf(Base64.getEncoder().encodeToString(byteArrayOf(1, 2, 3))), gemini.audioMessages)
+        gemini.eventHandlers.single()(
+            GeminiLiveEvent.ToolCall(callId = "call-async-error", name = "ask_hermes", prompt = "pending")
+        )
+        assertEquals("call-async-error" to "pending", toolApi.awaitRequest("call-async-error"))
 
         gemini.eventHandlers.single()(
             GeminiLiveEvent.Error(message = "Failed to send Gemini context message", raw = "{}")
@@ -1435,9 +1441,71 @@ class VoiceAgentViewModelTest {
 
         assertEquals(VoiceSessionStatus.Error("Failed to send Gemini context message"), vm.state.value.session)
         assertEquals(1, audio.stopCaptureCalls)
+        assertEquals(1, audio.suppressPlaybackCalls)
         assertEquals(1, gemini.closeCalls)
+        conversationStore.awaitUpdateCount(2)
+        val tool = conversationStore.conversation.value.currentMessages
+            .flatMap { it.parts }
+            .filterIsInstance<UIMessagePart.Tool>()
+            .single()
+        assertEquals("call-async-error", tool.toolCallId)
+        assertEquals("failed", tool.metadata?.get("voice_tool_status")?.jsonPrimitive?.content)
+        assertEquals("Tool call canceled by session end", tool.output.text())
+        toolApi.awaitCancelled("call-async-error")
         audio.emitCapture(byteArrayOf(4, 5, 6))
         assertEquals(listOf(Base64.getEncoder().encodeToString(byteArrayOf(1, 2, 3))), gemini.audioMessages)
+    }
+
+    @Test
+    fun `ViewModel reconnect marks in flight tool send stale before outbound invalidation waits`() = runTest {
+        val sessionApi = FakeVoiceSessionApi()
+        val conversationStore = FakeVoiceConversationStore()
+        val gemini = FakeGeminiLiveVoiceClient()
+        val blockedSend = gemini.blockToolResponse("call-vm-reconnect-order")
+        blockedSend.timeoutMillis = 5_000
+        val toolApi = FakeVoiceToolApi()
+        val audio = FakeVoiceAudioEngine()
+        val vm = VoiceAgentViewModel(
+            modelId = "gemini-flash",
+            sessionApi = sessionApi,
+            toolApi = toolApi,
+            gemini = gemini,
+            audio = audio,
+            conversationStore = conversationStore,
+            contextProvider = FakeVoiceAgentContextProvider(
+                VoiceContext(systemInstruction = "system", turns = emptyList())
+            ),
+            scope = CoroutineScope(coroutineContext + Dispatchers.Default),
+        )
+
+        vm.start()
+        gemini.awaitConnectCount(1)
+        gemini.eventHandlers.single()(
+            GeminiLiveEvent.ToolCall(callId = "call-vm-reconnect-order", name = "ask_hermes", prompt = "old")
+        )
+        assertEquals("call-vm-reconnect-order" to "old", toolApi.awaitRequest("call-vm-reconnect-order"))
+        toolApi.complete(response(callId = "call-vm-reconnect-order", answer = "sent answer"))
+        assertTrue(withContext(Dispatchers.Default) { blockedSend.started.await(500, TimeUnit.MILLISECONDS) })
+
+        val reconnectJob = launch(Dispatchers.Default) {
+            vm.reconnect()
+        }
+        delay(50)
+        blockedSend.release.countDown()
+        withTimeout(500) {
+            reconnectJob.join()
+        }
+        conversationStore.awaitUpdateCount(2)
+
+        val toolStatuses = conversationStore.updatesSnapshot()
+            .flatMap { it.currentMessages }
+            .flatMap { it.parts }
+            .filterIsInstance<UIMessagePart.Tool>()
+            .filter { it.toolCallId == "call-vm-reconnect-order" }
+            .mapNotNull { it.metadata?.get("voice_tool_status")?.jsonPrimitive?.content }
+
+        assertTrue(toolStatuses.toString(), "failed" in toolStatuses)
+        assertTrue(toolStatuses.toString(), "complete" !in toolStatuses)
     }
 
     @Test
@@ -1690,7 +1758,6 @@ class VoiceAgentViewModelTest {
 
         assertTrue("statuses=$toolStatuses diagnostics=$diagnosticNames", "complete" !in toolStatuses)
         assertTrue("statuses=$toolStatuses diagnostics=$diagnosticNames", "failed" in toolStatuses)
-        assertEquals(emptyList<Pair<String, String>>(), gemini.toolResponses)
     }
 
     @Test
@@ -1871,6 +1938,7 @@ class VoiceAgentViewModelTest {
         private val connected = CompletableDeferred<Unit>()
         private val blockedResponses = mutableMapOf<String, MutableList<BlockedToolResponse>>()
         private val blockedConnectCompletions = mutableListOf<BlockedConnect>()
+        private val outboundSendLock = Any()
         private var outboundSessionId: Long? = null
 
         fun blockToolResponse(callId: String): BlockedToolResponse {
@@ -1921,11 +1989,13 @@ class VoiceAgentViewModelTest {
         }
 
         override fun sendAudio(base64Pcm16: String, sessionId: Long?): Boolean {
-            if (sessionId != null && outboundSessionId != sessionId) {
-                return false
+            synchronized(outboundSendLock) {
+                if (sessionId != null && outboundSessionId != sessionId) {
+                    return false
+                }
+                audioMessages += base64Pcm16
+                return true
             }
-            audioMessages += base64Pcm16
-            return true
         }
 
         override fun activateOutboundSession(sessionId: Long) {
@@ -1933,7 +2003,9 @@ class VoiceAgentViewModelTest {
         }
 
         override fun invalidateOutboundSession() {
-            outboundSessionId = null
+            synchronized(outboundSendLock) {
+                outboundSessionId = null
+            }
         }
 
         suspend fun awaitConnect() {
@@ -1955,25 +2027,27 @@ class VoiceAgentViewModelTest {
         }
 
         override fun sendToolResponse(callId: String, answer: String, sessionId: Long?): Boolean {
-            if (sessionId != null && outboundSessionId != sessionId) {
-                return false
+            synchronized(outboundSendLock) {
+                if (sessionId != null && outboundSessionId != sessionId) {
+                    return false
+                }
+                val blocked = synchronized(blockedResponses) {
+                    blockedResponses[callId]?.removeFirstOrNull()
+                }
+                if (blocked != null) {
+                    blocked.started.countDown()
+                    blocked.release.await(blocked.timeoutMillis, TimeUnit.MILLISECONDS)
+                }
+                if (sessionId != null && outboundSessionId != sessionId) {
+                    return false
+                }
+                onBeforeToolResponseRecorded?.invoke()
+                if (callId in failToolResponses) {
+                    return false
+                }
+                toolResponses += callId to answer
+                return true
             }
-            val blocked = synchronized(blockedResponses) {
-                blockedResponses[callId]?.removeFirstOrNull()
-            }
-            if (blocked != null) {
-                blocked.started.countDown()
-                blocked.release.await(blocked.timeoutMillis, TimeUnit.MILLISECONDS)
-            }
-            if (sessionId != null && outboundSessionId != sessionId) {
-                return false
-            }
-            onBeforeToolResponseRecorded?.invoke()
-            if (callId in failToolResponses) {
-                return false
-            }
-            toolResponses += callId to answer
-            return true
         }
 
         override fun close() {

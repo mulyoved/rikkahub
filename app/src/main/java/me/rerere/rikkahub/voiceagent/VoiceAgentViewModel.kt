@@ -990,9 +990,10 @@ class VoiceAgentViewModel(
 
     private fun cleanupFailedStartup(sessionId: Long, closeGemini: Boolean) {
         if (!coordinator.isActiveSession(sessionId)) return
+        coordinator.prepareForSessionEnd()
         invalidateAudioSessions()
-        coordinator.invalidateActiveSession()
         audio.stopCapture()
+        audio.suppressPlayback()
         if (closeGemini) {
             gemini.close()
         }
@@ -1023,8 +1024,8 @@ class VoiceAgentViewModel(
     fun reconnect() {
         if (ended) return
         val previousJob = startJob
-        invalidateAudioSessions()
         coordinator.prepareForReconnect()
+        invalidateAudioSessions()
         audio.stopCapture()
         audio.suppressPlayback()
         gemini.close()
@@ -1043,8 +1044,8 @@ class VoiceAgentViewModel(
         if (ended) return
         ended = true
         val previousJob = startJob
-        invalidateAudioSessions()
         coordinator.prepareForSessionEnd()
+        invalidateAudioSessions()
         audio.stopCapture()
         audio.suppressPlayback()
         gemini.close()
@@ -1060,9 +1061,9 @@ class VoiceAgentViewModel(
         if (!ended) {
             ended = true
         }
-        invalidateAudioSessions()
         startJob?.cancel()
         coordinator.prepareForSessionEnd()
+        invalidateAudioSessions()
         audio.stopCapture()
         audio.suppressPlayback()
         coordinator.updateSessionStatus(VoiceSessionStatus.Ending)
