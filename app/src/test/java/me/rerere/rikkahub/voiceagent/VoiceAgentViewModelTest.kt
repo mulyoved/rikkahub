@@ -1491,6 +1491,7 @@ class VoiceAgentViewModelTest {
         withTimeout(500) {
             eventJob.join()
         }
+        assertEquals(emptyList<String>(), audio.playedPcm16)
         assertFalse(vm.state.value.audio == VoiceAudioStatus.AssistantSpeaking)
     }
 
@@ -1565,6 +1566,7 @@ class VoiceAgentViewModelTest {
         private val connected = CompletableDeferred<Unit>()
         private val blockedResponses = mutableMapOf<String, MutableList<BlockedToolResponse>>()
         private val blockedConnectCompletions = mutableListOf<BlockedConnect>()
+        private var outboundSessionId: Long? = null
 
         fun blockToolResponse(callId: String): BlockedToolResponse {
             return blockNextToolResponse(callId)
@@ -1612,6 +1614,22 @@ class VoiceAgentViewModelTest {
             audioMessages += base64Pcm16
         }
 
+        override fun sendAudio(base64Pcm16: String, sessionId: Long?): Boolean {
+            if (sessionId != null && outboundSessionId != sessionId) {
+                return false
+            }
+            audioMessages += base64Pcm16
+            return true
+        }
+
+        override fun activateOutboundSession(sessionId: Long) {
+            outboundSessionId = sessionId
+        }
+
+        override fun invalidateOutboundSession() {
+            outboundSessionId = null
+        }
+
         suspend fun awaitConnect() {
             withTimeout(500) {
                 connected.await()
@@ -1643,6 +1661,7 @@ class VoiceAgentViewModelTest {
         }
 
         override fun close() {
+            outboundSessionId = null
             closeCalls += 1
         }
     }
@@ -1733,6 +1752,7 @@ class VoiceAgentViewModelTest {
         var releaseCalls = 0
         var startCaptureCalls = 0
         var stopCaptureCalls = 0
+        private var playbackSessionId: Long? = null
         private var captureCallback: ((ByteArray) -> Unit)? = null
         private val blockedPlaybacks = mutableListOf<BlockedPlayback>()
         private val blockedSuppressions = mutableListOf<BlockedPlayback>()
@@ -1748,12 +1768,30 @@ class VoiceAgentViewModelTest {
         }
 
         override fun playPcm16(base64Pcm16: String) {
+            playPcm16(base64Pcm16 = base64Pcm16, sessionId = null)
+        }
+
+        override fun playPcm16(base64Pcm16: String, sessionId: Long?) {
+            if (sessionId != null && playbackSessionId != sessionId) {
+                return
+            }
             val blocked = synchronized(blockedPlaybacks) { blockedPlaybacks.removeFirstOrNull() }
             if (blocked != null) {
                 blocked.started.countDown()
                 blocked.release.await(500, TimeUnit.MILLISECONDS)
             }
+            if (sessionId != null && playbackSessionId != sessionId) {
+                return
+            }
             playedPcm16 += base64Pcm16
+        }
+
+        override fun activatePlaybackSession(sessionId: Long) {
+            playbackSessionId = sessionId
+        }
+
+        override fun invalidatePlaybackSession() {
+            playbackSessionId = null
         }
 
         override fun suppressPlayback() {

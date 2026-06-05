@@ -4,6 +4,11 @@ interface VoiceAudioEngine {
     fun startCapture(onPcm16: (ByteArray) -> Unit)
     fun stopCapture()
     fun playPcm16(base64Pcm16: String)
+    fun playPcm16(base64Pcm16: String, sessionId: Long?) {
+        playPcm16(base64Pcm16)
+    }
+    fun activatePlaybackSession(sessionId: Long) = Unit
+    fun invalidatePlaybackSession() = Unit
     fun suppressPlayback()
     fun release()
 }

@@ -41,6 +41,18 @@ class OkHttpGeminiLiveVoiceClient(
         delegate.sendAudio(base64Pcm16)
     }
 
+    override fun sendAudio(base64Pcm16: String, sessionId: Long?): Boolean {
+        return delegate.sendAudio(base64Pcm16 = base64Pcm16, sessionId = sessionId)
+    }
+
+    override fun activateOutboundSession(sessionId: Long) {
+        delegate.activateOutboundSession(sessionId)
+    }
+
+    override fun invalidateOutboundSession() {
+        delegate.invalidateOutboundSession()
+    }
+
     override fun sendToolResponse(callId: String, answer: String): Boolean {
         return delegate.sendToolResponse(callId = callId, answer = answer)
     }

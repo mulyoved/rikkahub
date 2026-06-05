@@ -231,8 +231,14 @@ class VoiceAgentCoordinator(
         if (shouldIgnoreEventAfterClose(event)) return
         when (event) {
             GeminiLiveEvent.SetupComplete -> diagnostics.record("gemini_setup_complete")
-            is GeminiLiveEvent.InputTranscript -> appendInputTranscript(event.text)
-            is GeminiLiveEvent.OutputTranscript -> appendOutputTranscript(event.text)
+            is GeminiLiveEvent.InputTranscript -> {
+                if (shouldIgnoreStaleSession(sessionId, event)) return
+                appendInputTranscript(event.text)
+            }
+            is GeminiLiveEvent.OutputTranscript -> {
+                if (shouldIgnoreStaleSession(sessionId, event)) return
+                appendOutputTranscript(event.text)
+            }
             is GeminiLiveEvent.OutputAudio -> playOutputAudio(event.base64Pcm16, sessionId = sessionId)
             is GeminiLiveEvent.Interrupted -> handleInterrupted(event)
             is GeminiLiveEvent.SessionResumptionUpdate -> diagnostics.record(
@@ -391,7 +397,8 @@ class VoiceAgentCoordinator(
             diagnostics.record("output_audio_suppressed_after_interruption")
             return
         }
-        audio.playPcm16(base64Pcm16)
+        if (shouldIgnoreStaleSession(sessionId, GeminiLiveEvent.OutputAudio(base64Pcm16))) return
+        audio.playPcm16(base64Pcm16, sessionId = sessionId)
         if (sessionId != null && !isActiveSession(sessionId)) {
             diagnostics.record("stale_output_audio_state_suppressed")
             return
@@ -516,6 +523,12 @@ class VoiceAgentCoordinator(
     private fun shouldIgnoreEventAfterClose(event: GeminiLiveEvent): Boolean {
         if (!isClosed()) return false
         diagnostics.record("gemini_event_after_close", event.javaClass.simpleName)
+        return true
+    }
+
+    private fun shouldIgnoreStaleSession(sessionId: Long?, event: GeminiLiveEvent): Boolean {
+        if (sessionId == null || isActiveSession(sessionId)) return false
+        diagnostics.record("stale_gemini_event", event.javaClass.simpleName)
         return true
     }
 
@@ -866,6 +879,8 @@ class VoiceAgentViewModel(
             )
             ensureActiveSession(currentSessionId)
             coordinator.updateSessionStatus(VoiceSessionStatus.Connected)
+            gemini.activateOutboundSession(currentSessionId)
+            audio.activatePlaybackSession(currentSessionId)
             if (!muted) {
                 startCapture(currentSessionId)
             }
@@ -961,8 +976,11 @@ class VoiceAgentViewModel(
             if (!coordinator.isActiveSession(currentSessionId)) {
                 return@startCapture
             }
-            gemini.sendAudio(Base64.getEncoder().encodeToString(pcm16))
-            if (coordinator.isActiveSession(currentSessionId)) {
+            val sent = gemini.sendAudio(
+                base64Pcm16 = Base64.getEncoder().encodeToString(pcm16),
+                sessionId = currentSessionId,
+            )
+            if (sent && coordinator.isActiveSession(currentSessionId)) {
                 coordinator.updateAudioStatus(VoiceAudioStatus.UserSpeaking)
             }
         }
@@ -971,6 +989,8 @@ class VoiceAgentViewModel(
 
     private fun invalidateActiveSessionForCapture() {
         coordinator.invalidateActiveSession()
+        gemini.invalidateOutboundSession()
+        audio.invalidatePlaybackSession()
     }
 
     override fun onCleared() {

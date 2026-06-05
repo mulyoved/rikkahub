@@ -33,6 +33,7 @@ class AndroidVoiceAudioEngine(context: Context) : VoiceAudioEngine {
     private var audioTrack: AudioTrack? = null
     private var captureGeneration = 0L
     private var playbackGeneration = 0L
+    private var playbackSessionId: Long? = null
     private var released = false
 
     override fun startCapture(onPcm16: (ByteArray) -> Unit) {
@@ -180,6 +181,10 @@ class AndroidVoiceAudioEngine(context: Context) : VoiceAudioEngine {
     }
 
     override fun playPcm16(base64Pcm16: String) {
+        playPcm16(base64Pcm16 = base64Pcm16, sessionId = null)
+    }
+
+    override fun playPcm16(base64Pcm16: String, sessionId: Long?) {
         val pcm16 = runCatching { Base64.decode(base64Pcm16, Base64.NO_WRAP) }
             .onFailure { Log.w(TAG, "Dropping malformed playback chunk", it) }
             .getOrNull()
@@ -190,6 +195,9 @@ class AndroidVoiceAudioEngine(context: Context) : VoiceAudioEngine {
 
         val generation = synchronized(lock) {
             if (released) {
+                return
+            }
+            if (sessionId != null && playbackSessionId != sessionId) {
                 return
             }
             playbackGeneration
@@ -206,6 +214,24 @@ class AndroidVoiceAudioEngine(context: Context) : VoiceAudioEngine {
                 return
             }
             track.writeNonBlocking(pcm16, generation)
+        }
+    }
+
+    override fun activatePlaybackSession(sessionId: Long) {
+        synchronized(lock) {
+            if (!released) {
+                playbackSessionId = sessionId
+                playbackGeneration += 1
+            }
+        }
+    }
+
+    override fun invalidatePlaybackSession() {
+        synchronized(lock) {
+            if (!released) {
+                playbackSessionId = null
+                playbackGeneration += 1
+            }
         }
     }
 
@@ -244,6 +270,7 @@ class AndroidVoiceAudioEngine(context: Context) : VoiceAudioEngine {
             released = true
             captureGeneration += 1
             playbackGeneration += 1
+            playbackSessionId = null
             job = captureJob
             captureJob = null
             recorder = audioRecord

@@ -14,6 +14,12 @@ interface GeminiLiveVoiceClient {
     )
 
     fun sendAudio(base64Pcm16: String)
+    fun sendAudio(base64Pcm16: String, sessionId: Long?): Boolean {
+        sendAudio(base64Pcm16)
+        return true
+    }
+    fun activateOutboundSession(sessionId: Long) = Unit
+    fun invalidateOutboundSession() = Unit
 
     fun sendToolResponse(callId: String, answer: String): Boolean
 
@@ -42,6 +48,7 @@ class TestableGeminiLiveVoiceClient(
     private val lifecycleLock = Any()
     private var nextGeneration = 0L
     private var sessionState: SessionState? = null
+    private var outboundSessionId: Long? = null
 
     override suspend fun connect(
         token: String,
@@ -128,6 +135,31 @@ class TestableGeminiLiveVoiceClient(
         )
     }
 
+    override fun sendAudio(base64Pcm16: String, sessionId: Long?): Boolean {
+        synchronized(lock) {
+            if (sessionId != null && outboundSessionId != sessionId) {
+                return false
+            }
+        }
+        return sendPostSetupMessage(
+            text = codec.realtimeAudioMessage(base64Pcm16),
+            errorMessage = "Failed to send Gemini audio message",
+            queueBeforeSetup = true,
+        )
+    }
+
+    override fun activateOutboundSession(sessionId: Long) {
+        synchronized(lock) {
+            outboundSessionId = sessionId
+        }
+    }
+
+    override fun invalidateOutboundSession() {
+        synchronized(lock) {
+            outboundSessionId = null
+        }
+    }
+
     override fun sendToolResponse(callId: String, answer: String): Boolean {
         return sendPostSetupMessage(
             text = codec.toolResponseMessage(callId = callId, answer = answer),
@@ -145,6 +177,7 @@ class TestableGeminiLiveVoiceClient(
                     state.pendingOutboundMessages.clear()
                 }
                 sessionState = null
+                outboundSessionId = null
             }
             socket.close()
         }
