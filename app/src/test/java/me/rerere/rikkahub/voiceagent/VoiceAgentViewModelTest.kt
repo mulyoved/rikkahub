@@ -8,6 +8,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
@@ -833,10 +834,12 @@ class VoiceAgentViewModelTest {
         val toolApi = FakeVoiceToolApi()
         val audio = FakeVoiceAudioEngine()
         val blockedPlayback = audio.blockNextPlayback()
+        val diagnostics = VoiceDiagnostics()
         val coordinator = VoiceAgentCoordinator(
             gemini = gemini,
             toolApi = toolApi,
             audio = audio,
+            diagnostics = diagnostics,
             scope = this,
             dispatcher = Dispatchers.Default,
         )
@@ -854,6 +857,7 @@ class VoiceAgentViewModelTest {
         val closeJob = launch(Dispatchers.Default) {
             coordinator.close()
         }
+        diagnostics.awaitEvent("coordinator_closing")
         toolApi.complete(response(callId = "call-close-wait", answer = "late answer"))
         coordinator.awaitToolJobsWithTimeout()
 
@@ -1543,6 +1547,58 @@ class VoiceAgentViewModelTest {
     }
 
     @Test
+    fun `ViewModel reconnect does not persist stale tool send completion during close gap`() = runTest {
+        val sessionApi = FakeVoiceSessionApi()
+        val conversationStore = FakeVoiceConversationStore()
+        val gemini = FakeGeminiLiveVoiceClient()
+        val blockedSend = gemini.blockToolResponse("call-vm-reconnect-sending")
+        blockedSend.timeoutMillis = 5_000
+        val toolApi = FakeVoiceToolApi()
+        val diagnostics = VoiceDiagnostics()
+        val vm = VoiceAgentViewModel(
+            modelId = "gemini-flash",
+            sessionApi = sessionApi,
+            toolApi = toolApi,
+            gemini = gemini,
+            audio = FakeVoiceAudioEngine(),
+            conversationStore = conversationStore,
+            contextProvider = FakeVoiceAgentContextProvider(
+                VoiceContext(systemInstruction = "system", turns = emptyList())
+            ),
+            diagnostics = diagnostics,
+            scope = CoroutineScope(coroutineContext + Dispatchers.Default),
+        )
+
+        vm.start()
+        gemini.awaitConnectCount(1)
+        val oldCallback = gemini.eventHandlers.single()
+        oldCallback(GeminiLiveEvent.ToolCall(callId = "call-vm-reconnect-sending", name = "ask_hermes", prompt = "old"))
+        assertEquals("call-vm-reconnect-sending" to "old", toolApi.awaitRequest("call-vm-reconnect-sending"))
+        toolApi.complete(response(callId = "call-vm-reconnect-sending", answer = "sent answer"))
+        assertTrue(withContext(Dispatchers.Default) { blockedSend.started.await(500, TimeUnit.MILLISECONDS) })
+        val closeHookCalled = CountDownLatch(1)
+        gemini.onClose = {
+            blockedSend.release.countDown()
+            closeHookCalled.countDown()
+        }
+
+        vm.reconnect()
+        assertTrue(closeHookCalled.await(500, TimeUnit.MILLISECONDS))
+        conversationStore.awaitUpdateCount(2)
+
+        val toolStatuses = conversationStore.updatesSnapshot()
+            .flatMap { it.currentMessages }
+            .flatMap { it.parts }
+            .filterIsInstance<UIMessagePart.Tool>()
+            .filter { it.toolCallId == "call-vm-reconnect-sending" }
+            .mapNotNull { it.metadata?.get("voice_tool_status")?.jsonPrimitive?.content }
+        val diagnosticNames = diagnostics.events.value.map { it.name }
+
+        assertTrue("statuses=$toolStatuses diagnostics=$diagnosticNames", "complete" !in toolStatuses)
+        assertTrue("statuses=$toolStatuses diagnostics=$diagnosticNames", "failed" in toolStatuses)
+    }
+
+    @Test
     fun `ViewModel end immediately invalidates previous Gemini callback`() = runTest {
         val sessionApi = FakeVoiceSessionApi()
         val gemini = FakeGeminiLiveVoiceClient()
@@ -1596,6 +1652,14 @@ class VoiceAgentViewModelTest {
     private fun List<UIMessagePart>.text(): String =
         filterIsInstance<UIMessagePart.Text>().joinToString("") { it.text }
 
+    private suspend fun VoiceDiagnostics.awaitEvent(name: String) {
+        withTimeout(500) {
+            while (events.value.none { it.name == name }) {
+                delay(10)
+            }
+        }
+    }
+
     private fun runTest(block: suspend CoroutineScope.() -> Unit) = runBlocking(block = block)
 
     private class FakeGeminiLiveVoiceClient : GeminiLiveVoiceClient {
@@ -1604,6 +1668,7 @@ class VoiceAgentViewModelTest {
         val failToolResponses = mutableSetOf<String>()
         var closeCalls = 0
         var onBeforeToolResponseRecorded: (() -> Unit)? = null
+        var onClose: (() -> Unit)? = null
         var connectedToken: String? = null
         var connectedWebsocketUrl: String? = null
         var connectedProviderModel: String? = null
@@ -1697,7 +1762,7 @@ class VoiceAgentViewModelTest {
             }
             if (blocked != null) {
                 blocked.started.countDown()
-                blocked.release.await(500, TimeUnit.MILLISECONDS)
+                blocked.release.await(blocked.timeoutMillis, TimeUnit.MILLISECONDS)
             }
             onBeforeToolResponseRecorded?.invoke()
             if (callId in failToolResponses) {
@@ -1708,6 +1773,7 @@ class VoiceAgentViewModelTest {
         }
 
         override fun close() {
+            onClose?.invoke()
             outboundSessionId = null
             closeCalls += 1
         }
@@ -1716,6 +1782,7 @@ class VoiceAgentViewModelTest {
     private class BlockedToolResponse {
         val started = CountDownLatch(1)
         val release = CountDownLatch(1)
+        var timeoutMillis: Long = 500
     }
 
     private class BlockedConnect {
@@ -1918,6 +1985,10 @@ class VoiceAgentViewModelTest {
 
         fun updateAt(index: Int): Conversation = synchronized(updates) {
             updates[index]
+        }
+
+        fun updatesSnapshot(): List<Conversation> = synchronized(updates) {
+            updates.toList()
         }
 
         suspend fun awaitUpdateCount(count: Int) {

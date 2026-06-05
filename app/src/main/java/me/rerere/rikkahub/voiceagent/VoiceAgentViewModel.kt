@@ -138,6 +138,7 @@ class VoiceAgentCoordinator(
     private val persistenceJobs = mutableSetOf<Job>()
     private var lastPersistenceJob: Job? = null
     private var activeSessionId = 0L
+    private val staleToolSendFailureMessages = mutableMapOf<Long, String>()
     private val toolJobs = mutableMapOf<String, ToolJobHandle>()
     private val toolCallLocks = mutableMapOf<String, Any>()
     private val cancelledToolCallIds = mutableSetOf<ToolCallKey>()
@@ -167,8 +168,14 @@ class VoiceAgentCoordinator(
         activeSessionId
     }
 
-    fun invalidateActiveSession() {
-        nextSessionId()
+    fun invalidateActiveSession(staleToolSendFailureMessage: String? = null) {
+        synchronized(toolJobsLock) {
+            val staleSessionId = activeSessionId
+            activeSessionId += 1
+            if (staleToolSendFailureMessage != null) {
+                staleToolSendFailureMessages[staleSessionId] = staleToolSendFailureMessage
+            }
+        }
     }
 
     fun onGeminiEvent(sessionId: Long, event: GeminiLiveEvent) {
@@ -301,6 +308,7 @@ class VoiceAgentCoordinator(
             val cleanup = synchronized(toolJobsLock) {
                 if (closed || closing) return
                 closing = true
+                diagnostics.record("coordinator_closing")
                 removeAllToolHandlesForCleanup(
                     staleSendingFailureMessage = if (waitForStartedSends) null else TOOL_CALL_CANCELED_BY_SESSION_END,
                 )
@@ -309,6 +317,9 @@ class VoiceAgentCoordinator(
                 cleanup.cancelableHandles
             } else {
                 cleanup.cancelableHandles + cleanup.sendingHandles
+            }
+            if (waitForStartedSends) {
+                cleanup.sendingHandles.forEach { it.allowInactiveSendCompletion = true }
             }
             handlesToPersistCanceled.forEach {
                 persistToolCanceled(it, TOOL_CALL_CANCELED_BY_SESSION_END)
@@ -345,7 +356,8 @@ class VoiceAgentCoordinator(
     }
 
     fun prepareForReconnect() {
-        invalidateActiveSession()
+        diagnostics.record("prepare_for_reconnect")
+        invalidateActiveSession(staleToolSendFailureMessage = TOOL_CALL_CANCELED_BY_RECONNECT)
         val handles = synchronized(toolJobsLock) {
             removeAllToolHandlesForCleanup(staleSendingFailureMessage = TOOL_CALL_CANCELED_BY_RECONNECT)
         }
@@ -474,37 +486,42 @@ class VoiceAgentCoordinator(
                 val sent = gemini.sendToolResponse(callId, response.answer)
                 val activeAfterSend = isToolHandleActive(callId, handle)
                 val staleSendingFailureMessage = if (activeAfterSend) null else staleSendingFailureMessage(handle)
+                val canPersistInactiveSend = activeAfterSend || handle.allowInactiveSendCompletion
                 if (sent) {
-                    if (staleSendingFailureMessage == null) {
+                    if (canPersistInactiveSend) {
                         diagnostics.record("hermes_tool_succeeded", "callId=$callId")
                         persistToolStatus(
                             callId = callId,
                             prompt = prompt,
                             status = VoiceToolRecordStatus.Complete(response.answer),
                         )
-                    } else {
+                    } else if (staleSendingFailureMessage != null) {
                         diagnostics.record(
                             "stale_hermes_tool_send_completed",
                             "callId=$callId, message=$staleSendingFailureMessage",
                         )
+                    } else {
+                        diagnostics.record("inactive_hermes_tool_send_completed", "callId=$callId")
                     }
                     if (activeAfterSend) {
                         updateToolStatus(callId, VoiceToolStatus.HermesAnswered(callId = callId, elapsedMs = 0L))
                     }
                 } else {
                     val message = "Failed to send Gemini tool response message"
-                    if (staleSendingFailureMessage == null) {
+                    if (canPersistInactiveSend) {
                         diagnostics.record("hermes_tool_failed", "callId=$callId, message=$message")
                         persistToolStatus(
                             callId = callId,
                             prompt = prompt,
                             status = VoiceToolRecordStatus.Failed(message),
                         )
-                    } else {
+                    } else if (staleSendingFailureMessage != null) {
                         diagnostics.record(
                             "stale_hermes_tool_send_failed",
                             "callId=$callId, message=$staleSendingFailureMessage",
                         )
+                    } else {
+                        diagnostics.record("inactive_hermes_tool_send_failed", "callId=$callId, message=$message")
                     }
                     if (activeAfterSend) {
                         updateToolStatus(callId, VoiceToolStatus.HermesFailed(callId = callId, message = message))
@@ -643,7 +660,7 @@ class VoiceAgentCoordinator(
                 if (handle != null) {
                     handle.superseded = true
                 }
-                handle?.toCleanup()
+                handle?.toCleanup(allowInactiveSendCompletion = true)
             }
         }
     }
@@ -670,8 +687,11 @@ class VoiceAgentCoordinator(
         )
     }
 
-    private fun ToolJobHandle.toCleanup(): ToolCleanup {
+    private fun ToolJobHandle.toCleanup(allowInactiveSendCompletion: Boolean = false): ToolCleanup {
         superseded = true
+        if (allowInactiveSendCompletion) {
+            this.allowInactiveSendCompletion = true
+        }
         return if (sendStarted) {
             ToolCleanup(cancelableHandles = emptyList(), sendingHandles = listOf(this))
         } else {
@@ -684,7 +704,7 @@ class VoiceAgentCoordinator(
     }
 
     private fun staleSendingFailureMessage(handle: ToolJobHandle): String? = synchronized(toolJobsLock) {
-        handle.staleSendingFailureMessage
+        handle.staleSendingFailureMessage ?: handle.sessionId?.let(staleToolSendFailureMessages::get)
     }
 
     private fun toolCallLock(callId: String): Any = synchronized(toolJobsLock) {
@@ -831,6 +851,7 @@ class VoiceAgentCoordinator(
         var superseded: Boolean = false
         var sendStarted: Boolean = false
         var staleSendingFailureMessage: String? = null
+        var allowInactiveSendCompletion: Boolean = false
         val key: ToolCallKey get() = ToolCallKey(sessionId = sessionId, callId = callId)
     }
 
@@ -951,15 +972,14 @@ class VoiceAgentViewModel(
     fun reconnect() {
         if (ended) return
         val previousJob = startJob
-        invalidateActiveSessionForCapture()
+        invalidateAudioSessions()
+        coordinator.prepareForReconnect()
         audio.stopCapture()
         audio.suppressPlayback()
         gemini.close()
         val reconnectJob = lifecycleScope.launch {
             previousJob?.cancelAndJoin()
             if (ended) return@launch
-            coordinator.prepareForReconnect()
-            gemini.close()
             coordinator.updateSessionStatus(VoiceSessionStatus.Reconnecting)
             val currentSessionId = coordinator.nextSessionId()
             sessionId = currentSessionId
@@ -988,11 +1008,10 @@ class VoiceAgentViewModel(
         if (!ended) {
             ended = true
         }
-        invalidateActiveSessionForCapture()
+        invalidateAudioSessions()
         startJob?.cancel()
         audio.stopCapture()
         audio.suppressPlayback()
-        gemini.close()
         coordinator.updateSessionStatus(VoiceSessionStatus.Ending)
         coordinator.close(waitForStartedSends = false)
         coordinator.launchPersistenceDrain()
@@ -1015,7 +1034,11 @@ class VoiceAgentViewModel(
     }
 
     private fun invalidateActiveSessionForCapture() {
+        invalidateAudioSessions()
         coordinator.invalidateActiveSession()
+    }
+
+    private fun invalidateAudioSessions() {
         gemini.invalidateOutboundSession()
         audio.invalidatePlaybackSession()
     }
