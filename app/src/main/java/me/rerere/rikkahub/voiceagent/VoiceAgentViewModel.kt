@@ -154,11 +154,25 @@ class VoiceAgentCoordinator(
     }
 
     fun onGeminiEvent(sessionId: Long, event: GeminiLiveEvent) {
-        if (!isActiveSession(sessionId)) {
-            diagnostics.record("stale_gemini_event", event.javaClass.simpleName)
-            return
+        when (event) {
+            is GeminiLiveEvent.ToolCall -> handleToolCall(call = event, sessionId = sessionId)
+            is GeminiLiveEvent.ToolCalls -> {
+                if (!isActiveSession(sessionId)) {
+                    diagnostics.record("stale_gemini_event", event.javaClass.simpleName)
+                    return
+                }
+                event.unsupportedCalls.forEach(::recordUnsupportedToolCall)
+                event.calls.forEach { handleToolCall(call = it, sessionId = sessionId) }
+            }
+            is GeminiLiveEvent.ToolCallCancellation -> handleToolCallCancellation(event = event, sessionId = sessionId)
+            else -> synchronized(eventLock) {
+                if (!isActiveSession(sessionId)) {
+                    diagnostics.record("stale_gemini_event", event.javaClass.simpleName)
+                    return
+                }
+                onNonToolGeminiEvent(event)
+            }
         }
-        onGeminiEvent(event)
     }
 
     fun suppressPlayback() {
@@ -178,16 +192,16 @@ class VoiceAgentCoordinator(
         when (event) {
             is GeminiLiveEvent.ToolCall -> {
                 if (shouldIgnoreEventAfterClose(event)) return
-                handleToolCall(event)
+                handleToolCall(event, sessionId = null)
             }
             is GeminiLiveEvent.ToolCalls -> {
                 if (shouldIgnoreEventAfterClose(event)) return
                 event.unsupportedCalls.forEach(::recordUnsupportedToolCall)
-                event.calls.forEach(::handleToolCall)
+                event.calls.forEach { handleToolCall(call = it, sessionId = null) }
             }
             is GeminiLiveEvent.ToolCallCancellation -> {
                 if (shouldIgnoreEventAfterClose(event)) return
-                handleToolCallCancellation(event)
+                handleToolCallCancellation(event = event, sessionId = null)
             }
             else -> synchronized(eventLock) {
                 onNonToolGeminiEvent(event)
@@ -259,23 +273,29 @@ class VoiceAgentCoordinator(
 
     fun close() {
         synchronized(closeLock) {
-            synchronized(toolJobsLock) {
+            val handles = synchronized(toolJobsLock) {
                 if (closed || closing) return
                 closing = true
+                val activeHandles = toolJobs.values.toList()
+                toolJobs.clear()
+                toolCallLocks.clear()
+                cancelledToolCallIds.clear()
+                activeHandles
             }
+            handles.forEach {
+                persistToolCanceled(it, TOOL_CALL_CANCELED_BY_SESSION_END)
+            }
+            val jobs = handles.map { it.job }
+            jobs.forEach { it.cancel() }
             synchronized(eventLock) {
                 // Wait for any in-flight non-tool event to finish before resources are released.
             }
-            val handles = synchronized(toolJobsLock) {
-                toolJobs.values.toList()
-            }
-            val jobs = handles.map { handle ->
+            handles.forEach { handle ->
                 synchronized(handle.sendLock) {
-                    handle.job
+                    // Wait for any already-started Gemini tool response write to return.
                 }
             }
             synchronized(toolJobsLock) {
-                toolJobs.clear()
                 closed = true
                 closing = false
             }
@@ -286,7 +306,6 @@ class VoiceAgentCoordinator(
                     toolCalls = emptyMap(),
                 )
             }
-            jobs.forEach { it.cancel() }
             gemini.close()
             audio.release()
             if (ownsScope) {
@@ -296,20 +315,20 @@ class VoiceAgentCoordinator(
     }
 
     fun prepareForReconnect() {
-        nextSessionId()
+        synchronized(eventLock) {
+            nextSessionId()
+        }
         val handles = synchronized(toolJobsLock) {
-            toolJobs.values.toList()
-        }
-        val jobs = handles.map { handle ->
-            synchronized(handle.sendLock) {
-                handle.job
-            }
-        }
-        synchronized(toolJobsLock) {
+            val activeHandles = toolJobs.values.toList()
             toolJobs.clear()
             toolCallLocks.clear()
             cancelledToolCallIds.clear()
+            activeHandles
         }
+        handles.forEach {
+            persistToolCanceled(it, TOOL_CALL_CANCELED_BY_RECONNECT)
+        }
+        val jobs = handles.map { it.job }
         jobs.forEach { it.cancel() }
         synchronized(playbackSuppressionLock) {
             outputAudioSuppressed = false
@@ -375,7 +394,11 @@ class VoiceAgentCoordinator(
         diagnostics.record("gemini_event_ignored", event.raw)
     }
 
-    private fun handleToolCall(call: GeminiLiveEvent.ToolCall) {
+    private fun handleToolCall(call: GeminiLiveEvent.ToolCall, sessionId: Long?) {
+        if (sessionId != null && !isActiveSession(sessionId)) {
+            diagnostics.record("stale_gemini_event", call.javaClass.simpleName)
+            return
+        }
         diagnostics.record("tool_call_received", "callId=${call.callId}, name=${call.name}")
         if (call.name != ASK_HERMES_TOOL) {
             recordUnsupportedToolCall(
@@ -387,7 +410,7 @@ class VoiceAgentCoordinator(
             return
         }
 
-        val handle = ToolJobHandle()
+        val handle = ToolJobHandle(callId = call.callId, prompt = call.prompt, sessionId = sessionId)
         val job = coordinatorScope.launch(toolLaunchContext, start = CoroutineStart.LAZY) {
             runHermesToolCall(callId = call.callId, prompt = call.prompt, handle = handle)
         }
@@ -471,47 +494,49 @@ class VoiceAgentCoordinator(
     }
 
     private fun isToolHandleActive(callId: String, handle: ToolJobHandle): Boolean = synchronized(toolJobsLock) {
-        !closed && !closing && !handle.superseded && callId !in cancelledToolCallIds && toolJobs[callId] === handle
+        !closed &&
+            !closing &&
+            isHandleSessionActive(handle) &&
+            !handle.superseded &&
+            callId !in cancelledToolCallIds &&
+            toolJobs[callId] === handle
     }
 
     private fun registerToolHandle(callId: String, handle: ToolJobHandle): Boolean {
         synchronized(toolCallLock(callId)) {
             val currentHandle = synchronized(toolJobsLock) {
-                if (closed || closing || callId in cancelledToolCallIds) return false
-                toolJobs[callId]
-            }
-            if (currentHandle != null) {
-                val currentSendStarted = synchronized(toolJobsLock) {
-                    if (closed || closing || callId in cancelledToolCallIds) return false
-                    if (toolJobs[callId] !== currentHandle) return false
-                    currentHandle.sendStarted
-                }
-                if (currentSendStarted) {
-                    diagnostics.record("duplicate_tool_call_after_send_started", "callId=$callId")
-                    return false
-                }
-                synchronized(toolJobsLock) {
-                    if (closed || closing || callId in cancelledToolCallIds) return false
-                    if (toolJobs[callId] !== currentHandle) return false
+                if (!canAcceptToolHandle(callId, handle)) return false
+                val currentHandle = toolJobs[callId]
+                if (currentHandle != null) {
+                    if (currentHandle.sendStarted) {
+                        diagnostics.record("duplicate_tool_call_after_send_started", "callId=$callId")
+                        return false
+                    }
                     currentHandle.superseded = true
                 }
+                currentHandle
+            }
+            if (currentHandle != null) {
                 synchronized(currentHandle.sendLock) {
                     synchronized(toolJobsLock) {
-                        if (closed || closing || callId in cancelledToolCallIds) return false
-                        if (toolJobs[callId] === currentHandle) {
-                            toolJobs[callId] = handle
-                            updateToolStatus(callId, VoiceToolStatus.CallingHermes(callId))
-                            currentHandle.job.cancel()
-                            return true
+                        if (!canAcceptToolHandle(callId, handle)) return false
+                        if (toolJobs[callId] !== currentHandle) return false
+                        if (currentHandle.sendStarted) {
+                            diagnostics.record("duplicate_tool_call_after_send_started", "callId=$callId")
+                            return false
                         }
+                        currentHandle.superseded = true
+                        toolJobs[callId] = handle
+                        updateToolStatus(callId, VoiceToolStatus.CallingHermes(callId))
+                        currentHandle.job.cancel()
+                        return true
                     }
                 }
             }
             synchronized(toolJobsLock) {
-                if (closed || closing || callId in cancelledToolCallIds) return false
-                if (toolJobs[callId] !== currentHandle) {
-                    return false
-                }
+                if (!canAcceptToolHandle(callId, handle)) return false
+                toolJobs[callId]
+                    ?.let { return false }
                 toolJobs[callId] = handle
                 updateToolStatus(callId, VoiceToolStatus.CallingHermes(callId))
                 return true
@@ -519,33 +544,44 @@ class VoiceAgentCoordinator(
         }
     }
 
-    private fun handleToolCallCancellation(event: GeminiLiveEvent.ToolCallCancellation) {
+    private fun canAcceptToolHandle(callId: String, handle: ToolJobHandle): Boolean {
+        return !closed && !closing && isHandleSessionActive(handle) && callId !in cancelledToolCallIds
+    }
+
+    private fun isHandleSessionActive(handle: ToolJobHandle): Boolean {
+        val sessionId = handle.sessionId ?: return true
+        return activeSessionId == sessionId
+    }
+
+    private fun handleToolCallCancellation(event: GeminiLiveEvent.ToolCallCancellation, sessionId: Long?) {
+        if (sessionId != null && !isActiveSession(sessionId)) {
+            diagnostics.record("stale_gemini_event", event.javaClass.simpleName)
+            return
+        }
         diagnostics.record(
             name = "tool_call_cancellation",
             detail = event.callIds.joinToString(","),
         )
-        val jobsToCancel = event.callIds.mapNotNull(::cancelToolCall)
+        val handlesToCancel = event.callIds.mapNotNull(::cancelToolCall)
+        handlesToCancel.forEach {
+            persistToolCanceled(it, TOOL_CALL_CANCELED_BY_GEMINI)
+        }
         removeToolStatuses(event.callIds)
-        jobsToCancel.forEach { it.cancel() }
+        handlesToCancel.forEach { it.job.cancel() }
     }
 
-    private fun cancelToolCall(callId: String): Job? {
+    private fun cancelToolCall(callId: String): ToolJobHandle? {
         synchronized(toolCallLock(callId)) {
-            val handle = synchronized(toolJobsLock) {
+            return synchronized(toolJobsLock) {
+                cancelledToolCallIds += callId
                 toolJobs[callId] ?: run {
-                    cancelledToolCallIds += callId
                     return null
                 }
-            }
-            return synchronized(handle.sendLock) {
-                synchronized(toolJobsLock) {
-                    cancelledToolCallIds += callId
-                    if (toolJobs[callId] === handle) {
-                        toolJobs.remove(callId)?.job
-                    } else {
-                        null
-                    }
+                val handle = toolJobs.remove(callId)
+                if (handle != null) {
+                    handle.superseded = true
                 }
+                handle
             }
         }
     }
@@ -602,6 +638,14 @@ class VoiceAgentCoordinator(
                 status = status,
             )
         }
+    }
+
+    private fun persistToolCanceled(handle: ToolJobHandle, message: String) {
+        persistToolStatus(
+            callId = handle.callId,
+            prompt = handle.prompt,
+            status = VoiceToolRecordStatus.Failed(message),
+        )
     }
 
     private fun persistAssistantTranscript() {
@@ -666,6 +710,9 @@ class VoiceAgentCoordinator(
 
     private companion object {
         const val ASK_HERMES_TOOL = "ask_hermes"
+        const val TOOL_CALL_CANCELED_BY_GEMINI = "Tool call canceled by Gemini"
+        const val TOOL_CALL_CANCELED_BY_RECONNECT = "Tool call canceled by reconnect"
+        const val TOOL_CALL_CANCELED_BY_SESSION_END = "Tool call canceled by session end"
     }
 
     private enum class TranscriptSpeaker {
@@ -674,6 +721,9 @@ class VoiceAgentCoordinator(
     }
 
     private class ToolJobHandle(
+        val callId: String,
+        val prompt: String,
+        val sessionId: Long?,
         val sendLock: Any = Any(),
     ) {
         lateinit var job: Job

@@ -11,6 +11,7 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import me.rerere.rikkahub.voiceagent.audio.VoiceAudioEngine
 import me.rerere.rikkahub.data.model.Conversation
 import me.rerere.ai.ui.UIMessagePart
@@ -957,6 +958,96 @@ class VoiceAgentViewModelTest {
     }
 
     @Test
+    fun `tool cancellation persists accepted Hermes record as failed`() = runTest {
+        val conversationStore = FakeVoiceConversationStore()
+        val toolApi = FakeVoiceToolApi()
+        val coordinator = VoiceAgentCoordinator(
+            gemini = FakeGeminiLiveVoiceClient(),
+            toolApi = toolApi,
+            audio = FakeVoiceAudioEngine(),
+            conversationStore = conversationStore,
+            scope = this,
+        )
+
+        coordinator.onGeminiEvent(
+            GeminiLiveEvent.ToolCall(callId = "call-cancel-persist", name = "ask_hermes", prompt = "cancel me")
+        )
+        assertEquals("call-cancel-persist" to "cancel me", toolApi.awaitRequest("call-cancel-persist"))
+
+        coordinator.onGeminiEvent(GeminiLiveEvent.ToolCallCancellation(listOf("call-cancel-persist")))
+        toolApi.awaitCancelled("call-cancel-persist")
+        coordinator.awaitPersistenceJobsWithTimeout()
+
+        val tool = conversationStore.conversation.value.currentMessages
+            .flatMap { it.parts }
+            .filterIsInstance<UIMessagePart.Tool>()
+            .single()
+        assertEquals("call-cancel-persist", tool.toolCallId)
+        assertEquals("failed", tool.metadata?.get("voice_tool_status")?.jsonPrimitive?.content)
+        assertEquals("Tool call canceled by Gemini", tool.output.text())
+    }
+
+    @Test
+    fun `reconnect cleanup persists accepted Hermes record as failed`() = runTest {
+        val conversationStore = FakeVoiceConversationStore()
+        val toolApi = FakeVoiceToolApi()
+        val coordinator = VoiceAgentCoordinator(
+            gemini = FakeGeminiLiveVoiceClient(),
+            toolApi = toolApi,
+            audio = FakeVoiceAudioEngine(),
+            conversationStore = conversationStore,
+            scope = this,
+        )
+
+        coordinator.onGeminiEvent(
+            GeminiLiveEvent.ToolCall(callId = "call-reconnect-persist", name = "ask_hermes", prompt = "old")
+        )
+        assertEquals("call-reconnect-persist" to "old", toolApi.awaitRequest("call-reconnect-persist"))
+
+        coordinator.prepareForReconnect()
+        toolApi.awaitCancelled("call-reconnect-persist")
+        coordinator.awaitPersistenceJobsWithTimeout()
+
+        val tool = conversationStore.conversation.value.currentMessages
+            .flatMap { it.parts }
+            .filterIsInstance<UIMessagePart.Tool>()
+            .single()
+        assertEquals("call-reconnect-persist", tool.toolCallId)
+        assertEquals("failed", tool.metadata?.get("voice_tool_status")?.jsonPrimitive?.content)
+        assertEquals("Tool call canceled by reconnect", tool.output.text())
+    }
+
+    @Test
+    fun `close persists accepted Hermes record as failed`() = runTest {
+        val conversationStore = FakeVoiceConversationStore()
+        val toolApi = FakeVoiceToolApi()
+        val coordinator = VoiceAgentCoordinator(
+            gemini = FakeGeminiLiveVoiceClient(),
+            toolApi = toolApi,
+            audio = FakeVoiceAudioEngine(),
+            conversationStore = conversationStore,
+            scope = this,
+        )
+
+        coordinator.onGeminiEvent(
+            GeminiLiveEvent.ToolCall(callId = "call-close-persist", name = "ask_hermes", prompt = "close")
+        )
+        assertEquals("call-close-persist" to "close", toolApi.awaitRequest("call-close-persist"))
+
+        coordinator.close()
+        toolApi.awaitCancelled("call-close-persist")
+        coordinator.awaitPersistenceJobsWithTimeout()
+
+        val tool = conversationStore.conversation.value.currentMessages
+            .flatMap { it.parts }
+            .filterIsInstance<UIMessagePart.Tool>()
+            .single()
+        assertEquals("call-close-persist", tool.toolCallId)
+        assertEquals("failed", tool.metadata?.get("voice_tool_status")?.jsonPrimitive?.content)
+        assertEquals("Tool call canceled by session end", tool.output.text())
+    }
+
+    @Test
     fun `coordinator snapshots transcript text before delayed persistence writes`() = runTest {
         val conversationStore = FakeVoiceConversationStore()
         val firstUpdate = conversationStore.blockNextUpdate()
@@ -999,6 +1090,33 @@ class VoiceAgentViewModelTest {
 
         assertEquals(emptyList<Pair<String, String>>(), gemini.toolResponses)
         assertEquals(VoiceToolStatus.Idle, coordinator.state.value.tool)
+    }
+
+    @Test
+    fun `stale session events after reconnect do not mutate coordinator state`() = runTest {
+        val gemini = FakeGeminiLiveVoiceClient()
+        val toolApi = FakeVoiceToolApi()
+        val diagnostics = VoiceDiagnostics()
+        val coordinator = VoiceAgentCoordinator(
+            gemini = gemini,
+            toolApi = toolApi,
+            audio = FakeVoiceAudioEngine(),
+            diagnostics = diagnostics,
+            scope = this,
+        )
+        val staleSessionId = coordinator.nextSessionId()
+
+        coordinator.prepareForReconnect()
+        coordinator.onGeminiEvent(staleSessionId, GeminiLiveEvent.InputTranscript("late input"))
+        coordinator.onGeminiEvent(
+            staleSessionId,
+            GeminiLiveEvent.ToolCall(callId = "call-stale-session", name = "ask_hermes", prompt = "stale"),
+        )
+        delay(50)
+
+        assertEquals("", coordinator.state.value.inputTranscript)
+        assertEquals(emptyList<Pair<String, String>>(), toolApi.requests)
+        assertTrue(diagnostics.events.value.any { it.name == "stale_gemini_event" })
     }
 
     @Test
@@ -1155,6 +1273,12 @@ class VoiceAgentViewModelTest {
     private suspend fun VoiceAgentCoordinator.awaitToolJobsWithTimeout() {
         withTimeout(500) {
             awaitToolJobs()
+        }
+    }
+
+    private suspend fun VoiceAgentCoordinator.awaitPersistenceJobsWithTimeout() {
+        withTimeout(500) {
+            awaitPersistenceJobs()
         }
     }
 
