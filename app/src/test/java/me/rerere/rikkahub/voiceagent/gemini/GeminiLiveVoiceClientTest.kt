@@ -577,6 +577,56 @@ class GeminiLiveVoiceClientTest {
     }
 
     @Test
+    fun `outbound invalidation waits for token aware tool response handoff`() = runBlocking {
+        val socket = FakeGeminiSocket()
+        val client = TestableGeminiLiveVoiceClient(socket = socket, codec = GeminiLiveCodec())
+
+        client.connect(
+            token = "token-1",
+            websocketUrl = "wss://example.test/live",
+            providerModel = "gemini-2.0-flash-live-001",
+            liveConnectConfig = liveConnectConfig,
+            systemInstruction = "You are Hermes.",
+            contextTurns = emptyList(),
+            onEvent = {},
+        )
+        socket.receive(setupCompleteMessage)
+        client.activateOutboundSession(1L)
+
+        val sendStarted = CountDownLatch(1)
+        val releaseSend = CountDownLatch(1)
+        socket.beforeSend = { text ->
+            if ("functionResponses" in text) {
+                sendStarted.countDown()
+                releaseSend.await(500, TimeUnit.MILLISECONDS)
+            }
+        }
+        val sendThread = thread {
+            assertTrue(client.sendToolResponse(callId = "call-1", answer = "42", sessionId = 1L))
+        }
+        assertTrue(sendStarted.await(500, TimeUnit.MILLISECONDS))
+
+        val invalidationReturned = AtomicBoolean(false)
+        val invalidateThread = thread {
+            client.invalidateOutboundSession()
+            invalidationReturned.set(true)
+        }
+        Thread.sleep(50)
+        assertFalse(invalidationReturned.get())
+
+        releaseSend.countDown()
+        sendThread.join(500)
+        invalidateThread.join(500)
+
+        assertFalse(sendThread.isAlive)
+        assertFalse(invalidateThread.isAlive)
+        assertTrue(invalidationReturned.get())
+        client.activateOutboundSession(2L)
+        assertFalse(client.sendToolResponse(callId = "call-late", answer = "late", sessionId = 1L))
+        assertEquals(1, socket.sentMessages.count { "functionResponses" in it })
+    }
+
+    @Test
     fun `socket close before setup complete terminates session without flushing later sends`() = runBlocking {
         val socket = FakeGeminiSocket()
         val client = TestableGeminiLiveVoiceClient(socket = socket, codec = GeminiLiveCodec())

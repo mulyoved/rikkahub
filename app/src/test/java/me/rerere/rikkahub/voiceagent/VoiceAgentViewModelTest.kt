@@ -1596,6 +1596,7 @@ class VoiceAgentViewModelTest {
 
         assertTrue("statuses=$toolStatuses diagnostics=$diagnosticNames", "complete" !in toolStatuses)
         assertTrue("statuses=$toolStatuses diagnostics=$diagnosticNames", "failed" in toolStatuses)
+        assertEquals(emptyList<Pair<String, String>>(), gemini.toolResponses)
     }
 
     @Test
@@ -1854,12 +1855,22 @@ class VoiceAgentViewModelTest {
         }
 
         override fun sendToolResponse(callId: String, answer: String): Boolean {
+            return sendToolResponse(callId = callId, answer = answer, sessionId = null)
+        }
+
+        override fun sendToolResponse(callId: String, answer: String, sessionId: Long?): Boolean {
+            if (sessionId != null && outboundSessionId != sessionId) {
+                return false
+            }
             val blocked = synchronized(blockedResponses) {
                 blockedResponses[callId]?.removeFirstOrNull()
             }
             if (blocked != null) {
                 blocked.started.countDown()
                 blocked.release.await(blocked.timeoutMillis, TimeUnit.MILLISECONDS)
+            }
+            if (sessionId != null && outboundSessionId != sessionId) {
+                return false
             }
             onBeforeToolResponseRecorded?.invoke()
             if (callId in failToolResponses) {

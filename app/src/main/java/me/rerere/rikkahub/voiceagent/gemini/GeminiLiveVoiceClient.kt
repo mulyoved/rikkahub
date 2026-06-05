@@ -22,6 +22,9 @@ interface GeminiLiveVoiceClient {
     fun invalidateOutboundSession() = Unit
 
     fun sendToolResponse(callId: String, answer: String): Boolean
+    fun sendToolResponse(callId: String, answer: String, sessionId: Long?): Boolean {
+        return sendToolResponse(callId = callId, answer = answer)
+    }
 
     fun close()
 }
@@ -147,6 +150,7 @@ class TestableGeminiLiveVoiceClient(
                 text = codec.realtimeAudioMessage(base64Pcm16),
                 errorMessage = "Failed to send Gemini audio message",
                 queueBeforeSetup = true,
+                requiredOutboundSessionId = sessionId,
             )
         }
     }
@@ -171,6 +175,17 @@ class TestableGeminiLiveVoiceClient(
             errorMessage = "Failed to send Gemini tool response message",
             queueBeforeSetup = false,
         )
+    }
+
+    override fun sendToolResponse(callId: String, answer: String, sessionId: Long?): Boolean {
+        synchronized(outboundSendLock) {
+            return sendPostSetupMessage(
+                text = codec.toolResponseMessage(callId = callId, answer = answer),
+                errorMessage = "Failed to send Gemini tool response message",
+                queueBeforeSetup = false,
+                requiredOutboundSessionId = sessionId,
+            )
+        }
     }
 
     override fun close() {
@@ -254,8 +269,12 @@ class TestableGeminiLiveVoiceClient(
         text: String,
         errorMessage: String,
         queueBeforeSetup: Boolean,
+        requiredOutboundSessionId: Long? = null,
     ): Boolean {
         val generation = synchronized(lock) {
+            if (requiredOutboundSessionId != null && outboundSessionId != requiredOutboundSessionId) {
+                return false
+            }
             val state = sessionState?.takeUnless { it.closed } ?: return false
             if (!state.setupComplete || state.flushingSetupComplete) {
                 if (!queueBeforeSetup) {

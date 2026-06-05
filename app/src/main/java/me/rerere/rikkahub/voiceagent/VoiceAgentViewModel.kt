@@ -506,7 +506,11 @@ class VoiceAgentCoordinator(
                     if (!isToolHandleActive(callId, handle)) return
                     handle.sendStarted = true
                 }
-                val sent = gemini.sendToolResponse(callId, response.answer)
+                val sent = gemini.sendToolResponse(
+                    callId = callId,
+                    answer = response.answer,
+                    sessionId = handle.sessionId,
+                )
                 val activeAfterSend = isToolHandleActive(callId, handle)
                 val staleSendingFailureMessage = if (activeAfterSend) null else staleSendingFailureMessage(handle)
                 val canPersistInactiveSend = activeAfterSend || handle.allowInactiveSendCompletion
