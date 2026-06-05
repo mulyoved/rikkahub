@@ -339,11 +339,6 @@ class VoiceAgentCoordinator(
         }
         val jobs = handles.cancelableHandles.map { it.job }
         jobs.forEach { it.cancel() }
-        handles.sendingHandles.forEach { handle ->
-            synchronized(handle.sendLock) {
-                // Send already started; let the send result persist the terminal tool record.
-            }
-        }
         synchronized(playbackSuppressionLock) {
             outputAudioSuppressed = false
         }
@@ -856,7 +851,7 @@ class VoiceAgentViewModel(
             ensureActiveSession(currentSessionId)
             coordinator.updateSessionStatus(VoiceSessionStatus.Connected)
             if (!muted) {
-                startCapture()
+                startCapture(currentSessionId)
             }
         } catch (error: CancellationException) {
             throw error
@@ -891,7 +886,7 @@ class VoiceAgentViewModel(
             audio.stopCapture()
             coordinator.updateAudioStatus(VoiceAudioStatus.Muted)
         } else if (state.value.session == VoiceSessionStatus.Connected) {
-            startCapture()
+            startCapture(sessionId)
         }
     }
 
@@ -937,8 +932,11 @@ class VoiceAgentViewModel(
         coordinator.launchPersistenceDrain()
     }
 
-    private fun startCapture() {
+    private fun startCapture(currentSessionId: Long) {
         audio.startCapture { pcm16 ->
+            if (!coordinator.isActiveSession(currentSessionId)) {
+                return@startCapture
+            }
             gemini.sendAudio(Base64.getEncoder().encodeToString(pcm16))
             coordinator.updateAudioStatus(VoiceAudioStatus.UserSpeaking)
         }

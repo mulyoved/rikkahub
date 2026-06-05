@@ -1089,7 +1089,7 @@ class VoiceAgentViewModelTest {
     }
 
     @Test
-    fun `reconnect after Gemini tool response send starts persists Hermes record as complete`() = runTest {
+    fun `reconnect after Gemini tool response send starts does not wait and persists Hermes record as complete`() = runTest {
         val conversationStore = FakeVoiceConversationStore()
         val gemini = FakeGeminiLiveVoiceClient()
         val blockedSend = gemini.blockToolResponse("call-reconnect-sending-persist")
@@ -1113,17 +1113,23 @@ class VoiceAgentViewModelTest {
         val reconnectJob = launch(Dispatchers.Default) {
             coordinator.prepareForReconnect()
         }
-        assertFalse(blockedSend.release.await(50, TimeUnit.MILLISECONDS))
-        blockedSend.release.countDown()
         withTimeout(500) {
             reconnectJob.join()
         }
-        coordinator.awaitPersistenceJobsWithTimeout()
+        assertFalse(blockedSend.release.await(50, TimeUnit.MILLISECONDS))
 
-        val tool = conversationStore.conversation.value.currentMessages
-            .flatMap { it.parts }
-            .filterIsInstance<UIMessagePart.Tool>()
-            .single()
+        blockedSend.release.countDown()
+        val tool = withTimeout(500) {
+            var completedTool: UIMessagePart.Tool? = null
+            while (completedTool?.metadata?.get("voice_tool_status")?.jsonPrimitive?.content != "complete") {
+                delay(10)
+                completedTool = conversationStore.conversation.value.currentMessages
+                    .flatMap { it.parts }
+                    .filterIsInstance<UIMessagePart.Tool>()
+                    .singleOrNull()
+            }
+            completedTool
+        }
         assertEquals("call-reconnect-sending-persist", tool.toolCallId)
         assertEquals("complete", tool.metadata?.get("voice_tool_status")?.jsonPrimitive?.content)
         assertEquals("sent answer", tool.output.text())
@@ -1287,6 +1293,35 @@ class VoiceAgentViewModelTest {
         assertEquals(1, gemini.closeCalls)
         assertEquals(1, audio.releaseCalls)
         assertEquals(VoiceSessionStatus.Ended, vm.state.value.session)
+    }
+
+    @Test
+    fun `ViewModel reconnect suppresses stale capture frames before capture stops`() = runTest {
+        val sessionApi = FakeVoiceSessionApi()
+        val gemini = FakeGeminiLiveVoiceClient()
+        val audio = FakeVoiceAudioEngine()
+        val vm = VoiceAgentViewModel(
+            modelId = "gemini-flash",
+            sessionApi = sessionApi,
+            toolApi = FakeVoiceToolApi(),
+            gemini = gemini,
+            audio = audio,
+            conversationStore = FakeVoiceConversationStore(),
+            contextProvider = FakeVoiceAgentContextProvider(
+                VoiceContext(systemInstruction = "system", turns = emptyList())
+            ),
+            scope = this,
+        )
+
+        vm.start()
+        gemini.awaitConnect()
+        audio.emitCapture(byteArrayOf(1, 2, 3))
+        assertEquals(1, gemini.audioMessages.size)
+
+        vm.reconnect()
+        audio.emitCapture(byteArrayOf(4, 5, 6))
+
+        assertEquals(listOf(Base64.getEncoder().encodeToString(byteArrayOf(1, 2, 3))), gemini.audioMessages)
     }
 
     @Test
