@@ -192,7 +192,7 @@ class GeminiLiveVoiceClientTest {
     }
 
     @Test
-    fun `early audio and tool response wait for setup complete and flush after context`() = runBlocking {
+    fun `early audio waits for setup complete and tool response is rejected before setup`() = runBlocking {
         val socket = FakeGeminiSocket()
         val client = TestableGeminiLiveVoiceClient(socket = socket, codec = GeminiLiveCodec())
         val events = mutableListOf<GeminiLiveEvent>()
@@ -208,17 +208,16 @@ class GeminiLiveVoiceClientTest {
         )
 
         client.sendAudio("base64-audio")
-        client.sendToolResponse(callId = "call-1", answer = "42")
+        assertFalse(client.sendToolResponse(callId = "call-1", answer = "42"))
 
         assertEquals(1, socket.sentMessages.size)
         assertTrue("setup" in socket.sentMessages[0].jsonObject())
 
         socket.receive(setupCompleteMessage)
 
-        assertEquals(4, socket.sentMessages.size)
+        assertEquals(3, socket.sentMessages.size)
         assertTrue("clientContent" in socket.sentMessages[1].jsonObject())
         assertTrue("realtimeInput" in socket.sentMessages[2].jsonObject())
-        assertTrue("toolResponse" in socket.sentMessages[3].jsonObject())
         assertEquals(listOf(GeminiLiveEvent.SetupComplete), events)
     }
 
@@ -303,7 +302,7 @@ class GeminiLiveVoiceClientTest {
 
         socket.receive(setupCompleteMessage)
         events.clear()
-        client.sendToolResponse(callId = "call-1", answer = "42")
+        assertFalse(client.sendToolResponse(callId = "call-1", answer = "42"))
 
         assertEquals(
             listOf(

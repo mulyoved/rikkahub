@@ -3,24 +3,33 @@ package me.rerere.rikkahub.voiceagent
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.buildJsonObject
 import me.rerere.rikkahub.voiceagent.audio.VoiceAudioEngine
+import me.rerere.rikkahub.data.model.Conversation
+import me.rerere.ai.ui.UIMessagePart
 import me.rerere.rikkahub.voiceagent.gemini.GeminiContentTurn
 import me.rerere.rikkahub.voiceagent.gemini.GeminiLiveCodec
 import me.rerere.rikkahub.voiceagent.gemini.GeminiLiveEvent
 import me.rerere.rikkahub.voiceagent.gemini.GeminiLiveVoiceClient
+import me.rerere.rikkahub.voiceagent.persistence.VoiceContext
 import me.rerere.rikkahub.voiceagent.telemetry.VoiceDiagnostics
 import me.rerere.rikkahub.voiceagent.voicelab.MobileHermesResponse
+import me.rerere.rikkahub.voiceagent.voicelab.MobileVoiceSessionResponse
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.util.Base64
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import kotlin.uuid.Uuid
 
 class VoiceAgentViewModelTest {
     @Test
@@ -48,6 +57,8 @@ class VoiceAgentViewModelTest {
         assertEquals(1, audio.suppressPlaybackCalls)
         assertEquals(VoiceAudioStatus.PlaybackSuppressed, coordinator.state.value.audio)
         assertEquals(VoiceToolStatus.CallingHermes("call-1"), coordinator.state.value.tool)
+        coordinator.onGeminiEvent(GeminiLiveEvent.OutputAudio("late-audio"))
+        assertEquals(emptyList<String>(), audio.playedPcm16)
 
         toolApi.complete(response(callId = "call-1", answer = "Hermes answer"))
         coordinator.awaitToolJobsWithTimeout()
@@ -867,6 +878,77 @@ class VoiceAgentViewModelTest {
         assertEquals("Gemini failed", coordinator.state.value.error)
     }
 
+    @Test
+    fun `coordinator persists transcripts and Hermes tool records`() = runTest {
+        val conversationStore = FakeVoiceConversationStore()
+        val toolApi = FakeVoiceToolApi()
+        val coordinator = VoiceAgentCoordinator(
+            gemini = FakeGeminiLiveVoiceClient(),
+            toolApi = toolApi,
+            audio = FakeVoiceAudioEngine(),
+            conversationStore = conversationStore,
+            scope = this,
+        )
+
+        coordinator.onGeminiEvent(GeminiLiveEvent.InputTranscript("hello"))
+        coordinator.onGeminiEvent(GeminiLiveEvent.OutputTranscript("hi"))
+        coordinator.onGeminiEvent(GeminiLiveEvent.ToolCall(callId = "call-persist", name = "ask_hermes", prompt = "look up"))
+        assertEquals("call-persist" to "look up", toolApi.awaitRequest("call-persist"))
+        toolApi.complete(response(callId = "call-persist", answer = "tool answer"))
+        coordinator.awaitToolJobsWithTimeout()
+        conversationStore.awaitUpdateCount(4)
+
+        val messages = conversationStore.conversation.value.currentMessages
+        assertEquals(3, messages.size)
+        assertTrue(messages[0].parts.filterIsInstance<UIMessagePart.Text>().any { it.text == "hello" })
+        assertTrue(messages[1].parts.filterIsInstance<UIMessagePart.Text>().any { it.text == "hi" })
+        val tool = messages[2].parts.filterIsInstance<UIMessagePart.Tool>().single()
+        assertEquals("call-persist", tool.toolCallId)
+        assertTrue(tool.output.filterIsInstance<UIMessagePart.Text>().any { it.text == "tool answer" })
+    }
+
+    @Test
+    fun `ViewModel starts session forwards capture audio and closes resources`() = runTest {
+        val sessionApi = FakeVoiceSessionApi()
+        val gemini = FakeGeminiLiveVoiceClient()
+        val audio = FakeVoiceAudioEngine()
+        val vm = VoiceAgentViewModel(
+            modelId = "gemini-flash",
+            sessionApi = sessionApi,
+            toolApi = FakeVoiceToolApi(),
+            gemini = gemini,
+            audio = audio,
+            conversationStore = FakeVoiceConversationStore(),
+            contextProvider = FakeVoiceAgentContextProvider(
+                VoiceContext(
+                    systemInstruction = "system voice prompt",
+                    turns = listOf(GeminiContentTurn(role = "user", text = "prior turn")),
+                )
+            ),
+            scope = this,
+        )
+
+        vm.start()
+        gemini.awaitConnect()
+
+        assertEquals(listOf("gemini-flash"), sessionApi.createdSessions)
+        assertEquals("token-1", gemini.connectedToken)
+        assertEquals("wss://voice.test/live", gemini.connectedWebsocketUrl)
+        assertEquals("gemini-live-test", gemini.connectedProviderModel)
+        assertEquals("system voice prompt", gemini.connectedSystemInstruction)
+        assertEquals(listOf(GeminiContentTurn(role = "user", text = "prior turn")), gemini.connectedContextTurns)
+        assertEquals(1, audio.startCaptureCalls)
+
+        audio.emitCapture(byteArrayOf(1, 2, 3))
+        assertEquals(listOf(Base64.getEncoder().encodeToString(byteArrayOf(1, 2, 3))), gemini.audioMessages)
+
+        vm.end()
+
+        assertEquals(1, gemini.closeCalls)
+        assertEquals(1, audio.releaseCalls)
+        assertEquals(VoiceSessionStatus.Ended, vm.state.value.session)
+    }
+
     private fun response(callId: String, answer: String): MobileHermesResponse = MobileHermesResponse(
         callId = callId,
         answer = answer,
@@ -884,10 +966,17 @@ class VoiceAgentViewModelTest {
     private fun runTest(block: suspend CoroutineScope.() -> Unit) = runBlocking(block = block)
 
     private class FakeGeminiLiveVoiceClient : GeminiLiveVoiceClient {
+        val audioMessages = mutableListOf<String>()
         val toolResponses = mutableListOf<Pair<String, String>>()
         val failToolResponses = mutableSetOf<String>()
         var closeCalls = 0
         var onBeforeToolResponseRecorded: (() -> Unit)? = null
+        var connectedToken: String? = null
+        var connectedWebsocketUrl: String? = null
+        var connectedProviderModel: String? = null
+        var connectedSystemInstruction: String? = null
+        var connectedContextTurns: List<GeminiContentTurn> = emptyList()
+        private val connected = CompletableDeferred<Unit>()
         private val blockedResponses = mutableMapOf<String, MutableList<BlockedToolResponse>>()
 
         fun blockToolResponse(callId: String): BlockedToolResponse {
@@ -910,9 +999,24 @@ class VoiceAgentViewModelTest {
             systemInstruction: String,
             contextTurns: List<GeminiContentTurn>,
             onEvent: (GeminiLiveEvent) -> Unit,
-        ) = Unit
+        ) {
+            connectedToken = token
+            connectedWebsocketUrl = websocketUrl
+            connectedProviderModel = providerModel
+            connectedSystemInstruction = systemInstruction
+            connectedContextTurns = contextTurns
+            connected.complete(Unit)
+        }
 
-        override fun sendAudio(base64Pcm16: String) = Unit
+        override fun sendAudio(base64Pcm16: String) {
+            audioMessages += base64Pcm16
+        }
+
+        suspend fun awaitConnect() {
+            withTimeout(500) {
+                connected.await()
+            }
+        }
 
         override fun sendToolResponse(callId: String, answer: String): Boolean {
             val blocked = synchronized(blockedResponses) {
@@ -1015,11 +1119,20 @@ class VoiceAgentViewModelTest {
         val playedPcm16 = mutableListOf<String>()
         var suppressPlaybackCalls = 0
         var releaseCalls = 0
+        var startCaptureCalls = 0
+        var stopCaptureCalls = 0
+        private var captureCallback: ((ByteArray) -> Unit)? = null
         private val blockedPlaybacks = mutableListOf<BlockedPlayback>()
 
-        override fun startCapture(onPcm16: (ByteArray) -> Unit) = Unit
+        override fun startCapture(onPcm16: (ByteArray) -> Unit) {
+            startCaptureCalls += 1
+            captureCallback = onPcm16
+        }
 
-        override fun stopCapture() = Unit
+        override fun stopCapture() {
+            stopCaptureCalls += 1
+            captureCallback = null
+        }
 
         override fun playPcm16(base64Pcm16: String) {
             val blocked = synchronized(blockedPlaybacks) { blockedPlaybacks.removeFirstOrNull() }
@@ -1045,10 +1158,61 @@ class VoiceAgentViewModelTest {
                 }
             }
         }
+
+        fun emitCapture(pcm16: ByteArray) {
+            captureCallback?.invoke(pcm16)
+        }
     }
 
     private class BlockedPlayback {
         val started = CountDownLatch(1)
         val release = CountDownLatch(1)
+    }
+
+    private class FakeVoiceConversationStore : VoiceConversationStore {
+        private val updates = mutableListOf<Conversation>()
+        override val conversation: StateFlow<Conversation> = MutableStateFlow(
+            Conversation.ofId(id = Uuid.random())
+        )
+
+        override suspend fun update(transform: (Conversation) -> Conversation) {
+            val flow = conversation as MutableStateFlow<Conversation>
+            flow.value = transform(flow.value)
+            synchronized(updates) {
+                updates += flow.value
+            }
+        }
+
+        suspend fun awaitUpdateCount(count: Int) {
+            withTimeout(500) {
+                while (synchronized(updates) { updates.size } < count) {
+                    delay(10)
+                }
+            }
+        }
+    }
+
+    private class FakeVoiceSessionApi : VoiceSessionApi {
+        val createdSessions = mutableListOf<String>()
+
+        override suspend fun createSession(modelId: String): MobileVoiceSessionResponse {
+            createdSessions += modelId
+            return MobileVoiceSessionResponse(
+                token = "token-1",
+                modelId = modelId,
+                providerModel = "gemini-live-test",
+                apiVersion = "v1alpha",
+                websocketUrl = "wss://voice.test/live",
+                inputSampleRate = 16000,
+                outputSampleRate = 24000,
+                liveConnectConfig = buildJsonObject {},
+            )
+        }
+    }
+
+    private class FakeVoiceAgentContextProvider(
+        private val context: VoiceContext,
+    ) : VoiceAgentContextProvider {
+        override fun build(conversation: Conversation): VoiceContext = context
     }
 }

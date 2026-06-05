@@ -1,6 +1,7 @@
 package me.rerere.rikkahub.voiceagent
 
 import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
@@ -17,15 +18,86 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import me.rerere.rikkahub.data.datastore.SettingsStore
+import me.rerere.rikkahub.data.datastore.getAssistantById
+import me.rerere.rikkahub.data.model.Conversation
+import me.rerere.rikkahub.service.ChatService
 import me.rerere.rikkahub.voiceagent.audio.VoiceAudioEngine
 import me.rerere.rikkahub.voiceagent.gemini.GeminiLiveEvent
 import me.rerere.rikkahub.voiceagent.gemini.GeminiLiveVoiceClient
+import me.rerere.rikkahub.voiceagent.persistence.VoiceContext
+import me.rerere.rikkahub.voiceagent.persistence.VoiceContextBuilder
+import me.rerere.rikkahub.voiceagent.persistence.VoiceConversationPersister
+import me.rerere.rikkahub.voiceagent.persistence.VoiceToolRecordStatus
 import me.rerere.rikkahub.voiceagent.telemetry.VoiceDiagnostics
 import me.rerere.rikkahub.voiceagent.voicelab.MobileHermesResponse
+import me.rerere.rikkahub.voiceagent.voicelab.MobileVoiceSessionResponse
+import me.rerere.rikkahub.voiceagent.voicelab.VoiceLabMobileApi
+import java.util.Base64
 import kotlin.coroutines.EmptyCoroutineContext
+import kotlin.uuid.Uuid
+
+interface VoiceSessionApi {
+    suspend fun createSession(modelId: String): MobileVoiceSessionResponse
+}
+
+class VoiceLabVoiceSessionApi(
+    private val api: VoiceLabMobileApi,
+) : VoiceSessionApi {
+    override suspend fun createSession(modelId: String): MobileVoiceSessionResponse =
+        api.createSession(modelId = modelId)
+}
 
 interface VoiceToolApi {
     suspend fun askHermes(callId: String, prompt: String): MobileHermesResponse
+}
+
+class VoiceLabHermesToolApi(
+    private val api: VoiceLabMobileApi,
+    private val profileId: String? = null,
+) : VoiceToolApi {
+    override suspend fun askHermes(callId: String, prompt: String): MobileHermesResponse =
+        api.askHermes(callId = callId, prompt = prompt, profileId = profileId)
+}
+
+interface VoiceConversationStore {
+    val conversation: StateFlow<Conversation>
+    suspend fun update(transform: (Conversation) -> Conversation)
+}
+
+class ChatServiceVoiceConversationStore(
+    private val conversationId: Uuid,
+    private val chatService: ChatService,
+) : VoiceConversationStore {
+    override val conversation: StateFlow<Conversation> = chatService.getConversationFlow(conversationId)
+
+    override suspend fun update(transform: (Conversation) -> Conversation) {
+        val updatedConversation = transform(conversation.value)
+        chatService.saveConversation(conversationId = conversationId, conversation = updatedConversation)
+    }
+}
+
+interface VoiceAgentContextProvider {
+    fun build(conversation: Conversation): VoiceContext
+}
+
+class SettingsVoiceAgentContextProvider(
+    private val settingsStore: SettingsStore,
+    private val contextBuilder: VoiceContextBuilder = VoiceContextBuilder(),
+) : VoiceAgentContextProvider {
+    override fun build(conversation: Conversation): VoiceContext {
+        val settings = settingsStore.settingsFlow.value
+        val assistant = settings.getAssistantById(conversation.assistantId)
+        return contextBuilder.build(
+            assistantName = assistant?.name?.takeIf { it.isNotBlank() } ?: "RikkaHub",
+            assistantPrompt = conversation.customSystemPrompt
+                ?: assistant?.systemPrompt
+                ?: "",
+            conversation = conversation,
+        )
+    }
 }
 
 class VoiceAgentCoordinator(
@@ -33,6 +105,8 @@ class VoiceAgentCoordinator(
     private val toolApi: VoiceToolApi,
     private val audio: VoiceAudioEngine,
     private val diagnostics: VoiceDiagnostics = VoiceDiagnostics(),
+    private val conversationStore: VoiceConversationStore? = null,
+    private val persister: VoiceConversationPersister = VoiceConversationPersister(),
     scope: CoroutineScope? = null,
     dispatcher: CoroutineDispatcher? = null,
 ) {
@@ -42,14 +116,30 @@ class VoiceAgentCoordinator(
     private val closeLock = Any()
     private val eventLock = Any()
     private val toolJobsLock = Any()
+    private val persistenceLock = Mutex()
     private val toolJobs = mutableMapOf<String, ToolJobHandle>()
     private val toolCallLocks = mutableMapOf<String, Any>()
     private val cancelledToolCallIds = mutableSetOf<String>()
     private var closing = false
     private var closed = false
+    private var outputAudioSuppressed = false
 
     private val _state = MutableStateFlow(VoiceAgentUiState())
     val state: StateFlow<VoiceAgentUiState> = _state.asStateFlow()
+
+    fun updateSessionStatus(status: VoiceSessionStatus) {
+        _state.update { it.copy(session = status, error = (status as? VoiceSessionStatus.Error)?.message) }
+    }
+
+    fun updateAudioStatus(status: VoiceAudioStatus) {
+        _state.update { it.copy(audio = status) }
+    }
+
+    fun suppressPlayback() {
+        outputAudioSuppressed = true
+        audio.suppressPlayback()
+        _state.update { it.reduce(VoiceAgentEvent.UserInterrupted) }
+    }
 
     fun onGeminiEvent(event: GeminiLiveEvent) {
         when (event) {
@@ -129,6 +219,7 @@ class VoiceAgentCoordinator(
             }
             _state.update { current ->
                 current.copy(
+                    session = VoiceSessionStatus.Ended,
                     tool = VoiceToolStatus.Idle,
                     toolCalls = emptyMap(),
                 )
@@ -143,22 +234,32 @@ class VoiceAgentCoordinator(
     }
 
     private fun appendInputTranscript(text: String) {
+        outputAudioSuppressed = false
         _state.update { it.copy(inputTranscript = it.inputTranscript + text) }
+        persistConversation { conversation ->
+            persister.appendUserTurn(conversation = conversation, text = text)
+        }
     }
 
     private fun appendOutputTranscript(text: String) {
         _state.update { it.copy(outputTranscript = it.outputTranscript + text) }
+        persistConversation { conversation ->
+            persister.appendAssistantTurn(conversation = conversation, text = text, interrupted = outputAudioSuppressed)
+        }
     }
 
     private fun playOutputAudio(base64Pcm16: String) {
+        if (outputAudioSuppressed) {
+            diagnostics.record("output_audio_suppressed_after_interruption")
+            return
+        }
         audio.playPcm16(base64Pcm16)
         _state.update { it.copy(audio = VoiceAudioStatus.AssistantSpeaking) }
     }
 
     private fun handleInterrupted(event: GeminiLiveEvent.Interrupted) {
-        audio.suppressPlayback()
         diagnostics.record("gemini_interrupted", event.reason)
-        _state.update { it.reduce(VoiceAgentEvent.UserInterrupted) }
+        suppressPlayback()
     }
 
     private fun handleIgnored(event: GeminiLiveEvent.Ignored) {
@@ -188,6 +289,7 @@ class VoiceAgentCoordinator(
             return
         }
         diagnostics.record("hermes_tool_started", "callId=${call.callId}")
+        persistToolStatus(callId = call.callId, prompt = call.prompt, status = VoiceToolRecordStatus.Pending)
         job.invokeOnCompletion {
             synchronized(toolJobsLock) {
                 if (toolJobs[call.callId] === handle && !handle.superseded) {
@@ -209,10 +311,20 @@ class VoiceAgentCoordinator(
                 if (!isToolHandleActive(callId, handle)) return
                 if (sent) {
                     diagnostics.record("hermes_tool_succeeded", "callId=$callId")
+                    persistToolStatus(
+                        callId = callId,
+                        prompt = prompt,
+                        status = VoiceToolRecordStatus.Complete(response.answer),
+                    )
                     updateToolStatus(callId, VoiceToolStatus.HermesAnswered(callId = callId, elapsedMs = 0L))
                 } else {
                     val message = "Failed to send Gemini tool response message"
                     diagnostics.record("hermes_tool_failed", "callId=$callId, message=$message")
+                    persistToolStatus(
+                        callId = callId,
+                        prompt = prompt,
+                        status = VoiceToolRecordStatus.Failed(message),
+                    )
                     updateToolStatus(callId, VoiceToolStatus.HermesFailed(callId = callId, message = message))
                 }
             }
@@ -223,6 +335,11 @@ class VoiceAgentCoordinator(
             synchronized(handle.sendLock) {
                 if (!isToolHandleActive(callId, handle)) return
                 diagnostics.record("hermes_tool_failed", "callId=$callId, message=$message")
+                persistToolStatus(
+                    callId = callId,
+                    prompt = prompt,
+                    status = VoiceToolRecordStatus.Failed(message),
+                )
                 updateToolStatus(callId, VoiceToolStatus.HermesFailed(callId = callId, message = message))
             }
         }
@@ -350,6 +467,35 @@ class VoiceAgentCoordinator(
         diagnostics.record("unsupported_tool_call", "callId=${call.callId}, name=${call.name}")
     }
 
+    private fun persistToolStatus(callId: String, prompt: String, status: VoiceToolRecordStatus) {
+        persistConversation { conversation ->
+            persister.upsertHermesTool(
+                conversation = conversation,
+                callId = callId,
+                prompt = prompt,
+                status = status,
+            )
+        }
+    }
+
+    private fun persistConversation(transform: (Conversation) -> Conversation) {
+        val store = conversationStore ?: return
+        coordinatorScope.launch(toolLaunchContext) {
+            _state.update { it.copy(persistence = VoicePersistenceStatus.Saving) }
+            runCatching {
+                persistenceLock.withLock {
+                    store.update(transform)
+                }
+            }.onSuccess {
+                _state.update { it.copy(persistence = VoicePersistenceStatus.Saved) }
+            }.onFailure { error ->
+                val message = error.message ?: error.javaClass.simpleName
+                diagnostics.record("conversation_persist_failed", message)
+                _state.update { it.copy(persistence = VoicePersistenceStatus.SaveFailed(message)) }
+            }
+        }
+    }
+
     private companion object {
         const val ASK_HERMES_TOOL = "ask_hermes"
     }
@@ -362,7 +508,106 @@ class VoiceAgentCoordinator(
     }
 }
 
-class VoiceAgentViewModel : ViewModel() {
-    private val _state = MutableStateFlow(VoiceAgentUiState())
-    val state: StateFlow<VoiceAgentUiState> = _state.asStateFlow()
+class VoiceAgentViewModel(
+    private val modelId: String,
+    private val sessionApi: VoiceSessionApi,
+    private val toolApi: VoiceToolApi,
+    private val gemini: GeminiLiveVoiceClient,
+    private val audio: VoiceAudioEngine,
+    conversationStore: VoiceConversationStore,
+    contextProvider: VoiceAgentContextProvider,
+    diagnostics: VoiceDiagnostics = VoiceDiagnostics(),
+    scope: CoroutineScope? = null,
+) : ViewModel() {
+    private val lifecycleScope = scope ?: viewModelScope
+    private val coordinator = VoiceAgentCoordinator(
+        gemini = gemini,
+        toolApi = toolApi,
+        audio = audio,
+        diagnostics = diagnostics,
+        conversationStore = conversationStore,
+        scope = lifecycleScope,
+    )
+    private var startJob: Job? = null
+    private var muted = false
+
+    val state: StateFlow<VoiceAgentUiState> = coordinator.state
+    private val conversation = conversationStore.conversation
+    private val contextProvider = contextProvider
+
+    fun start() {
+        if (startJob?.isActive == true) return
+        startJob = lifecycleScope.launch {
+            try {
+                coordinator.updateSessionStatus(VoiceSessionStatus.PreparingContext)
+                val voiceContext = contextProvider.build(conversation.value)
+                coordinator.updateSessionStatus(VoiceSessionStatus.RequestingToken)
+                val session = sessionApi.createSession(modelId = modelId)
+                coordinator.updateSessionStatus(VoiceSessionStatus.ConnectingGemini)
+                gemini.connect(
+                    token = session.token,
+                    websocketUrl = session.websocketUrl,
+                    providerModel = session.providerModel,
+                    liveConnectConfig = session.liveConnectConfig,
+                    systemInstruction = voiceContext.systemInstruction,
+                    contextTurns = voiceContext.turns,
+                    onEvent = coordinator::onGeminiEvent,
+                )
+                coordinator.updateSessionStatus(VoiceSessionStatus.Connected)
+                if (!muted) {
+                    startCapture()
+                }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Throwable) {
+                coordinator.updateSessionStatus(
+                    VoiceSessionStatus.Error(error.message ?: error.javaClass.simpleName)
+                )
+            }
+        }
+    }
+
+    fun interrupt() {
+        coordinator.suppressPlayback()
+    }
+
+    fun setMuted(value: Boolean) {
+        if (muted == value) return
+        muted = value
+        if (muted) {
+            audio.stopCapture()
+            coordinator.updateAudioStatus(VoiceAudioStatus.Muted)
+        } else if (state.value.session == VoiceSessionStatus.Connected) {
+            startCapture()
+        } else {
+            coordinator.updateAudioStatus(VoiceAudioStatus.Listening)
+        }
+    }
+
+    fun reconnect() {
+        startJob?.cancel()
+        audio.stopCapture()
+        gemini.close()
+        coordinator.updateSessionStatus(VoiceSessionStatus.Reconnecting)
+        start()
+    }
+
+    fun end() {
+        startJob?.cancel()
+        coordinator.updateSessionStatus(VoiceSessionStatus.Ending)
+        coordinator.close()
+    }
+
+    private fun startCapture() {
+        audio.startCapture { pcm16 ->
+            gemini.sendAudio(Base64.getEncoder().encodeToString(pcm16))
+            coordinator.updateAudioStatus(VoiceAudioStatus.UserSpeaking)
+        }
+        coordinator.updateAudioStatus(VoiceAudioStatus.Listening)
+    }
+
+    override fun onCleared() {
+        end()
+        super.onCleared()
+    }
 }

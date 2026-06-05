@@ -119,6 +119,7 @@ class TestableGeminiLiveVoiceClient(
         sendPostSetupMessage(
             text = codec.realtimeAudioMessage(base64Pcm16),
             errorMessage = "Failed to send Gemini audio message",
+            queueBeforeSetup = true,
         )
     }
 
@@ -126,6 +127,7 @@ class TestableGeminiLiveVoiceClient(
         return sendPostSetupMessage(
             text = codec.toolResponseMessage(callId = callId, answer = answer),
             errorMessage = "Failed to send Gemini tool response message",
+            queueBeforeSetup = false,
         )
     }
 
@@ -205,10 +207,17 @@ class TestableGeminiLiveVoiceClient(
         }
     }
 
-    private fun sendPostSetupMessage(text: String, errorMessage: String): Boolean {
+    private fun sendPostSetupMessage(
+        text: String,
+        errorMessage: String,
+        queueBeforeSetup: Boolean,
+    ): Boolean {
         val generation = synchronized(lock) {
             val state = sessionState?.takeUnless { it.closed } ?: return false
             if (!state.setupComplete || state.flushingSetupComplete) {
+                if (!queueBeforeSetup) {
+                    return false
+                }
                 state.pendingOutboundMessages += PendingMessage(
                     text = text,
                     errorMessage = errorMessage,
