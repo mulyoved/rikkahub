@@ -952,7 +952,7 @@ class VoiceAgentViewModel(
                 liveConnectConfig = session.liveConnectConfig,
                 systemInstruction = voiceContext.systemInstruction,
                 contextTurns = voiceContext.turns,
-                onEvent = { event -> coordinator.onGeminiEvent(currentSessionId, event) },
+                onEvent = { event -> handleGeminiEvent(currentSessionId, event) },
             )
             ensureActiveSession(currentSessionId)
             if (coordinator.state.value.session is VoiceSessionStatus.Error) {
@@ -978,6 +978,13 @@ class VoiceAgentViewModel(
             if (startJob === sessionJob) {
                 startJob = null
             }
+        }
+    }
+
+    private fun handleGeminiEvent(sessionId: Long, event: GeminiLiveEvent) {
+        coordinator.onGeminiEvent(sessionId, event)
+        if (event is GeminiLiveEvent.Error) {
+            cleanupFailedStartup(sessionId, closeGemini = true)
         }
     }
 

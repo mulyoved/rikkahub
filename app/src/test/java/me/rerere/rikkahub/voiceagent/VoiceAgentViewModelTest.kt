@@ -1404,6 +1404,43 @@ class VoiceAgentViewModelTest {
     }
 
     @Test
+    fun `ViewModel closes Gemini and stops capture on async Gemini error`() = runTest {
+        val gemini = FakeGeminiLiveVoiceClient()
+        val audio = FakeVoiceAudioEngine()
+        val vm = VoiceAgentViewModel(
+            modelId = "gemini-flash",
+            sessionApi = FakeVoiceSessionApi(),
+            toolApi = FakeVoiceToolApi(),
+            gemini = gemini,
+            audio = audio,
+            conversationStore = FakeVoiceConversationStore(),
+            contextProvider = FakeVoiceAgentContextProvider(
+                VoiceContext(
+                    systemInstruction = "system",
+                    turns = listOf(GeminiContentTurn(role = "user", text = "existing context")),
+                )
+            ),
+            scope = this,
+        )
+
+        vm.start()
+        gemini.awaitConnect()
+        assertEquals(1, audio.startCaptureCalls)
+        audio.emitCapture(byteArrayOf(1, 2, 3))
+        assertEquals(listOf(Base64.getEncoder().encodeToString(byteArrayOf(1, 2, 3))), gemini.audioMessages)
+
+        gemini.eventHandlers.single()(
+            GeminiLiveEvent.Error(message = "Failed to send Gemini context message", raw = "{}")
+        )
+
+        assertEquals(VoiceSessionStatus.Error("Failed to send Gemini context message"), vm.state.value.session)
+        assertEquals(1, audio.stopCaptureCalls)
+        assertEquals(1, gemini.closeCalls)
+        audio.emitCapture(byteArrayOf(4, 5, 6))
+        assertEquals(listOf(Base64.getEncoder().encodeToString(byteArrayOf(1, 2, 3))), gemini.audioMessages)
+    }
+
+    @Test
     fun `ViewModel reconnect suppresses stale capture frames before capture stops`() = runTest {
         val sessionApi = FakeVoiceSessionApi()
         val gemini = FakeGeminiLiveVoiceClient()
