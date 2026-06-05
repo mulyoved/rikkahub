@@ -935,6 +935,7 @@ class VoiceAgentViewModel(
     private suspend fun runSession(currentSessionId: Long) {
         val sessionJob = currentCoroutineContext()[Job]
         startJob = sessionJob
+        var geminiStarted = false
         try {
             coordinator.updateSessionStatus(VoiceSessionStatus.PreparingContext)
             val voiceContext = contextProvider.build(conversation.value)
@@ -943,6 +944,7 @@ class VoiceAgentViewModel(
             val session = sessionApi.createSession(modelId = modelId)
             ensureActiveSession(currentSessionId)
             coordinator.updateSessionStatus(VoiceSessionStatus.ConnectingGemini)
+            geminiStarted = true
             gemini.connect(
                 token = session.token,
                 websocketUrl = session.websocketUrl,
@@ -953,6 +955,10 @@ class VoiceAgentViewModel(
                 onEvent = { event -> coordinator.onGeminiEvent(currentSessionId, event) },
             )
             ensureActiveSession(currentSessionId)
+            if (coordinator.state.value.session is VoiceSessionStatus.Error) {
+                cleanupFailedStartup(currentSessionId, closeGemini = true)
+                return
+            }
             coordinator.updateSessionStatus(VoiceSessionStatus.Connected)
             gemini.activateOutboundSession(currentSessionId)
             audio.activatePlaybackSession(currentSessionId)
@@ -963,6 +969,7 @@ class VoiceAgentViewModel(
             throw error
         } catch (error: Throwable) {
             if (coordinator.isActiveSession(currentSessionId)) {
+                cleanupFailedStartup(currentSessionId, closeGemini = geminiStarted)
                 coordinator.updateSessionStatus(
                     VoiceSessionStatus.Error(error.message ?: error.javaClass.simpleName)
                 )
@@ -971,6 +978,16 @@ class VoiceAgentViewModel(
             if (startJob === sessionJob) {
                 startJob = null
             }
+        }
+    }
+
+    private fun cleanupFailedStartup(sessionId: Long, closeGemini: Boolean) {
+        if (!coordinator.isActiveSession(sessionId)) return
+        invalidateAudioSessions()
+        coordinator.invalidateActiveSession()
+        audio.stopCapture()
+        if (closeGemini) {
+            gemini.close()
         }
     }
 
