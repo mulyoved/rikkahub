@@ -79,6 +79,7 @@ class VoiceAgentCallManagerTest {
 
         assertEquals(0, session.endCalls)
         assertEquals(0, session.closeNowCalls)
+        assertEquals(null, manager.activeConversationId.value?.takeIf { session.endCalls > 0 })
     }
 
     @Test
