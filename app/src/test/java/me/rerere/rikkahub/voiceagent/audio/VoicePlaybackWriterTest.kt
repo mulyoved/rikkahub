@@ -59,7 +59,10 @@ class VoicePlaybackWriterTest {
         assertFalse(writer.playBase64(base64Pcm16 = "AQID", sessionId = 99L))
 
         assertEquals(0, sinkCreations)
-        assertTrue(diagnostics.any { it is VoicePlaybackDiagnostic.StaleChunkRejected })
+        val diagnostic = diagnostics.filterIsInstance<VoicePlaybackDiagnostic.StaleChunkRejected>().single()
+        assertEquals(1L, diagnostic.activeGeneration)
+        assertEquals(99L, diagnostic.rejectedSessionId)
+        assertEquals(100L, diagnostic.activeSessionId)
 
         writer.release()
         scope.cancel()
@@ -99,6 +102,103 @@ class VoicePlaybackWriterTest {
         assertEquals(1, sink.pauseAndFlushCalls)
         assertTrue(diagnostics.any { it is VoicePlaybackDiagnostic.PlaybackSuppressed })
         assertTrue(diagnostics.any { it is VoicePlaybackDiagnostic.StaleChunkRejected })
+
+        writer.release()
+        scope.cancel()
+    }
+
+    @Test
+    fun `invalidate session flushes sink and rejects previous session playback`() {
+        val scope = testScope()
+        val diagnostics = CopyOnWriteArrayList<VoicePlaybackDiagnostic>()
+        val sink = FakeVoicePcm16Sink(expectedWrites = 1)
+        val writer = VoicePlaybackWriter(
+            scope = scope,
+            createSink = { sink },
+            onDiagnostic = diagnostics::add,
+        )
+
+        writer.activateSession(100L)
+        assertTrue(writer.playBase64(base64Pcm16 = "AQID", sessionId = 100L))
+        assertTrue(sink.awaitWrites(2))
+
+        writer.invalidateSession()
+
+        assertEquals(1, sink.pauseAndFlushCalls)
+        assertFalse(writer.playBase64(base64Pcm16 = "BAUG", sessionId = 100L))
+        assertEquals(listOf(listOf<Byte>(1, 2, 3)), sink.writes)
+        assertTrue(diagnostics.any { it is VoicePlaybackDiagnostic.StaleChunkRejected })
+
+        writer.release()
+        scope.cancel()
+    }
+
+    @Test
+    fun `release during blocked failed write stops sink only once`() {
+        val scope = testScope()
+        val diagnostics = CopyOnWriteArrayList<VoicePlaybackDiagnostic>()
+        val writeFailedLatch = CountDownLatch(1)
+        val sink = FakeVoicePcm16Sink(
+            expectedWrites = 1,
+            blockFirstWrite = true,
+            writeResult = VoicePcm16Sink.WriteResult.Failed("write failed"),
+        )
+        val writer = VoicePlaybackWriter(
+            scope = scope,
+            createSink = { sink },
+            onDiagnostic = { diagnostic ->
+                diagnostics += diagnostic
+                if (diagnostic is VoicePlaybackDiagnostic.SinkWriteFailed) {
+                    writeFailedLatch.countDown()
+                }
+            },
+        )
+
+        writer.activateSession(100L)
+        assertTrue(writer.playBase64(base64Pcm16 = "AQID", sessionId = 100L))
+        assertTrue(sink.awaitWriteStarted())
+
+        writer.release()
+        sink.releaseBlockedWrite()
+
+        assertTrue(writeFailedLatch.await(2, TimeUnit.SECONDS))
+        assertEquals(1, sink.stopAndReleaseCalls)
+        assertTrue(diagnostics.any { it is VoicePlaybackDiagnostic.Released })
+
+        scope.cancel()
+    }
+
+    @Test
+    fun `throwing sink start is released and worker accepts later playback`() {
+        val scope = testScope()
+        val diagnostics = CopyOnWriteArrayList<VoicePlaybackDiagnostic>()
+        val startFailedLatch = CountDownLatch(1)
+        val firstSink = FakeVoicePcm16Sink(
+            startException = IllegalStateException("start exploded"),
+        )
+        val secondSink = FakeVoicePcm16Sink(expectedWrites = 1)
+        val sinkIndex = AtomicInteger()
+        val writer = VoicePlaybackWriter(
+            scope = scope,
+            createSink = {
+                if (sinkIndex.getAndIncrement() == 0) firstSink else secondSink
+            },
+            onDiagnostic = { diagnostic ->
+                diagnostics += diagnostic
+                if (diagnostic is VoicePlaybackDiagnostic.SinkStartFailed) {
+                    startFailedLatch.countDown()
+                }
+            },
+        )
+
+        writer.activateSession(100L)
+        assertTrue(writer.playBase64(base64Pcm16 = "AQID", sessionId = 100L))
+        assertTrue(startFailedLatch.await(2, TimeUnit.SECONDS))
+
+        assertEquals(1, firstSink.stopAndReleaseCalls)
+        assertTrue(writer.playBase64(base64Pcm16 = "BAUG", sessionId = 100L))
+        assertTrue(secondSink.awaitWrites(2))
+        assertEquals(listOf(listOf<Byte>(4, 5, 6)), secondSink.writes)
 
         writer.release()
         scope.cancel()
@@ -158,6 +258,8 @@ class VoicePlaybackWriterTest {
     private class FakeVoicePcm16Sink(
         expectedWrites: Int = 0,
         private val blockFirstWrite: Boolean = false,
+        private val startException: RuntimeException? = null,
+        private val writeResult: VoicePcm16Sink.WriteResult? = null,
     ) : VoicePcm16Sink {
         private val writesLatch = CountDownLatch(expectedWrites)
         private val writeStartedLatch = CountDownLatch(1)
@@ -178,6 +280,7 @@ class VoicePlaybackWriterTest {
 
         override fun start(): VoicePcm16Sink.StartResult {
             startCallCount.incrementAndGet()
+            startException?.let { throw it }
             return VoicePcm16Sink.StartResult.Started
         }
 
@@ -186,9 +289,12 @@ class VoicePlaybackWriterTest {
             if (blockFirstWrite && writes.isEmpty()) {
                 assertTrue(releaseBlockedWriteLatch.await(2, TimeUnit.SECONDS))
             }
-            writes += pcm16.toList()
+            val result = writeResult ?: VoicePcm16Sink.WriteResult.Written(pcm16.size)
+            if (result is VoicePcm16Sink.WriteResult.Written) {
+                writes += pcm16.toList()
+            }
             writesLatch.countDown()
-            return VoicePcm16Sink.WriteResult.Written(pcm16.size)
+            return result
         }
 
         override fun pauseAndFlush() {

@@ -25,7 +25,12 @@ internal interface VoicePcm16Sink {
 internal sealed interface VoicePlaybackDiagnostic {
     data class ChunkQueued(val bytes: Int, val generation: Long) : VoicePlaybackDiagnostic
     data class ChunkWritten(val bytes: Int, val generation: Long) : VoicePlaybackDiagnostic
-    data class StaleChunkRejected(val generation: Long, val activeGeneration: Long) : VoicePlaybackDiagnostic
+    data class StaleChunkRejected(
+        val generation: Long,
+        val activeGeneration: Long,
+        val rejectedSessionId: Long? = null,
+        val activeSessionId: Long? = null,
+    ) : VoicePlaybackDiagnostic
     data class MalformedChunk(val message: String) : VoicePlaybackDiagnostic
     data class SinkStartFailed(val message: String) : VoicePlaybackDiagnostic
     data class SinkWriteFailed(val message: String) : VoicePlaybackDiagnostic
@@ -66,11 +71,13 @@ internal class VoicePlaybackWriter(
         }
 
         var staleActiveGeneration: Long? = null
+        var staleActiveSessionId: Long? = null
         val command = synchronized(lock) {
             if (released) {
                 null
             } else if (sessionId != null && activeSessionId != sessionId) {
                 staleActiveGeneration = generation
+                staleActiveSessionId = activeSessionId
                 null
             } else {
                 PlaybackCommand.Play(pcm16 = pcm16, generation = generation)
@@ -82,6 +89,8 @@ internal class VoicePlaybackWriter(
                     VoicePlaybackDiagnostic.StaleChunkRejected(
                         generation = activeGeneration,
                         activeGeneration = activeGeneration,
+                        rejectedSessionId = sessionId,
+                        activeSessionId = staleActiveSessionId,
                     ),
                 )
             }
@@ -176,8 +185,9 @@ internal class VoicePlaybackWriter(
                 }
             }
             is VoicePcm16Sink.WriteResult.Failed -> {
-                clearSink(sink)
-                sink.stopAndRelease()
+                if (clearSink(sink)) {
+                    sink.stopAndRelease()
+                }
                 onDiagnostic(VoicePlaybackDiagnostic.SinkWriteFailed(result.message))
             }
         }
@@ -213,11 +223,19 @@ internal class VoicePlaybackWriter(
             return null
         }
 
-        when (val result = newSink.start()) {
+        val startResult = try {
+            newSink.start()
+        } catch (e: Exception) {
+            newSink.stopAndRelease()
+            onDiagnostic(VoicePlaybackDiagnostic.SinkStartFailed(e.message ?: e.javaClass.simpleName))
+            return null
+        }
+
+        when (startResult) {
             VoicePcm16Sink.StartResult.Started -> Unit
             is VoicePcm16Sink.StartResult.Failed -> {
                 newSink.stopAndRelease()
-                onDiagnostic(VoicePlaybackDiagnostic.SinkStartFailed(result.message))
+                onDiagnostic(VoicePlaybackDiagnostic.SinkStartFailed(startResult.message))
                 return null
             }
         }
@@ -257,11 +275,12 @@ internal class VoicePlaybackWriter(
         !released && generation == commandGeneration && activeSink === sink
     }
 
-    private fun clearSink(sink: VoicePcm16Sink) {
-        synchronized(lock) {
-            if (activeSink === sink) {
-                activeSink = null
-            }
+    private fun clearSink(sink: VoicePcm16Sink): Boolean = synchronized(lock) {
+        if (activeSink === sink) {
+            activeSink = null
+            true
+        } else {
+            false
         }
     }
 
