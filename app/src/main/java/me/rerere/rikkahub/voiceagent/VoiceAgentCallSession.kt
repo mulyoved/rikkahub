@@ -26,7 +26,7 @@ class VoiceAgentCallSession(
     private val contextProvider: VoiceAgentContextProvider,
     diagnostics: VoiceDiagnostics = VoiceDiagnostics(),
     private val scope: CoroutineScope,
-) {
+) : ManagedVoiceCallSession {
     private val coordinator = VoiceAgentCoordinator(
         gemini = gemini,
         toolApi = toolApi,
@@ -40,10 +40,10 @@ class VoiceAgentCallSession(
     private var sessionId = 0L
     private var ended = false
 
-    val state: StateFlow<VoiceAgentUiState> = coordinator.state
+    override val state: StateFlow<VoiceAgentUiState> = coordinator.state
     private val conversation = conversationStore.conversation
 
-    fun start() {
+    override fun start() {
         if (ended || startJob?.isActive == true) return
         val currentSessionId = coordinator.nextSessionId()
         sessionId = currentSessionId
@@ -138,13 +138,13 @@ class VoiceAgentCallSession(
         check(coordinator.isActiveSession(sessionId)) { "Voice Agent session is stale" }
     }
 
-    fun interrupt() {
+    override fun interrupt() {
         if (!ended) {
             coordinator.suppressPlayback()
         }
     }
 
-    fun setMuted(value: Boolean) {
+    override fun setMuted(value: Boolean) {
         if (ended || muted == value) return
         muted = value
         if (muted) {
@@ -156,7 +156,7 @@ class VoiceAgentCallSession(
         }
     }
 
-    fun reconnect() {
+    override fun reconnect() {
         if (ended) return
         val previousJob = startJob
         coordinator.prepareForReconnect()
@@ -175,7 +175,7 @@ class VoiceAgentCallSession(
         startJob = reconnectJob
     }
 
-    fun end() {
+    override fun end() {
         endWithVisibleReason(visibleReason = null)
     }
 
@@ -203,7 +203,7 @@ class VoiceAgentCallSession(
         }
     }
 
-    fun closeNow() {
+    override fun closeNow() {
         if (!ended) {
             ended = true
         }
