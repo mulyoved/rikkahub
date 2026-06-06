@@ -16,6 +16,9 @@ import me.rerere.rikkahub.utils.EmojiUtils
 import me.rerere.rikkahub.utils.JsonInstant
 import me.rerere.rikkahub.utils.SoundEffectPlayer
 import me.rerere.rikkahub.utils.UpdateChecker
+import me.rerere.rikkahub.voiceagent.DefaultVoiceAgentCallFactory
+import me.rerere.rikkahub.voiceagent.VoiceAgentCallFactory
+import me.rerere.rikkahub.voiceagent.VoiceAgentCallManager
 import me.rerere.rikkahub.voiceagent.VoiceAgentViewModelFactory
 import me.rerere.rikkahub.web.WebServerManager
 import me.rerere.tts.provider.TTSManager
@@ -96,6 +99,19 @@ val appModule = module {
             settingsStore = get(),
             okHttpClient = get(),
         )
+    }
+
+    single<VoiceAgentCallFactory> {
+        DefaultVoiceAgentCallFactory(
+            context = get(),
+            chatService = get(),
+            settingsStore = get(),
+            okHttpClient = get(),
+        )
+    }
+
+    single {
+        VoiceAgentCallManager(factory = get())
     }
 
     single {

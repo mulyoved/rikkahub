@@ -12,6 +12,14 @@ import kotlin.uuid.Uuid
 
 class VoiceAgentCallManagerTest {
     @Test
+    fun `manager exposes idle state before start`() {
+        val manager = VoiceAgentCallManager(factory = FakeVoiceAgentCallFactory(FakeManagedVoiceCallSession()))
+
+        assertEquals(VoiceSessionStatus.Idle, manager.state.value.session)
+        assertEquals(null, manager.activeConversationId.value)
+    }
+
+    @Test
     fun `start creates one active session and exposes its state`() = runTest {
         val session = FakeManagedVoiceCallSession()
         val factory = FakeVoiceAgentCallFactory(session)
