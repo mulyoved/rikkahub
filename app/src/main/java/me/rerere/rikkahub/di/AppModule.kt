@@ -19,6 +19,7 @@ import me.rerere.rikkahub.utils.UpdateChecker
 import me.rerere.rikkahub.voiceagent.DefaultVoiceAgentCallFactory
 import me.rerere.rikkahub.voiceagent.VoiceAgentCallFactory
 import me.rerere.rikkahub.voiceagent.VoiceAgentCallManager
+import me.rerere.rikkahub.voiceagent.VoiceAgentNotificationFactory
 import me.rerere.rikkahub.voiceagent.VoiceAgentViewModelFactory
 import me.rerere.rikkahub.web.WebServerManager
 import me.rerere.tts.provider.TTSManager
@@ -112,6 +113,10 @@ val appModule = module {
 
     single {
         VoiceAgentCallManager(factory = get())
+    }
+
+    single {
+        VoiceAgentNotificationFactory(context = get())
     }
 
     single {
