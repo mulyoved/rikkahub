@@ -68,6 +68,13 @@ class VoiceAgentCallManager(
         }
     }
 
+    fun recordDiagnostic(name: String, detail: String) {
+        val session = synchronized(lock) { activeSession }
+        if (session is VoiceAgentCallSession) {
+            session.recordDiagnostic(name = name, detail = detail)
+        }
+    }
+
     fun end() {
         val session = synchronized(lock) {
             stateCollectionJob?.cancel()

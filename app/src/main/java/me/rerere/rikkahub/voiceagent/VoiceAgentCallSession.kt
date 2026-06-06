@@ -185,6 +185,10 @@ class VoiceAgentCallSession(
         endWithVisibleReason(visibleReason = BACKGROUND_END_MESSAGE)
     }
 
+    fun recordDiagnostic(name: String, detail: String) {
+        coordinator.recordDiagnostic(name = name, detail = detail)
+    }
+
     private fun endWithVisibleReason(visibleReason: String?) {
         if (ended) return
         ended = true

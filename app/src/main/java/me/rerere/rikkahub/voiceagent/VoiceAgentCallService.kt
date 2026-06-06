@@ -23,6 +23,7 @@ class VoiceAgentCallService : Service() {
     private val settingsStore: SettingsStore by inject()
     private val chatService: ChatService by inject()
     private val notificationFactory: VoiceAgentNotificationFactory by inject()
+    private val telecomAdapter: VoiceAgentTelecomAdapter by inject()
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private var activeConversationId: Uuid? = null
     private var notificationJob: Job? = null
@@ -64,6 +65,18 @@ class VoiceAgentCallService : Service() {
                 is VoiceAgentConfigResult.Available -> {
                     manager.start(conversationId = id, config = result.config, scope = serviceScope)
                     manager.updateCallStatus(VoiceCallStatus.BackgroundCapable)
+                    telecomAdapter.register()
+                        .onFailure {
+                            val detail = it.message ?: it.javaClass.simpleName
+                            manager.recordDiagnostic("telecom_register_failed", detail)
+                            manager.updateCallStatus(VoiceCallStatus.Degraded("Telecom unavailable: $detail"))
+                        }
+                    telecomAdapter.startCall()
+                        .onFailure {
+                            val detail = it.message ?: it.javaClass.simpleName
+                            manager.recordDiagnostic("telecom_start_failed", detail)
+                            manager.updateCallStatus(VoiceCallStatus.Degraded("Telecom call unavailable: $detail"))
+                        }
                     notificationJob = serviceScope.launch {
                         manager.state.collect { state ->
                             startForegroundFor(id.toString(), state)
