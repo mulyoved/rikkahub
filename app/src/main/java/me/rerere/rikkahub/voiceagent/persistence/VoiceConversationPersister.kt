@@ -77,6 +77,7 @@ class VoiceConversationPersister {
         ),
         transcriptRole = VOICE_TRANSCRIPT_USER_ROLE,
         turnId = turnId,
+        sessionId = sessionId,
     )
 
     fun upsertAssistantTranscriptTurn(
@@ -108,6 +109,7 @@ class VoiceConversationPersister {
         ),
         transcriptRole = VOICE_TRANSCRIPT_ASSISTANT_ROLE,
         turnId = turnId,
+        sessionId = sessionId,
     )
 
     fun upsertHermesTool(
@@ -169,20 +171,21 @@ class VoiceConversationPersister {
         message: UIMessage,
         transcriptRole: String,
         turnId: String,
+        sessionId: String?,
     ): Conversation {
         if (message.parts.filterIsInstance<UIMessagePart.Text>().joinToString("") { it.text }.isBlank()) {
             return conversation
         }
 
         val currentMessages = conversation.currentMessages
-        val existingIndex = currentMessages.indexOfLast { it.isVoiceTranscript(transcriptRole, turnId) }
+        val existingIndex = currentMessages.indexOfLast {
+            it.isVoiceTranscript(transcriptRole = transcriptRole, turnId = turnId, sessionId = sessionId)
+        }
         if (existingIndex >= 0) {
             val updatedMessages = currentMessages.toMutableList()
             val existingMessage = currentMessages[existingIndex]
             updatedMessages[existingIndex] = message.copy(id = existingMessage.id)
-            return conversation.updateCurrentMessages(
-                updatedMessages
-            )
+            return conversation.updateCurrentMessages(updatedMessages)
         }
 
         return conversation.appendMessage(message)
@@ -271,11 +274,23 @@ class VoiceConversationPersister {
         }
     }
 
-    private fun UIMessage.isVoiceTranscript(transcriptRole: String, turnId: String): Boolean {
+    private fun UIMessage.isVoiceTranscript(
+        transcriptRole: String,
+        turnId: String,
+        sessionId: String?,
+    ): Boolean {
         return parts.any { part ->
-            part is UIMessagePart.Text &&
-                part.metadata?.get(VOICE_TRANSCRIPT_ROLE_KEY)?.jsonPrimitive?.content == transcriptRole &&
-                part.metadata?.get(VOICE_TRANSCRIPT_TURN_ID_KEY)?.jsonPrimitive?.content == turnId
+            if (part !is UIMessagePart.Text) return@any false
+            val metadata = part.metadata ?: return@any false
+            val roleMatches = metadata[VOICE_TRANSCRIPT_ROLE_KEY]?.jsonPrimitive?.content == transcriptRole
+            val turnMatches = metadata[VOICE_TRANSCRIPT_TURN_ID_KEY]?.jsonPrimitive?.content == turnId
+            val existingSessionId = metadata[VOICE_SESSION_ID_KEY]?.jsonPrimitive?.content
+            val sessionMatches = if (sessionId == null || existingSessionId == null) {
+                true
+            } else {
+                existingSessionId == sessionId
+            }
+            roleMatches && turnMatches && sessionMatches
         }
     }
 
