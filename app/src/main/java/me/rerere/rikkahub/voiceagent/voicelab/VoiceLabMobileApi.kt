@@ -49,8 +49,6 @@ private val ERROR_SENSITIVE_KEYS = setOf(
     "token",
     "secret",
     "password",
-    "prompt",
-    "answer",
     "websocketurl",
     "liveconnectconfig",
     "connectconfig",
@@ -63,15 +61,15 @@ private val ERROR_SECRET_PATTERNS = listOf(
         option = RegexOption.IGNORE_CASE,
     ),
     Regex(
-        pattern = """("?(?:authorization|api[_-]?key|key|cf[_-]?access[_-]?client[_-]?id|cf[_-]?access[_-]?client[_-]?secret|cloudflare[_-]?client[_-]?id|cloudflare[_-]?client[_-]?secret|client[_-]?id|client[_-]?secret|access[_-]?token|refresh[_-]?token|token|secret|password|prompt|answer|websocket[_-]?url|live[_-]?connect[_-]?config|connect[_-]?config|provider[_-]?config|session[_-]?url)"?\s*[:=]\s*")([^"]*)("?|$)""",
+        pattern = """("?(?:authorization|api[_-]?key|key|cf[_-]?access[_-]?client[_-]?id|cf[_-]?access[_-]?client[_-]?secret|cloudflare[_-]?client[_-]?id|cloudflare[_-]?client[_-]?secret|client[_-]?id|client[_-]?secret|access[_-]?token|refresh[_-]?token|token|secret|password|websocket[_-]?url|live[_-]?connect[_-]?config|connect[_-]?config|provider[_-]?config|session[_-]?url)"?\s*[:=]\s*")([^"]*)("?|$)""",
         option = RegexOption.IGNORE_CASE,
     ),
     Regex(
-        pattern = """('?(?:authorization|api[_-]?key|key|cf[_-]?access[_-]?client[_-]?id|cf[_-]?access[_-]?client[_-]?secret|cloudflare[_-]?client[_-]?id|cloudflare[_-]?client[_-]?secret|client[_-]?id|client[_-]?secret|access[_-]?token|refresh[_-]?token|token|secret|password|prompt|answer|websocket[_-]?url|live[_-]?connect[_-]?config|connect[_-]?config|provider[_-]?config|session[_-]?url)'?\s*[:=]\s*')([^']*)('?|$)""",
+        pattern = """('?(?:authorization|api[_-]?key|key|cf[_-]?access[_-]?client[_-]?id|cf[_-]?access[_-]?client[_-]?secret|cloudflare[_-]?client[_-]?id|cloudflare[_-]?client[_-]?secret|client[_-]?id|client[_-]?secret|access[_-]?token|refresh[_-]?token|token|secret|password|websocket[_-]?url|live[_-]?connect[_-]?config|connect[_-]?config|provider[_-]?config|session[_-]?url)'?\s*[:=]\s*')([^']*)('?|$)""",
         option = RegexOption.IGNORE_CASE,
     ),
     Regex(
-        pattern = """\b((?:authorization|api[_-]?key|key|cf[_-]?access[_-]?client[_-]?id|cf[_-]?access[_-]?client[_-]?secret|cloudflare[_-]?client[_-]?id|cloudflare[_-]?client[_-]?secret|client[_-]?id|client[_-]?secret|access[_-]?token|refresh[_-]?token|token|secret|password|prompt|answer|websocket[_-]?url|live[_-]?connect[_-]?config|connect[_-]?config|provider[_-]?config|session[_-]?url)\s*[:=]\s*)([^\r\n,;}\]]+)""",
+        pattern = """\b((?:authorization|api[_-]?key|key|cf[_-]?access[_-]?client[_-]?id|cf[_-]?access[_-]?client[_-]?secret|cloudflare[_-]?client[_-]?id|cloudflare[_-]?client[_-]?secret|client[_-]?id|client[_-]?secret|access[_-]?token|refresh[_-]?token|token|secret|password|websocket[_-]?url|live[_-]?connect[_-]?config|connect[_-]?config|provider[_-]?config|session[_-]?url)\s*[:=]\s*)([^\r\n,;}\]]+)""",
         option = RegexOption.IGNORE_CASE,
     ),
 )
@@ -138,7 +136,7 @@ class VoiceLabMobileApi internal constructor(
         ) {
             "Voice Lab Cloudflare Access credentials must be provided together or omitted together"
         }
-        require(parsedBaseUrl.isHttps || parsedBaseUrl.host in DEV_HTTP_HOSTS) {
+        require(parsedBaseUrl.isHttps || parsedBaseUrl.host.isDevHttpHost()) {
             "Voice Lab baseUrl must use HTTPS unless it targets a local development host"
         }
         require(parsedBaseUrl.query == null && parsedBaseUrl.fragment == null) {
@@ -193,6 +191,17 @@ class VoiceLabMobileApi internal constructor(
                 }
             }
         }
+}
+
+private fun String.isDevHttpHost(): Boolean =
+    this in DEV_HTTP_HOSTS || isTailscaleIpv4()
+
+private fun String.isTailscaleIpv4(): Boolean {
+    val octets = split('.').map { it.toIntOrNull() ?: return false }
+    return octets.size == 4 &&
+        octets.all { it in 0..255 } &&
+        octets[0] == 100 &&
+        octets[1] in 64..127
 }
 
 private fun Response.toErrorPreview(): String =

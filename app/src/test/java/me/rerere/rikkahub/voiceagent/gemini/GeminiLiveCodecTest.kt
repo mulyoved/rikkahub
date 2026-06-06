@@ -127,6 +127,89 @@ class GeminiLiveCodecTest {
     }
 
     @Test
+    fun `setup message defaults ask hermes tool to required function calling`() {
+        val liveConnectConfig = JsonObject(
+            mapOf(
+                "tools" to JsonArray(
+                    listOf(
+                        JsonObject(
+                            mapOf(
+                                "functionDeclarations" to JsonArray(
+                                    listOf(
+                                        JsonObject(
+                                            mapOf(
+                                                "name" to JsonPrimitive("ask_hermes"),
+                                                "description" to JsonPrimitive("Ask Hermes"),
+                                            )
+                                        )
+                                    )
+                                )
+                            )
+                        )
+                    )
+                ),
+            )
+        )
+
+        val message = codec.setupMessage(
+            providerModel = "gemini-2.0-flash-live-001",
+            liveConnectConfig = liveConnectConfig,
+            systemInstruction = "Local instruction.",
+        ).jsonObject()
+
+        val functionCallingConfig = message["setup"]!!
+            .jsonObject["toolConfig"]!!
+            .jsonObject["functionCallingConfig"]!!
+            .jsonObject
+        assertEquals("ANY", functionCallingConfig["mode"]!!.jsonPrimitive.content)
+        assertEquals(
+            listOf("ask_hermes"),
+            functionCallingConfig["allowedFunctionNames"]!!.jsonArray.map { it.jsonPrimitive.content },
+        )
+    }
+
+    @Test
+    fun `setup message preserves explicit server tool config`() {
+        val explicitToolConfig = JsonObject(
+            mapOf(
+                "functionCallingConfig" to JsonObject(
+                    mapOf(
+                        "mode" to JsonPrimitive("AUTO"),
+                    )
+                )
+            )
+        )
+        val liveConnectConfig = JsonObject(
+            mapOf(
+                "tools" to JsonArray(
+                    listOf(
+                        JsonObject(
+                            mapOf(
+                                "functionDeclarations" to JsonArray(
+                                    listOf(
+                                        JsonObject(
+                                            mapOf("name" to JsonPrimitive("ask_hermes"))
+                                        )
+                                    )
+                                )
+                            )
+                        )
+                    )
+                ),
+                "toolConfig" to explicitToolConfig,
+            )
+        )
+
+        val message = codec.setupMessage(
+            providerModel = "gemini-2.0-flash-live-001",
+            liveConnectConfig = liveConnectConfig,
+            systemInstruction = "Local instruction.",
+        ).jsonObject()
+
+        assertEquals(explicitToolConfig, message["setup"]!!.jsonObject["toolConfig"])
+    }
+
+    @Test
     fun `setup message omits optional live connect fields when config omits them`() {
         val liveConnectConfig = JsonObject(
             mapOf(
@@ -159,7 +242,7 @@ class GeminiLiveCodecTest {
     }
 
     @Test
-    fun `client content message emits incomplete text turns`() {
+    fun `client content message emits completed startup context turns`() {
         val message = codec.clientContentMessage(
             listOf(
                 GeminiContentTurn(role = "user", text = "Hello"),
@@ -168,7 +251,7 @@ class GeminiLiveCodecTest {
         ).jsonObject()
 
         val clientContent = message["clientContent"]!!.jsonObject
-        assertFalse(clientContent["turnComplete"]!!.jsonPrimitive.boolean)
+        assertTrue(clientContent["turnComplete"]!!.jsonPrimitive.boolean)
         val turns = clientContent["turns"]!!.jsonArray
         assertEquals("user", turns[0].jsonObject["role"]!!.jsonPrimitive.content)
         assertEquals(
@@ -195,6 +278,13 @@ class GeminiLiveCodecTest {
     }
 
     @Test
+    fun `realtime audio stream end message flushes audio input`() {
+        val message = codec.realtimeAudioStreamEndMessage().jsonObject()
+
+        assertEquals(true, message["realtimeInput"]!!.jsonObject["audioStreamEnd"]!!.jsonPrimitive.boolean)
+    }
+
+    @Test
     fun `tool response message emits ask hermes answer`() {
         val message = codec.toolResponseMessage(callId = "call-1", answer = "42").jsonObject()
 
@@ -212,6 +302,88 @@ class GeminiLiveCodecTest {
         assertEquals(
             GeminiLiveEvent.SetupComplete,
             codec.parseServerMessage("""{"setupComplete":{}}"""),
+        )
+    }
+
+    @Test
+    fun `parse server generation and turn completion signals`() {
+        assertEquals(
+            GeminiLiveEvent.GenerationComplete,
+            codec.parseServerMessage("""{"serverContent":{"generationComplete":true}}"""),
+        )
+        assertEquals(
+            GeminiLiveEvent.TurnComplete,
+            codec.parseServerMessage("""{"serverContent":{"turnComplete":true}}"""),
+        )
+        assertTrue(
+            codec.parseServerMessage("""{"serverContent":{"generationComplete":false,"turnComplete":false}}""")
+                is GeminiLiveEvent.Ignored
+        )
+    }
+
+    @Test
+    fun `parse server message preserves transcript audio and completion events from same payload`() {
+        assertEquals(
+            GeminiLiveEvent.Events(
+                listOf(
+                    GeminiLiveEvent.OutputTranscript("final words"),
+                    GeminiLiveEvent.OutputAudio("base64-pcm"),
+                    GeminiLiveEvent.GenerationComplete,
+                    GeminiLiveEvent.TurnComplete,
+                )
+            ),
+            codec.parseServerMessage(
+                """
+                {
+                  "serverContent":{
+                    "outputTranscription":{"text":"final words"},
+                    "modelTurn":{
+                      "parts":[
+                        {"inlineData":{"mimeType":"audio/pcm;rate=24000","data":"base64-pcm"}}
+                      ]
+                    },
+                    "generationComplete":true,
+                    "turnComplete":true
+                  }
+                }
+                """.trimIndent()
+            ),
+        )
+    }
+
+    @Test
+    fun `parse server message preserves tool call and server content from same payload`() {
+        assertEquals(
+            GeminiLiveEvent.Events(
+                listOf(
+                    GeminiLiveEvent.ToolCall(
+                        callId = "call-1",
+                        name = "ask_hermes",
+                        prompt = "Use Hermes",
+                    ),
+                    GeminiLiveEvent.OutputTranscript("I will check."),
+                    GeminiLiveEvent.GenerationComplete,
+                )
+            ),
+            codec.parseServerMessage(
+                """
+                {
+                  "toolCall":{
+                    "functionCalls":[
+                      {
+                        "id":"call-1",
+                        "name":"ask_hermes",
+                        "args":{"prompt":"Use Hermes"}
+                      }
+                    ]
+                  },
+                  "serverContent":{
+                    "outputTranscription":{"text":"I will check."},
+                    "generationComplete":true
+                  }
+                }
+                """.trimIndent()
+            ),
         )
     }
 

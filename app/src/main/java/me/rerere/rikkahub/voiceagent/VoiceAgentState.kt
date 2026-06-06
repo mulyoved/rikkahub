@@ -43,6 +43,13 @@ data class VoiceAgentUiState(
     val inputTranscript: String = "",
     val outputTranscript: String = "",
     val error: String? = null,
+    val diagnostics: List<VoiceDiagnosticLine> = emptyList(),
+)
+
+data class VoiceDiagnosticLine(
+    val name: String,
+    val detail: String,
+    val at: String,
 )
 
 sealed interface VoiceAgentEvent {

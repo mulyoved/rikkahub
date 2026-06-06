@@ -1,5 +1,6 @@
 package me.rerere.rikkahub.voiceagent.gemini
 
+import android.util.Log
 import kotlinx.serialization.json.JsonObject
 import okhttp3.HttpUrl
 import okhttp3.OkHttpClient
@@ -7,6 +8,7 @@ import okhttp3.Request
 import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
+import okio.ByteString
 
 class OkHttpGeminiLiveVoiceClient(
     httpClient: OkHttpClient,
@@ -15,6 +17,7 @@ class OkHttpGeminiLiveVoiceClient(
     private val delegate = TestableGeminiLiveVoiceClient(
         socket = OkHttpGeminiSocket(httpClient),
         codec = codec,
+        debugObserver = ::logGeminiDebugEvent,
     )
 
     override suspend fun connect(
@@ -45,6 +48,10 @@ class OkHttpGeminiLiveVoiceClient(
         return delegate.sendAudio(base64Pcm16 = base64Pcm16, sessionId = sessionId)
     }
 
+    override fun sendAudioStreamEnd(sessionId: Long?): Boolean {
+        return delegate.sendAudioStreamEnd(sessionId = sessionId)
+    }
+
     override fun activateOutboundSession(sessionId: Long) {
         delegate.activateOutboundSession(sessionId)
     }
@@ -63,6 +70,22 @@ class OkHttpGeminiLiveVoiceClient(
 
     override fun close() {
         delegate.close()
+    }
+
+    private fun logGeminiDebugEvent(event: GeminiLiveDebugEvent) {
+        when (event) {
+            GeminiLiveDebugEvent.Open -> Log.d(TAG, "open")
+            is GeminiLiveDebugEvent.Event -> Log.d(TAG, "event kind=${event.kind}")
+            is GeminiLiveDebugEvent.Receive -> Log.d(TAG, "receive kind=${event.kind}")
+            is GeminiLiveDebugEvent.Send -> Log.d(
+                TAG,
+                "send kind=${event.kind} sent=${event.sent} dataBytes=${event.dataBytes ?: "n/a"}",
+            )
+        }
+    }
+
+    private companion object {
+        const val TAG = "VoiceAgentGemini"
     }
 }
 
@@ -102,6 +125,12 @@ class OkHttpGeminiSocket(
                 override fun onMessage(webSocket: WebSocket, text: String) {
                     if (isCurrent(webSocket, openGeneration)) {
                         onMessage(text)
+                    }
+                }
+
+                override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
+                    if (isCurrent(webSocket, openGeneration)) {
+                        onMessage(bytes.utf8())
                     }
                 }
 

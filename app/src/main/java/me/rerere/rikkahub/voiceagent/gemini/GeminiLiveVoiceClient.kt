@@ -1,6 +1,28 @@
 package me.rerere.rikkahub.voiceagent.gemini
 
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import me.rerere.rikkahub.utils.JsonInstant
+
+sealed interface GeminiLiveDebugEvent {
+    data object Open : GeminiLiveDebugEvent
+    data class Send(
+        val kind: String,
+        val sent: Boolean,
+        val dataBytes: Int? = null,
+    ) : GeminiLiveDebugEvent
+
+    data class Receive(
+        val kind: String,
+    ) : GeminiLiveDebugEvent
+
+    data class Event(
+        val kind: String,
+    ) : GeminiLiveDebugEvent
+}
 
 interface GeminiLiveVoiceClient {
     suspend fun connect(
@@ -18,6 +40,7 @@ interface GeminiLiveVoiceClient {
         sendAudio(base64Pcm16)
         return true
     }
+    fun sendAudioStreamEnd(sessionId: Long?): Boolean = true
     fun activateOutboundSession(sessionId: Long) = Unit
     fun invalidateOutboundSession() = Unit
 
@@ -46,6 +69,7 @@ interface GeminiSocket {
 class TestableGeminiLiveVoiceClient(
     private val socket: GeminiSocket,
     private val codec: GeminiLiveCodec = GeminiLiveCodec(),
+    private val debugObserver: (GeminiLiveDebugEvent) -> Unit = {},
 ) : GeminiLiveVoiceClient {
     private val lock = Any()
     private val outboundSendLock = Any()
@@ -65,7 +89,7 @@ class TestableGeminiLiveVoiceClient(
     ) {
         val setupMessage = codec.setupMessage(
             providerModel = providerModel,
-            liveConnectConfig = liveConnectConfig,
+            liveConnectConfig = liveConnectConfig.withInitialHistoryConfigIfNeeded(contextTurns),
             systemInstruction = systemInstruction,
         )
         val pendingContext = contextTurns
@@ -101,22 +125,22 @@ class TestableGeminiLiveVoiceClient(
                 onClosed = { code, reason ->
                     terminateCurrentSessionWithError(
                         generation = generation,
-                        GeminiLiveEvent.Error(
-                            message = "WebSocket closed: $code $reason",
-                            raw = "",
+                        GeminiLiveEvent.WebSocketClosed(
+                            code = code,
+                            reason = reason,
                         ),
                     )
                 },
                 onFailure = { error ->
                     terminateCurrentSessionWithError(
                         generation = generation,
-                        GeminiLiveEvent.Error(
+                        GeminiLiveEvent.WebSocketFailure(
                             message = error.message ?: error.javaClass.simpleName,
-                            raw = "",
                         ),
                     )
                 },
             )
+            debugObserver(GeminiLiveDebugEvent.Open)
             when (val result = sendOrGetPendingError(
                 generation = generation,
                 text = setupMessage,
@@ -149,6 +173,22 @@ class TestableGeminiLiveVoiceClient(
             return sendPostSetupMessage(
                 text = codec.realtimeAudioMessage(base64Pcm16),
                 errorMessage = "Failed to send Gemini audio message",
+                queueBeforeSetup = true,
+                requiredOutboundSessionId = sessionId,
+            )
+        }
+    }
+
+    override fun sendAudioStreamEnd(sessionId: Long?): Boolean {
+        synchronized(outboundSendLock) {
+            synchronized(lock) {
+                if (sessionId != null && outboundSessionId != sessionId) {
+                    return false
+                }
+            }
+            return sendPostSetupMessage(
+                text = codec.realtimeAudioStreamEndMessage(),
+                errorMessage = "Failed to send Gemini audio stream end message",
                 queueBeforeSetup = true,
                 requiredOutboundSessionId = sessionId,
             )
@@ -204,18 +244,21 @@ class TestableGeminiLiveVoiceClient(
     }
 
     private fun handleMessage(generation: Long, message: String) {
-        val event = codec.parseServerMessage(message)
-        if (event == GeminiLiveEvent.SetupComplete) {
-            handleSetupComplete(generation = generation, event = event)
-            return
-        }
+        debugObserver(GeminiLiveDebugEvent.Receive(kind = message.geminiDebugMessageKind()))
+        codec.parseServerMessage(message).flatten().forEach { event ->
+            debugObserver(GeminiLiveDebugEvent.Event(kind = event.geminiDebugEventKind()))
+            if (event == GeminiLiveEvent.SetupComplete) {
+                handleSetupComplete(generation = generation, event = event)
+                return@forEach
+            }
 
-        val onEvent = synchronized(lock) {
-            sessionState
-                ?.takeIf { it.generation == generation && !it.closed }
-                ?.onEvent
+            val onEvent = synchronized(lock) {
+                sessionState
+                    ?.takeIf { it.generation == generation && !it.closed }
+                    ?.onEvent
+            }
+            onEvent?.invoke(event)
         }
-        onEvent?.invoke(event)
     }
 
     private fun handleSetupComplete(generation: Long, event: GeminiLiveEvent) {
@@ -325,6 +368,13 @@ class TestableGeminiLiveVoiceClient(
                 ?: return SendResult.Stale
         }
         val sent = socket.send(text)
+        debugObserver(
+            GeminiLiveDebugEvent.Send(
+                kind = text.geminiDebugMessageKind(),
+                sent = sent,
+                dataBytes = text.geminiDebugAudioDataBytes(),
+            )
+        )
         if (sent) {
             return SendResult.Sent
         }
@@ -348,7 +398,7 @@ class TestableGeminiLiveVoiceClient(
         onEvent?.invoke(event)
     }
 
-    private fun terminateCurrentSessionWithError(generation: Long, event: GeminiLiveEvent.Error) {
+    private fun terminateCurrentSessionWithError(generation: Long, event: GeminiLiveEvent) {
         val onEvent = synchronized(lock) {
             val state = sessionState
                 ?.takeIf { it.generation == generation && !it.closed }
@@ -397,4 +447,83 @@ class TestableGeminiLiveVoiceClient(
             ),
         )
     }
+
+    private fun GeminiLiveEvent.flatten(): List<GeminiLiveEvent> = when (this) {
+        is GeminiLiveEvent.Events -> events.flatMap { it.flatten() }
+        else -> listOf(this)
+    }
+
+    private fun JsonObject.withInitialHistoryConfigIfNeeded(
+        contextTurns: List<GeminiContentTurn>,
+    ): JsonObject {
+        if (contextTurns.isEmpty()) return this
+
+        val updated = toMutableMap()
+        val historyConfig = (updated["historyConfig"] as? JsonObject)
+            ?.toMutableMap()
+            ?: mutableMapOf()
+        historyConfig.putIfAbsent("initialHistoryInClientContent", JsonPrimitive(true))
+        updated["historyConfig"] = JsonObject(historyConfig)
+        return JsonObject(updated)
+    }
+}
+
+private fun String.geminiDebugMessageKind(): String = runCatching {
+    val root = JsonInstant.parseToJsonElement(this).jsonObject
+    when {
+        "setup" in root -> "setup"
+        "clientContent" in root -> "clientContent"
+        "toolResponse" in root -> "toolResponse"
+        "toolCall" in root -> "toolCall"
+        "toolCallCancellation" in root -> "toolCallCancellation"
+        "setupComplete" in root -> "setupComplete"
+        "sessionResumptionUpdate" in root -> "sessionResumptionUpdate"
+        "serverContent" in root -> "serverContent"
+        "realtimeInput" in root -> {
+            val realtimeInput = root["realtimeInput"]?.jsonObject
+            when {
+                realtimeInput?.get("audio") != null -> "realtimeInput.audio"
+                realtimeInput?.get("audioStreamEnd") != null -> "realtimeInput.audioStreamEnd"
+                else -> "realtimeInput"
+            }
+        }
+        else -> "unknown"
+    }
+}.getOrDefault("invalid-json")
+
+private fun String.geminiDebugAudioDataBytes(): Int? = runCatching {
+    val root = JsonInstant.parseToJsonElement(this).jsonObject
+    val data = root["realtimeInput"]
+        ?.jsonObject
+        ?.get("audio")
+        ?.jsonObject
+        ?.get("data")
+        ?.jsonPrimitive
+        ?.contentOrNull
+        ?: return null
+    data.estimatedBase64DecodedBytes()
+}.getOrNull()
+
+private fun String.estimatedBase64DecodedBytes(): Int {
+    val padding = takeLastWhile { it == '=' }.length.coerceAtMost(2)
+    return ((length * 3) / 4 - padding).coerceAtLeast(0)
+}
+
+private fun GeminiLiveEvent.geminiDebugEventKind(): String = when (this) {
+    GeminiLiveEvent.GenerationComplete -> "GenerationComplete"
+    GeminiLiveEvent.SetupComplete -> "SetupComplete"
+    GeminiLiveEvent.TurnComplete -> "TurnComplete"
+    is GeminiLiveEvent.Error -> "Error"
+    is GeminiLiveEvent.Events -> "Events"
+    is GeminiLiveEvent.Ignored -> "Ignored"
+    is GeminiLiveEvent.InputTranscript -> "InputTranscript"
+    is GeminiLiveEvent.Interrupted -> "Interrupted"
+    is GeminiLiveEvent.OutputAudio -> "OutputAudio"
+    is GeminiLiveEvent.OutputTranscript -> "OutputTranscript"
+    is GeminiLiveEvent.SessionResumptionUpdate -> "SessionResumptionUpdate"
+    is GeminiLiveEvent.ToolCall -> "ToolCall"
+    is GeminiLiveEvent.ToolCallCancellation -> "ToolCallCancellation"
+    is GeminiLiveEvent.ToolCalls -> "ToolCalls"
+    is GeminiLiveEvent.WebSocketClosed -> "WebSocketClosed"
+    is GeminiLiveEvent.WebSocketFailure -> "WebSocketFailure"
 }

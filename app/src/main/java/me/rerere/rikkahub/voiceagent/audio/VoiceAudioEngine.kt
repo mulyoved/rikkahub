@@ -1,6 +1,7 @@
 package me.rerere.rikkahub.voiceagent.audio
 
 interface VoiceAudioEngine {
+    fun setErrorHandler(onError: ((String) -> Unit)?) = Unit
     fun startCapture(onPcm16: (ByteArray) -> Unit)
     fun stopCapture()
     fun playPcm16(base64Pcm16: String)

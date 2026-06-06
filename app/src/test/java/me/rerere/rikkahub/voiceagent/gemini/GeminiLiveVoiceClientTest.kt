@@ -4,12 +4,19 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.boolean
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import me.rerere.rikkahub.utils.JsonInstant
+import mockwebserver3.MockResponse
+import mockwebserver3.MockWebServer
 import okhttp3.Interceptor
 import okhttp3.OkHttpClient
+import okhttp3.Response
+import okhttp3.WebSocket
+import okhttp3.WebSocketListener
+import okio.ByteString.Companion.encodeUtf8
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -50,11 +57,26 @@ class GeminiLiveVoiceClientTest {
         assertEquals("token-1", socket.openedToken)
         assertEquals(1, socket.sentMessages.size)
         assertTrue("setup" in socket.sentMessages[0].jsonObject())
+        assertEquals(
+            true,
+            socket.sentMessages[0]
+                .jsonObject()["setup"]!!
+                .jsonObject["historyConfig"]!!
+                .jsonObject["initialHistoryInClientContent"]!!
+                .jsonPrimitive.boolean,
+        )
 
         socket.receive(setupCompleteMessage)
 
         assertEquals(2, socket.sentMessages.size)
         assertTrue("clientContent" in socket.sentMessages[1].jsonObject())
+        assertEquals(
+            true,
+            socket.sentMessages[1]
+                .jsonObject()["clientContent"]!!
+                .jsonObject["turnComplete"]!!
+                .jsonPrimitive.boolean,
+        )
         assertEquals(listOf(GeminiLiveEvent.SetupComplete), events)
         events.clear()
 
@@ -128,6 +150,50 @@ class GeminiLiveVoiceClientTest {
         assertEquals(1, socket.sentMessages.size)
         assertTrue("setup" in socket.sentMessages.single().jsonObject())
         assertFalse("clientContent" in socket.sentMessages.single().jsonObject())
+    }
+
+    @Test
+    fun `combined server content is emitted as ordered individual events`() = runBlocking {
+        val socket = FakeGeminiSocket()
+        val client = TestableGeminiLiveVoiceClient(socket = socket, codec = GeminiLiveCodec())
+        val events = mutableListOf<GeminiLiveEvent>()
+
+        client.connect(
+            token = "token-1",
+            websocketUrl = "wss://example.test/live",
+            providerModel = "gemini-2.0-flash-live-001",
+            liveConnectConfig = liveConnectConfig,
+            systemInstruction = "",
+            contextTurns = emptyList(),
+            onEvent = events::add,
+        )
+        socket.receive(setupCompleteMessage)
+        events.clear()
+
+        socket.receive(
+            """
+            {
+              "serverContent":{
+                "outputTranscription":{"text":"final words"},
+                "modelTurn":{
+                  "parts":[
+                    {"inlineData":{"mimeType":"audio/pcm;rate=24000","data":"base64-pcm"}}
+                  ]
+                },
+                "generationComplete":true
+              }
+            }
+            """.trimIndent()
+        )
+
+        assertEquals(
+            listOf(
+                GeminiLiveEvent.OutputTranscript("final words"),
+                GeminiLiveEvent.OutputAudio("base64-pcm"),
+                GeminiLiveEvent.GenerationComplete,
+            ),
+            events,
+        )
     }
 
     @Test
@@ -246,6 +312,67 @@ class GeminiLiveVoiceClientTest {
             .jsonObject
         assertEquals("audio/pcm;rate=16000", audio["mimeType"]!!.jsonPrimitive.content)
         assertEquals("base64-audio", audio["data"]!!.jsonPrimitive.content)
+    }
+
+    @Test
+    fun `send audio stream end uses realtime input stream end shape after setup complete`() = runBlocking {
+        val socket = FakeGeminiSocket()
+        val client = TestableGeminiLiveVoiceClient(socket = socket, codec = GeminiLiveCodec())
+
+        client.connect(
+            token = "token-1",
+            websocketUrl = "wss://example.test/live",
+            providerModel = "gemini-2.0-flash-live-001",
+            liveConnectConfig = liveConnectConfig,
+            systemInstruction = "You are Hermes.",
+            contextTurns = emptyList(),
+            onEvent = {},
+        )
+        socket.receive(setupCompleteMessage)
+
+        assertTrue(client.sendAudioStreamEnd(sessionId = null))
+
+        val realtimeInput = socket.sentMessages.last()
+            .jsonObject()["realtimeInput"]!!
+            .jsonObject
+        assertEquals(true, realtimeInput["audioStreamEnd"]!!.jsonPrimitive.boolean)
+    }
+
+    @Test
+    fun `debug observer receives sanitized Gemini boundary events`() = runBlocking {
+        val socket = FakeGeminiSocket()
+        val observed = mutableListOf<GeminiLiveDebugEvent>()
+        val client = TestableGeminiLiveVoiceClient(
+            socket = socket,
+            codec = GeminiLiveCodec(),
+            debugObserver = observed::add,
+        )
+
+        client.connect(
+            token = "token-1",
+            websocketUrl = "wss://example.test/live",
+            providerModel = "gemini-2.0-flash-live-001",
+            liveConnectConfig = liveConnectConfig,
+            systemInstruction = "You are Hermes.",
+            contextTurns = emptyList(),
+            onEvent = {},
+        )
+        socket.receive(setupCompleteMessage)
+
+        client.sendAudio("base64-audio")
+        client.sendAudioStreamEnd(sessionId = null)
+
+        assertEquals(
+            listOf(
+                GeminiLiveDebugEvent.Open,
+                GeminiLiveDebugEvent.Send(kind = "setup", sent = true, dataBytes = null),
+                GeminiLiveDebugEvent.Receive(kind = "setupComplete"),
+                GeminiLiveDebugEvent.Event(kind = "SetupComplete"),
+                GeminiLiveDebugEvent.Send(kind = "realtimeInput.audio", sent = true, dataBytes = 9),
+                GeminiLiveDebugEvent.Send(kind = "realtimeInput.audioStreamEnd", sent = true, dataBytes = null),
+            ),
+            observed,
+        )
     }
 
     @Test
@@ -650,9 +777,9 @@ class GeminiLiveVoiceClientTest {
 
         assertEquals(
             listOf(
-                GeminiLiveEvent.Error(
-                    message = "WebSocket closed: 1001 going away",
-                    raw = "",
+                GeminiLiveEvent.WebSocketClosed(
+                    code = 1001,
+                    reason = "going away",
                 ),
             ),
             events,
@@ -685,9 +812,8 @@ class GeminiLiveVoiceClientTest {
 
         assertEquals(
             listOf(
-                GeminiLiveEvent.Error(
+                GeminiLiveEvent.WebSocketFailure(
                     message = "network down",
-                    raw = "",
                 ),
             ),
             events,
@@ -697,7 +823,7 @@ class GeminiLiveVoiceClientTest {
     }
 
     @Test
-    fun `socket close and failure become error events`() = runBlocking {
+    fun `socket close and failure become typed diagnostics events`() = runBlocking {
         val socket = FakeGeminiSocket()
         val client = TestableGeminiLiveVoiceClient(socket = socket, codec = GeminiLiveCodec())
         val closeEvents = mutableListOf<GeminiLiveEvent>()
@@ -727,18 +853,17 @@ class GeminiLiveVoiceClientTest {
 
         assertEquals(
             listOf(
-                GeminiLiveEvent.Error(
-                    message = "WebSocket closed: 1001 going away",
-                    raw = "",
+                GeminiLiveEvent.WebSocketClosed(
+                    code = 1001,
+                    reason = "going away",
                 ),
             ),
             closeEvents,
         )
         assertEquals(
             listOf(
-                GeminiLiveEvent.Error(
+                GeminiLiveEvent.WebSocketFailure(
                     message = "network down",
-                    raw = "",
                 ),
             ),
             failureEvents,
@@ -765,6 +890,45 @@ class GeminiLiveVoiceClientTest {
         assertEquals("sse", url.queryParameter("alt"))
         assertEquals("token value", url.queryParameter("access_token"))
         assertEquals(2, url.querySize)
+    }
+
+    @Test
+    fun `okhttp socket forwards binary text frames as server messages`() {
+        val server = MockWebServer()
+        val message = """{"setupComplete":{}}"""
+        server.enqueue(
+            MockResponse.Builder()
+                .webSocketUpgrade(
+                    object : WebSocketListener() {
+                        override fun onOpen(webSocket: WebSocket, response: Response) {
+                            webSocket.send(message.encodeUtf8())
+                        }
+                    }
+                )
+                .build()
+        )
+        server.start()
+        try {
+            val received = mutableListOf<String>()
+            val latch = CountDownLatch(1)
+            val socket = OkHttpGeminiSocket(OkHttpClient())
+
+            socket.open(
+                url = server.url("/live").toString().replace("http://", "ws://"),
+                token = "token-1",
+                onMessage = {
+                    received += it
+                    latch.countDown()
+                },
+                onClosed = { _, _ -> },
+                onFailure = { throw AssertionError(it) },
+            )
+
+            assertTrue(latch.await(1, TimeUnit.SECONDS))
+            assertEquals(listOf(message), received)
+        } finally {
+            server.close()
+        }
     }
 
     @Test

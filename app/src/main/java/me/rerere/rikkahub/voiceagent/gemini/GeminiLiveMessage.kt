@@ -3,6 +3,14 @@ package me.rerere.rikkahub.voiceagent.gemini
 sealed interface GeminiLiveEvent {
     data object SetupComplete : GeminiLiveEvent
 
+    data object GenerationComplete : GeminiLiveEvent
+
+    data object TurnComplete : GeminiLiveEvent
+
+    data class Events(
+        val events: List<GeminiLiveEvent>,
+    ) : GeminiLiveEvent
+
     data class InputTranscript(
         val text: String,
     ) : GeminiLiveEvent
@@ -47,6 +55,15 @@ sealed interface GeminiLiveEvent {
     data class Error(
         val message: String,
         val raw: String,
+    ) : GeminiLiveEvent
+
+    data class WebSocketClosed(
+        val code: Int,
+        val reason: String,
+    ) : GeminiLiveEvent
+
+    data class WebSocketFailure(
+        val message: String,
     ) : GeminiLiveEvent
 
     data class Ignored(

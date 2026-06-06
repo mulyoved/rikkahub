@@ -76,7 +76,8 @@ class VoiceLabMobileApiTest {
                   "answer":"done",
                   "model":"ms-agent",
                   "profileId":"default",
-                  "profileLabel":"Default"
+                  "profileLabel":"Default",
+                  "elapsedMs":321
                 }
                 """.trimIndent(),
             )
@@ -100,6 +101,7 @@ class VoiceLabMobileApiTest {
         assertFalse(seenBody.contains("profileId"))
         assertEquals("done", response.answer)
         assertEquals("default", response.profileId)
+        assertEquals(321L, response.elapsedMs)
     }
 
     @Test
@@ -157,7 +159,7 @@ class VoiceLabMobileApiTest {
     }
 
     @Test
-    fun `successful response decode failures are sanitized`() {
+    fun `successful response decode failures keep prompt and answer visible while redacting tokens`() {
         val transport = transportFor { request ->
             responseFor(
                 request = request,
@@ -184,8 +186,8 @@ class VoiceLabMobileApiTest {
         assertTrue(message.contains("Voice Lab response decode failed"))
         assertTrue(message.contains("[redacted]"))
         assertFalse(message.contains("decode-token"))
-        assertFalse(message.contains("decode-prompt"))
-        assertFalse(message.contains("decode-answer"))
+        assertTrue(message.contains("decode-prompt"))
+        assertTrue(message.contains("decode-answer"))
     }
 
     @Test
@@ -216,7 +218,7 @@ class VoiceLabMobileApiTest {
     }
 
     @Test
-    fun `non successful response previews redact obvious secrets`() {
+    fun `non successful response previews keep prompt and answer visible while redacting credentials`() {
         val transport = transportFor { request ->
             responseFor(
                 request = request,
@@ -271,10 +273,10 @@ class VoiceLabMobileApiTest {
         assertFalse(message.contains("signed.example.test"))
         assertFalse(message.contains("url-token"))
         assertFalse(message.contains("config-token"))
-        assertFalse(message.contains("private prompt"))
-        assertFalse(message.contains("private answer"))
-        assertFalse(message.contains("escaped-secret"))
-        assertFalse(message.contains("embedded-prompt"))
+        assertTrue(message.contains("private prompt"))
+        assertTrue(message.contains("private answer"))
+        assertTrue(message.contains("escaped-secret"))
+        assertTrue(message.contains("embedded-prompt"))
         assertFalse(message.contains("embedded-token"))
         assertFalse(message.contains("single-token"))
         assertFalse(message.contains("plain-key"))
@@ -425,6 +427,7 @@ class VoiceLabMobileApiTest {
 
         VoiceLabMobileApi(baseUrl = "http://127.0.0.1:8787", credentials = credentials)
         VoiceLabMobileApi(baseUrl = "http://10.0.2.2:8787", credentials = credentials)
+        VoiceLabMobileApi(baseUrl = "http://100.83.49.15:8787", credentials = credentials)
     }
 
     @Test

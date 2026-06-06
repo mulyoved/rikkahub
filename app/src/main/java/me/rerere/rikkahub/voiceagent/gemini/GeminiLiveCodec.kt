@@ -34,6 +34,16 @@ class GeminiLiveCodec(
                             put(key, value)
                         }
                     }
+                    if ("toolConfig" !in liveConnectConfig && liveConnectConfig.declaresAskHermesTool()) {
+                        putJsonObject("toolConfig") {
+                            putJsonObject("functionCallingConfig") {
+                                put("mode", "ANY")
+                                putJsonArray("allowedFunctionNames") {
+                                    add(JsonPrimitive(ASK_HERMES_TOOL_NAME))
+                                }
+                            }
+                        }
+                    }
                     put("model", "models/$providerModel")
                     if (generationConfig != null || topLevelResponseModalities != null) {
                         put(
@@ -79,7 +89,7 @@ class GeminiLiveCodec(
                         )
                     }
                 }
-                put("turnComplete", false)
+                put("turnComplete", true)
             }
         }
     )
@@ -91,6 +101,14 @@ class GeminiLiveCodec(
                     put("mimeType", "audio/pcm;rate=16000")
                     put("data", base64Pcm16)
                 }
+            }
+        }
+    )
+
+    fun realtimeAudioStreamEndMessage(): String = json.encodeToString(
+        buildJsonObject {
+            putJsonObject("realtimeInput") {
+                put("audioStreamEnd", true)
             }
         }
     )
@@ -122,26 +140,45 @@ class GeminiLiveCodec(
         }
         val root = element as? JsonObject ?: return GeminiLiveEvent.Ignored(text)
 
-        if ("setupComplete" in root) {
-            return GeminiLiveEvent.SetupComplete
+        val events = buildList {
+            if ("setupComplete" in root) {
+                add(GeminiLiveEvent.SetupComplete)
+            }
+            if ("sessionResumptionUpdate" in root) {
+                root.sessionResumptionUpdate(text)
+                    .takeUnless { it is GeminiLiveEvent.Ignored }
+                    ?.let(::add)
+            }
+            root.toolCallEvent()?.let(::add)
+            root.toolCallCancellation()?.let(::add)
+            addAll(root.serverContentEvents())
         }
 
-        if ("sessionResumptionUpdate" in root) {
-            return root.sessionResumptionUpdate(text)
+        return events.toEventOrIgnored(raw = text)
+    }
+
+    private fun JsonObject.serverContentEvents(): List<GeminiLiveEvent> {
+        val serverContent = this["serverContent"] as? JsonObject ?: return emptyList()
+        return buildList {
+            if (serverContent["interrupted"]?.jsonPrimitiveOrNull()?.booleanOrNull == true) {
+                add(GeminiLiveEvent.Interrupted())
+            }
+            serverContent.transcript("inputTranscription")?.let { add(GeminiLiveEvent.InputTranscript(it)) }
+            serverContent.transcript("outputTranscription")?.let { add(GeminiLiveEvent.OutputTranscript(it)) }
+            serverContent.outputAudio()?.let { add(GeminiLiveEvent.OutputAudio(it)) }
+            if (serverContent["generationComplete"]?.jsonPrimitiveOrNull()?.booleanOrNull == true) {
+                add(GeminiLiveEvent.GenerationComplete)
+            }
+            if (serverContent["turnComplete"]?.jsonPrimitiveOrNull()?.booleanOrNull == true) {
+                add(GeminiLiveEvent.TurnComplete)
+            }
         }
+    }
 
-        root.toolCallEvent()?.let { return it }
-        root.toolCallCancellation()?.let { return it }
-
-        val serverContent = root["serverContent"] as? JsonObject
-        if (serverContent?.get("interrupted")?.jsonPrimitiveOrNull()?.booleanOrNull == true) {
-            return GeminiLiveEvent.Interrupted()
-        }
-        serverContent?.transcript("inputTranscription")?.let { return GeminiLiveEvent.InputTranscript(it) }
-        serverContent?.transcript("outputTranscription")?.let { return GeminiLiveEvent.OutputTranscript(it) }
-        serverContent?.outputAudio()?.let { return GeminiLiveEvent.OutputAudio(it) }
-
-        return GeminiLiveEvent.Ignored(text)
+    private fun List<GeminiLiveEvent>.toEventOrIgnored(raw: String): GeminiLiveEvent = when (size) {
+        0 -> GeminiLiveEvent.Ignored(raw)
+        1 -> single()
+        else -> GeminiLiveEvent.Events(this)
     }
 
     private fun JsonObject.toolCallEvent(): GeminiLiveEvent? {
@@ -199,6 +236,20 @@ class GeminiLiveCodec(
         if (ids.isEmpty()) return null
         return GeminiLiveEvent.ToolCallCancellation(ids)
     }
+
+    private fun JsonObject.declaresAskHermesTool(): Boolean =
+        this["tools"]
+            ?.jsonArrayOrNull()
+            ?.any { tool ->
+                tool.jsonObjectOrNull()
+                    ?.get("functionDeclarations")
+                    ?.jsonArrayOrNull()
+                    ?.any { declaration ->
+                        declaration.jsonObjectOrNull()
+                            ?.get("name")
+                            ?.stringContentOrNull() == ASK_HERMES_TOOL_NAME
+                    } == true
+            } == true
 
     private fun JsonObject.sessionResumptionUpdate(raw: String): GeminiLiveEvent {
         val update = this["sessionResumptionUpdate"]?.jsonObjectOrNull()

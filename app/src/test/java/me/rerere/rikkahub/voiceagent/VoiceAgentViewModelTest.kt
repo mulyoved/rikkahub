@@ -26,6 +26,7 @@ import me.rerere.rikkahub.voiceagent.voicelab.MobileHermesResponse
 import me.rerere.rikkahub.voiceagent.voicelab.MobileVoiceSessionResponse
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.util.Base64
@@ -62,11 +63,15 @@ class VoiceAgentViewModelTest {
         coordinator.onGeminiEvent(GeminiLiveEvent.OutputAudio("late-audio"))
         assertEquals(emptyList<String>(), audio.playedPcm16)
 
+        withContext(Dispatchers.Default) {
+            Thread.sleep(25)
+        }
         toolApi.complete(response(callId = "call-1", answer = "Hermes answer"))
         coordinator.awaitToolJobsWithTimeout()
 
         assertEquals(listOf("call-1" to "Hermes answer"), gemini.toolResponses)
-        assertEquals(VoiceToolStatus.HermesAnswered(callId = "call-1", elapsedMs = 0L), coordinator.state.value.tool)
+        val answered = assertHermesAnswered(callId = "call-1", status = coordinator.state.value.tool)
+        assertTrue("Expected delayed Hermes call to record elapsed time", answered.elapsedMs >= 1L)
     }
 
     @Test
@@ -93,6 +98,60 @@ class VoiceAgentViewModelTest {
         assertEquals(emptyList<Pair<String, String>>(), gemini.toolResponses)
         assertEquals(VoiceToolStatus.Idle, coordinator.state.value.tool)
         assertTrue(diagnostics.events.value.any { it.name == "unsupported_tool_call" && it.detail.contains("call-2") })
+    }
+
+    @Test
+    fun `pending Hermes tool status refreshes elapsed time while request is waiting`() = runTest {
+        val toolApi = FakeVoiceToolApi()
+        val coordinator = VoiceAgentCoordinator(
+            gemini = FakeGeminiLiveVoiceClient(),
+            toolApi = toolApi,
+            audio = FakeVoiceAudioEngine(),
+            scope = this,
+        )
+
+        coordinator.onGeminiEvent(
+            GeminiLiveEvent.ToolCall(callId = "call-timer", name = "ask_hermes", prompt = "wait")
+        )
+        assertEquals("call-timer" to "wait", toolApi.awaitRequest("call-timer"))
+
+        withTimeout(1500) {
+            while ((coordinator.state.value.tool as? VoiceToolStatus.CallingHermes)?.elapsedMs == 0L) {
+                delay(10)
+            }
+        }
+
+        val calling = coordinator.state.value.tool as VoiceToolStatus.CallingHermes
+        assertEquals("call-timer", calling.callId)
+        assertTrue("Expected pending Hermes status to expose elapsed time", calling.elapsedMs > 0L)
+
+        toolApi.complete(response(callId = "call-timer", answer = "done"))
+        coordinator.awaitToolJobsWithTimeout()
+    }
+
+    @Test
+    fun `diagnostic events are exposed in ui state for alpha visibility`() = runTest {
+        val diagnostics = VoiceDiagnostics()
+        val coordinator = VoiceAgentCoordinator(
+            gemini = FakeGeminiLiveVoiceClient(),
+            toolApi = FakeVoiceToolApi(),
+            audio = FakeVoiceAudioEngine(),
+            diagnostics = diagnostics,
+            scope = this,
+        )
+
+        diagnostics.record("manual_probe", "visible detail")
+
+        withTimeout(500) {
+            while (coordinator.state.value.diagnostics.none { it.name == "manual_probe" }) {
+                delay(10)
+            }
+        }
+        assertTrue(
+            coordinator.state.value.diagnostics.any {
+                it.name == "manual_probe" && it.detail == "visible detail"
+            }
+        )
     }
 
     @Test
@@ -284,14 +343,9 @@ class VoiceAgentViewModelTest {
 
         assertEquals(listOf("call-b" to "Second answer"), gemini.toolResponses)
         assertEquals(false, toolApi.wasCancelled("call-b"))
-        assertEquals(
-            VoiceToolStatus.HermesAnswered(callId = "call-b", elapsedMs = 0L),
-            coordinator.state.value.tool,
-        )
-        assertEquals(
-            mapOf("call-b" to VoiceToolStatus.HermesAnswered(callId = "call-b", elapsedMs = 0L)),
-            coordinator.state.value.toolCalls,
-        )
+        assertHermesAnswered(callId = "call-b", status = coordinator.state.value.tool)
+        assertEquals(setOf("call-b"), coordinator.state.value.toolCalls.keys)
+        assertHermesAnswered(callId = "call-b", status = coordinator.state.value.toolCalls.getValue("call-b"))
         assertTrue(
             diagnostics.events.value.any {
                 it.name == "tool_call_cancellation" && it.detail.contains("call-a")
@@ -352,10 +406,7 @@ class VoiceAgentViewModelTest {
         coordinator.awaitToolJobsWithTimeout()
 
         assertEquals(listOf("call-replay" to "new answer"), gemini.toolResponses)
-        assertEquals(
-            VoiceToolStatus.HermesAnswered(callId = "call-replay", elapsedMs = 0L),
-            coordinator.state.value.tool,
-        )
+        assertHermesAnswered(callId = "call-replay", status = coordinator.state.value.tool)
     }
 
     @Test
@@ -395,10 +446,7 @@ class VoiceAgentViewModelTest {
             listOf("call-replay-send" to "old answer"),
             gemini.toolResponses,
         )
-        assertEquals(
-            VoiceToolStatus.HermesAnswered(callId = "call-replay-send", elapsedMs = 0L),
-            coordinator.state.value.tool,
-        )
+        assertHermesAnswered(callId = "call-replay-send", status = coordinator.state.value.tool)
     }
 
     @Test
@@ -439,13 +487,9 @@ class VoiceAgentViewModelTest {
             }
         }
         assertEquals(VoiceToolStatus.CallingHermes("call-b"), coordinator.state.value.tool)
-        assertEquals(
-            mapOf(
-                "call-a" to VoiceToolStatus.HermesAnswered(callId = "call-a", elapsedMs = 0L),
-                "call-b" to VoiceToolStatus.CallingHermes("call-b"),
-            ),
-            coordinator.state.value.toolCalls,
-        )
+        assertEquals(setOf("call-a", "call-b"), coordinator.state.value.toolCalls.keys)
+        assertHermesAnswered(callId = "call-a", status = coordinator.state.value.toolCalls.getValue("call-a"))
+        assertEquals(VoiceToolStatus.CallingHermes("call-b"), coordinator.state.value.toolCalls.getValue("call-b"))
 
         toolApi.complete(response(callId = "call-b", answer = "Second answer"))
         coordinator.awaitToolJobsWithTimeout()
@@ -454,21 +498,21 @@ class VoiceAgentViewModelTest {
             setOf("call-a" to "First answer", "call-b" to "Second answer"),
             gemini.toolResponses.toSet(),
         )
-        assertEquals(
-            mapOf(
-                "call-a" to VoiceToolStatus.HermesAnswered(callId = "call-a", elapsedMs = 0L),
-                "call-b" to VoiceToolStatus.HermesAnswered(callId = "call-b", elapsedMs = 0L),
-            ),
-            coordinator.state.value.toolCalls,
-        )
+        assertEquals(setOf("call-a", "call-b"), coordinator.state.value.toolCalls.keys)
+        assertHermesAnswered(callId = "call-a", status = coordinator.state.value.toolCalls.getValue("call-a"))
+        assertHermesAnswered(callId = "call-b", status = coordinator.state.value.toolCalls.getValue("call-b"))
         assertTrue(
             diagnostics.events.value.any {
-                it.name == "hermes_tool_succeeded" && it.detail.contains("callId=call-a")
+                it.name == "hermes_tool_succeeded" &&
+                    it.detail.contains("callId=call-a") &&
+                    it.detail.contains("elapsedMs=")
             }
         )
         assertTrue(
             diagnostics.events.value.any {
-                it.name == "hermes_tool_succeeded" && it.detail.contains("callId=call-b")
+                it.name == "hermes_tool_succeeded" &&
+                    it.detail.contains("callId=call-b") &&
+                    it.detail.contains("elapsedMs=")
             }
         )
         assertTrue(
@@ -520,13 +564,12 @@ class VoiceAgentViewModelTest {
             VoiceToolStatus.HermesFailed(callId = "call-fail", message = "Hermes failed"),
             coordinator.state.value.tool,
         )
+        assertEquals(setOf("call-fail", "call-ok"), coordinator.state.value.toolCalls.keys)
         assertEquals(
-            mapOf(
-                "call-fail" to VoiceToolStatus.HermesFailed(callId = "call-fail", message = "Hermes failed"),
-                "call-ok" to VoiceToolStatus.HermesAnswered(callId = "call-ok", elapsedMs = 0L),
-            ),
-            coordinator.state.value.toolCalls,
+            VoiceToolStatus.HermesFailed(callId = "call-fail", message = "Hermes failed"),
+            coordinator.state.value.toolCalls.getValue("call-fail"),
         )
+        assertHermesAnswered(callId = "call-ok", status = coordinator.state.value.toolCalls.getValue("call-ok"))
         assertEquals(listOf("call-ok" to "Second answer"), gemini.toolResponses)
     }
 
@@ -931,6 +974,70 @@ class VoiceAgentViewModelTest {
     }
 
     @Test
+    fun `Gemini WebSocket close records structured diagnostic and visible error`() = runTest {
+        val coordinator = VoiceAgentCoordinator(
+            gemini = FakeGeminiLiveVoiceClient(),
+            toolApi = FakeVoiceToolApi(),
+            audio = FakeVoiceAudioEngine(),
+            scope = this,
+        )
+
+        coordinator.onGeminiEvent(GeminiLiveEvent.WebSocketClosed(code = 1001, reason = "going away"))
+
+        assertEquals(
+            VoiceSessionStatus.Error("Gemini WebSocket closed: 1001 going away"),
+            coordinator.state.value.session,
+        )
+        assertTrue(
+            coordinator.state.value.diagnostics.any {
+                it.name == "gemini_ws_closed" && it.detail == "code=1001, reason=going away"
+            }
+        )
+    }
+
+    @Test
+    fun `Gemini WebSocket close after session end is ignored instead of shown as error`() = runTest {
+        val coordinator = VoiceAgentCoordinator(
+            gemini = FakeGeminiLiveVoiceClient(),
+            toolApi = FakeVoiceToolApi(),
+            audio = FakeVoiceAudioEngine(),
+            scope = this,
+        )
+        coordinator.updateSessionStatus(VoiceSessionStatus.Connected)
+
+        coordinator.prepareForSessionEnd()
+        coordinator.onGeminiEvent(GeminiLiveEvent.WebSocketClosed(code = 1008, reason = "The operation was aborted."))
+
+        assertEquals(VoiceSessionStatus.Connected, coordinator.state.value.session)
+        assertEquals(null, coordinator.state.value.error)
+        assertTrue(
+            coordinator.state.value.diagnostics.any {
+                it.name == "stale_gemini_event" && it.detail == "WebSocketClosed"
+            }
+        )
+    }
+
+    @Test
+    fun `asynchronous audio error records diagnostic and visible error`() = runTest {
+        val audio = FakeVoiceAudioEngine()
+        val coordinator = VoiceAgentCoordinator(
+            gemini = FakeGeminiLiveVoiceClient(),
+            toolApi = FakeVoiceToolApi(),
+            audio = audio,
+            scope = this,
+        )
+
+        audio.emitError("Audio focus lost: -1")
+
+        assertEquals(VoiceSessionStatus.Error("Audio focus lost: -1"), coordinator.state.value.session)
+        assertTrue(
+            coordinator.state.value.diagnostics.any {
+                it.name == "audio_error" && it.detail == "Audio focus lost: -1"
+            }
+        )
+    }
+
+    @Test
     fun `coordinator persists transcript fragments as turns and Hermes tool records`() = runTest {
         val conversationStore = FakeVoiceConversationStore()
         val toolApi = FakeVoiceToolApi()
@@ -948,7 +1055,7 @@ class VoiceAgentViewModelTest {
         coordinator.onGeminiEvent(GeminiLiveEvent.OutputTranscript("i"))
         coordinator.onGeminiEvent(GeminiLiveEvent.ToolCall(callId = "call-persist", name = "ask_hermes", prompt = "look up"))
         assertEquals("call-persist" to "look up", toolApi.awaitRequest("call-persist"))
-        toolApi.complete(response(callId = "call-persist", answer = "tool answer"))
+        toolApi.complete(response(callId = "call-persist", answer = "tool answer", elapsedMs = 321L))
         coordinator.awaitToolJobsWithTimeout()
         conversationStore.awaitUpdateCount(6)
 
@@ -956,9 +1063,103 @@ class VoiceAgentViewModelTest {
         assertEquals(3, messages.size)
         assertTrue(messages[0].parts.filterIsInstance<UIMessagePart.Text>().any { it.text == "hello" })
         assertTrue(messages[1].parts.filterIsInstance<UIMessagePart.Text>().any { it.text == "hi" })
+        val userText = messages[0].parts.filterIsInstance<UIMessagePart.Text>().single()
+        val assistantText = messages[1].parts.filterIsInstance<UIMessagePart.Text>().single()
         val tool = messages[2].parts.filterIsInstance<UIMessagePart.Tool>().single()
+        val sessionId = userText.metadata?.get("voice_session_id")?.jsonPrimitive?.content
+        assertTrue(!sessionId.isNullOrBlank())
+        assertEquals("voice_agent", userText.metadata?.get("voice_source")?.jsonPrimitive?.content)
+        assertEquals(sessionId, assistantText.metadata?.get("voice_session_id")?.jsonPrimitive?.content)
+        assertEquals(sessionId, tool.metadata?.get("voice_session_id")?.jsonPrimitive?.content)
+        assertEquals("user-1", userText.metadata?.get("voice_event_id")?.jsonPrimitive?.content)
+        assertEquals("assistant-2", assistantText.metadata?.get("voice_event_id")?.jsonPrimitive?.content)
+        assertEquals("call-persist", tool.metadata?.get("voice_event_id")?.jsonPrimitive?.content)
+        assertEquals("call-persist", tool.metadata?.get("voice_call_id")?.jsonPrimitive?.content)
+        assertTrue(!tool.metadata?.get("voice_created_at")?.jsonPrimitive?.content.isNullOrBlank())
         assertEquals("call-persist", tool.toolCallId)
         assertTrue(tool.output.filterIsInstance<UIMessagePart.Text>().any { it.text == "tool answer" })
+        assertTrue(
+            coordinator.state.value.diagnostics.any {
+                it.name == "input_transcript_delta" && it.detail.contains("text=hel")
+            }
+        )
+        assertTrue(
+            coordinator.state.value.diagnostics.any {
+                it.name == "output_transcript_delta" && it.detail.contains("text=h")
+            }
+        )
+        assertTrue(
+            coordinator.state.value.diagnostics.any {
+                it.name == "hermes_tool_succeeded" &&
+                    it.detail.contains("elapsedMs=") &&
+                    it.detail.contains("serverElapsedMs=321") &&
+                    it.detail.contains("answer=tool answer")
+            }
+        )
+        assertTrue(coordinator.state.value.diagnostics.any { it.name == "conversation_persist_saved" })
+    }
+
+    @Test
+    fun `coordinator persists live user transcript as partial and marks session closed before final on close`() = runTest {
+        val conversationStore = FakeVoiceConversationStore()
+        val coordinator = VoiceAgentCoordinator(
+            gemini = FakeGeminiLiveVoiceClient(),
+            toolApi = FakeVoiceToolApi(),
+            audio = FakeVoiceAudioEngine(),
+            conversationStore = conversationStore,
+            scope = this,
+        )
+
+        coordinator.onGeminiEvent(GeminiLiveEvent.InputTranscript("hel"))
+        conversationStore.awaitUpdateCount(1)
+
+        val liveUserText = conversationStore.conversation.value.currentMessages.single()
+            .parts
+            .filterIsInstance<UIMessagePart.Text>()
+            .single()
+        assertEquals("hel", liveUserText.text)
+        assertEquals("partial", liveUserText.metadata?.get("voice_status")?.jsonPrimitive?.content)
+
+        coordinator.closeAndDrain()
+
+        val closedUserText = conversationStore.conversation.value.currentMessages.single()
+            .parts
+            .filterIsInstance<UIMessagePart.Text>()
+            .single()
+        assertEquals("hel", closedUserText.text)
+        assertEquals("session-closed-before-final", closedUserText.metadata?.get("voice_status")?.jsonPrimitive?.content)
+    }
+
+    @Test
+    fun `coordinator persists assistant transcript as partial until Gemini generation completes`() = runTest {
+        val conversationStore = FakeVoiceConversationStore()
+        val coordinator = VoiceAgentCoordinator(
+            gemini = FakeGeminiLiveVoiceClient(),
+            toolApi = FakeVoiceToolApi(),
+            audio = FakeVoiceAudioEngine(),
+            conversationStore = conversationStore,
+            scope = this,
+        )
+
+        coordinator.onGeminiEvent(GeminiLiveEvent.OutputTranscript("hel"))
+        conversationStore.awaitUpdateCount(1)
+
+        val partialAssistantText = conversationStore.conversation.value.currentMessages.single()
+            .parts
+            .filterIsInstance<UIMessagePart.Text>()
+            .single()
+        assertEquals("hel", partialAssistantText.text)
+        assertEquals("partial", partialAssistantText.metadata?.get("voice_status")?.jsonPrimitive?.content)
+
+        coordinator.onGeminiEvent(GeminiLiveEvent.GenerationComplete)
+        conversationStore.awaitUpdateCount(2)
+
+        val completeAssistantText = conversationStore.conversation.value.currentMessages.single()
+            .parts
+            .filterIsInstance<UIMessagePart.Text>()
+            .single()
+        assertEquals("hel", completeAssistantText.text)
+        assertEquals("complete", completeAssistantText.metadata?.get("voice_status")?.jsonPrimitive?.content)
     }
 
     @Test
@@ -1327,12 +1528,19 @@ class VoiceAgentViewModelTest {
         assertEquals("token-1", gemini.connectedToken)
         assertEquals("wss://voice.test/live", gemini.connectedWebsocketUrl)
         assertEquals("gemini-live-test", gemini.connectedProviderModel)
-        assertEquals("system voice prompt", gemini.connectedSystemInstruction)
-        assertEquals(listOf(GeminiContentTurn(role = "user", text = "prior turn")), gemini.connectedContextTurns)
+        assertEquals(
+            "system voice prompt\n\nPrevious RikkaHub conversation context:\nUser: prior turn",
+            gemini.connectedSystemInstruction,
+        )
+        assertEquals(emptyList<GeminiContentTurn>(), gemini.connectedContextTurns)
         assertEquals(1, audio.startCaptureCalls)
 
         audio.emitCapture(byteArrayOf(1, 2, 3))
         assertEquals(listOf(Base64.getEncoder().encodeToString(byteArrayOf(1, 2, 3))), gemini.audioMessages)
+
+        vm.setMuted(true)
+        assertEquals(listOf(1L), gemini.audioStreamEndSessionIds)
+        assertEquals(1, audio.stopCaptureCalls)
 
         vm.end()
         withTimeout(500) {
@@ -1344,6 +1552,44 @@ class VoiceAgentViewModelTest {
         assertTrue(gemini.closeCalls >= 1)
         assertEquals(1, audio.releaseCalls)
         assertEquals(VoiceSessionStatus.Ended, vm.state.value.session)
+    }
+
+    @Test
+    fun `ViewModel ends active session with diagnostic when screen backgrounds`() = runTest {
+        val gemini = FakeGeminiLiveVoiceClient()
+        val audio = FakeVoiceAudioEngine()
+        val diagnostics = VoiceDiagnostics()
+        val vm = VoiceAgentViewModel(
+            modelId = "gemini-flash",
+            sessionApi = FakeVoiceSessionApi(),
+            toolApi = FakeVoiceToolApi(),
+            gemini = gemini,
+            audio = audio,
+            conversationStore = FakeVoiceConversationStore(),
+            contextProvider = FakeVoiceAgentContextProvider(
+                VoiceContext(systemInstruction = "system", turns = emptyList())
+            ),
+            diagnostics = diagnostics,
+            scope = this,
+        )
+
+        vm.start()
+        gemini.awaitConnect()
+
+        vm.endBecauseBackgrounded()
+
+        withTimeout(500) {
+            while (gemini.closeCalls < 1 || audio.releaseCalls < 1) {
+                delay(10)
+            }
+        }
+        assertEquals(VoiceSessionStatus.Ended, vm.state.value.session)
+        assertTrue(vm.state.value.error.orEmpty().contains("background"))
+        assertTrue(
+            vm.state.value.diagnostics.any {
+                it.name == "voice_agent_backgrounded" && it.detail.contains("background")
+            }
+        )
     }
 
     @Test
@@ -1371,6 +1617,22 @@ class VoiceAgentViewModelTest {
         assertEquals(VoiceSessionStatus.Error("Failed to send Gemini setup message"), vm.state.value.session)
         assertEquals(0, audio.startCaptureCalls)
         assertEquals(1, gemini.closeCalls)
+    }
+
+    @Test
+    fun `coordinator clears previous visible error when Gemini setup completes`() = runTest {
+        val coordinator = VoiceAgentCoordinator(
+            gemini = FakeGeminiLiveVoiceClient(),
+            toolApi = FakeVoiceToolApi(),
+            audio = FakeVoiceAudioEngine(),
+            scope = this,
+        )
+
+        coordinator.onGeminiEvent(GeminiLiveEvent.Error(message = "Failed to connect", raw = "{}"))
+        coordinator.onGeminiEvent(GeminiLiveEvent.SetupComplete)
+
+        assertEquals(VoiceSessionStatus.Connected, coordinator.state.value.session)
+        assertNull(coordinator.state.value.error)
     }
 
     @Test
@@ -1881,13 +2143,32 @@ class VoiceAgentViewModelTest {
         assertEquals(VoiceToolStatus.Idle, vm.state.value.tool)
     }
 
-    private fun response(callId: String, answer: String): MobileHermesResponse = MobileHermesResponse(
+    private fun response(
+        callId: String,
+        answer: String,
+        elapsedMs: Long? = null,
+    ): MobileHermesResponse = MobileHermesResponse(
         callId = callId,
         answer = answer,
         model = "hermes-test",
         profileId = "profile",
         profileLabel = "Profile",
+        elapsedMs = elapsedMs,
     )
+
+    private fun assertHermesAnswered(
+        callId: String,
+        status: VoiceToolStatus,
+    ): VoiceToolStatus.HermesAnswered {
+        assertTrue(
+            "Expected HermesAnswered($callId) but was $status",
+            status is VoiceToolStatus.HermesAnswered,
+        )
+        val answered = status as VoiceToolStatus.HermesAnswered
+        assertEquals(callId, answered.callId)
+        assertTrue("Expected non-negative elapsed time", answered.elapsedMs >= 0L)
+        return answered
+    }
 
     private suspend fun VoiceAgentCoordinator.awaitToolJobsWithTimeout() {
         withTimeout(500) {
@@ -1923,6 +2204,7 @@ class VoiceAgentViewModelTest {
 
     private class FakeGeminiLiveVoiceClient : GeminiLiveVoiceClient {
         val audioMessages = mutableListOf<String>()
+        val audioStreamEndSessionIds = mutableListOf<Long?>()
         val toolResponses = mutableListOf<Pair<String, String>>()
         val failToolResponses = mutableSetOf<String>()
         var closeCalls = 0
@@ -2000,6 +2282,16 @@ class VoiceAgentViewModelTest {
 
         override fun activateOutboundSession(sessionId: Long) {
             outboundSessionId = sessionId
+        }
+
+        override fun sendAudioStreamEnd(sessionId: Long?): Boolean {
+            synchronized(outboundSendLock) {
+                if (sessionId != null && outboundSessionId != sessionId) {
+                    return false
+                }
+                audioStreamEndSessionIds += sessionId
+                return true
+            }
         }
 
         override fun invalidateOutboundSession() {
@@ -2145,10 +2437,15 @@ class VoiceAgentViewModelTest {
         var startCaptureCalls = 0
         var stopCaptureCalls = 0
         var startCaptureError: Throwable? = null
+        private var errorHandler: ((String) -> Unit)? = null
         private var playbackSessionId: Long? = null
         private var captureCallback: ((ByteArray) -> Unit)? = null
         private val blockedPlaybacks = mutableListOf<BlockedPlayback>()
         private val blockedSuppressions = mutableListOf<BlockedPlayback>()
+
+        override fun setErrorHandler(onError: ((String) -> Unit)?) {
+            errorHandler = onError
+        }
 
         override fun startCapture(onPcm16: (ByteArray) -> Unit) {
             startCaptureCalls += 1
@@ -2227,6 +2524,10 @@ class VoiceAgentViewModelTest {
 
         fun emitCapture(pcm16: ByteArray) {
             captureCallback?.invoke(pcm16)
+        }
+
+        fun emitError(message: String) {
+            errorHandler?.invoke(message)
         }
     }
 

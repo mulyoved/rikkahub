@@ -15,13 +15,30 @@ data class VoiceDiagnosticEvent(
 
 class VoiceDiagnostics {
     private val _events = MutableStateFlow<List<VoiceDiagnosticEvent>>(emptyList())
+    private val listeners = mutableSetOf<(VoiceDiagnosticEvent) -> Unit>()
     val events: StateFlow<List<VoiceDiagnosticEvent>> = _events.asStateFlow()
 
     fun record(event: VoiceDiagnosticEvent) {
         _events.update { it + event }
+        synchronized(listeners) {
+            listeners.toList()
+        }.forEach { listener ->
+            listener(event)
+        }
     }
 
     fun record(name: String, detail: String = "") {
         record(VoiceDiagnosticEvent(name = name, detail = detail))
+    }
+
+    fun addListener(listener: (VoiceDiagnosticEvent) -> Unit): () -> Unit {
+        synchronized(listeners) {
+            listeners += listener
+        }
+        return {
+            synchronized(listeners) {
+                listeners -= listener
+            }
+        }
     }
 }

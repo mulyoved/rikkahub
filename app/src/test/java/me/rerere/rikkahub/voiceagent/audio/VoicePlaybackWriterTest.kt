@@ -69,7 +69,7 @@ class VoicePlaybackWriterTest {
     }
 
     @Test
-    fun `suppress increments generation flushes active sink and skips queued stale chunks`() {
+    fun `suppress increments generation retires active sink and skips queued stale chunks`() {
         val scope = testScope()
         val diagnostics = CopyOnWriteArrayList<VoicePlaybackDiagnostic>()
         val staleRejectedLatch = CountDownLatch(2)
@@ -99,7 +99,7 @@ class VoicePlaybackWriterTest {
         assertTrue(staleRejectedLatch.await(2, TimeUnit.SECONDS))
 
         assertEquals(listOf(listOf<Byte>(1, 2, 3)), sink.writes)
-        assertEquals(1, sink.pauseAndFlushCalls)
+        assertEquals(1, sink.stopAndReleaseCalls)
         assertTrue(diagnostics.any { it is VoicePlaybackDiagnostic.PlaybackSuppressed })
         assertTrue(diagnostics.any { it is VoicePlaybackDiagnostic.StaleChunkRejected })
 
@@ -124,7 +124,7 @@ class VoicePlaybackWriterTest {
 
         writer.invalidateSession()
 
-        assertEquals(1, sink.pauseAndFlushCalls)
+        assertEquals(1, sink.stopAndReleaseCalls)
         assertFalse(writer.playBase64(base64Pcm16 = "BAUG", sessionId = 100L))
         assertEquals(listOf(listOf<Byte>(1, 2, 3)), sink.writes)
         assertTrue(diagnostics.any { it is VoicePlaybackDiagnostic.StaleChunkRejected })
@@ -248,6 +248,71 @@ class VoicePlaybackWriterTest {
 
         assertEquals(0, sinkCreations)
         assertTrue(diagnostics.any { it is VoicePlaybackDiagnostic.MalformedChunk })
+
+        writer.release()
+        scope.cancel()
+    }
+
+    @Test
+    fun `null sink factory reports start failure and worker accepts later playback`() {
+        val scope = testScope()
+        val diagnostics = CopyOnWriteArrayList<VoicePlaybackDiagnostic>()
+        val startFailedLatch = CountDownLatch(1)
+        val sink = FakeVoicePcm16Sink(expectedWrites = 1)
+        val sinkIndex = AtomicInteger()
+        val writer = VoicePlaybackWriter(
+            scope = scope,
+            createSink = {
+                if (sinkIndex.getAndIncrement() == 0) null else sink
+            },
+            onDiagnostic = { diagnostic ->
+                diagnostics += diagnostic
+                if (diagnostic is VoicePlaybackDiagnostic.SinkStartFailed) {
+                    startFailedLatch.countDown()
+                }
+            },
+        )
+
+        writer.activateSession(100L)
+        assertTrue(writer.playBase64(base64Pcm16 = "AQID", sessionId = 100L))
+        assertTrue(startFailedLatch.await(2, TimeUnit.SECONDS))
+
+        assertTrue(writer.playBase64(base64Pcm16 = "BAUG", sessionId = 100L))
+        assertTrue(sink.awaitWrites(2))
+        assertEquals(listOf(listOf<Byte>(4, 5, 6)), sink.writes)
+        assertTrue(diagnostics.any { it is VoicePlaybackDiagnostic.SinkStartFailed })
+
+        writer.release()
+        scope.cancel()
+    }
+
+    @Test
+    fun `interrupted write is treated as stale playback not sink failure`() {
+        val scope = testScope()
+        val diagnostics = CopyOnWriteArrayList<VoicePlaybackDiagnostic>()
+        val staleRejectedLatch = CountDownLatch(1)
+        val sink = FakeVoicePcm16Sink(
+            expectedWrites = 1,
+            writeResult = VoicePcm16Sink.WriteResult.Interrupted,
+        )
+        val writer = VoicePlaybackWriter(
+            scope = scope,
+            createSink = { sink },
+            onDiagnostic = { diagnostic ->
+                diagnostics += diagnostic
+                if (diagnostic is VoicePlaybackDiagnostic.StaleChunkRejected) {
+                    staleRejectedLatch.countDown()
+                }
+            },
+        )
+
+        writer.activateSession(100L)
+        assertTrue(writer.playBase64(base64Pcm16 = "AQID", sessionId = 100L))
+        assertTrue(sink.awaitWrites(2))
+
+        assertTrue(staleRejectedLatch.await(2, TimeUnit.SECONDS))
+        assertFalse(diagnostics.any { it is VoicePlaybackDiagnostic.SinkWriteFailed })
+        assertEquals(0, sink.stopAndReleaseCalls)
 
         writer.release()
         scope.cancel()

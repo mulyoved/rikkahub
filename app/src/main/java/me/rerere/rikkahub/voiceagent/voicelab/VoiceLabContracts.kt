@@ -53,6 +53,7 @@ data class MobileHermesResponse(
     val model: String,
     val profileId: String,
     val profileLabel: String,
+    val elapsedMs: Long? = null,
 ) {
     override fun toString(): String =
         "MobileHermesResponse(" +
@@ -60,7 +61,8 @@ data class MobileHermesResponse(
             "answer=[redacted], " +
             "model=$model, " +
             "profileId=$profileId, " +
-            "profileLabel=$profileLabel" +
+            "profileLabel=$profileLabel, " +
+            "elapsedMs=$elapsedMs" +
             ")"
 }
 

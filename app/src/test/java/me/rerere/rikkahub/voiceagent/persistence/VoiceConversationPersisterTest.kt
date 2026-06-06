@@ -101,6 +101,74 @@ class VoiceConversationPersisterTest {
     }
 
     @Test
+    fun `user transcript upsert preserves partial and session closed statuses`() {
+        val persister = VoiceConversationPersister()
+        val conversation = emptyConversation()
+            .let {
+                persister.upsertUserTranscriptTurn(
+                    conversation = it,
+                    text = "hel",
+                    turnId = "user-1",
+                    status = VoiceTranscriptStatus.Partial,
+                )
+            }
+            .let {
+                persister.upsertUserTranscriptTurn(
+                    conversation = it,
+                    text = "hello",
+                    turnId = "user-1",
+                    status = VoiceTranscriptStatus.SessionClosedBeforeFinal,
+                )
+            }
+
+        assertEquals(1, conversation.currentMessages.size)
+        val userText = conversation.currentMessages.single().parts.single() as UIMessagePart.Text
+        assertEquals("hello", userText.text)
+        assertEquals("session-closed-before-final", userText.metadata!!["voice_status"]!!.jsonPrimitive.content)
+    }
+
+    @Test
+    fun `assistant transcript upsert preserves partial complete and session closed statuses`() {
+        val persister = VoiceConversationPersister()
+        val conversation = emptyConversation()
+            .let {
+                persister.upsertAssistantTranscriptTurn(
+                    conversation = it,
+                    text = "h",
+                    interrupted = false,
+                    turnId = "assistant-1",
+                    status = VoiceTranscriptStatus.Partial,
+                )
+            }
+            .let {
+                persister.upsertAssistantTranscriptTurn(
+                    conversation = it,
+                    text = "hi",
+                    interrupted = false,
+                    turnId = "assistant-1",
+                    status = VoiceTranscriptStatus.Complete,
+                )
+            }
+            .let {
+                persister.upsertAssistantTranscriptTurn(
+                    conversation = it,
+                    text = "later",
+                    interrupted = false,
+                    turnId = "assistant-2",
+                    status = VoiceTranscriptStatus.SessionClosedBeforeFinal,
+                )
+            }
+
+        assertEquals(2, conversation.currentMessages.size)
+        val completeText = conversation.currentMessages[0].parts.single() as UIMessagePart.Text
+        val closedText = conversation.currentMessages[1].parts.single() as UIMessagePart.Text
+        assertEquals("hi", completeText.text)
+        assertEquals("complete", completeText.metadata!!["voice_status"]!!.jsonPrimitive.content)
+        assertEquals("later", closedText.text)
+        assertEquals("session-closed-before-final", closedText.metadata!!["voice_status"]!!.jsonPrimitive.content)
+    }
+
+    @Test
     fun `voice transcript upsert replaces matching turn even when tool record interleaves`() {
         val persister = VoiceConversationPersister()
         val conversation = emptyConversation()
@@ -343,10 +411,92 @@ class VoiceConversationPersisterTest {
         assertEquals("interrupted", textPart.metadata!!["voice_status"]!!.jsonPrimitive.content)
     }
 
+    @Test
+    fun `voice artifacts include session source identifiers status and timestamps`() {
+        val persister = VoiceConversationPersister()
+        val conversation = emptyConversation()
+            .let {
+                persister.upsertUserTranscriptTurn(
+                    conversation = it,
+                    text = "hello",
+                    turnId = "user-1",
+                    sessionId = "session-1",
+                )
+            }
+            .let {
+                persister.upsertAssistantTranscriptTurn(
+                    conversation = it,
+                    text = "hi",
+                    interrupted = true,
+                    turnId = "assistant-1",
+                    sessionId = "session-1",
+                )
+            }
+            .let {
+                persister.upsertHermesTool(
+                    conversation = it,
+                    callId = "call-1",
+                    prompt = "Ask Hermes",
+                    status = VoiceToolRecordStatus.Complete("Hermes answer"),
+                    sessionId = "session-1",
+                )
+            }
+
+        val userText = conversation.currentMessages[0].parts.single() as UIMessagePart.Text
+        val assistantText = conversation.currentMessages[1].parts.single() as UIMessagePart.Text
+        val tool = conversation.currentMessages[2].parts.single() as UIMessagePart.Tool
+        val toolOutput = tool.output.single() as UIMessagePart.Text
+
+        assertVoiceMetadata(
+            metadata = userText.metadata!!,
+            sessionId = "session-1",
+            eventId = "user-1",
+            status = "complete",
+        )
+        assertVoiceMetadata(
+            metadata = assistantText.metadata!!,
+            sessionId = "session-1",
+            eventId = "assistant-1",
+            status = "interrupted",
+        )
+        assertVoiceMetadata(
+            metadata = tool.metadata!!,
+            sessionId = "session-1",
+            eventId = "call-1",
+            status = "complete",
+            callId = "call-1",
+        )
+        assertVoiceMetadata(
+            metadata = toolOutput.metadata!!,
+            sessionId = "session-1",
+            eventId = "call-1",
+            status = "complete",
+            callId = "call-1",
+        )
+    }
+
     private fun emptyConversation(): Conversation = Conversation.ofId(
         id = Uuid.random(),
         messages = emptyList(),
     )
+
+    private fun assertVoiceMetadata(
+        metadata: kotlinx.serialization.json.JsonObject,
+        sessionId: String,
+        eventId: String,
+        status: String,
+        callId: String? = null,
+    ) {
+        assertEquals("voice_agent", metadata["voice_source"]!!.jsonPrimitive.content)
+        assertEquals(sessionId, metadata["voice_session_id"]!!.jsonPrimitive.content)
+        assertEquals(eventId, metadata["voice_event_id"]!!.jsonPrimitive.content)
+        assertEquals(status, metadata["voice_status"]!!.jsonPrimitive.content)
+        assertTrue(metadata["voice_created_at"]!!.jsonPrimitive.content.isNotBlank())
+        assertTrue(metadata["voice_updated_at"]!!.jsonPrimitive.content.isNotBlank())
+        if (callId != null) {
+            assertEquals(callId, metadata["voice_call_id"]!!.jsonPrimitive.content)
+        }
+    }
 
     private fun String.promptJson(): String = JsonInstant
         .parseToJsonElement(this)

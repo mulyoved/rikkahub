@@ -19,6 +19,7 @@ internal interface VoicePcm16Sink {
     sealed interface WriteResult {
         data class Written(val bytes: Int) : WriteResult
         data class Failed(val message: String) : WriteResult
+        data object Interrupted : WriteResult
     }
 }
 
@@ -40,7 +41,7 @@ internal sealed interface VoicePlaybackDiagnostic {
 
 internal class VoicePlaybackWriter(
     scope: CoroutineScope,
-    private val createSink: () -> VoicePcm16Sink,
+    private val createSink: () -> VoicePcm16Sink?,
     private val onDiagnostic: (VoicePlaybackDiagnostic) -> Unit = {},
 ) {
     private val lock = Any()
@@ -112,9 +113,11 @@ internal class VoicePlaybackWriter(
             }
             activeSessionId = sessionId
             generation += 1
-            activeSink
+            val sink = activeSink
+            activeSink = null
+            sink
         }
-        sink?.pauseAndFlush()
+        sink?.stopAndRelease()
     }
 
     fun invalidateSession() {
@@ -124,9 +127,11 @@ internal class VoicePlaybackWriter(
             }
             activeSessionId = null
             generation += 1
-            activeSink
+            val sink = activeSink
+            activeSink = null
+            sink
         }
-        sink?.pauseAndFlush()
+        sink?.stopAndRelease()
     }
 
     fun suppress() {
@@ -135,9 +140,11 @@ internal class VoicePlaybackWriter(
                 return
             }
             generation += 1
-            SuppressResult(sink = activeSink, generation = generation)
+            val sink = activeSink
+            activeSink = null
+            SuppressResult(sink = sink, generation = generation)
         }
-        result.sink?.pauseAndFlush()
+        result.sink?.stopAndRelease()
         onDiagnostic(VoicePlaybackDiagnostic.PlaybackSuppressed(result.generation))
     }
 
@@ -190,6 +197,10 @@ internal class VoicePlaybackWriter(
                 }
                 onDiagnostic(VoicePlaybackDiagnostic.SinkWriteFailed(result.message))
             }
+            VoicePcm16Sink.WriteResult.Interrupted -> {
+                clearSink(sink)
+                emitStale(command.generation)
+            }
         }
     }
 
@@ -220,6 +231,9 @@ internal class VoicePlaybackWriter(
             createSink()
         } catch (e: Exception) {
             onDiagnostic(VoicePlaybackDiagnostic.SinkStartFailed(e.message ?: e.javaClass.simpleName))
+            return null
+        } ?: run {
+            onDiagnostic(VoicePlaybackDiagnostic.SinkStartFailed("Playback sink creation failed"))
             return null
         }
 
