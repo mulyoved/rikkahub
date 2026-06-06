@@ -11,7 +11,6 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.currentCoroutineContext
-import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -39,7 +38,6 @@ import me.rerere.rikkahub.voiceagent.telemetry.VoiceDiagnostics
 import me.rerere.rikkahub.voiceagent.voicelab.MobileHermesResponse
 import me.rerere.rikkahub.voiceagent.voicelab.MobileVoiceSessionResponse
 import me.rerere.rikkahub.voiceagent.voicelab.VoiceLabMobileApi
-import java.util.Base64
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.EmptyCoroutineContext
 import kotlin.time.Clock
@@ -121,29 +119,6 @@ class SettingsVoiceAgentContextProvider(
         )
     }
 }
-
-private fun VoiceContext.withTurnsFoldedIntoSystemInstruction(): VoiceContext {
-    if (turns.isEmpty()) return this
-
-    val previousContext = turns.joinToString(separator = "\n\n") { turn ->
-        "${turn.voiceContextLabel()}: ${turn.text}"
-    }
-    return copy(
-        systemInstruction = listOf(
-            systemInstruction,
-            "Previous RikkaHub conversation context:\n$previousContext",
-        )
-            .filter { it.isNotBlank() }
-            .joinToString(separator = "\n\n"),
-        turns = emptyList(),
-    )
-}
-
-private fun me.rerere.rikkahub.voiceagent.gemini.GeminiContentTurn.voiceContextLabel(): String =
-    when (role) {
-        "model" -> "Assistant"
-        else -> "User"
-    }
 
 class VoiceAgentCoordinator(
     private val gemini: GeminiLiveVoiceClient,
@@ -1128,229 +1103,46 @@ class VoiceAgentViewModel(
     scope: CoroutineScope? = null,
 ) : ViewModel() {
     private val lifecycleScope = scope ?: viewModelScope
-    private val coordinator = VoiceAgentCoordinator(
-        gemini = gemini,
+    private val callSession = VoiceAgentCallSession(
+        modelId = modelId,
+        sessionApi = sessionApi,
         toolApi = toolApi,
+        gemini = gemini,
         audio = audio,
-        diagnostics = diagnostics,
         conversationStore = conversationStore,
+        contextProvider = contextProvider,
+        diagnostics = diagnostics,
         scope = lifecycleScope,
     )
-    private var startJob: Job? = null
-    private var muted = false
-    private var sessionId = 0L
-    private var ended = false
 
-    val state: StateFlow<VoiceAgentUiState> = coordinator.state
-    private val conversation = conversationStore.conversation
-    private val contextProvider = contextProvider
+    val state: StateFlow<VoiceAgentUiState> = callSession.state
 
     fun start() {
-        if (ended || startJob?.isActive == true) return
-        val currentSessionId = coordinator.nextSessionId()
-        sessionId = currentSessionId
-        val job = lifecycleScope.launch {
-            runSession(currentSessionId)
-        }
-        startJob = job
-    }
-
-    private suspend fun runSession(currentSessionId: Long) {
-        val sessionJob = currentCoroutineContext()[Job]
-        startJob = sessionJob
-        var geminiStarted = false
-        try {
-            coordinator.updateSessionStatus(VoiceSessionStatus.PreparingContext)
-            val voiceContext = contextProvider.build(conversation.value).withTurnsFoldedIntoSystemInstruction()
-            coordinator.recordDiagnostic(
-                name = "voice_context_prepared",
-                detail = "turns=${voiceContext.turns.size}, systemInstructionChars=${voiceContext.systemInstruction.length}",
-            )
-            ensureActiveSession(currentSessionId)
-            coordinator.updateSessionStatus(VoiceSessionStatus.RequestingToken)
-            val session = sessionApi.createSession(modelId = modelId)
-            coordinator.recordDiagnostic(
-                name = "voice_session_created",
-                detail = "modelId=${session.modelId}, providerModel=${session.providerModel}, " +
-                    "inputSampleRate=${session.inputSampleRate}, outputSampleRate=${session.outputSampleRate}",
-            )
-            ensureActiveSession(currentSessionId)
-            coordinator.updateSessionStatus(VoiceSessionStatus.ConnectingGemini)
-            geminiStarted = true
-            gemini.connect(
-                token = session.token,
-                websocketUrl = session.websocketUrl,
-                providerModel = session.providerModel,
-                liveConnectConfig = session.liveConnectConfig,
-                systemInstruction = voiceContext.systemInstruction,
-                contextTurns = voiceContext.turns,
-                onEvent = { event -> handleGeminiEvent(currentSessionId, event) },
-            )
-            ensureActiveSession(currentSessionId)
-            if (coordinator.state.value.session is VoiceSessionStatus.Error) {
-                cleanupFailedStartup(currentSessionId, closeGemini = true)
-                return
-            }
-            coordinator.updateSessionStatus(VoiceSessionStatus.Connected)
-            gemini.activateOutboundSession(currentSessionId)
-            audio.activatePlaybackSession(currentSessionId)
-            if (!muted) {
-                startCapture(currentSessionId)
-            }
-        } catch (error: CancellationException) {
-            throw error
-        } catch (error: Throwable) {
-            if (coordinator.isActiveSession(currentSessionId)) {
-                cleanupFailedStartup(currentSessionId, closeGemini = geminiStarted)
-                coordinator.updateSessionStatus(
-                    VoiceSessionStatus.Error(error.message ?: error.javaClass.simpleName)
-                )
-            }
-        } finally {
-            if (startJob === sessionJob) {
-                startJob = null
-            }
-        }
-    }
-
-    private fun handleGeminiEvent(sessionId: Long, event: GeminiLiveEvent) {
-        coordinator.onGeminiEvent(sessionId, event)
-        when (event) {
-            is GeminiLiveEvent.Error,
-            is GeminiLiveEvent.WebSocketClosed,
-            is GeminiLiveEvent.WebSocketFailure,
-                -> cleanupFailedStartup(sessionId, closeGemini = true)
-            else -> Unit
-        }
-    }
-
-    private fun cleanupFailedStartup(sessionId: Long, closeGemini: Boolean) {
-        if (!coordinator.isActiveSession(sessionId)) return
-        coordinator.prepareForSessionEnd()
-        invalidateAudioSessions()
-        audio.stopCapture()
-        audio.suppressPlayback()
-        if (closeGemini) {
-            gemini.close()
-        }
-    }
-
-    private suspend fun ensureActiveSession(sessionId: Long) {
-        currentCoroutineContext().ensureActive()
-        check(coordinator.isActiveSession(sessionId)) { "Voice Agent session is stale" }
+        callSession.start()
     }
 
     fun interrupt() {
-        if (!ended) {
-            coordinator.suppressPlayback()
-        }
+        callSession.interrupt()
     }
 
     fun setMuted(value: Boolean) {
-        if (ended || muted == value) return
-        muted = value
-        if (muted) {
-            gemini.sendAudioStreamEnd(sessionId)
-            audio.stopCapture()
-            coordinator.updateAudioStatus(VoiceAudioStatus.Muted)
-        } else if (state.value.session == VoiceSessionStatus.Connected) {
-            startCapture(sessionId)
-        }
+        callSession.setMuted(value)
     }
 
     fun reconnect() {
-        if (ended) return
-        val previousJob = startJob
-        coordinator.prepareForReconnect()
-        invalidateAudioSessions()
-        audio.stopCapture()
-        audio.suppressPlayback()
-        gemini.close()
-        val reconnectJob = lifecycleScope.launch {
-            previousJob?.cancelAndJoin()
-            if (ended) return@launch
-            coordinator.updateSessionStatus(VoiceSessionStatus.Reconnecting)
-            val currentSessionId = coordinator.nextSessionId()
-            sessionId = currentSessionId
-            runSession(currentSessionId)
-        }
-        startJob = reconnectJob
+        callSession.reconnect()
     }
 
     fun end() {
-        endWithVisibleReason(visibleReason = null)
-    }
-
-    private fun endWithVisibleReason(visibleReason: String?) {
-        if (ended) return
-        ended = true
-        val previousJob = startJob
-        coordinator.prepareForSessionEnd()
-        invalidateAudioSessions()
-        audio.stopCapture()
-        audio.suppressPlayback()
-        gemini.close()
-        lifecycleScope.launch {
-            previousJob?.cancelAndJoin()
-            coordinator.updateSessionStatus(VoiceSessionStatus.Ending)
-            coordinator.close()
-            visibleReason?.let(coordinator::setVisibleError)
-            coordinator.launchPersistenceDrain()
-        }
+        callSession.end()
     }
 
     fun endBecauseBackgrounded() {
-        if (ended) return
-        coordinator.recordDiagnostic("voice_agent_backgrounded", BACKGROUND_END_MESSAGE)
-        endWithVisibleReason(visibleReason = BACKGROUND_END_MESSAGE)
-    }
-
-    private fun closeNow() {
-        if (!ended) {
-            ended = true
-        }
-        startJob?.cancel()
-        coordinator.prepareForSessionEnd()
-        invalidateAudioSessions()
-        audio.stopCapture()
-        audio.suppressPlayback()
-        coordinator.updateSessionStatus(VoiceSessionStatus.Ending)
-        coordinator.close(waitForStartedSends = false)
-        coordinator.launchPersistenceDrain()
-    }
-
-    private fun startCapture(currentSessionId: Long) {
-        audio.startCapture { pcm16 ->
-            if (!coordinator.isActiveSession(currentSessionId)) {
-                return@startCapture
-            }
-            val sent = gemini.sendAudio(
-                base64Pcm16 = Base64.getEncoder().encodeToString(pcm16),
-                sessionId = currentSessionId,
-            )
-            if (sent && coordinator.isActiveSession(currentSessionId)) {
-                coordinator.updateAudioStatus(VoiceAudioStatus.UserSpeaking)
-            }
-        }
-        coordinator.updateAudioStatus(VoiceAudioStatus.Listening)
-    }
-
-    private fun invalidateActiveSessionForCapture() {
-        invalidateAudioSessions()
-        coordinator.invalidateActiveSession()
-    }
-
-    private fun invalidateAudioSessions() {
-        gemini.invalidateOutboundSession()
-        audio.invalidatePlaybackSession()
-    }
-
-    private companion object {
-        const val BACKGROUND_END_MESSAGE = "Voice Agent ended because RikkaHub went to background."
+        callSession.endBecauseBackgrounded()
     }
 
     override fun onCleared() {
-        closeNow()
+        callSession.closeNow()
         super.onCleared()
     }
 }
