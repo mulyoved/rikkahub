@@ -24,7 +24,7 @@ import java.util.Base64
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
-class VoiceAgentViewModelTest {
+class VoiceAgentRuntimeTest {
     @Test
     fun `batched Hermes tool call continues after interruption and sends response to Gemini`() = runTest {
         val gemini = FakeGeminiLiveVoiceClient()
@@ -1491,11 +1491,11 @@ class VoiceAgentViewModelTest {
     }
 
     @Test
-    fun `ViewModel starts session forwards capture audio and closes resources`() = runTest {
+    fun `session starts forwards capture audio and closes resources`() = runTest {
         val sessionApi = FakeVoiceSessionApi()
         val gemini = FakeGeminiLiveVoiceClient()
         val audio = FakeVoiceAudioEngine()
-        val vm = VoiceAgentViewModel(
+        val session = VoiceAgentCallSession(
             modelId = "gemini-flash",
             sessionApi = sessionApi,
             toolApi = FakeVoiceToolApi(),
@@ -1511,7 +1511,7 @@ class VoiceAgentViewModelTest {
             scope = this,
         )
 
-        vm.start()
+        session.start()
         gemini.awaitConnect()
 
         assertEquals(listOf("gemini-flash"), sessionApi.createdSessions)
@@ -1528,11 +1528,11 @@ class VoiceAgentViewModelTest {
         audio.emitCapture(byteArrayOf(1, 2, 3))
         assertEquals(listOf(Base64.getEncoder().encodeToString(byteArrayOf(1, 2, 3))), gemini.audioMessages)
 
-        vm.setMuted(true)
+        session.setMuted(true)
         assertEquals(listOf(1L), gemini.audioStreamEndSessionIds)
         assertEquals(1, audio.stopCaptureCalls)
 
-        vm.end()
+        session.end()
         withTimeout(500) {
             while (gemini.closeCalls < 1 || audio.releaseCalls < 1) {
                 delay(10)
@@ -1541,54 +1541,16 @@ class VoiceAgentViewModelTest {
 
         assertTrue(gemini.closeCalls >= 1)
         assertEquals(1, audio.releaseCalls)
-        assertEquals(VoiceSessionStatus.Ended, vm.state.value.session)
+        assertEquals(VoiceSessionStatus.Ended, session.state.value.session)
     }
 
     @Test
-    fun `ViewModel ends active session with diagnostic when screen backgrounds`() = runTest {
-        val gemini = FakeGeminiLiveVoiceClient()
-        val audio = FakeVoiceAudioEngine()
-        val diagnostics = VoiceDiagnostics()
-        val vm = VoiceAgentViewModel(
-            modelId = "gemini-flash",
-            sessionApi = FakeVoiceSessionApi(),
-            toolApi = FakeVoiceToolApi(),
-            gemini = gemini,
-            audio = audio,
-            conversationStore = FakeVoiceConversationStore(),
-            contextProvider = FakeVoiceAgentContextProvider(
-                VoiceContext(systemInstruction = "system", turns = emptyList())
-            ),
-            diagnostics = diagnostics,
-            scope = this,
-        )
-
-        vm.start()
-        gemini.awaitConnect()
-
-        vm.endBecauseBackgrounded()
-
-        withTimeout(500) {
-            while (gemini.closeCalls < 1 || audio.releaseCalls < 1) {
-                delay(10)
-            }
-        }
-        assertEquals(VoiceSessionStatus.Ended, vm.state.value.session)
-        assertTrue(vm.state.value.error.orEmpty().contains("background"))
-        assertTrue(
-            vm.state.value.diagnostics.any {
-                it.name == "voice_agent_backgrounded" && it.detail.contains("background")
-            }
-        )
-    }
-
-    @Test
-    fun `ViewModel does not overwrite Gemini startup error with connected`() = runTest {
+    fun `session does not overwrite Gemini startup error with connected`() = runTest {
         val gemini = FakeGeminiLiveVoiceClient().apply {
             connectEvent = GeminiLiveEvent.Error(message = "Failed to send Gemini setup message", raw = "{}")
         }
         val audio = FakeVoiceAudioEngine()
-        val vm = VoiceAgentViewModel(
+        val session = VoiceAgentCallSession(
             modelId = "gemini-flash",
             sessionApi = FakeVoiceSessionApi(),
             toolApi = FakeVoiceToolApi(),
@@ -1601,10 +1563,10 @@ class VoiceAgentViewModelTest {
             scope = this,
         )
 
-        vm.start()
+        session.start()
         gemini.awaitConnect()
 
-        assertEquals(VoiceSessionStatus.Error("Failed to send Gemini setup message"), vm.state.value.session)
+        assertEquals(VoiceSessionStatus.Error("Failed to send Gemini setup message"), session.state.value.session)
         assertEquals(0, audio.startCaptureCalls)
         assertEquals(1, gemini.closeCalls)
     }
@@ -1626,12 +1588,12 @@ class VoiceAgentViewModelTest {
     }
 
     @Test
-    fun `ViewModel closes Gemini when capture startup fails after connect`() = runTest {
+    fun `session closes Gemini when capture startup fails after connect`() = runTest {
         val gemini = FakeGeminiLiveVoiceClient()
         val audio = FakeVoiceAudioEngine().apply {
             startCaptureError = IllegalStateException("microphone unavailable")
         }
-        val vm = VoiceAgentViewModel(
+        val session = VoiceAgentCallSession(
             modelId = "gemini-flash",
             sessionApi = FakeVoiceSessionApi(),
             toolApi = FakeVoiceToolApi(),
@@ -1644,10 +1606,10 @@ class VoiceAgentViewModelTest {
             scope = this,
         )
 
-        vm.start()
+        session.start()
         gemini.awaitConnect()
 
-        assertEquals(VoiceSessionStatus.Error("microphone unavailable"), vm.state.value.session)
+        assertEquals(VoiceSessionStatus.Error("microphone unavailable"), session.state.value.session)
         assertEquals(1, audio.startCaptureCalls)
         assertEquals(1, audio.stopCaptureCalls)
         assertEquals(1, gemini.closeCalls)
@@ -1656,12 +1618,12 @@ class VoiceAgentViewModelTest {
     }
 
     @Test
-    fun `ViewModel closes Gemini and stops capture on async Gemini error`() = runTest {
+    fun `session closes Gemini and stops capture on async Gemini error`() = runTest {
         val gemini = FakeGeminiLiveVoiceClient()
         val audio = FakeVoiceAudioEngine()
         val toolApi = FakeVoiceToolApi()
         val conversationStore = FakeVoiceConversationStore()
-        val vm = VoiceAgentViewModel(
+        val session = VoiceAgentCallSession(
             modelId = "gemini-flash",
             sessionApi = FakeVoiceSessionApi(),
             toolApi = toolApi,
@@ -1677,7 +1639,7 @@ class VoiceAgentViewModelTest {
             scope = this,
         )
 
-        vm.start()
+        session.start()
         gemini.awaitConnect()
         assertEquals(1, audio.startCaptureCalls)
         audio.emitCapture(byteArrayOf(1, 2, 3))
@@ -1691,7 +1653,7 @@ class VoiceAgentViewModelTest {
             GeminiLiveEvent.Error(message = "Failed to send Gemini context message", raw = "{}")
         )
 
-        assertEquals(VoiceSessionStatus.Error("Failed to send Gemini context message"), vm.state.value.session)
+        assertEquals(VoiceSessionStatus.Error("Failed to send Gemini context message"), session.state.value.session)
         assertEquals(1, audio.stopCaptureCalls)
         assertEquals(1, audio.suppressPlaybackCalls)
         assertEquals(1, gemini.closeCalls)
@@ -1709,7 +1671,7 @@ class VoiceAgentViewModelTest {
     }
 
     @Test
-    fun `ViewModel reconnect marks in flight tool send stale before outbound invalidation waits`() = runTest {
+    fun `session reconnect marks in flight tool send stale before outbound invalidation waits`() = runTest {
         val sessionApi = FakeVoiceSessionApi()
         val conversationStore = FakeVoiceConversationStore()
         val gemini = FakeGeminiLiveVoiceClient()
@@ -1717,7 +1679,7 @@ class VoiceAgentViewModelTest {
         blockedSend.timeoutMillis = 5_000
         val toolApi = FakeVoiceToolApi()
         val audio = FakeVoiceAudioEngine()
-        val vm = VoiceAgentViewModel(
+        val session = VoiceAgentCallSession(
             modelId = "gemini-flash",
             sessionApi = sessionApi,
             toolApi = toolApi,
@@ -1730,7 +1692,7 @@ class VoiceAgentViewModelTest {
             scope = CoroutineScope(coroutineContext + Dispatchers.Default),
         )
 
-        vm.start()
+        session.start()
         gemini.awaitConnectCount(1)
         gemini.eventHandlers.single()(
             GeminiLiveEvent.ToolCall(callId = "call-vm-reconnect-order", name = "ask_hermes", prompt = "old")
@@ -1740,7 +1702,7 @@ class VoiceAgentViewModelTest {
         assertTrue(withContext(Dispatchers.Default) { blockedSend.started.await(500, TimeUnit.MILLISECONDS) })
 
         val reconnectJob = launch(Dispatchers.Default) {
-            vm.reconnect()
+            session.reconnect()
         }
         delay(50)
         blockedSend.release.countDown()
@@ -1761,11 +1723,11 @@ class VoiceAgentViewModelTest {
     }
 
     @Test
-    fun `ViewModel reconnect suppresses stale capture frames before capture stops`() = runTest {
+    fun `session reconnect suppresses stale capture frames before capture stops`() = runTest {
         val sessionApi = FakeVoiceSessionApi()
         val gemini = FakeGeminiLiveVoiceClient()
         val audio = FakeVoiceAudioEngine()
-        val vm = VoiceAgentViewModel(
+        val session = VoiceAgentCallSession(
             modelId = "gemini-flash",
             sessionApi = sessionApi,
             toolApi = FakeVoiceToolApi(),
@@ -1778,23 +1740,23 @@ class VoiceAgentViewModelTest {
             scope = this,
         )
 
-        vm.start()
+        session.start()
         gemini.awaitConnect()
         audio.emitCapture(byteArrayOf(1, 2, 3))
         assertEquals(1, gemini.audioMessages.size)
 
-        vm.reconnect()
+        session.reconnect()
         audio.emitCapture(byteArrayOf(4, 5, 6))
 
         assertEquals(listOf(Base64.getEncoder().encodeToString(byteArrayOf(1, 2, 3))), gemini.audioMessages)
     }
 
     @Test
-    fun `ViewModel reconnect cancels delayed old start before opening new Gemini session`() = runTest {
+    fun `session reconnect cancels delayed old start before opening new Gemini session`() = runTest {
         val sessionApi = FakeVoiceSessionApi()
         val blockedSession = sessionApi.blockNextSession()
         val gemini = FakeGeminiLiveVoiceClient()
-        val vm = VoiceAgentViewModel(
+        val session = VoiceAgentCallSession(
             modelId = "gemini-flash",
             sessionApi = sessionApi,
             toolApi = FakeVoiceToolApi(),
@@ -1807,23 +1769,23 @@ class VoiceAgentViewModelTest {
             scope = this,
         )
 
-        vm.start()
+        session.start()
         withTimeout(500) {
             blockedSession.started.await()
         }
 
-        vm.reconnect()
+        session.reconnect()
         gemini.awaitConnectCount(1)
 
         assertEquals(2, sessionApi.createdSessions.size)
         assertEquals(1, gemini.eventHandlers.size)
-        assertEquals(VoiceSessionStatus.Connected, vm.state.value.session)
+        assertEquals(VoiceSessionStatus.Connected, session.state.value.session)
     }
 
     @Test
-    fun `ViewModel end is terminal and later start does not reopen session`() = runTest {
+    fun `session end is terminal and later start does not reopen session`() = runTest {
         val gemini = FakeGeminiLiveVoiceClient()
-        val vm = VoiceAgentViewModel(
+        val session = VoiceAgentCallSession(
             modelId = "gemini-flash",
             sessionApi = FakeVoiceSessionApi(),
             toolApi = FakeVoiceToolApi(),
@@ -1836,29 +1798,29 @@ class VoiceAgentViewModelTest {
             scope = this,
         )
 
-        vm.start()
+        session.start()
         gemini.awaitConnectCount(1)
-        vm.end()
+        session.end()
         withTimeout(500) {
             while (gemini.closeCalls < 1) {
                 delay(10)
             }
         }
 
-        vm.start()
+        session.start()
         delay(50)
 
         assertEquals(1, gemini.eventHandlers.size)
-        assertEquals(VoiceSessionStatus.Ended, vm.state.value.session)
+        assertEquals(VoiceSessionStatus.Ended, session.state.value.session)
     }
 
     @Test
-    fun `ViewModel ignores delayed Gemini callbacks from previous session after reconnect`() = runTest {
+    fun `session ignores delayed Gemini callbacks from previous session after reconnect`() = runTest {
         val sessionApi = FakeVoiceSessionApi()
         val gemini = FakeGeminiLiveVoiceClient()
         val audio = FakeVoiceAudioEngine()
         val toolApi = FakeVoiceToolApi()
-        val vm = VoiceAgentViewModel(
+        val session = VoiceAgentCallSession(
             modelId = "gemini-flash",
             sessionApi = sessionApi,
             toolApi = toolApi,
@@ -1871,27 +1833,27 @@ class VoiceAgentViewModelTest {
             scope = this,
         )
 
-        vm.start()
+        session.start()
         gemini.awaitConnectCount(1)
         val oldCallback = gemini.eventHandlers.single()
 
-        vm.reconnect()
+        session.reconnect()
         gemini.awaitConnectCount(2)
 
         oldCallback(GeminiLiveEvent.ToolCall(callId = "stale-call", name = "ask_hermes", prompt = "stale"))
         delay(50)
 
         assertEquals(emptyList<Pair<String, String>>(), toolApi.requests)
-        assertEquals(VoiceToolStatus.Idle, vm.state.value.tool)
+        assertEquals(VoiceToolStatus.Idle, session.state.value.tool)
     }
 
     @Test
-    fun `ViewModel reconnect immediately invalidates previous Gemini callback`() = runTest {
+    fun `session reconnect immediately invalidates previous Gemini callback`() = runTest {
         val sessionApi = FakeVoiceSessionApi()
         val gemini = FakeGeminiLiveVoiceClient()
         gemini.blockNextConnectCompletion()
         val toolApi = FakeVoiceToolApi()
-        val vm = VoiceAgentViewModel(
+        val session = VoiceAgentCallSession(
             modelId = "gemini-flash",
             sessionApi = sessionApi,
             toolApi = toolApi,
@@ -1904,26 +1866,26 @@ class VoiceAgentViewModelTest {
             scope = this,
         )
 
-        vm.start()
+        session.start()
         gemini.awaitConnectCount(1)
         val oldCallback = gemini.eventHandlers.single()
 
-        vm.reconnect()
+        session.reconnect()
         oldCallback(GeminiLiveEvent.ToolCall(callId = "stale-reconnect", name = "ask_hermes", prompt = "stale"))
         delay(50)
 
         assertEquals(emptyList<Pair<String, String>>(), toolApi.requests)
-        assertEquals(VoiceToolStatus.Idle, vm.state.value.tool)
+        assertEquals(VoiceToolStatus.Idle, session.state.value.tool)
     }
 
     @Test
-    fun `ViewModel reconnect invalidates previous Gemini callback while output audio is blocked`() = runTest {
+    fun `session reconnect invalidates previous Gemini callback while output audio is blocked`() = runTest {
         val sessionApi = FakeVoiceSessionApi()
         val gemini = FakeGeminiLiveVoiceClient()
         val audio = FakeVoiceAudioEngine()
         val blockedPlayback = audio.blockNextPlayback()
         val toolApi = FakeVoiceToolApi()
-        val vm = VoiceAgentViewModel(
+        val session = VoiceAgentCallSession(
             modelId = "gemini-flash",
             sessionApi = sessionApi,
             toolApi = toolApi,
@@ -1936,7 +1898,7 @@ class VoiceAgentViewModelTest {
             scope = this,
         )
 
-        vm.start()
+        session.start()
         gemini.awaitConnectCount(1)
         val oldCallback = gemini.eventHandlers.single()
         val eventJob = launch(Dispatchers.Default) {
@@ -1944,24 +1906,24 @@ class VoiceAgentViewModelTest {
         }
         assertTrue(blockedPlayback.started.await(500, TimeUnit.MILLISECONDS))
 
-        vm.reconnect()
+        session.reconnect()
         assertEquals(1, audio.suppressPlaybackCalls)
         oldCallback(GeminiLiveEvent.ToolCall(callId = "stale-blocked-reconnect", name = "ask_hermes", prompt = "stale"))
         delay(50)
 
         assertEquals(emptyList<Pair<String, String>>(), toolApi.requests)
-        assertEquals(VoiceToolStatus.Idle, vm.state.value.tool)
+        assertEquals(VoiceToolStatus.Idle, session.state.value.tool)
 
         blockedPlayback.release.countDown()
         withTimeout(500) {
             eventJob.join()
         }
         assertEquals(emptyList<String>(), audio.playedPcm16)
-        assertFalse(vm.state.value.audio == VoiceAudioStatus.AssistantSpeaking)
+        assertFalse(session.state.value.audio == VoiceAudioStatus.AssistantSpeaking)
     }
 
     @Test
-    fun `ViewModel reconnect does not persist stale tool send completion during close gap`() = runTest {
+    fun `session reconnect does not persist stale tool send completion during close gap`() = runTest {
         val sessionApi = FakeVoiceSessionApi()
         val conversationStore = FakeVoiceConversationStore()
         val gemini = FakeGeminiLiveVoiceClient()
@@ -1969,7 +1931,7 @@ class VoiceAgentViewModelTest {
         blockedSend.timeoutMillis = 5_000
         val toolApi = FakeVoiceToolApi()
         val diagnostics = VoiceDiagnostics()
-        val vm = VoiceAgentViewModel(
+        val session = VoiceAgentCallSession(
             modelId = "gemini-flash",
             sessionApi = sessionApi,
             toolApi = toolApi,
@@ -1983,7 +1945,7 @@ class VoiceAgentViewModelTest {
             scope = CoroutineScope(coroutineContext + Dispatchers.Default),
         )
 
-        vm.start()
+        session.start()
         gemini.awaitConnectCount(1)
         val oldCallback = gemini.eventHandlers.single()
         oldCallback(GeminiLiveEvent.ToolCall(callId = "call-vm-reconnect-sending", name = "ask_hermes", prompt = "old"))
@@ -1996,7 +1958,7 @@ class VoiceAgentViewModelTest {
             closeHookCalled.countDown()
         }
 
-        vm.reconnect()
+        session.reconnect()
         assertTrue(closeHookCalled.await(500, TimeUnit.MILLISECONDS))
         conversationStore.awaitUpdateCount(2)
 
@@ -2013,12 +1975,12 @@ class VoiceAgentViewModelTest {
     }
 
     @Test
-    fun `ViewModel end persists pending tool as failed before Gemini close gap`() = runTest {
+    fun `session end persists pending tool as failed before Gemini close gap`() = runTest {
         val sessionApi = FakeVoiceSessionApi()
         val conversationStore = FakeVoiceConversationStore()
         val gemini = FakeGeminiLiveVoiceClient()
         val toolApi = FakeVoiceToolApi()
-        val vm = VoiceAgentViewModel(
+        val session = VoiceAgentCallSession(
             modelId = "gemini-flash",
             sessionApi = sessionApi,
             toolApi = toolApi,
@@ -2031,7 +1993,7 @@ class VoiceAgentViewModelTest {
             scope = CoroutineScope(coroutineContext + Dispatchers.Default),
         )
 
-        vm.start()
+        session.start()
         gemini.awaitConnectCount(1)
         val oldCallback = gemini.eventHandlers.single()
         oldCallback(GeminiLiveEvent.ToolCall(callId = "call-vm-end-pending", name = "ask_hermes", prompt = "end"))
@@ -2042,7 +2004,7 @@ class VoiceAgentViewModelTest {
             closeHookCalled.countDown()
         }
 
-        vm.end()
+        session.end()
         assertTrue(closeHookCalled.await(500, TimeUnit.MILLISECONDS))
         conversationStore.awaitUpdateCount(2)
 
@@ -2058,12 +2020,12 @@ class VoiceAgentViewModelTest {
     }
 
     @Test
-    fun `ViewModel onCleared persists pending tool as failed before Gemini close gap`() = runTest {
+    fun `session closeNow persists pending tool as failed before Gemini close gap`() = runTest {
         val sessionApi = FakeVoiceSessionApi()
         val conversationStore = FakeVoiceConversationStore()
         val gemini = FakeGeminiLiveVoiceClient()
         val toolApi = FakeVoiceToolApi()
-        val vm = VoiceAgentViewModel(
+        val session = VoiceAgentCallSession(
             modelId = "gemini-flash",
             sessionApi = sessionApi,
             toolApi = toolApi,
@@ -2076,7 +2038,7 @@ class VoiceAgentViewModelTest {
             scope = CoroutineScope(coroutineContext + Dispatchers.Default),
         )
 
-        vm.start()
+        session.start()
         gemini.awaitConnectCount(1)
         val oldCallback = gemini.eventHandlers.single()
         oldCallback(GeminiLiveEvent.ToolCall(callId = "call-vm-cleared-pending", name = "ask_hermes", prompt = "clear"))
@@ -2087,7 +2049,7 @@ class VoiceAgentViewModelTest {
             closeHookCalled.countDown()
         }
 
-        vm.invokeOnClearedForTest()
+        session.closeNow()
         assertTrue(closeHookCalled.await(500, TimeUnit.MILLISECONDS))
         conversationStore.awaitUpdateCount(2)
 
@@ -2103,12 +2065,12 @@ class VoiceAgentViewModelTest {
     }
 
     @Test
-    fun `ViewModel end immediately invalidates previous Gemini callback`() = runTest {
+    fun `session end immediately invalidates previous Gemini callback`() = runTest {
         val sessionApi = FakeVoiceSessionApi()
         val gemini = FakeGeminiLiveVoiceClient()
         gemini.blockNextConnectCompletion()
         val toolApi = FakeVoiceToolApi()
-        val vm = VoiceAgentViewModel(
+        val session = VoiceAgentCallSession(
             modelId = "gemini-flash",
             sessionApi = sessionApi,
             toolApi = toolApi,
@@ -2121,16 +2083,16 @@ class VoiceAgentViewModelTest {
             scope = this,
         )
 
-        vm.start()
+        session.start()
         gemini.awaitConnectCount(1)
         val oldCallback = gemini.eventHandlers.single()
 
-        vm.end()
+        session.end()
         oldCallback(GeminiLiveEvent.ToolCall(callId = "stale-end", name = "ask_hermes", prompt = "stale"))
         delay(50)
 
         assertEquals(emptyList<Pair<String, String>>(), toolApi.requests)
-        assertEquals(VoiceToolStatus.Idle, vm.state.value.tool)
+        assertEquals(VoiceToolStatus.Idle, session.state.value.tool)
     }
 
     private fun response(
@@ -2174,13 +2136,6 @@ class VoiceAgentViewModelTest {
 
     private fun List<UIMessagePart>.text(): String =
         filterIsInstance<UIMessagePart.Text>().joinToString("") { it.text }
-
-    private fun VoiceAgentViewModel.invokeOnClearedForTest() {
-        javaClass.getDeclaredMethod("onCleared").apply {
-            isAccessible = true
-            invoke(this@invokeOnClearedForTest)
-        }
-    }
 
     private suspend fun VoiceDiagnostics.awaitEvent(name: String) {
         withTimeout(500) {

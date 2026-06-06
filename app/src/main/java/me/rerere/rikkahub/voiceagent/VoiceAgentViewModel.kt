@@ -1,7 +1,5 @@
 package me.rerere.rikkahub.voiceagent
 
-import androidx.lifecycle.ViewModel
-import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
@@ -1089,60 +1087,4 @@ class VoiceAgentCoordinator(
         val sessionId: Long?,
         val callId: String,
     )
-}
-
-class VoiceAgentViewModel(
-    private val modelId: String,
-    private val sessionApi: VoiceSessionApi,
-    private val toolApi: VoiceToolApi,
-    private val gemini: GeminiLiveVoiceClient,
-    private val audio: VoiceAudioEngine,
-    conversationStore: VoiceConversationStore,
-    contextProvider: VoiceAgentContextProvider,
-    diagnostics: VoiceDiagnostics = VoiceDiagnostics(),
-    scope: CoroutineScope? = null,
-) : ViewModel() {
-    private val lifecycleScope = scope ?: viewModelScope
-    private val callSession = VoiceAgentCallSession(
-        modelId = modelId,
-        sessionApi = sessionApi,
-        toolApi = toolApi,
-        gemini = gemini,
-        audio = audio,
-        conversationStore = conversationStore,
-        contextProvider = contextProvider,
-        diagnostics = diagnostics,
-        scope = lifecycleScope,
-    )
-
-    val state: StateFlow<VoiceAgentUiState> = callSession.state
-
-    fun start() {
-        callSession.start()
-    }
-
-    fun interrupt() {
-        callSession.interrupt()
-    }
-
-    fun setMuted(value: Boolean) {
-        callSession.setMuted(value)
-    }
-
-    fun reconnect() {
-        callSession.reconnect()
-    }
-
-    fun end() {
-        callSession.end()
-    }
-
-    fun endBecauseBackgrounded() {
-        callSession.endBecauseBackgrounded()
-    }
-
-    override fun onCleared() {
-        callSession.closeNow()
-        super.onCleared()
-    }
 }

@@ -179,12 +179,6 @@ class VoiceAgentCallSession(
         endWithVisibleReason(visibleReason = null)
     }
 
-    fun endBecauseBackgrounded() {
-        if (ended) return
-        coordinator.recordDiagnostic("voice_agent_backgrounded", BACKGROUND_END_MESSAGE)
-        endWithVisibleReason(visibleReason = BACKGROUND_END_MESSAGE)
-    }
-
     fun recordDiagnostic(name: String, detail: String) {
         coordinator.recordDiagnostic(name = name, detail = detail)
     }
@@ -242,9 +236,6 @@ class VoiceAgentCallSession(
         audio.invalidatePlaybackSession()
     }
 
-    private companion object {
-        const val BACKGROUND_END_MESSAGE = "Voice Agent ended because RikkaHub went to background."
-    }
 }
 
 private fun VoiceContext.withTurnsFoldedIntoSystemInstruction(): VoiceContext {
