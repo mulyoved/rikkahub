@@ -28,9 +28,8 @@ class VoiceAgentDebugSeedReceiver : BroadcastReceiver() {
             try {
                 val apiKey = intent.getStringExtra(EXTRA_API_KEY)?.takeIf { it.isNotBlank() }
                     ?: error("Missing $EXTRA_API_KEY")
-                val baseUrl = intent.getStringExtra(EXTRA_BASE_URL)
-                    ?.takeIf { it.isNotBlank() }
-                    ?: DEFAULT_BASE_URL
+                val baseUrl = intent.getStringExtra(EXTRA_BASE_URL)?.takeIf { it.isNotBlank() }
+                    ?: error("Missing $EXTRA_BASE_URL")
                 val conversationId = intent.getStringExtra(EXTRA_CONVERSATION_ID)
                     ?.takeIf { it.isNotBlank() }
                     ?.let { Uuid.parse(it) }
@@ -98,7 +97,6 @@ class VoiceAgentDebugSeedReceiver : BroadcastReceiver() {
         const val EXTRA_API_KEY = "api_key"
         const val EXTRA_BASE_URL = "base_url"
         const val EXTRA_CONVERSATION_ID = "conversation_id"
-        const val DEFAULT_BASE_URL = "https://muly-hermes-api.core8.co/v1"
         val HERMES_PROVIDER_ID: Uuid = Uuid.parse("7fb50d0d-3d06-4e4d-9f8a-f7c1a2e4b201")
         val HERMES_MODEL_ID: Uuid = Uuid.parse("22b11ed9-91b7-44a7-a0d2-3e939dca89b2")
         private const val TAG = "VoiceAgentDebugSeed"

@@ -47,7 +47,7 @@ class VoiceAgentCallSession(
         if (ended || startJob?.isActive == true) return
         val currentSessionId = coordinator.nextSessionId()
         sessionId = currentSessionId
-        VoiceAgentDebugLog.d(TAG, "start sessionId=$currentSessionId modelId=$modelId")
+        VoiceAgentLog.d(TAG, "start sessionId=$currentSessionId modelId=$modelId")
         val job = scope.launch {
             runSession(currentSessionId)
         }
@@ -60,9 +60,9 @@ class VoiceAgentCallSession(
         var geminiStarted = false
         try {
             coordinator.updateSessionStatus(VoiceSessionStatus.PreparingContext)
-            VoiceAgentDebugLog.d(TAG, "preparing context sessionId=$currentSessionId")
+            VoiceAgentLog.d(TAG, "preparing context sessionId=$currentSessionId")
             val voiceContext = contextProvider.build(conversation.value).withTurnsFoldedIntoSystemInstruction()
-            VoiceAgentDebugLog.d(
+            VoiceAgentLog.d(
                 TAG,
                 "context prepared sessionId=$currentSessionId turns=${voiceContext.turns.size} " +
                     "systemInstructionChars=${voiceContext.systemInstruction.length}",
@@ -73,9 +73,9 @@ class VoiceAgentCallSession(
             )
             ensureActiveSession(currentSessionId)
             coordinator.updateSessionStatus(VoiceSessionStatus.RequestingToken)
-            VoiceAgentDebugLog.d(TAG, "requesting voice session sessionId=$currentSessionId modelId=$modelId")
+            VoiceAgentLog.d(TAG, "requesting voice session sessionId=$currentSessionId modelId=$modelId")
             val session = sessionApi.createSession(modelId = modelId)
-            VoiceAgentDebugLog.d(
+            VoiceAgentLog.d(
                 TAG,
                 "voice session created sessionId=$currentSessionId modelId=${session.modelId} " +
                     "providerModel=${session.providerModel} inputSampleRate=${session.inputSampleRate} " +
@@ -89,7 +89,7 @@ class VoiceAgentCallSession(
             ensureActiveSession(currentSessionId)
             coordinator.updateSessionStatus(VoiceSessionStatus.ConnectingGemini)
             geminiStarted = true
-            VoiceAgentDebugLog.d(
+            VoiceAgentLog.d(
                 TAG,
                 "connecting Gemini sessionId=$currentSessionId providerModel=${session.providerModel}",
             )
@@ -102,15 +102,15 @@ class VoiceAgentCallSession(
                 contextTurns = voiceContext.turns,
                 onEvent = { event -> handleGeminiEvent(currentSessionId, event) },
             )
-            VoiceAgentDebugLog.d(TAG, "Gemini connect returned sessionId=$currentSessionId")
+            VoiceAgentLog.d(TAG, "Gemini connect returned sessionId=$currentSessionId")
             ensureActiveSession(currentSessionId)
             if (coordinator.state.value.session is VoiceSessionStatus.Error) {
-                VoiceAgentDebugLog.w(TAG, "Gemini connect returned with error state sessionId=$currentSessionId")
+                VoiceAgentLog.w(TAG, "Gemini connect returned with error state sessionId=$currentSessionId")
                 cleanupFailedStartup(currentSessionId, closeGemini = true)
                 return
             }
             coordinator.updateSessionStatus(VoiceSessionStatus.Connected)
-            VoiceAgentDebugLog.d(TAG, "session connected sessionId=$currentSessionId")
+            VoiceAgentLog.d(TAG, "session connected sessionId=$currentSessionId")
             gemini.activateOutboundSession(currentSessionId)
             audio.activatePlaybackSession(currentSessionId)
             if (!muted) {
@@ -120,7 +120,7 @@ class VoiceAgentCallSession(
             throw error
         } catch (error: Throwable) {
             if (coordinator.isActiveSession(currentSessionId)) {
-                VoiceAgentDebugLog.w(
+                VoiceAgentLog.w(
                     TAG,
                     "run session failed sessionId=$currentSessionId detail=${error.toVoiceAgentLogDetail()}",
                 )
@@ -141,7 +141,7 @@ class VoiceAgentCallSession(
             event is GeminiLiveEvent.WebSocketClosed ||
             event is GeminiLiveEvent.WebSocketFailure
         ) {
-            VoiceAgentDebugLog.w(TAG, "Gemini failure event sessionId=$sessionId event=${event::class.simpleName}")
+            VoiceAgentLog.w(TAG, "Gemini failure event sessionId=$sessionId event=${event::class.simpleName}")
         }
         coordinator.onGeminiEvent(sessionId, event)
         when (event) {
@@ -155,7 +155,7 @@ class VoiceAgentCallSession(
 
     private fun cleanupFailedStartup(sessionId: Long, closeGemini: Boolean) {
         if (!coordinator.isActiveSession(sessionId)) return
-        VoiceAgentDebugLog.d(TAG, "cleanup failed startup sessionId=$sessionId closeGemini=$closeGemini")
+        VoiceAgentLog.d(TAG, "cleanup failed startup sessionId=$sessionId closeGemini=$closeGemini")
         coordinator.prepareForSessionEnd()
         invalidateAudioSessions()
         audio.stopCapture()
@@ -263,7 +263,7 @@ class VoiceAgentCallSession(
     }
 
     private fun startCapture(currentSessionId: Long) {
-        VoiceAgentDebugLog.d(TAG, "starting audio capture sessionId=$currentSessionId muted=$muted")
+        VoiceAgentLog.d(TAG, "starting audio capture sessionId=$currentSessionId muted=$muted")
         audio.startCapture(
             onPcm16 = { pcm16 ->
                 if (!coordinator.isActiveSession(currentSessionId)) {
@@ -279,7 +279,7 @@ class VoiceAgentCallSession(
             },
             onDebugInjectionComplete = {
                 if (coordinator.isActiveSession(currentSessionId)) {
-                    VoiceAgentDebugLog.d(
+                    VoiceAgentLog.d(
                         TAG,
                         "debug injection complete; stopping capture and sending audio stream end " +
                             "sessionId=$currentSessionId",

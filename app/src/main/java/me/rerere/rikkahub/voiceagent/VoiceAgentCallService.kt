@@ -58,11 +58,11 @@ class VoiceAgentCallService : Service() {
         val id = intent.getStringExtra(VoiceAgentCallContract.EXTRA_CONVERSATION_ID)
             ?.let { runCatching { Uuid.parse(it) }.getOrNull() }
             ?: run {
-                VoiceAgentDebugLog.w(TAG, "start ignored: missing or invalid conversation id")
+                VoiceAgentLog.w(TAG, "start ignored: missing or invalid conversation id")
                 stopSelf()
                 return
         }
-        VoiceAgentDebugLog.d(TAG, "start requested conversationId=$id")
+        VoiceAgentLog.d(TAG, "start requested conversationId=$id")
         callGeneration += 1
         val startGeneration = callGeneration
         endJob = null
@@ -75,16 +75,16 @@ class VoiceAgentCallService : Service() {
         startForegroundFor(id.toString(), manager.state.value)
         serviceScope.launch {
             try {
-                VoiceAgentDebugLog.d(TAG, "loading settings and conversation")
+                VoiceAgentLog.d(TAG, "loading settings and conversation")
                 val settings = settingsStore.settingsFlow.first()
                 val conversation = chatService.getConversationFlow(id).value
                 if (startGeneration != callGeneration) {
-                    VoiceAgentDebugLog.d(TAG, "start canceled before config resolution")
+                    VoiceAgentLog.d(TAG, "start canceled before config resolution")
                     return@launch
                 }
                 when (val result = VoiceAgentConfigResolver().resolve(settings = settings, conversation = conversation)) {
                     is VoiceAgentConfigResult.Available -> {
-                        VoiceAgentDebugLog.d(
+                        VoiceAgentLog.d(
                             TAG,
                             "config available voiceModelId=${result.config.voiceModelId} " +
                                 "baseUrl=${result.config.voiceLabBaseUrl}",
@@ -94,7 +94,7 @@ class VoiceAgentCallService : Service() {
                             config = result.config,
                             scope = serviceScope,
                         )
-                        VoiceAgentDebugLog.d(TAG, "manager start returned startedNewSession=$startedNewSession")
+                        VoiceAgentLog.d(TAG, "manager start returned startedNewSession=$startedNewSession")
                         notificationJob = serviceScope.launch {
                             manager.state.collect { state ->
                                 startForegroundFor(id.toString(), state)
@@ -103,14 +103,14 @@ class VoiceAgentCallService : Service() {
                         val serviceReconnect = !startedNewSession &&
                             manager.state.value.session is VoiceSessionStatus.Error
                         if (serviceReconnect) {
-                            VoiceAgentDebugLog.d(TAG, "existing session is error; reconnecting")
+                            VoiceAgentLog.d(TAG, "existing session is error; reconnecting")
                             manager.reconnect()
                         }
                         val hasActiveTelecomCall = telecomConversationId == id &&
                             telecomCallRegistry.hasActiveConnection()
                         val needsTelecomSetup = startedNewSession || !hasActiveTelecomCall
                         if (needsTelecomSetup) {
-                            VoiceAgentDebugLog.d(TAG, "waiting for startup state")
+                            VoiceAgentLog.d(TAG, "waiting for startup state")
                             var observedReconnectAttempt = !serviceReconnect
                             val startupState = manager.state.first { state ->
                                 if (startGeneration != callGeneration) {
@@ -125,10 +125,10 @@ class VoiceAgentCallService : Service() {
                                     state.session == VoiceSessionStatus.Ended
                             }
                             if (startGeneration != callGeneration) {
-                                VoiceAgentDebugLog.d(TAG, "start canceled while waiting for startup state")
+                                VoiceAgentLog.d(TAG, "start canceled while waiting for startup state")
                                 return@launch
                             }
-                            VoiceAgentDebugLog.d(TAG, "startup state=${startupState.session}")
+                            VoiceAgentLog.d(TAG, "startup state=${startupState.session}")
                             when (val session = startupState.session) {
                                 VoiceSessionStatus.Connected -> Unit
                                 is VoiceSessionStatus.Error -> {
@@ -156,7 +156,7 @@ class VoiceAgentCallService : Service() {
                         }
                     }
                     is VoiceAgentConfigResult.Unavailable -> {
-                        VoiceAgentDebugLog.w(TAG, "config unavailable: ${result.message.redactForVoiceAgentLog()}")
+                        VoiceAgentLog.w(TAG, "config unavailable: ${result.message.redactForVoiceAgentLog()}")
                         manager.updateCallStatus(VoiceCallStatus.Degraded(result.message))
                         startForegroundFor(id.toString(), manager.state.value)
                         stopForeground(STOP_FOREGROUND_REMOVE)
@@ -167,7 +167,7 @@ class VoiceAgentCallService : Service() {
                 throw error
             } catch (error: Throwable) {
                 if (startGeneration == callGeneration) {
-                    VoiceAgentDebugLog.w(TAG, "start failed: ${error.toVoiceAgentLogDetail()}")
+                    VoiceAgentLog.w(TAG, "start failed: ${error.toVoiceAgentLogDetail()}")
                     tearDownFailedStart(
                         conversationId = id.toString(),
                         error = error,
@@ -207,7 +207,7 @@ class VoiceAgentCallService : Service() {
 
     private fun tearDownFailedStart(conversationId: String, error: Throwable, preserveSession: Boolean = false) {
         val detail = error.message ?: error.javaClass.simpleName
-        VoiceAgentDebugLog.w(
+        VoiceAgentLog.w(
             TAG,
             "tearing down failed start preserveSession=$preserveSession detail=${detail.redactForVoiceAgentLog()}",
         )
@@ -228,13 +228,13 @@ class VoiceAgentCallService : Service() {
     }
 
     private fun startTelecomCall(conversationId: Uuid) {
-        VoiceAgentDebugLog.d(TAG, "starting telecom call conversationId=$conversationId")
+        VoiceAgentLog.d(TAG, "starting telecom call conversationId=$conversationId")
         telecomConversationId = null
         telecomCallRegistry.disconnectActive()
         telecomAdapter.register()
             .onFailure {
                 val detail = it.message ?: it.javaClass.simpleName
-                VoiceAgentDebugLog.w(TAG, "telecom register failed: ${detail.redactForVoiceAgentLog()}")
+                VoiceAgentLog.w(TAG, "telecom register failed: ${detail.redactForVoiceAgentLog()}")
                 manager.recordDiagnostic("telecom_register_failed", detail)
                 manager.updateCallStatus(VoiceCallStatus.Degraded("Telecom unavailable: $detail"))
                 return
@@ -248,7 +248,7 @@ class VoiceAgentCallService : Service() {
             }
             .onFailure {
                 val detail = it.message ?: it.javaClass.simpleName
-                VoiceAgentDebugLog.w(TAG, "telecom start failed: ${detail.redactForVoiceAgentLog()}")
+                VoiceAgentLog.w(TAG, "telecom start failed: ${detail.redactForVoiceAgentLog()}")
                 manager.recordDiagnostic("telecom_start_failed", detail)
                 manager.updateCallStatus(VoiceCallStatus.Degraded("Telecom call unavailable: $detail"))
             }
