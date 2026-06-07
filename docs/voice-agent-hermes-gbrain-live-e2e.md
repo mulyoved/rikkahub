@@ -27,15 +27,19 @@ Set these values in your shell or source them from a local file outside the repo
 | `VOICE_AGENT_E2E_PCM_PATH` | Absolute path to the private PCM prompt file. |
 | `VOICE_AGENT_E2E_CONVERSATION_ID` | Existing app conversation id used to start the Voice Agent service. |
 
-For the current remote USB ADB setup, these are the current known values:
+If the Android device is connected through a remote ADB server, point `adb` at that server before running:
 
 ```bash
-export ADB_SERVER_SOCKET='tcp:100.69.79.32:5037'
-export VOICE_AGENT_E2E_SERIAL='RZCX71NXRPB'
+export ADB_SERVER_SOCKET='tcp:<adb-host>:5037'
 ```
 
-Confirm both values against operator inventory before running. Keep them here because they are operationally useful for
-this environment, but do not treat them as permanent device assignments.
+When more than one authorized device is visible, set the device serial explicitly:
+
+```bash
+export VOICE_AGENT_E2E_SERIAL='<adb-device-serial>'
+```
+
+Confirm the ADB server and serial against the current operator inventory before running.
 
 The Hermes base URL is optional. The script defaults to this value:
 
