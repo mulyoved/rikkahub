@@ -558,6 +558,38 @@ class VoiceAgentRuntimeTest {
     }
 
     @Test
+    fun `Hermes response hash diagnostic is skipped without expected hash`() = runTest {
+        val gemini = FakeGeminiLiveVoiceClient()
+        val toolApi = FakeVoiceToolApi()
+        val diagnostics = VoiceDiagnostics()
+        var hashLogCalls = 0
+        val coordinator = VoiceAgentCoordinator(
+            gemini = gemini,
+            toolApi = toolApi,
+            audio = FakeVoiceAudioEngine(),
+            diagnostics = diagnostics,
+            hermesResponseExpectedHash = "",
+            logHermesResponseHash = { hashLogCalls++ },
+            scope = this,
+        )
+
+        coordinator.onGeminiEvent(
+            GeminiLiveEvent.ToolCall(callId = "call-no-hash", name = "ask_hermes", prompt = "private prompt")
+        )
+        assertEquals("call-no-hash" to "private prompt", toolApi.awaitRequest("call-no-hash"))
+        toolApi.complete(response(callId = "call-no-hash", answer = "alpha beta"))
+        coordinator.awaitToolJobsWithTimeout()
+
+        assertEquals(listOf("call-no-hash" to "alpha beta"), gemini.toolResponses)
+        assertEquals(0, hashLogCalls)
+        assertFalse(diagnostics.events.value.any { it.name == "hermes_tool_response_hash" })
+        val successEvent = diagnostics.events.value.single { it.name == "hermes_tool_succeeded" }
+        assertTrue(successEvent.detail.contains("callId=call-no-hash"))
+        assertTrue(successEvent.detail.contains("answerChars=10"))
+        assertFalse(successEvent.detail.contains("alpha beta"))
+    }
+
+    @Test
     fun `Hermes response hash logger failure does not fail tool call`() = runTest {
         val gemini = FakeGeminiLiveVoiceClient()
         val toolApi = FakeVoiceToolApi()

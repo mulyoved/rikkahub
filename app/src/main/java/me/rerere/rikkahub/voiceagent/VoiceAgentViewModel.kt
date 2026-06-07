@@ -926,21 +926,20 @@ class VoiceAgentCoordinator(
         elapsedMs: Long,
         serverElapsedMs: Long?,
     ) {
+        val configuredExpectedHash = expectedHash?.takeIf { it.isNotBlank() } ?: return
         val detail = HermesToolResponseHash.diagnosticDetail(
             callId = callId,
             answer = answer,
-            expectedSha256 = expectedHash,
+            expectedSha256 = configuredExpectedHash,
             elapsedMs = elapsedMs,
             serverElapsedMs = serverElapsedMs,
         )
         diagnostics.record("hermes_tool_response_hash", detail)
-        if (expectedHash != null) {
-            runCatching {
-                logHermesResponseHash(detail)
-            }.onFailure { error ->
-                val message = error.message ?: error.javaClass.simpleName
-                diagnostics.record("hermes_tool_response_hash_log_failed", "callId=$callId, message=$message")
-            }
+        runCatching {
+            logHermesResponseHash(detail)
+        }.onFailure { error ->
+            val message = error.message ?: error.javaClass.simpleName
+            diagnostics.record("hermes_tool_response_hash_log_failed", "callId=$callId, message=$message")
         }
     }
 
