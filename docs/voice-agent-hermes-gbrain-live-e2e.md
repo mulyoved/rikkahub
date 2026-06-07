@@ -64,6 +64,10 @@ Prepare the expected answer locally without writing it into this repository.
 3. Hash the normalized UTF-8 text with SHA-256.
 4. Use only the hex digest as `VOICE_AGENT_E2E_EXPECTED_HASH`.
 
+Use a high-entropy, unpredictable private fact for this test. A SHA-256 digest of a short, common, or guessable answer
+can be brute-forced offline from the debug APK, build output, or logcat artifact. Low-entropy private facts are not safe
+for this verification even though the raw answer is never logged.
+
 For example, if the harmless expected text were two words separated by arbitrary whitespace, the normalized input to the
 hash function would be `alpha beta`. Do not paste the private expected answer into the runbook, scripts, committed test
 data, shell history, or shared logs.
@@ -142,7 +146,7 @@ The script fails when any of these markers or conditions appear:
 `AndroidRuntime`, but still treat it as local only.
 
 The E2E hash diagnostic log only includes call id, raw and normalized character counts, SHA-256 hash, match result, and
-timing. It does not log the Hermes answer.
+timing. It does not log the Hermes answer, but the hash can still reveal low-entropy answers through offline guessing.
 
 The Hermes failure E2E log preserves bounded failure summaries such as `Voice Lab request failed 403` and redacts or
 drops response previews. Do not paste unredacted runtime logs into issues, commits, docs, or chat.
