@@ -10,6 +10,7 @@ CALL_END_ACTION="me.rerere.rikkahub.voiceagent.action.END"
 APP_PCM_PATH="voice-e2e/prompt.pcm"
 LOG_DIR="${VOICE_AGENT_E2E_LOG_DIR:-build/voice-agent-e2e}"
 LOG_FILE="$LOG_DIR/logcat.txt"
+CALL_STARTED=0
 
 require_env() {
   local name="$1"
@@ -54,15 +55,41 @@ fail_if_log() {
   fi
 }
 
+wait_for_log_or_fail() {
+  local label="$1"
+  local pattern="$2"
+  local failure_label="$3"
+  local failure_pattern="$4"
+  local timeout_seconds="${5:-90}"
+  local deadline=$((SECONDS + timeout_seconds))
+  while (( SECONDS < deadline )); do
+    if grep -E "$pattern" "$LOG_FILE" >/dev/null 2>&1; then
+      printf 'PASS marker: %s\n' "$label"
+      return 0
+    fi
+    if grep -E "$failure_pattern" "$LOG_FILE" >/dev/null 2>&1; then
+      printf 'Forbidden marker found: %s\n' "$failure_label" >&2
+      printf 'Pattern: %s\n' "$failure_pattern" >&2
+      return 1
+    fi
+    sleep 1
+  done
+  printf 'Missing marker after %ss: %s\n' "$timeout_seconds" "$label" >&2
+  printf 'Pattern: %s\n' "$pattern" >&2
+  return 1
+}
+
 cleanup() {
   local status=$?
   if [[ -n "${LOGCAT_PID:-}" ]]; then
     kill "$LOGCAT_PID" >/dev/null 2>&1 || true
     wait "$LOGCAT_PID" >/dev/null 2>&1 || true
   fi
-  adb_cmd shell am start-foreground-service \
-    -n "$SERVICE_COMPONENT" \
-    -a "$CALL_END_ACTION" >/dev/null 2>&1 || true
+  if [[ "$CALL_STARTED" == "1" ]]; then
+    adb_cmd shell am start-foreground-service \
+      -n "$SERVICE_COMPONENT" \
+      -a "$CALL_END_ACTION" >/dev/null 2>&1 || true
+  fi
   exit "$status"
 }
 trap cleanup EXIT
@@ -105,26 +132,40 @@ printf 'Granting debug permissions...\n'
 adb_cmd shell pm grant "$PACKAGE" android.permission.RECORD_AUDIO >/dev/null 2>&1 || true
 adb_cmd shell pm grant "$PACKAGE" android.permission.POST_NOTIFICATIONS >/dev/null 2>&1 || true
 
+printf 'Starting scoped log capture...\n'
+adb_cmd logcat -c
+adb_cmd logcat -v time \
+  VoiceAgentGemini:D \
+  VoiceAgentE2E:I \
+  VoiceAudioDebugInjection:I \
+  AndroidVoiceAudioEngine:D \
+  VoiceAgentDebugSeed:I \
+  '*:S' > "$LOG_FILE" &
+LOGCAT_PID=$!
+
 printf 'Seeding Hermes provider in debug settings...\n'
 adb_cmd shell am broadcast \
   -a "$SEED_ACTION" \
   --es api_key "$HERMES_PROFILE_API_KEY" \
   --es base_url "${VOICE_AGENT_E2E_HERMES_BASE_URL:-https://muly-hermes-api.core8.co/v1}" >/dev/null
 
+wait_for_log_or_fail \
+  "Hermes debug seed succeeded" \
+  'VoiceAgentDebugSeed: debug_seed_hermes_provider result=success' \
+  "Hermes debug seed failed" \
+  'VoiceAgentDebugSeed: debug_seed_hermes_provider failed' \
+  30
+
 printf 'Copying private PCM prompt into app-private files...\n'
 adb_cmd shell "run-as $PACKAGE mkdir -p files/voice-e2e"
 adb_cmd exec-out "run-as $PACKAGE sh -c 'cat > files/$APP_PCM_PATH'" < "$VOICE_AGENT_E2E_PCM_PATH"
-
-printf 'Starting log capture...\n'
-adb_cmd logcat -c
-adb_cmd logcat -v time > "$LOG_FILE" &
-LOGCAT_PID=$!
 
 printf 'Starting Voice Agent foreground service...\n'
 adb_cmd shell am start-foreground-service \
   -n "$SERVICE_COMPONENT" \
   -a "$CALL_START_ACTION" \
   --es conversationId "$VOICE_AGENT_E2E_CONVERSATION_ID" >/dev/null
+CALL_STARTED=1
 
 wait_for_log "Gemini setup complete" 'VoiceAgentGemini: event kind=SetupComplete' 120
 
