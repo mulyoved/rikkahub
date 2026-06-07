@@ -50,6 +50,7 @@ class VoiceAgentDebugSeedReceiver : BroadcastReceiver() {
                     )
                     settingsStore.update(
                         current.copy(
+                            assistantId = DEFAULT_ASSISTANT_ID,
                             chatModelId = HERMES_MODEL_ID,
                             fastModelId = HERMES_MODEL_ID,
                             providers = current.providers
