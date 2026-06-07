@@ -285,8 +285,8 @@ class VoiceConversationPersister {
             val roleMatches = metadata[VOICE_TRANSCRIPT_ROLE_KEY]?.jsonPrimitive?.content == transcriptRole
             val turnMatches = metadata[VOICE_TRANSCRIPT_TURN_ID_KEY]?.jsonPrimitive?.content == turnId
             val existingSessionId = metadata[VOICE_SESSION_ID_KEY]?.jsonPrimitive?.content
-            val sessionMatches = if (sessionId == null || existingSessionId == null) {
-                true
+            val sessionMatches = if (sessionId == null) {
+                existingSessionId == null
             } else {
                 existingSessionId == sessionId
             }

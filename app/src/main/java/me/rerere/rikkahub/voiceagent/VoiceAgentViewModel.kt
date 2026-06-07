@@ -128,6 +128,9 @@ class VoiceAgentCoordinator(
     private val diagnostics: VoiceDiagnostics = VoiceDiagnostics(),
     private val hermesResponseExpectedHash: String? =
         BuildConfig.VOICE_AGENT_HERMES_E2E_EXPECTED_HASH.trim().takeIf { it.isNotBlank() },
+    private val logHermesRequestHash: (String) -> Unit = { detail ->
+        Log.i(E2E_TAG, "hermes_tool_request_hash $detail")
+    },
     private val logHermesResponseHash: (String) -> Unit = { detail ->
         Log.i(E2E_TAG, "hermes_tool_response_hash $detail")
     },
@@ -554,7 +557,10 @@ class VoiceAgentCoordinator(
             diagnostics.record("stale_gemini_event", call.javaClass.simpleName)
             return
         }
-        diagnostics.record("tool_call_received", "callId=${call.callId}, name=${call.name}, prompt=${call.prompt}")
+        diagnostics.record(
+            "tool_call_received",
+            "callId=${call.callId}, name=${call.name}, promptChars=${call.prompt.length}",
+        )
         if (call.name != ASK_HERMES_TOOL) {
             recordUnsupportedToolCall(
                 GeminiLiveEvent.UnsupportedToolCall(
@@ -564,6 +570,7 @@ class VoiceAgentCoordinator(
             )
             return
         }
+        recordHermesToolRequestHash(callId = call.callId, prompt = call.prompt)
 
         val handle = ToolJobHandle(callId = call.callId, prompt = call.prompt, sessionId = sessionId)
         val job = coordinatorScope.launch(toolLaunchContext, start = CoroutineStart.LAZY) {
@@ -917,6 +924,17 @@ class VoiceAgentCoordinator(
 
     private fun recordUnsupportedToolCall(call: GeminiLiveEvent.UnsupportedToolCall) {
         diagnostics.record("unsupported_tool_call", "callId=${call.callId}, name=${call.name}")
+    }
+
+    private fun recordHermesToolRequestHash(callId: String, prompt: String) {
+        val detail = HermesToolResponseHash.requestDiagnosticDetail(callId = callId, prompt = prompt)
+        diagnostics.record("hermes_tool_request_hash", detail)
+        runCatching {
+            logHermesRequestHash(detail)
+        }.onFailure { error ->
+            val message = error.message ?: error.javaClass.simpleName
+            diagnostics.record("hermes_tool_request_hash_log_failed", "callId=$callId, message=$message")
+        }
     }
 
     private fun recordHermesToolResponseHash(

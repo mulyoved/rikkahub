@@ -519,6 +519,35 @@ class VoiceAgentRuntimeTest {
     }
 
     @Test
+    fun `Hermes request hash diagnostic is emitted without raw prompt`() = runTest {
+        val diagnostics = VoiceDiagnostics()
+        val toolApi = FakeVoiceToolApi()
+        val expectedPromptHash = HermesToolResponseHash.sha256HexNormalized("private prompt")
+        val coordinator = VoiceAgentCoordinator(
+            gemini = FakeGeminiLiveVoiceClient(),
+            toolApi = toolApi,
+            audio = FakeVoiceAudioEngine(),
+            diagnostics = diagnostics,
+            scope = this,
+        )
+
+        coordinator.onGeminiEvent(
+            GeminiLiveEvent.ToolCall(callId = "call-request-hash", name = "ask_hermes", prompt = "private prompt")
+        )
+
+        val hashEvent = diagnostics.events.value.single { it.name == "hermes_tool_request_hash" }
+        assertTrue(hashEvent.detail.contains("callId=call-request-hash"))
+        assertTrue(hashEvent.detail.contains("promptChars=14"))
+        assertTrue(hashEvent.detail.contains("normalizedChars=14"))
+        assertTrue(hashEvent.detail.contains("promptHash=$expectedPromptHash"))
+        assertFalse(diagnostics.events.value.any { it.detail.contains("private prompt") })
+
+        assertEquals("call-request-hash" to "private prompt", toolApi.awaitRequest("call-request-hash"))
+        toolApi.complete(response(callId = "call-request-hash", answer = "done"))
+        coordinator.awaitToolJobsWithTimeout()
+    }
+
+    @Test
     fun `Hermes response hash diagnostic is emitted without raw answer`() = runTest {
         val gemini = FakeGeminiLiveVoiceClient()
         val toolApi = FakeVoiceToolApi()

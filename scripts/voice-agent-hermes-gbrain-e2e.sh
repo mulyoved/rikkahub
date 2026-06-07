@@ -16,6 +16,8 @@ LOG_FILE="$LOG_DIR/logcat.txt"
 ADB_TIMEOUT_SECONDS="${VOICE_AGENT_E2E_ADB_TIMEOUT_SECONDS:-20}"
 ADB_LONG_TIMEOUT_SECONDS="${VOICE_AGENT_E2E_ADB_LONG_TIMEOUT_SECONDS:-120}"
 ADB_READY_SCRIPT="${VOICE_AGENT_E2E_ADB_READY_SCRIPT:-scripts/adb-device-ready.sh}"
+GEMINI_TOOL_CALL_TIMEOUT_SECONDS="${VOICE_AGENT_E2E_GEMINI_TOOL_CALL_TIMEOUT_SECONDS:-240}"
+HERMES_RESPONSE_TIMEOUT_SECONDS="${VOICE_AGENT_E2E_HERMES_RESPONSE_TIMEOUT_SECONDS:-360}"
 CALL_STARTED=0
 COMMON_FORBIDDEN_PATTERN='Voice Lab request failed 403|Cloudflare|cf-error|Access denied|FATAL EXCEPTION|VoiceAgentE2E.*hermes_tool_response_hash .*expectedHashMatch=false|Voice playback write failed|AudioTrack write failed|AudioTrack write error'
 
@@ -181,6 +183,8 @@ adb_cmd shell pm grant "$PACKAGE" android.permission.POST_NOTIFICATIONS >/dev/nu
 printf 'Starting scoped log capture...\n'
 adb_cmd logcat -c
 adb_logcat logcat -v time \
+  VoiceAgentCallService:D \
+  VoiceAgentCallSession:D \
   VoiceAgentGemini:D \
   VoiceAgentE2E:D \
   VoiceAudioDebugInjection:I \
@@ -194,6 +198,7 @@ printf 'Seeding Hermes provider in debug settings...\n'
 adb_cmd shell am broadcast \
   -n "$SEED_COMPONENT" \
   -a "$SEED_ACTION" \
+  --es conversation_id "$VOICE_AGENT_E2E_CONVERSATION_ID" \
   --es api_key "$HERMES_PROFILE_API_KEY" \
   --es base_url "${VOICE_AGENT_E2E_HERMES_BASE_URL:-https://muly-hermes-api.core8.co/v1}" >/dev/null
 
@@ -224,14 +229,14 @@ adb_cmd shell am broadcast \
   -n "$INJECT_COMPONENT" \
   -a "$INJECT_ACTION" \
   --es path "$APP_PCM_PATH" \
-  --ei chunk_bytes 3200 \
-  --el chunk_delay_ms 100 \
-  --el leading_silence_ms 500 \
-  --el trailing_silence_ms 800 >/dev/null
+  --ei chunk_bytes "${VOICE_AGENT_E2E_CHUNK_BYTES:-3200}" \
+  --el chunk_delay_ms "${VOICE_AGENT_E2E_CHUNK_DELAY_MS:-20}" \
+  --el leading_silence_ms "${VOICE_AGENT_E2E_LEADING_SILENCE_MS:-100}" \
+  --el trailing_silence_ms "${VOICE_AGENT_E2E_TRAILING_SILENCE_MS:-200}" >/dev/null
 
 wait_for_log "debug PCM delivered" 'VoiceAudioDebugInjection.*debug_audio_injection result delivered=true' 30
-wait_for_log "Gemini ask_hermes tool call received" 'VoiceAgentGemini.*receive kind=toolCall' 180
-wait_for_log "Hermes response hash matched" "VoiceAgentE2E.*hermes_tool_response_hash .*actualHash=$EXPECTED_HASH_LOWER.*expectedHashMatch=true" 180
+wait_for_log "Gemini ask_hermes tool call received" 'VoiceAgentGemini.*receive kind=toolCall' "$GEMINI_TOOL_CALL_TIMEOUT_SECONDS"
+wait_for_log "Hermes response hash matched" "VoiceAgentE2E.*hermes_tool_response_hash .*actualHash=$EXPECTED_HASH_LOWER.*expectedHashMatch=true" "$HERMES_RESPONSE_TIMEOUT_SECONDS"
 wait_for_log "Gemini tool response sent" 'VoiceAgentGemini.*send kind=toolResponse sent=true' 60
 wait_for_log "Gemini output audio received" 'VoiceAgentGemini.*event kind=OutputAudio' 120
 wait_for_log "Voice playback queued" 'AndroidVoiceAudioEngine.*Voice playback queued' 60

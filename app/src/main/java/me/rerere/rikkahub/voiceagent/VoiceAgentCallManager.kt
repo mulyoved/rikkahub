@@ -21,10 +21,10 @@ class VoiceAgentCallManager(
     val activeConversationId: StateFlow<Uuid?> = _activeConversationId.asStateFlow()
     val state: StateFlow<VoiceAgentUiState> = _state.asStateFlow()
 
-    fun start(conversationId: Uuid, config: VoiceAgentLaunchConfig, scope: CoroutineScope) {
+    fun start(conversationId: Uuid, config: VoiceAgentLaunchConfig, scope: CoroutineScope): Boolean {
         synchronized(lock) {
             if (activeSession != null && _activeConversationId.value == conversationId) {
-                return
+                return false
             }
         }
 
@@ -51,6 +51,7 @@ class VoiceAgentCallManager(
             }
         }
         session.start()
+        return true
     }
 
     fun detachUi() = Unit
@@ -87,6 +88,23 @@ class VoiceAgentCallManager(
             }
         }
         session?.end()
+    }
+
+    suspend fun endAndDrain() {
+        detachForEndAndDrain()?.endAndDrain()
+    }
+
+    fun detachForEndAndDrain(): ManagedVoiceCallSession? {
+        return synchronized(lock) {
+            stateCollectionJob?.cancel()
+            stateCollectionJob = null
+            callStatus = VoiceCallStatus.Ending
+            _state.value = _state.value.copy(call = VoiceCallStatus.Ending)
+            activeSession.also {
+                activeSession = null
+                _activeConversationId.value = null
+            }
+        }
     }
 
     fun closeNow() {

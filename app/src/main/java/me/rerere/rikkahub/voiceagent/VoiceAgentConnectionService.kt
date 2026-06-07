@@ -8,15 +8,22 @@ import org.koin.android.ext.android.inject
 
 class VoiceAgentConnectionService : ConnectionService() {
     private val callManager: VoiceAgentCallManager by inject()
+    private val telecomCallRegistry: VoiceAgentTelecomCallRegistry by inject()
 
     override fun onCreateOutgoingConnection(
         connectionManagerPhoneAccount: PhoneAccountHandle?,
         request: ConnectionRequest?,
     ): Connection {
-        return VoiceAgentTelecomConnection(context = applicationContext).apply {
+        val connection = VoiceAgentTelecomConnection(
+            context = applicationContext,
+            onDisconnected = telecomCallRegistry::clear,
+        ).apply {
             setInitializing()
             setActive()
         }
+        telecomCallRegistry.replace(connection)
+        callManager.updateCallStatus(VoiceCallStatus.BackgroundCapable)
+        return connection
     }
 
     override fun onCreateOutgoingConnectionFailed(

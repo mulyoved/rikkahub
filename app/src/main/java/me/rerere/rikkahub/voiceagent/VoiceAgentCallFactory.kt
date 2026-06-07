@@ -18,6 +18,7 @@ interface ManagedVoiceCallSession {
     fun setMuted(value: Boolean)
     fun reconnect()
     fun end()
+    suspend fun endAndDrain()
     fun closeNow()
 }
 

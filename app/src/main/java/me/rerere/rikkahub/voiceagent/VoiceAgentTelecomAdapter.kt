@@ -21,6 +21,7 @@ class VoiceAgentTelecomAdapter(
         val telecomManager = requireTelecomManager()
         val account = PhoneAccount.builder(handle, "RikkaHub Voice Agent")
             .setCapabilities(PhoneAccount.CAPABILITY_SELF_MANAGED)
+            .addSupportedUriScheme(VOICE_AGENT_CALL_URI_SCHEME)
             .build()
         telecomManager.registerPhoneAccount(account)
     }
@@ -30,10 +31,14 @@ class VoiceAgentTelecomAdapter(
         val extras = Bundle().apply {
             putParcelable(TelecomManager.EXTRA_PHONE_ACCOUNT_HANDLE, handle)
         }
-        telecomManager.placeCall(Uri.fromParts("rikkahub-voice", "voice-agent", null), extras)
+        telecomManager.placeCall(Uri.fromParts(VOICE_AGENT_CALL_URI_SCHEME, "voice-agent", null), extras)
     }
 
     private fun requireTelecomManager(): TelecomManager =
         context.getSystemService(TelecomManager::class.java)
             ?: error("TelecomManager unavailable")
+
+    private companion object {
+        const val VOICE_AGENT_CALL_URI_SCHEME = "rikkahub-voice"
+    }
 }

@@ -21,6 +21,7 @@ import me.rerere.rikkahub.voiceagent.VoiceAgentCallFactory
 import me.rerere.rikkahub.voiceagent.VoiceAgentCallManager
 import me.rerere.rikkahub.voiceagent.VoiceAgentNotificationFactory
 import me.rerere.rikkahub.voiceagent.VoiceAgentTelecomAdapter
+import me.rerere.rikkahub.voiceagent.VoiceAgentTelecomCallRegistry
 import me.rerere.rikkahub.web.WebServerManager
 import me.rerere.tts.provider.TTSManager
 import org.koin.dsl.module
@@ -112,6 +113,10 @@ val appModule = module {
 
     single {
         VoiceAgentTelecomAdapter(context = get())
+    }
+
+    single {
+        VoiceAgentTelecomCallRegistry()
     }
 
     single {

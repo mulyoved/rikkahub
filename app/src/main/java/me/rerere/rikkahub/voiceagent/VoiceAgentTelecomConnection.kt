@@ -6,10 +6,20 @@ import android.telecom.DisconnectCause
 
 class VoiceAgentTelecomConnection(
     private val context: Context,
-) : Connection() {
+    private val onDisconnected: (VoiceAgentTelecomConnection) -> Unit,
+) : Connection(), VoiceAgentTelecomCall {
     override fun onDisconnect() {
         context.startService(voiceAgentCallEndIntent(context))
-        setDisconnected(DisconnectCause(DisconnectCause.LOCAL))
+        disconnect(cause = DisconnectCause(DisconnectCause.LOCAL))
+    }
+
+    override fun disconnectFromApp() {
+        disconnect(cause = DisconnectCause(DisconnectCause.LOCAL))
+    }
+
+    private fun disconnect(cause: DisconnectCause) {
+        onDisconnected(this)
+        setDisconnected(cause)
         destroy()
     }
 }

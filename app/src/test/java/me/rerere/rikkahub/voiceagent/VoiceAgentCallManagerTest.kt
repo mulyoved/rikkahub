@@ -1,9 +1,11 @@
 package me.rerere.rikkahub.voiceagent
 
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.test.advanceUntilIdle
-import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.yield
 import me.rerere.rikkahub.voiceagent.voicelab.VoiceLabMobileCredentials
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertSame
@@ -27,12 +29,13 @@ class VoiceAgentCallManagerTest {
         val conversationId = Uuid.parse("33333333-3333-4333-8333-333333333333")
         val config = fakeLaunchConfig()
 
-        manager.start(conversationId = conversationId, config = config, scope = this)
+        val started = manager.start(conversationId = conversationId, config = config, scope = this)
 
         val observedState = manager.state
         session.state.value = VoiceAgentUiState(session = VoiceSessionStatus.Connected)
-        advanceUntilIdle()
+        yield()
 
+        assertEquals(true, started)
         assertSame(observedState, manager.state)
         assertEquals(VoiceSessionStatus.Connected, manager.state.value.session)
         assertEquals(listOf(conversationId to config), factory.created)
@@ -47,9 +50,11 @@ class VoiceAgentCallManagerTest {
         val firstConversationId = Uuid.parse("44444444-4444-4444-8444-444444444444")
         val secondConversationId = Uuid.parse("55555555-5555-4555-8555-555555555555")
 
-        manager.start(firstConversationId, fakeLaunchConfig(), this)
-        manager.start(secondConversationId, fakeLaunchConfig(), this)
+        val startedFirst = manager.start(firstConversationId, fakeLaunchConfig(), this)
+        val startedSecond = manager.start(secondConversationId, fakeLaunchConfig(), this)
 
+        assertEquals(true, startedFirst)
+        assertEquals(true, startedSecond)
         assertEquals(1, first.endCalls)
         assertEquals(0, first.closeNowCalls)
         assertEquals(1, second.startCalls)
@@ -62,11 +67,43 @@ class VoiceAgentCallManagerTest {
         val manager = VoiceAgentCallManager(factory = FakeVoiceAgentCallFactory(session))
         val conversationId = Uuid.parse("66666666-6666-4666-8666-666666666666")
 
-        manager.start(conversationId, fakeLaunchConfig(), this)
-        manager.start(conversationId, fakeLaunchConfig(), this)
+        val startedFirst = manager.start(conversationId, fakeLaunchConfig(), this)
+        val startedDuplicate = manager.start(conversationId, fakeLaunchConfig(), this)
 
+        assertEquals(true, startedFirst)
+        assertEquals(false, startedDuplicate)
         assertEquals(1, session.startCalls)
         assertEquals(0, session.endCalls)
+    }
+
+    @Test
+    fun `starting same conversation preserves existing degraded call status`() = runTest {
+        val session = FakeManagedVoiceCallSession()
+        val manager = VoiceAgentCallManager(factory = FakeVoiceAgentCallFactory(session))
+        val conversationId = Uuid.parse("77777777-7777-4777-8777-777777777777")
+        val degraded = VoiceCallStatus.Degraded("Telecom unavailable")
+
+        manager.start(conversationId, fakeLaunchConfig(), this)
+        manager.updateCallStatus(degraded)
+        val startedDuplicate = manager.start(conversationId, fakeLaunchConfig(), this)
+
+        assertEquals(false, startedDuplicate)
+        assertEquals(degraded, manager.state.value.call)
+    }
+
+    @Test
+    fun `reconnect forwards to active same conversation session`() = runTest {
+        val session = FakeManagedVoiceCallSession()
+        val manager = VoiceAgentCallManager(factory = FakeVoiceAgentCallFactory(session))
+        val conversationId = Uuid.parse("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+
+        manager.start(conversationId, fakeLaunchConfig(), this)
+        manager.reconnect()
+
+        assertEquals(1, session.reconnectCalls)
+        assertEquals(1, session.startCalls)
+        assertEquals(0, session.endCalls)
+        assertEquals(conversationId, manager.activeConversationId.value)
     }
 
     @Test
@@ -93,12 +130,45 @@ class VoiceAgentCallManagerTest {
         assertEquals(1, session.endCalls)
         assertEquals(null, manager.activeConversationId.value)
     }
+
+    @Test
+    fun `end and drain forwards draining close and clears active call`() = runTest {
+        val session = FakeManagedVoiceCallSession()
+        val manager = VoiceAgentCallManager(factory = FakeVoiceAgentCallFactory(session))
+
+        manager.start(Uuid.random(), fakeLaunchConfig(), this)
+        manager.endAndDrain()
+
+        assertEquals(0, session.endCalls)
+        assertEquals(1, session.endAndDrainCalls)
+        assertEquals(null, manager.activeConversationId.value)
+    }
+
+    @Test
+    fun `detached end drain does not drain replacement session`() = runTest {
+        val first = FakeManagedVoiceCallSession()
+        val second = FakeManagedVoiceCallSession()
+        val manager = VoiceAgentCallManager(factory = FakeVoiceAgentCallFactory(first, second))
+        val firstConversationId = Uuid.parse("88888888-8888-4888-8888-888888888888")
+        val secondConversationId = Uuid.parse("99999999-9999-4999-8999-999999999999")
+
+        manager.start(firstConversationId, fakeLaunchConfig(), this)
+        val detached = manager.detachForEndAndDrain()
+        manager.start(secondConversationId, fakeLaunchConfig(), this)
+        detached?.endAndDrain()
+
+        assertEquals(1, first.endAndDrainCalls)
+        assertEquals(0, second.endAndDrainCalls)
+        assertEquals(secondConversationId, manager.activeConversationId.value)
+    }
 }
 
 private class FakeManagedVoiceCallSession : ManagedVoiceCallSession {
     override val state = MutableStateFlow(VoiceAgentUiState())
     var startCalls = 0
+    var reconnectCalls = 0
     var endCalls = 0
+    var endAndDrainCalls = 0
     var closeNowCalls = 0
 
     override fun start() {
@@ -109,10 +179,16 @@ private class FakeManagedVoiceCallSession : ManagedVoiceCallSession {
 
     override fun setMuted(value: Boolean) = Unit
 
-    override fun reconnect() = Unit
+    override fun reconnect() {
+        reconnectCalls += 1
+    }
 
     override fun end() {
         endCalls += 1
+    }
+
+    override suspend fun endAndDrain() {
+        endAndDrainCalls += 1
     }
 
     override fun closeNow() {
@@ -143,3 +219,12 @@ private fun fakeLaunchConfig() = VoiceAgentLaunchConfig(
     assistantName = "Hermes",
     assistantPrompt = "system",
 )
+
+private fun runTest(block: suspend CoroutineScope.() -> Unit) = runBlocking {
+    val testScope = CoroutineScope(coroutineContext + SupervisorJob())
+    try {
+        testScope.block()
+    } finally {
+        testScope.cancel()
+    }
+}

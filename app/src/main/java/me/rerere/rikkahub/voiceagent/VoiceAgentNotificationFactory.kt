@@ -28,6 +28,7 @@ class VoiceAgentNotificationFactory(
 
     private fun openVoiceAgentPendingIntent(conversationId: String): PendingIntent {
         val intent = Intent(context, RouteActivity::class.java)
+            .setFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
             .putExtra(VoiceAgentCallContract.EXTRA_ROUTE_VOICE_AGENT_CONVERSATION_ID, conversationId)
         return PendingIntent.getActivity(
             context,

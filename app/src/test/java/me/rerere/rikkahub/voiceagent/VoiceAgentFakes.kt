@@ -257,6 +257,7 @@ class FakeVoiceAudioEngine : VoiceAudioEngine {
     private var errorHandler: ((String) -> Unit)? = null
     private var playbackSessionId: Long? = null
     private var captureCallback: ((ByteArray) -> Unit)? = null
+    private var debugInjectionCompleteCallback: (() -> Unit)? = null
     private val blockedPlaybacks = mutableListOf<BlockedPlayback>()
     private val blockedSuppressions = mutableListOf<BlockedPlayback>()
 
@@ -264,15 +265,17 @@ class FakeVoiceAudioEngine : VoiceAudioEngine {
         errorHandler = onError
     }
 
-    override fun startCapture(onPcm16: (ByteArray) -> Unit) {
+    override fun startCapture(onPcm16: (ByteArray) -> Unit, onDebugInjectionComplete: () -> Unit) {
         startCaptureCalls += 1
         startCaptureError?.let { throw it }
         captureCallback = onPcm16
+        debugInjectionCompleteCallback = onDebugInjectionComplete
     }
 
     override fun stopCapture() {
         stopCaptureCalls += 1
         captureCallback = null
+        debugInjectionCompleteCallback = null
     }
 
     override fun playPcm16(base64Pcm16: String) {
@@ -341,6 +344,10 @@ class FakeVoiceAudioEngine : VoiceAudioEngine {
 
     fun emitCapture(pcm16: ByteArray) {
         captureCallback?.invoke(pcm16)
+    }
+
+    fun completeDebugInjection() {
+        debugInjectionCompleteCallback?.invoke()
     }
 
     fun emitError(message: String) {

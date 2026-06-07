@@ -46,6 +46,12 @@ internal object HermesToolResponseHash {
             "$expectedMatch, elapsedMs=$elapsedMs$serverElapsed"
     }
 
+    fun requestDiagnosticDetail(callId: String, prompt: String): String {
+        val normalized = normalize(prompt)
+        return "callId=$callId, promptChars=${prompt.length}, " +
+            "normalizedChars=${normalized.length}, promptHash=${sha256Hex(normalized)}"
+    }
+
     private fun sha256Hex(value: String): String =
         MessageDigest.getInstance("SHA-256")
             .digest(value.toByteArray(Charsets.UTF_8))
