@@ -27,12 +27,15 @@ Set these values in your shell or source them from a local file outside the repo
 | `VOICE_AGENT_E2E_PCM_PATH` | Absolute path to the private PCM prompt file. |
 | `VOICE_AGENT_E2E_CONVERSATION_ID` | Existing app conversation id used to start the Voice Agent service. |
 
-For the current remote USB ADB setup, set:
+For the current remote USB ADB setup, these are the current known values:
 
 ```bash
 export ADB_SERVER_SOCKET='tcp:100.69.79.32:5037'
 export VOICE_AGENT_E2E_SERIAL='RZCX71NXRPB'
 ```
+
+Confirm both values against operator inventory before running. Keep them here because they are operationally useful for
+this environment, but do not treat them as permanent device assignments.
 
 The Hermes base URL is optional. The script defaults to this value:
 
@@ -42,6 +45,12 @@ export VOICE_AGENT_E2E_HERMES_BASE_URL='https://muly-hermes-api.core8.co/v1'
 
 Do not commit credentials, local secret-loading files, the private Gbrain question, the raw expected answer, the PCM
 prompt, or logcat artifacts.
+
+Important: this script builds a credentialed debug APK and local build output. The Cloudflare credentials and
+`VOICE_AGENT_E2E_EXPECTED_HASH` are embedded into `BuildConfig` for the debug APK produced by this run. Do not share the
+APK, build outputs, or installed debug app/device state. Treat the connected device as credential-bearing until the
+debug APK is removed or replaced. If the machine is shared, or if artifacts may leave the trusted environment, clean
+local build artifacts when the run is complete.
 
 ## Preparing The Expected Hash
 
@@ -79,6 +88,10 @@ scripts/voice-agent-hermes-gbrain-e2e.sh
 
 The script requires all secret inputs except `VOICE_AGENT_E2E_HERMES_BASE_URL`, verifies the PCM file exists, lowercases
 the expected hash for marker matching, and writes a local scoped log to `build/voice-agent-e2e/logcat.txt`.
+
+Before running, verify that the selected ADB socket and serial still refer to the intended operator device. After a run,
+do not distribute the debug APK, copied build outputs, or device state because this run embeds credential material into
+the debug app build.
 
 The current script behavior is:
 
