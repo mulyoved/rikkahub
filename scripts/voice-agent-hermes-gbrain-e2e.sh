@@ -11,6 +11,7 @@ APP_PCM_PATH="voice-e2e/prompt.pcm"
 LOG_DIR="${VOICE_AGENT_E2E_LOG_DIR:-build/voice-agent-e2e}"
 LOG_FILE="$LOG_DIR/logcat.txt"
 CALL_STARTED=0
+COMMON_FORBIDDEN_PATTERN='Voice Lab request failed 403|Cloudflare|cf-error|Access denied|FATAL EXCEPTION|VoiceAgentE2E: hermes_tool_response_hash .*expectedHashMatch=false|Voice playback write failed|AudioTrack write failed|AudioTrack write error'
 
 require_env() {
   local name="$1"
@@ -34,6 +35,7 @@ wait_for_log() {
   local timeout_seconds="${3:-90}"
   local deadline=$((SECONDS + timeout_seconds))
   while (( SECONDS < deadline )); do
+    fail_if_log "common forbidden marker" "$COMMON_FORBIDDEN_PATTERN" || return 1
     if grep -E "$pattern" "$LOG_FILE" >/dev/null 2>&1; then
       printf 'PASS marker: %s\n' "$label"
       return 0
@@ -63,6 +65,7 @@ wait_for_log_or_fail() {
   local timeout_seconds="${5:-90}"
   local deadline=$((SECONDS + timeout_seconds))
   while (( SECONDS < deadline )); do
+    fail_if_log "common forbidden marker" "$COMMON_FORBIDDEN_PATTERN" || return 1
     if grep -E "$pattern" "$LOG_FILE" >/dev/null 2>&1; then
       printf 'PASS marker: %s\n' "$label"
       return 0
@@ -140,6 +143,7 @@ adb_cmd logcat -v time \
   VoiceAudioDebugInjection:I \
   AndroidVoiceAudioEngine:D \
   VoiceAgentDebugSeed:I \
+  AndroidRuntime:E \
   '*:S' > "$LOG_FILE" &
 LOGCAT_PID=$!
 
