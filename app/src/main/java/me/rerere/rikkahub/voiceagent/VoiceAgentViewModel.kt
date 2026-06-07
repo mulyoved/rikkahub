@@ -131,6 +131,9 @@ class VoiceAgentCoordinator(
     private val logHermesResponseHash: (String) -> Unit = { detail ->
         Log.i(E2E_TAG, "hermes_tool_response_hash $detail")
     },
+    private val logHermesToolFailure: (String) -> Unit = { detail ->
+        Log.w(E2E_TAG, "hermes_tool_failed $detail")
+    },
     private val conversationStore: VoiceConversationStore? = null,
     private val persister: VoiceConversationPersister = VoiceConversationPersister(),
     scope: CoroutineScope? = null,
@@ -675,7 +678,11 @@ class VoiceAgentCoordinator(
                 val active = isToolHandleActive(callId, handle)
                 if (!active && !hasToolResponseSendStarted(handle)) return
                 val elapsedMs = handle.elapsedMs()
-                diagnostics.record("hermes_tool_failed", "callId=$callId, elapsedMs=$elapsedMs, message=$message")
+                val detail = "callId=$callId, elapsedMs=$elapsedMs, message=$message"
+                diagnostics.record("hermes_tool_failed", detail)
+                runCatching {
+                    logHermesToolFailure(detail)
+                }
                 persistToolStatus(
                     callId = callId,
                     prompt = prompt,

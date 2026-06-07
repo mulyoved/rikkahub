@@ -139,7 +139,7 @@ printf 'Starting scoped log capture...\n'
 adb_cmd logcat -c
 adb_cmd logcat -v time \
   VoiceAgentGemini:D \
-  VoiceAgentE2E:I \
+  VoiceAgentE2E:D \
   VoiceAudioDebugInjection:I \
   AndroidVoiceAudioEngine:D \
   VoiceAgentDebugSeed:I \

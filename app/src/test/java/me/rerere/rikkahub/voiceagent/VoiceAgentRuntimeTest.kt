@@ -676,6 +676,38 @@ class VoiceAgentRuntimeTest {
     }
 
     @Test
+    fun `Hermes failure log sink receives safe auth failure detail`() = runTest {
+        val gemini = FakeGeminiLiveVoiceClient()
+        val toolApi = FakeVoiceToolApi()
+        val capturedFailures = mutableListOf<String>()
+        val coordinator = VoiceAgentCoordinator(
+            gemini = gemini,
+            toolApi = toolApi,
+            audio = FakeVoiceAudioEngine(),
+            logHermesToolFailure = { capturedFailures += it },
+            scope = this,
+        )
+
+        coordinator.onGeminiEvent(
+            GeminiLiveEvent.ToolCall(
+                callId = "call-auth-fail",
+                name = "ask_hermes",
+                prompt = "private prompt",
+            )
+        )
+        assertEquals("call-auth-fail" to "private prompt", toolApi.awaitRequest("call-auth-fail"))
+
+        toolApi.fail(IllegalStateException("Voice Lab request failed 403: [redacted]"))
+        coordinator.awaitToolJobsWithTimeout()
+
+        val failureDetail = capturedFailures.single()
+        assertTrue(failureDetail.contains("callId=call-auth-fail"))
+        assertTrue(failureDetail.contains("elapsedMs="))
+        assertTrue(failureDetail.contains("Voice Lab request failed 403"))
+        assertFalse(failureDetail.contains("private prompt"))
+    }
+
+    @Test
     fun `failed Gemini tool response send marks Hermes tool failed instead of answered`() = runTest {
         val gemini = FakeGeminiLiveVoiceClient().apply {
             failToolResponses += "call-send-fails"
