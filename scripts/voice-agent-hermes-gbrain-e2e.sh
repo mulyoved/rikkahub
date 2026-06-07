@@ -13,6 +13,9 @@ APP_PCM_PATH="voice-e2e/prompt.pcm"
 DEVICE_TMP_PCM="/data/local/tmp/rikkahub-voice-agent-e2e-prompt.pcm"
 LOG_DIR="${VOICE_AGENT_E2E_LOG_DIR:-build/voice-agent-e2e}"
 LOG_FILE="$LOG_DIR/logcat.txt"
+ADB_TIMEOUT_SECONDS="${VOICE_AGENT_E2E_ADB_TIMEOUT_SECONDS:-20}"
+ADB_LONG_TIMEOUT_SECONDS="${VOICE_AGENT_E2E_ADB_LONG_TIMEOUT_SECONDS:-120}"
+ADB_READY_SCRIPT="${VOICE_AGENT_E2E_ADB_READY_SCRIPT:-scripts/adb-device-ready.sh}"
 CALL_STARTED=0
 COMMON_FORBIDDEN_PATTERN='Voice Lab request failed 403|Cloudflare|cf-error|Access denied|FATAL EXCEPTION|VoiceAgentE2E.*hermes_tool_response_hash .*expectedHashMatch=false|Voice playback write failed|AudioTrack write failed|AudioTrack write error'
 
@@ -24,7 +27,32 @@ require_env() {
   fi
 }
 
+adb_cmd_with_timeout() {
+  local timeout_seconds="$1"
+  shift
+  set +e
+  if [[ -n "${VOICE_AGENT_E2E_SERIAL:-}" ]]; then
+    timeout "${timeout_seconds}s" adb -s "$VOICE_AGENT_E2E_SERIAL" "$@"
+  else
+    timeout "${timeout_seconds}s" adb "$@"
+  fi
+  local status=$?
+  set -e
+  if [[ "$status" -eq 124 ]]; then
+    printf 'ADB command timed out after %ss.\n' "$timeout_seconds" >&2
+  fi
+  return "$status"
+}
+
 adb_cmd() {
+  adb_cmd_with_timeout "$ADB_TIMEOUT_SECONDS" "$@"
+}
+
+adb_long_cmd() {
+  adb_cmd_with_timeout "$ADB_LONG_TIMEOUT_SECONDS" "$@"
+}
+
+adb_logcat() {
   if [[ -n "${VOICE_AGENT_E2E_SERIAL:-}" ]]; then
     adb -s "$VOICE_AGENT_E2E_SERIAL" "$@"
   else
@@ -116,6 +144,18 @@ EXPECTED_HASH_LOWER="$(printf '%s' "$VOICE_AGENT_E2E_EXPECTED_HASH" | tr '[:uppe
 mkdir -p "$LOG_DIR"
 rm -f "$LOG_FILE"
 
+printf 'Checking ADB device readiness...\n'
+if [[ -x "$ADB_READY_SCRIPT" ]]; then
+  if [[ -n "${VOICE_AGENT_E2E_SERIAL:-}" ]]; then
+    "$ADB_READY_SCRIPT" "$VOICE_AGENT_E2E_SERIAL"
+  else
+    "$ADB_READY_SCRIPT"
+  fi
+else
+  printf 'ADB readiness helper is not executable: %s\n' "$ADB_READY_SCRIPT" >&2
+  exit 2
+fi
+
 printf 'Building credentialed debug APK...\n'
 CF_ACCESS_CLIENT_ID="$CF_ACCESS_CLIENT_ID" \
 CF_ACCESS_CLIENT_SECRET="$CF_ACCESS_CLIENT_SECRET" \
@@ -132,7 +172,7 @@ if [[ ! -f "$APK" ]]; then
 fi
 
 printf 'Installing debug APK...\n'
-adb_cmd install -r "$APK" >/dev/null
+adb_long_cmd install -r "$APK" >/dev/null
 
 printf 'Granting debug permissions...\n'
 adb_cmd shell pm grant "$PACKAGE" android.permission.RECORD_AUDIO >/dev/null 2>&1 || true
@@ -140,7 +180,7 @@ adb_cmd shell pm grant "$PACKAGE" android.permission.POST_NOTIFICATIONS >/dev/nu
 
 printf 'Starting scoped log capture...\n'
 adb_cmd logcat -c
-adb_cmd logcat -v time \
+adb_logcat logcat -v time \
   VoiceAgentGemini:D \
   VoiceAgentE2E:D \
   VoiceAudioDebugInjection:I \
@@ -166,7 +206,7 @@ wait_for_log_or_fail \
 
 printf 'Copying private PCM prompt into app-private files...\n'
 adb_cmd shell "run-as $PACKAGE mkdir -p files/voice-e2e"
-adb_cmd push "$VOICE_AGENT_E2E_PCM_PATH" "$DEVICE_TMP_PCM" >/dev/null
+adb_long_cmd push "$VOICE_AGENT_E2E_PCM_PATH" "$DEVICE_TMP_PCM" >/dev/null
 adb_cmd shell "run-as $PACKAGE cp $DEVICE_TMP_PCM files/$APP_PCM_PATH"
 adb_cmd shell rm -f "$DEVICE_TMP_PCM" >/dev/null 2>&1 || true
 
