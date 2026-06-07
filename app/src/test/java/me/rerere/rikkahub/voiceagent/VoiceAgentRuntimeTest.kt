@@ -697,7 +697,11 @@ class VoiceAgentRuntimeTest {
         )
         assertEquals("call-auth-fail" to "private prompt", toolApi.awaitRequest("call-auth-fail"))
 
-        toolApi.fail(IllegalStateException("Voice Lab request failed 403: [redacted]"))
+        toolApi.fail(
+            IllegalStateException(
+                "Voice Lab request failed 403: {\"prompt\":\"private prompt\",\"answer\":\"private answer\"}"
+            )
+        )
         coordinator.awaitToolJobsWithTimeout()
 
         val failureDetail = capturedFailures.single()
@@ -705,6 +709,9 @@ class VoiceAgentRuntimeTest {
         assertTrue(failureDetail.contains("elapsedMs="))
         assertTrue(failureDetail.contains("Voice Lab request failed 403"))
         assertFalse(failureDetail.contains("private prompt"))
+        assertFalse(failureDetail.contains("private answer"))
+        assertFalse(failureDetail.contains("\"prompt\""))
+        assertFalse(failureDetail.contains("\"answer\""))
     }
 
     @Test

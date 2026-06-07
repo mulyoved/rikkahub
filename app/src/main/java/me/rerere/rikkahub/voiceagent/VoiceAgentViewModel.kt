@@ -680,8 +680,10 @@ class VoiceAgentCoordinator(
                 val elapsedMs = handle.elapsedMs()
                 val detail = "callId=$callId, elapsedMs=$elapsedMs, message=$message"
                 diagnostics.record("hermes_tool_failed", detail)
+                val e2eDetail = "callId=$callId, elapsedMs=$elapsedMs, " +
+                    "message=${message.e2eSafeHermesFailureMessage()}"
                 runCatching {
-                    logHermesToolFailure(detail)
+                    logHermesToolFailure(e2eDetail)
                 }
                 persistToolStatus(
                     callId = callId,
@@ -1107,6 +1109,11 @@ class VoiceAgentCoordinator(
 
     private fun MobileHermesResponse.serverElapsedDiagnostic(): String =
         elapsedMs?.let { ", serverElapsedMs=$it" }.orEmpty()
+
+    private fun String.e2eSafeHermesFailureMessage(): String {
+        Regex("Voice Lab request failed \\d+").find(this)?.let { return it.value }
+        return substringBefore(':').take(120).ifBlank { "Hermes tool failed" }
+    }
 
     private class ToolJobHandle(
         val callId: String,
