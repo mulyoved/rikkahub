@@ -48,9 +48,12 @@ prompt, or logcat artifacts.
 
 Important: this script builds a credentialed debug APK and local build output. The Cloudflare credentials and
 `VOICE_AGENT_E2E_EXPECTED_HASH` are embedded into `BuildConfig` for the debug APK produced by this run. Do not share the
-APK, build outputs, or installed debug app/device state. Treat the connected device as credential-bearing until the
-debug APK is removed or replaced. If the machine is shared, or if artifacts may leave the trusted environment, clean
-local build artifacts when the run is complete.
+APK, build outputs, or installed debug app/device state. The run also seeds the Hermes API key into app settings and
+copies the private PCM prompt into app-private files. Treat the connected device as credential/private-data-bearing
+until app data is cleared, the debug app is uninstalled, or the seeded Hermes provider/settings and copied PCM prompt
+are explicitly removed. Simply replacing or reinstalling the APK is not enough when app data is preserved. If the
+machine is shared, or if artifacts may leave the trusted environment, clean local build artifacts when the run is
+complete.
 
 ## Preparing The Expected Hash
 
@@ -91,7 +94,7 @@ the expected hash for marker matching, and writes a local scoped log to `build/v
 
 Before running, verify that the selected ADB socket and serial still refer to the intended operator device. After a run,
 do not distribute the debug APK, copied build outputs, or device state because this run embeds credential material into
-the debug app build.
+the debug app build and writes private E2E data into app storage.
 
 The current script behavior is:
 
@@ -143,6 +146,10 @@ timing. It does not log the Hermes answer.
 
 The Hermes failure E2E log preserves bounded failure summaries such as `Voice Lab request failed 403` and redacts or
 drops response previews. Do not paste unredacted runtime logs into issues, commits, docs, or chat.
+
+Post-run device cleanup must remove both installed code and app data that the script changes. Clear app data, uninstall
+the debug app, or explicitly remove the seeded Hermes provider/settings and copied PCM prompt. An `adb install -r`
+replacement alone can preserve app data, so it is not a sufficient cleanup step for this run.
 
 ## Security And Privacy
 
