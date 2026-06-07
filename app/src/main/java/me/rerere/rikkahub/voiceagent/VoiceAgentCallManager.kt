@@ -54,8 +54,6 @@ class VoiceAgentCallManager(
         return true
     }
 
-    fun detachUi() = Unit
-
     fun interrupt() = synchronized(lock) { activeSession }?.interrupt()
 
     fun setMuted(value: Boolean) = synchronized(lock) { activeSession }?.setMuted(value)
@@ -69,12 +67,8 @@ class VoiceAgentCallManager(
         }
     }
 
-    fun recordDiagnostic(name: String, detail: String) {
-        val session = synchronized(lock) { activeSession }
-        if (session is VoiceAgentCallSession) {
-            session.recordDiagnostic(name = name, detail = detail)
-        }
-    }
+    fun recordDiagnostic(name: String, detail: String) =
+        synchronized(lock) { activeSession }?.recordDiagnostic(name = name, detail = detail)
 
     fun end() {
         val session = synchronized(lock) {
@@ -88,10 +82,6 @@ class VoiceAgentCallManager(
             }
         }
         session?.end()
-    }
-
-    suspend fun endAndDrain() {
-        detachForEndAndDrain()?.endAndDrain()
     }
 
     fun detachForEndAndDrain(): ManagedVoiceCallSession? {

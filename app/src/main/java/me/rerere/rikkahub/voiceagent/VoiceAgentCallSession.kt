@@ -216,7 +216,7 @@ class VoiceAgentCallSession(
         finishEnd(previousJob = preparation.previousJob, visibleReason = null)
     }
 
-    fun recordDiagnostic(name: String, detail: String) {
+    override fun recordDiagnostic(name: String, detail: String) {
         coordinator.recordDiagnostic(name = name, detail = detail)
     }
 

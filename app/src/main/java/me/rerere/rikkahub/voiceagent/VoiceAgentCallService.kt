@@ -27,7 +27,6 @@ class VoiceAgentCallService : Service() {
     private val telecomAdapter: VoiceAgentTelecomAdapter by inject()
     private val telecomCallRegistry: VoiceAgentTelecomCallRegistry by inject()
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
-    private var activeConversationId: Uuid? = null
     private var notificationJob: Job? = null
     private var endJob: Job? = null
     private var callGeneration = 0L
@@ -62,9 +61,8 @@ class VoiceAgentCallService : Service() {
                 VoiceAgentDebugLog.w(TAG, "start ignored: missing or invalid conversation id")
                 stopSelf()
                 return
-            }
+        }
         VoiceAgentDebugLog.d(TAG, "start requested conversationId=$id")
-        activeConversationId = id
         callGeneration += 1
         val startGeneration = callGeneration
         endJob = null
@@ -239,6 +237,7 @@ class VoiceAgentCallService : Service() {
                 VoiceAgentDebugLog.w(TAG, "telecom register failed: ${detail.redactForVoiceAgentLog()}")
                 manager.recordDiagnostic("telecom_register_failed", detail)
                 manager.updateCallStatus(VoiceCallStatus.Degraded("Telecom unavailable: $detail"))
+                return
             }
         telecomAdapter.startCall()
             .onSuccess {

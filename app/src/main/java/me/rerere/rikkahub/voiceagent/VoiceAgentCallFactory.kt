@@ -17,6 +17,7 @@ interface ManagedVoiceCallSession {
     fun interrupt()
     fun setMuted(value: Boolean)
     fun reconnect()
+    fun recordDiagnostic(name: String, detail: String)
     fun end()
     suspend fun endAndDrain()
     fun closeNow()

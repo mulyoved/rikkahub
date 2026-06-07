@@ -28,7 +28,6 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -90,7 +89,6 @@ fun VoiceAgentRoute(conversationId: Uuid) {
                 onMuteToggle = { muted -> callManager.setMuted(!muted) },
                 onInterrupt = callManager::interrupt,
                 onReconnect = callManager::reconnect,
-                onDetach = callManager::detachUi,
                 onEnd = {
                     context.startService(voiceAgentCallEndIntent(context))
                     navController.popBackStack()
@@ -115,7 +113,6 @@ private fun VoiceAgentScreen(
     onMuteToggle: (Boolean) -> Unit,
     onInterrupt: () -> Unit,
     onReconnect: () -> Unit,
-    onDetach: () -> Unit,
     onEnd: () -> Unit,
 ) {
     val state by stateProvider().collectAsStateWithLifecycle()
@@ -156,12 +153,6 @@ private fun VoiceAgentScreen(
     LaunchedEffect(startGate) {
         if (startGate == VoiceAgentStartGate.Ready) {
             onStart()
-        }
-    }
-
-    DisposableEffect(Unit) {
-        onDispose {
-            onDetach()
         }
     }
 

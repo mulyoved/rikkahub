@@ -107,16 +107,14 @@ class VoiceAgentCallManagerTest {
     }
 
     @Test
-    fun `detach does not end active session`() = runTest {
+    fun `record diagnostic forwards to active session`() = runTest {
         val session = FakeManagedVoiceCallSession()
         val manager = VoiceAgentCallManager(factory = FakeVoiceAgentCallFactory(session))
 
         manager.start(Uuid.random(), fakeLaunchConfig(), this)
-        manager.detachUi()
+        manager.recordDiagnostic(name = "telecom_register_failed", detail = "registration error")
 
-        assertEquals(0, session.endCalls)
-        assertEquals(0, session.closeNowCalls)
-        assertEquals(null, manager.activeConversationId.value?.takeIf { session.endCalls > 0 })
+        assertEquals(listOf("telecom_register_failed" to "registration error"), session.diagnostics)
     }
 
     @Test
@@ -128,19 +126,6 @@ class VoiceAgentCallManagerTest {
         manager.end()
 
         assertEquals(1, session.endCalls)
-        assertEquals(null, manager.activeConversationId.value)
-    }
-
-    @Test
-    fun `end and drain forwards draining close and clears active call`() = runTest {
-        val session = FakeManagedVoiceCallSession()
-        val manager = VoiceAgentCallManager(factory = FakeVoiceAgentCallFactory(session))
-
-        manager.start(Uuid.random(), fakeLaunchConfig(), this)
-        manager.endAndDrain()
-
-        assertEquals(0, session.endCalls)
-        assertEquals(1, session.endAndDrainCalls)
         assertEquals(null, manager.activeConversationId.value)
     }
 
@@ -170,6 +155,7 @@ private class FakeManagedVoiceCallSession : ManagedVoiceCallSession {
     var endCalls = 0
     var endAndDrainCalls = 0
     var closeNowCalls = 0
+    val diagnostics = mutableListOf<Pair<String, String>>()
 
     override fun start() {
         startCalls += 1
@@ -181,6 +167,10 @@ private class FakeManagedVoiceCallSession : ManagedVoiceCallSession {
 
     override fun reconnect() {
         reconnectCalls += 1
+    }
+
+    override fun recordDiagnostic(name: String, detail: String) {
+        diagnostics += name to detail
     }
 
     override fun end() {
