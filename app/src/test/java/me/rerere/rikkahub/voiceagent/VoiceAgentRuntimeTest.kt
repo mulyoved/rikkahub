@@ -589,6 +589,10 @@ class VoiceAgentRuntimeTest {
                     it.detail.contains("expectedHashMatch=true")
             }
         )
+        val successEvent = diagnostics.events.value.single { it.name == "hermes_tool_succeeded" }
+        assertTrue(successEvent.detail.contains("callId=call-log-fails"))
+        assertTrue(successEvent.detail.contains("answerChars=10"))
+        assertFalse(successEvent.detail.contains("alpha beta"))
         assertFalse(
             diagnostics.events.value.any {
                 it.name == "hermes_tool_failed" && it.detail.contains("logger failed")
@@ -1162,9 +1166,11 @@ class VoiceAgentRuntimeTest {
                 it.name == "hermes_tool_succeeded" &&
                     it.detail.contains("elapsedMs=") &&
                     it.detail.contains("serverElapsedMs=321") &&
-                    it.detail.contains("answerChars=11") &&
-                    !it.detail.contains("tool answer")
+                    it.detail.contains("answerChars=11")
             }
+        )
+        assertFalse(
+            coordinator.state.value.diagnostics.any { it.detail.contains("tool answer") }
         )
         assertTrue(coordinator.state.value.diagnostics.any { it.name == "conversation_persist_saved" })
     }
