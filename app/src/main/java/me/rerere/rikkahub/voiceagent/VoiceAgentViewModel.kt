@@ -561,7 +561,7 @@ class VoiceAgentCoordinator(
             "tool_call_received",
             "callId=${call.callId}, name=${call.name}, promptChars=${call.prompt.length}",
         )
-        if (call.name != ASK_HERMES_TOOL) {
+        if (call.name != VoiceAgentToolNames.ASK_HERMES) {
             recordUnsupportedToolCall(
                 GeminiLiveEvent.UnsupportedToolCall(
                     callId = call.callId,
@@ -1078,7 +1078,6 @@ class VoiceAgentCoordinator(
     }
 
     private companion object {
-        const val ASK_HERMES_TOOL = "ask_hermes"
         const val E2E_TAG = "VoiceAgentE2E"
         const val TOOL_CALL_CANCELED_BY_GEMINI = "Tool call canceled by Gemini"
         const val TOOL_CALL_CANCELED_BY_RECONNECT = "Tool call canceled by reconnect"

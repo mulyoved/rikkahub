@@ -8,6 +8,7 @@ import me.rerere.ai.ui.UIMessage
 import me.rerere.ai.ui.UIMessagePart
 import me.rerere.rikkahub.data.model.Conversation
 import me.rerere.rikkahub.utils.JsonInstant
+import me.rerere.rikkahub.voiceagent.VoiceAgentToolNames
 import kotlin.time.Clock
 
 sealed interface VoiceToolRecordStatus {
@@ -121,7 +122,7 @@ class VoiceConversationPersister {
     ): Conversation {
         val tool = UIMessagePart.Tool(
             toolCallId = callId,
-            toolName = ASK_HERMES_TOOL_NAME,
+            toolName = VoiceAgentToolNames.ASK_HERMES,
             input = JsonInstant.encodeToString(
                 buildJsonObject {
                     put("prompt", prompt)
@@ -214,7 +215,7 @@ class VoiceConversationPersister {
     }
 
     private fun UIMessagePart.Tool.isHermesTool(callId: String): Boolean {
-        return toolCallId == callId && toolName == ASK_HERMES_TOOL_NAME
+        return toolCallId == callId && toolName == VoiceAgentToolNames.ASK_HERMES
     }
 
     private fun UIMessagePart.Tool.isPendingHermesTool(callId: String): Boolean {
@@ -223,7 +224,7 @@ class VoiceConversationPersister {
     }
 
     private fun VoiceToolRecordStatus.toMetadata(sessionId: String?, callId: String) = buildJsonObject {
-        put(HERMES_TOOL_SOURCE_KEY, ASK_HERMES_TOOL_NAME)
+        put(HERMES_TOOL_SOURCE_KEY, VoiceAgentToolNames.ASK_HERMES)
         put(HERMES_TOOL_STATUS_KEY, statusName)
         putVoiceArtifactMetadata(
             sessionId = sessionId,
@@ -302,7 +303,6 @@ class VoiceConversationPersister {
         }
 
     private companion object {
-        const val ASK_HERMES_TOOL_NAME = "ask_hermes"
         const val HERMES_TOOL_SOURCE_KEY = "voice_tool_source"
         const val HERMES_TOOL_STATUS_KEY = "voice_tool_status"
         const val VOICE_SOURCE_KEY = "voice_source"

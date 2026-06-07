@@ -5,6 +5,8 @@ import org.junit.Test
 import org.w3c.dom.Element
 import java.io.File
 import javax.xml.parsers.DocumentBuilderFactory
+import me.rerere.rikkahub.voiceagent.audio.VoiceAudioDebugInjector
+import me.rerere.rikkahub.voiceagent.debug.VoiceAgentDebugSeedReceiver
 
 class VoiceAgentDebugManifestTest {
     @Test
@@ -33,11 +35,11 @@ class VoiceAgentDebugManifestTest {
         val seedReceiver = findReceiver(".voiceagent.debug.VoiceAgentDebugSeedReceiver")
 
         assertEquals(
-            listOf("me.rerere.rikkahub.debug.voiceagent.INJECT_PCM"),
+            listOf(VoiceAudioDebugInjector.ACTION_INJECT_PCM),
             audioReceiver.actionNames(),
         )
         assertEquals(
-            listOf("me.rerere.rikkahub.debug.voiceagent.SEED_HERMES_PROVIDER"),
+            listOf(VoiceAgentDebugSeedReceiver.ACTION_SEED_HERMES_PROVIDER),
             seedReceiver.actionNames(),
         )
     }

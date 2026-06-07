@@ -7,6 +7,7 @@ import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import me.rerere.rikkahub.utils.JsonInstant
+import me.rerere.rikkahub.voiceagent.VoiceAgentToolNames
 
 sealed interface GeminiLiveDebugEvent {
     data object Open : GeminiLiveDebugEvent
@@ -558,11 +559,9 @@ private fun JsonObject.declaresAskHermesTool(): Boolean =
             tool.jsonObject["functionDeclarations"]
                 ?.jsonArray
                 ?.any { declaration ->
-                    declaration.jsonObject["name"]?.jsonPrimitive?.contentOrNull == ASK_HERMES_TOOL_NAME
+                    declaration.jsonObject["name"]?.jsonPrimitive?.contentOrNull == VoiceAgentToolNames.ASK_HERMES
                 } == true
         } == true
-
-private const val ASK_HERMES_TOOL_NAME = "ask_hermes"
 
 private fun String.estimatedBase64DecodedBytes(): Int {
     val padding = takeLastWhile { it == '=' }.length.coerceAtMost(2)
