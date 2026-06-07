@@ -598,14 +598,6 @@ class VoiceAgentCoordinator(
     private suspend fun runHermesToolCall(callId: String, prompt: String, handle: ToolJobHandle) {
         try {
             val response = toolApi.askHermes(callId = callId, prompt = prompt)
-            val responseElapsedMs = handle.elapsedMs()
-            recordHermesToolResponseHash(
-                callId = callId,
-                answer = response.answer,
-                expectedHash = hermesResponseExpectedHash,
-                elapsedMs = responseElapsedMs,
-                serverElapsedMs = response.elapsedMs,
-            )
             val coroutineContext = currentCoroutineContext()
             synchronized(handle.sendLock) {
                 if (!isToolHandleActive(callId, handle)) return
@@ -614,6 +606,13 @@ class VoiceAgentCoordinator(
                     if (!isToolHandleActive(callId, handle)) return
                     handle.sendStarted = true
                 }
+                recordHermesToolResponseHash(
+                    callId = callId,
+                    answer = response.answer,
+                    expectedHash = hermesResponseExpectedHash,
+                    elapsedMs = handle.elapsedMs(),
+                    serverElapsedMs = response.elapsedMs,
+                )
                 val sent = gemini.sendToolResponse(
                     callId = callId,
                     answer = response.answer,
@@ -927,7 +926,12 @@ class VoiceAgentCoordinator(
         )
         diagnostics.record("hermes_tool_response_hash", detail)
         if (expectedHash != null) {
-            logHermesResponseHash(detail)
+            runCatching {
+                logHermesResponseHash(detail)
+            }.onFailure { error ->
+                val message = error.message ?: error.javaClass.simpleName
+                diagnostics.record("hermes_tool_response_hash_log_failed", "callId=$callId, message=$message")
+            }
         }
     }
 

@@ -558,6 +558,45 @@ class VoiceAgentRuntimeTest {
     }
 
     @Test
+    fun `Hermes response hash logger failure does not fail tool call`() = runTest {
+        val gemini = FakeGeminiLiveVoiceClient()
+        val toolApi = FakeVoiceToolApi()
+        val diagnostics = VoiceDiagnostics()
+        val expectedHash = HermesToolResponseHash.sha256HexNormalized("alpha beta")
+        val coordinator = VoiceAgentCoordinator(
+            gemini = gemini,
+            toolApi = toolApi,
+            audio = FakeVoiceAudioEngine(),
+            diagnostics = diagnostics,
+            hermesResponseExpectedHash = expectedHash,
+            logHermesResponseHash = { error("logger failed") },
+            scope = this,
+        )
+
+        coordinator.onGeminiEvent(
+            GeminiLiveEvent.ToolCall(callId = "call-log-fails", name = "ask_hermes", prompt = "private prompt")
+        )
+        assertEquals("call-log-fails" to "private prompt", toolApi.awaitRequest("call-log-fails"))
+        toolApi.complete(response(callId = "call-log-fails", answer = "alpha beta"))
+        coordinator.awaitToolJobsWithTimeout()
+
+        assertEquals(listOf("call-log-fails" to "alpha beta"), gemini.toolResponses)
+        assertHermesAnswered(callId = "call-log-fails", status = coordinator.state.value.tool)
+        assertTrue(
+            diagnostics.events.value.any {
+                it.name == "hermes_tool_response_hash" &&
+                    it.detail.contains("callId=call-log-fails") &&
+                    it.detail.contains("expectedHashMatch=true")
+            }
+        )
+        assertFalse(
+            diagnostics.events.value.any {
+                it.name == "hermes_tool_failed" && it.detail.contains("logger failed")
+            }
+        )
+    }
+
+    @Test
     fun `batched failure remains aggregate summary after another call succeeds`() = runTest {
         val gemini = FakeGeminiLiveVoiceClient()
         val toolApi = FakeVoiceToolApi()
