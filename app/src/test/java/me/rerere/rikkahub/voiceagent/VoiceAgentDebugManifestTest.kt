@@ -11,29 +11,26 @@ class VoiceAgentDebugManifestTest {
     fun `debug receivers require shell held permission`() {
         val audioReceiver = findReceiver(".voiceagent.debug.VoiceAudioDebugInjectionReceiver")
         val seedReceiver = findReceiver(".voiceagent.debug.VoiceAgentDebugSeedReceiver")
-        val callReceiver = findReceiver(".voiceagent.debug.VoiceAgentDebugCallReceiver")
 
         assertEquals("android.permission.DUMP", audioReceiver.getAttribute("android:permission"))
         assertEquals("android.permission.DUMP", seedReceiver.getAttribute("android:permission"))
-        assertEquals("android.permission.DUMP", callReceiver.getAttribute("android:permission"))
+        assertEquals("android.permission.DUMP", findService(".voiceagent.VoiceAgentCallService").getAttribute("android:permission"))
     }
 
     @Test
     fun `debug receivers remain exported for adb workflows`() {
         val audioReceiver = findReceiver(".voiceagent.debug.VoiceAudioDebugInjectionReceiver")
         val seedReceiver = findReceiver(".voiceagent.debug.VoiceAgentDebugSeedReceiver")
-        val callReceiver = findReceiver(".voiceagent.debug.VoiceAgentDebugCallReceiver")
 
         assertEquals("true", audioReceiver.getAttribute("android:exported"))
         assertEquals("true", seedReceiver.getAttribute("android:exported"))
-        assertEquals("true", callReceiver.getAttribute("android:exported"))
+        assertEquals("true", findService(".voiceagent.VoiceAgentCallService").getAttribute("android:exported"))
     }
 
     @Test
     fun `debug receivers keep expected actions`() {
         val audioReceiver = findReceiver(".voiceagent.debug.VoiceAudioDebugInjectionReceiver")
         val seedReceiver = findReceiver(".voiceagent.debug.VoiceAgentDebugSeedReceiver")
-        val callReceiver = findReceiver(".voiceagent.debug.VoiceAgentDebugCallReceiver")
 
         assertEquals(
             listOf("me.rerere.rikkahub.debug.voiceagent.INJECT_PCM"),
@@ -43,22 +40,23 @@ class VoiceAgentDebugManifestTest {
             listOf("me.rerere.rikkahub.debug.voiceagent.SEED_HERMES_PROVIDER"),
             seedReceiver.actionNames(),
         )
-        assertEquals(
-            listOf(
-                "me.rerere.rikkahub.debug.voiceagent.START_CALL",
-                "me.rerere.rikkahub.debug.voiceagent.END_CALL",
-            ),
-            callReceiver.actionNames(),
-        )
     }
 
     private fun findReceiver(name: String): Element {
+        return findManifestElement(tagName = "receiver", name = name)
+    }
+
+    private fun findService(name: String): Element {
+        return findManifestElement(tagName = "service", name = name)
+    }
+
+    private fun findManifestElement(tagName: String, name: String): Element {
         val manifest = File("src/debug/AndroidManifest.xml")
         val document = DocumentBuilderFactory.newInstance().newDocumentBuilder().parse(manifest)
-        val receivers = document.getElementsByTagName("receiver")
+        val elements = document.getElementsByTagName(tagName)
 
-        return (0 until receivers.length)
-            .map { receivers.item(it) as Element }
+        return (0 until elements.length)
+            .map { elements.item(it) as Element }
             .first { it.getAttribute("android:name") == name }
     }
 

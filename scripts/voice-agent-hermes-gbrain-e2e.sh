@@ -5,11 +5,10 @@ PACKAGE="${VOICE_AGENT_E2E_PACKAGE:-me.rerere.rikkahub.debug}"
 SERVICE_COMPONENT="$PACKAGE/me.rerere.rikkahub.voiceagent.VoiceAgentCallService"
 SEED_COMPONENT="$PACKAGE/me.rerere.rikkahub.voiceagent.debug.VoiceAgentDebugSeedReceiver"
 INJECT_COMPONENT="$PACKAGE/me.rerere.rikkahub.voiceagent.debug.VoiceAudioDebugInjectionReceiver"
-CALL_CONTROL_COMPONENT="$PACKAGE/me.rerere.rikkahub.voiceagent.debug.VoiceAgentDebugCallReceiver"
 SEED_ACTION="me.rerere.rikkahub.debug.voiceagent.SEED_HERMES_PROVIDER"
 INJECT_ACTION="me.rerere.rikkahub.debug.voiceagent.INJECT_PCM"
-CALL_START_ACTION="me.rerere.rikkahub.debug.voiceagent.START_CALL"
-CALL_END_ACTION="me.rerere.rikkahub.debug.voiceagent.END_CALL"
+CALL_START_ACTION="me.rerere.rikkahub.voiceagent.action.START"
+CALL_END_ACTION="me.rerere.rikkahub.voiceagent.action.END"
 APP_PCM_PATH="voice-e2e/prompt.pcm"
 DEVICE_TMP_PCM="/data/local/tmp/rikkahub-voice-agent-e2e-prompt.pcm"
 LOG_DIR="${VOICE_AGENT_E2E_LOG_DIR:-build/voice-agent-e2e}"
@@ -93,8 +92,8 @@ cleanup() {
     wait "$LOGCAT_PID" >/dev/null 2>&1 || true
   fi
   if [[ "$CALL_STARTED" == "1" ]]; then
-    adb_cmd shell am broadcast \
-      -n "$CALL_CONTROL_COMPONENT" \
+    adb_cmd shell am start-foreground-service \
+      -n "$SERVICE_COMPONENT" \
       -a "$CALL_END_ACTION" >/dev/null 2>&1 || true
   fi
   exit "$status"
@@ -146,7 +145,6 @@ adb_cmd logcat -v time \
   VoiceAgentE2E:D \
   VoiceAudioDebugInjection:I \
   AndroidVoiceAudioEngine:D \
-  VoiceAgentDebugCall:I \
   VoiceAgentDebugSeed:I \
   AndroidRuntime:E \
   '*:S' > "$LOG_FILE" &
@@ -173,8 +171,8 @@ adb_cmd shell "run-as $PACKAGE cp $DEVICE_TMP_PCM files/$APP_PCM_PATH"
 adb_cmd shell rm -f "$DEVICE_TMP_PCM" >/dev/null 2>&1 || true
 
 printf 'Starting Voice Agent foreground service...\n'
-adb_cmd shell am broadcast \
-  -n "$CALL_CONTROL_COMPONENT" \
+adb_cmd shell am start-foreground-service \
+  -n "$SERVICE_COMPONENT" \
   -a "$CALL_START_ACTION" \
   --es conversationId "$VOICE_AGENT_E2E_CONVERSATION_ID" >/dev/null
 CALL_STARTED=1
