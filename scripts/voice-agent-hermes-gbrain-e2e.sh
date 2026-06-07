@@ -13,7 +13,7 @@ APP_PCM_PATH="voice-e2e/prompt.pcm"
 LOG_DIR="${VOICE_AGENT_E2E_LOG_DIR:-build/voice-agent-e2e}"
 LOG_FILE="$LOG_DIR/logcat.txt"
 CALL_STARTED=0
-COMMON_FORBIDDEN_PATTERN='Voice Lab request failed 403|Cloudflare|cf-error|Access denied|FATAL EXCEPTION|VoiceAgentE2E: hermes_tool_response_hash .*expectedHashMatch=false|Voice playback write failed|AudioTrack write failed|AudioTrack write error'
+COMMON_FORBIDDEN_PATTERN='Voice Lab request failed 403|Cloudflare|cf-error|Access denied|FATAL EXCEPTION|VoiceAgentE2E.*hermes_tool_response_hash .*expectedHashMatch=false|Voice playback write failed|AudioTrack write failed|AudioTrack write error'
 
 require_env() {
   local name="$1"
@@ -158,9 +158,9 @@ adb_cmd shell am broadcast \
 
 wait_for_log_or_fail \
   "Hermes debug seed succeeded" \
-  'VoiceAgentDebugSeed: debug_seed_hermes_provider result=success' \
+  'VoiceAgentDebugSeed.*debug_seed_hermes_provider result=success' \
   "Hermes debug seed failed" \
-  'VoiceAgentDebugSeed: debug_seed_hermes_provider failed' \
+  'VoiceAgentDebugSeed.*debug_seed_hermes_provider failed' \
   30
 
 printf 'Copying private PCM prompt into app-private files...\n'
@@ -174,7 +174,7 @@ adb_cmd shell am start-foreground-service \
   --es conversationId "$VOICE_AGENT_E2E_CONVERSATION_ID" >/dev/null
 CALL_STARTED=1
 
-wait_for_log "Gemini setup complete" 'VoiceAgentGemini: event kind=SetupComplete' 120
+wait_for_log "Gemini setup complete" 'VoiceAgentGemini.*event kind=SetupComplete' 120
 
 printf 'Injecting private PCM prompt...\n'
 adb_cmd shell am broadcast \
@@ -186,18 +186,18 @@ adb_cmd shell am broadcast \
   --el leading_silence_ms 500 \
   --el trailing_silence_ms 800 >/dev/null
 
-wait_for_log "debug PCM delivered" 'VoiceAudioDebugInjection: debug_audio_injection result delivered=true' 30
-wait_for_log "Gemini ask_hermes tool call received" 'VoiceAgentGemini: receive kind=toolCall' 180
-wait_for_log "Hermes response hash matched" "VoiceAgentE2E: hermes_tool_response_hash .*actualHash=$EXPECTED_HASH_LOWER.*expectedHashMatch=true" 180
-wait_for_log "Gemini tool response sent" 'VoiceAgentGemini: send kind=toolResponse sent=true' 60
-wait_for_log "Gemini output audio received" 'VoiceAgentGemini: event kind=OutputAudio' 120
-wait_for_log "Voice playback queued" 'AndroidVoiceAudioEngine: Voice playback queued' 60
-wait_for_log "Voice playback wrote" 'AndroidVoiceAudioEngine: Voice playback wrote' 60
+wait_for_log "debug PCM delivered" 'VoiceAudioDebugInjection.*debug_audio_injection result delivered=true' 30
+wait_for_log "Gemini ask_hermes tool call received" 'VoiceAgentGemini.*receive kind=toolCall' 180
+wait_for_log "Hermes response hash matched" "VoiceAgentE2E.*hermes_tool_response_hash .*actualHash=$EXPECTED_HASH_LOWER.*expectedHashMatch=true" 180
+wait_for_log "Gemini tool response sent" 'VoiceAgentGemini.*send kind=toolResponse sent=true' 60
+wait_for_log "Gemini output audio received" 'VoiceAgentGemini.*event kind=OutputAudio' 120
+wait_for_log "Voice playback queued" 'AndroidVoiceAudioEngine.*Voice playback queued' 60
+wait_for_log "Voice playback wrote" 'AndroidVoiceAudioEngine.*Voice playback wrote' 60
 
 fail_if_log "Voice Lab 403" 'Voice Lab request failed 403'
 fail_if_log "Cloudflare auth HTML" 'Cloudflare|cf-error|Access denied'
 fail_if_log "fatal exception" 'FATAL EXCEPTION'
-fail_if_log "Hermes hash mismatch" 'VoiceAgentE2E: hermes_tool_response_hash .*expectedHashMatch=false'
+fail_if_log "Hermes hash mismatch" 'VoiceAgentE2E.*hermes_tool_response_hash .*expectedHashMatch=false'
 fail_if_log "playback write failure" 'Voice playback write failed|AudioTrack write failed|AudioTrack write error'
 
 printf 'Voice Agent Hermes/Gbrain live E2E passed. Safe log: %s\n' "$LOG_FILE"
