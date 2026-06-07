@@ -3,6 +3,8 @@ set -euo pipefail
 
 PACKAGE="${VOICE_AGENT_E2E_PACKAGE:-me.rerere.rikkahub.debug}"
 SERVICE_COMPONENT="$PACKAGE/me.rerere.rikkahub.voiceagent.VoiceAgentCallService"
+SEED_COMPONENT="$PACKAGE/me.rerere.rikkahub.voiceagent.debug.VoiceAgentDebugSeedReceiver"
+INJECT_COMPONENT="$PACKAGE/me.rerere.rikkahub.voiceagent.debug.VoiceAudioDebugInjectionReceiver"
 SEED_ACTION="me.rerere.rikkahub.debug.voiceagent.SEED_HERMES_PROVIDER"
 INJECT_ACTION="me.rerere.rikkahub.debug.voiceagent.INJECT_PCM"
 CALL_START_ACTION="me.rerere.rikkahub.voiceagent.action.START"
@@ -149,6 +151,7 @@ LOGCAT_PID=$!
 
 printf 'Seeding Hermes provider in debug settings...\n'
 adb_cmd shell am broadcast \
+  -n "$SEED_COMPONENT" \
   -a "$SEED_ACTION" \
   --es api_key "$HERMES_PROFILE_API_KEY" \
   --es base_url "${VOICE_AGENT_E2E_HERMES_BASE_URL:-https://muly-hermes-api.core8.co/v1}" >/dev/null
@@ -175,6 +178,7 @@ wait_for_log "Gemini setup complete" 'VoiceAgentGemini: event kind=SetupComplete
 
 printf 'Injecting private PCM prompt...\n'
 adb_cmd shell am broadcast \
+  -n "$INJECT_COMPONENT" \
   -a "$INJECT_ACTION" \
   --es path "$APP_PCM_PATH" \
   --ei chunk_bytes 3200 \
