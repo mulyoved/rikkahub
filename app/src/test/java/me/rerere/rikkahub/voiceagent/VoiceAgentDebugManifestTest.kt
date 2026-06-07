@@ -11,24 +11,29 @@ class VoiceAgentDebugManifestTest {
     fun `debug receivers require shell held permission`() {
         val audioReceiver = findReceiver(".voiceagent.debug.VoiceAudioDebugInjectionReceiver")
         val seedReceiver = findReceiver(".voiceagent.debug.VoiceAgentDebugSeedReceiver")
+        val callReceiver = findReceiver(".voiceagent.debug.VoiceAgentDebugCallReceiver")
 
         assertEquals("android.permission.DUMP", audioReceiver.getAttribute("android:permission"))
         assertEquals("android.permission.DUMP", seedReceiver.getAttribute("android:permission"))
+        assertEquals("android.permission.DUMP", callReceiver.getAttribute("android:permission"))
     }
 
     @Test
     fun `debug receivers remain exported for adb workflows`() {
         val audioReceiver = findReceiver(".voiceagent.debug.VoiceAudioDebugInjectionReceiver")
         val seedReceiver = findReceiver(".voiceagent.debug.VoiceAgentDebugSeedReceiver")
+        val callReceiver = findReceiver(".voiceagent.debug.VoiceAgentDebugCallReceiver")
 
         assertEquals("true", audioReceiver.getAttribute("android:exported"))
         assertEquals("true", seedReceiver.getAttribute("android:exported"))
+        assertEquals("true", callReceiver.getAttribute("android:exported"))
     }
 
     @Test
     fun `debug receivers keep expected actions`() {
         val audioReceiver = findReceiver(".voiceagent.debug.VoiceAudioDebugInjectionReceiver")
         val seedReceiver = findReceiver(".voiceagent.debug.VoiceAgentDebugSeedReceiver")
+        val callReceiver = findReceiver(".voiceagent.debug.VoiceAgentDebugCallReceiver")
 
         assertEquals(
             listOf("me.rerere.rikkahub.debug.voiceagent.INJECT_PCM"),
@@ -37,6 +42,13 @@ class VoiceAgentDebugManifestTest {
         assertEquals(
             listOf("me.rerere.rikkahub.debug.voiceagent.SEED_HERMES_PROVIDER"),
             seedReceiver.actionNames(),
+        )
+        assertEquals(
+            listOf(
+                "me.rerere.rikkahub.debug.voiceagent.START_CALL",
+                "me.rerere.rikkahub.debug.voiceagent.END_CALL",
+            ),
+            callReceiver.actionNames(),
         )
     }
 
