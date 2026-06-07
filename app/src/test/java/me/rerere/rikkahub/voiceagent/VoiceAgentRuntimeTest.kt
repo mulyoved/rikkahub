@@ -13,6 +13,7 @@ import me.rerere.rikkahub.voiceagent.gemini.GeminiContentTurn
 import me.rerere.rikkahub.voiceagent.gemini.GeminiLiveCodec
 import me.rerere.rikkahub.voiceagent.gemini.GeminiLiveEvent
 import me.rerere.rikkahub.voiceagent.persistence.VoiceContext
+import me.rerere.rikkahub.voiceagent.telemetry.HermesToolResponseHash
 import me.rerere.rikkahub.voiceagent.telemetry.VoiceDiagnostics
 import me.rerere.rikkahub.voiceagent.voicelab.MobileHermesResponse
 import org.junit.Assert.assertEquals
@@ -515,6 +516,45 @@ class VoiceAgentRuntimeTest {
                 it.name == "hermes_tool_started" && it.detail.contains("callId=call-b")
             }
         )
+    }
+
+    @Test
+    fun `Hermes response hash diagnostic is emitted without raw answer`() = runTest {
+        val gemini = FakeGeminiLiveVoiceClient()
+        val toolApi = FakeVoiceToolApi()
+        val diagnostics = VoiceDiagnostics()
+        val expectedHash = HermesToolResponseHash.sha256HexNormalized("alpha beta")
+        val coordinator = VoiceAgentCoordinator(
+            gemini = gemini,
+            toolApi = toolApi,
+            audio = FakeVoiceAudioEngine(),
+            diagnostics = diagnostics,
+            hermesResponseExpectedHash = expectedHash,
+            logHermesResponseHash = {},
+            scope = this,
+        )
+
+        coordinator.onGeminiEvent(
+            GeminiLiveEvent.ToolCall(callId = "call-hash", name = "ask_hermes", prompt = "private prompt")
+        )
+        assertEquals("call-hash" to "private prompt", toolApi.awaitRequest("call-hash"))
+        toolApi.complete(response(callId = "call-hash", answer = " \nalpha\t  beta\r\n", elapsedMs = 321))
+        coordinator.awaitToolJobsWithTimeout()
+
+        assertEquals(listOf("call-hash" to " \nalpha\t  beta\r\n"), gemini.toolResponses)
+        val hashEvent = diagnostics.events.value.single { it.name == "hermes_tool_response_hash" }
+        assertTrue(hashEvent.detail.contains("callId=call-hash"))
+        assertTrue(hashEvent.detail.contains("actualHash=$expectedHash"))
+        assertTrue(hashEvent.detail.contains("expectedHashMatch=true"))
+        assertTrue(hashEvent.detail.contains("serverElapsedMs=321"))
+        assertFalse(hashEvent.detail.contains("alpha"))
+        assertFalse(hashEvent.detail.contains("beta"))
+
+        val successEvent = diagnostics.events.value.single { it.name == "hermes_tool_succeeded" }
+        assertTrue(successEvent.detail.contains("callId=call-hash"))
+        assertTrue(successEvent.detail.contains("answerChars=16"))
+        assertFalse(successEvent.detail.contains("alpha"))
+        assertFalse(successEvent.detail.contains("beta"))
     }
 
     @Test
@@ -1083,7 +1123,8 @@ class VoiceAgentRuntimeTest {
                 it.name == "hermes_tool_succeeded" &&
                     it.detail.contains("elapsedMs=") &&
                     it.detail.contains("serverElapsedMs=321") &&
-                    it.detail.contains("answer=tool answer")
+                    it.detail.contains("answerChars=11") &&
+                    !it.detail.contains("tool answer")
             }
         )
         assertTrue(coordinator.state.value.diagnostics.any { it.name == "conversation_persist_saved" })

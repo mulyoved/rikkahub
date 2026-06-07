@@ -1,5 +1,6 @@
 package me.rerere.rikkahub.voiceagent
 
+import android.util.Log
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
@@ -19,6 +20,7 @@ import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import me.rerere.rikkahub.BuildConfig
 import me.rerere.rikkahub.data.datastore.SettingsStore
 import me.rerere.rikkahub.data.datastore.getAssistantById
 import me.rerere.rikkahub.data.model.Conversation
@@ -31,6 +33,7 @@ import me.rerere.rikkahub.voiceagent.persistence.VoiceContextBuilder
 import me.rerere.rikkahub.voiceagent.persistence.VoiceConversationPersister
 import me.rerere.rikkahub.voiceagent.persistence.VoiceToolRecordStatus
 import me.rerere.rikkahub.voiceagent.persistence.VoiceTranscriptStatus
+import me.rerere.rikkahub.voiceagent.telemetry.HermesToolResponseHash
 import me.rerere.rikkahub.voiceagent.telemetry.VoiceDiagnosticEvent
 import me.rerere.rikkahub.voiceagent.telemetry.VoiceDiagnostics
 import me.rerere.rikkahub.voiceagent.voicelab.MobileHermesResponse
@@ -123,6 +126,11 @@ class VoiceAgentCoordinator(
     private val toolApi: VoiceToolApi,
     private val audio: VoiceAudioEngine,
     private val diagnostics: VoiceDiagnostics = VoiceDiagnostics(),
+    private val hermesResponseExpectedHash: String? =
+        BuildConfig.VOICE_AGENT_HERMES_E2E_EXPECTED_HASH.trim().takeIf { it.isNotBlank() },
+    private val logHermesResponseHash: (String) -> Unit = { detail ->
+        Log.i(E2E_TAG, "hermes_tool_response_hash $detail")
+    },
     private val conversationStore: VoiceConversationStore? = null,
     private val persister: VoiceConversationPersister = VoiceConversationPersister(),
     scope: CoroutineScope? = null,
@@ -590,6 +598,14 @@ class VoiceAgentCoordinator(
     private suspend fun runHermesToolCall(callId: String, prompt: String, handle: ToolJobHandle) {
         try {
             val response = toolApi.askHermes(callId = callId, prompt = prompt)
+            val responseElapsedMs = handle.elapsedMs()
+            recordHermesToolResponseHash(
+                callId = callId,
+                answer = response.answer,
+                expectedHash = hermesResponseExpectedHash,
+                elapsedMs = responseElapsedMs,
+                serverElapsedMs = response.elapsedMs,
+            )
             val coroutineContext = currentCoroutineContext()
             synchronized(handle.sendLock) {
                 if (!isToolHandleActive(callId, handle)) return
@@ -612,7 +628,7 @@ class VoiceAgentCoordinator(
                         diagnostics.record(
                             "hermes_tool_succeeded",
                             "callId=$callId, elapsedMs=$elapsedMs${response.serverElapsedDiagnostic()}, " +
-                                "answer=${response.answer}",
+                                "answerChars=${response.answer.length}",
                         )
                         persistToolStatus(
                             callId = callId,
@@ -895,6 +911,26 @@ class VoiceAgentCoordinator(
         diagnostics.record("unsupported_tool_call", "callId=${call.callId}, name=${call.name}")
     }
 
+    private fun recordHermesToolResponseHash(
+        callId: String,
+        answer: String,
+        expectedHash: String?,
+        elapsedMs: Long,
+        serverElapsedMs: Long?,
+    ) {
+        val detail = HermesToolResponseHash.diagnosticDetail(
+            callId = callId,
+            answer = answer,
+            expectedSha256 = expectedHash,
+            elapsedMs = elapsedMs,
+            serverElapsedMs = serverElapsedMs,
+        )
+        diagnostics.record("hermes_tool_response_hash", detail)
+        if (expectedHash != null) {
+            logHermesResponseHash(detail)
+        }
+    }
+
     private fun persistToolStatus(callId: String, prompt: String, status: VoiceToolRecordStatus) {
         persistConversation { conversation ->
             persister.upsertHermesTool(
@@ -1013,6 +1049,7 @@ class VoiceAgentCoordinator(
 
     private companion object {
         const val ASK_HERMES_TOOL = "ask_hermes"
+        const val E2E_TAG = "VoiceAgentE2E"
         const val TOOL_CALL_CANCELED_BY_GEMINI = "Tool call canceled by Gemini"
         const val TOOL_CALL_CANCELED_BY_RECONNECT = "Tool call canceled by reconnect"
         const val TOOL_CALL_CANCELED_BY_SESSION_END = "Tool call canceled by session end"
