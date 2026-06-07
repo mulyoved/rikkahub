@@ -10,6 +10,7 @@ INJECT_ACTION="me.rerere.rikkahub.debug.voiceagent.INJECT_PCM"
 CALL_START_ACTION="me.rerere.rikkahub.voiceagent.action.START"
 CALL_END_ACTION="me.rerere.rikkahub.voiceagent.action.END"
 APP_PCM_PATH="voice-e2e/prompt.pcm"
+DEVICE_TMP_PCM="/data/local/tmp/rikkahub-voice-agent-e2e-prompt.pcm"
 LOG_DIR="${VOICE_AGENT_E2E_LOG_DIR:-build/voice-agent-e2e}"
 LOG_FILE="$LOG_DIR/logcat.txt"
 CALL_STARTED=0
@@ -165,7 +166,9 @@ wait_for_log_or_fail \
 
 printf 'Copying private PCM prompt into app-private files...\n'
 adb_cmd shell "run-as $PACKAGE mkdir -p files/voice-e2e"
-adb_cmd exec-out "run-as $PACKAGE sh -c 'cat > files/$APP_PCM_PATH'" < "$VOICE_AGENT_E2E_PCM_PATH"
+adb_cmd push "$VOICE_AGENT_E2E_PCM_PATH" "$DEVICE_TMP_PCM" >/dev/null
+adb_cmd shell "run-as $PACKAGE cp $DEVICE_TMP_PCM files/$APP_PCM_PATH"
+adb_cmd shell rm -f "$DEVICE_TMP_PCM" >/dev/null 2>&1 || true
 
 printf 'Starting Voice Agent foreground service...\n'
 adb_cmd shell am start-foreground-service \
