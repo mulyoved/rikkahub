@@ -7,7 +7,7 @@ This runbook verifies the real Voice Agent pipeline:
 3. The app calls Hermes/MS-agent.
 4. Hermes retrieves an existing private Gbrain fact.
 5. The app hashes the Hermes response inside the app process.
-6. The hash matches the expected SHA-256 value.
+6. The shell script matches the emitted actual hash to the expected SHA-256 value.
 7. The app sends the tool response back to Gemini.
 8. Gemini returns output audio.
 9. Android playback queues and writes the audio.
@@ -16,15 +16,17 @@ This is a live, credentialed, device-backed check. It is not part of CI.
 There is no separate dry-run or script-contract wrapper for this check; use the live script below when asked to run the
 Voice Agent Hermes/Gbrain E2E.
 
+Before running this script, the installed Android app must already be configured with the Hermes/MS-agent provider API
+key and any Cloudflare Access headers required by the Hermes endpoint. The script validates that installed-app
+configuration through the live call. It does not build or install an APK, does not write provider secrets into generated
+constants or packaged artifacts, and does not create or update provider settings.
+
 ## Secret Inputs
 
 Set these values in your shell or source them from a local file outside the repository:
 
 | Variable | Notes |
 | --- | --- |
-| `CF_ACCESS_CLIENT_ID` | Cloudflare Access client id for the Hermes endpoint. |
-| `CF_ACCESS_CLIENT_SECRET` | Cloudflare Access client secret for the Hermes endpoint. |
-| `HERMES_PROFILE_API_KEY` | Hermes profile API key used by the debug seed broadcast. |
 | `VOICE_AGENT_E2E_EXPECTED_HASH` | SHA-256 hex digest of the normalized expected Hermes answer. |
 | `VOICE_AGENT_E2E_PCM_PATH` | Absolute path to the private PCM prompt file. |
 | `VOICE_AGENT_E2E_CONVERSATION_ID` | Existing app conversation id used to start the Voice Agent service. |
@@ -41,25 +43,19 @@ When more than one authorized device is visible, set the device serial explicitl
 export VOICE_AGENT_E2E_SERIAL='<adb-device-serial>'
 ```
 
-Confirm the ADB server and serial against the current operator inventory before running.
-
-The Hermes base URL is optional. The script defaults to this value:
-
-```bash
-export VOICE_AGENT_E2E_HERMES_BASE_URL='https://muly-hermes-api.core8.co/v1'
-```
+Confirm the ADB server and serial against the current operator inventory before running. The selected device must
+already have the target package installed and configured for the Hermes/MS-agent provider.
 
 Do not commit credentials, local secret-loading files, the private Gbrain question, the raw expected answer, the PCM
 prompt, or logcat artifacts.
 
-Important: this script builds a credentialed debug APK and local build output. The Cloudflare credentials and
-`VOICE_AGENT_E2E_EXPECTED_HASH` are embedded into `BuildConfig` for the debug APK produced by this run. Do not share the
-APK, build outputs, or installed debug app/device state. The run also seeds the Hermes API key into app settings and
-copies the private PCM prompt into app-private files. Treat the connected device as credential/private-data-bearing
-until app data is cleared, the debug app is uninstalled, or the seeded Hermes provider/settings and copied PCM prompt
-are explicitly removed. Simply replacing or reinstalling the APK is not enough when app data is preserved. If the
-machine is shared, or if artifacts may leave the trusted environment, clean local build artifacts when the run is
-complete.
+Important: this script uses the app already installed on the selected device. Treat that installed app and device state
+as credential/private-data-bearing because provider keys and access headers are configured in the app before the run.
+The script copies the private PCM prompt first to a public temporary device path, then into app-private files. On the
+normal path it removes the public temporary copy immediately after the app-private copy succeeds; the exit trap also
+removes any remaining public temporary copy and the app-private copy. It does not clear app provider settings or other
+app data. If the device is shared, clear app data, uninstall the app, or manually remove the configured provider
+credentials after the run.
 
 ## Preparing The Expected Hash
 
@@ -71,8 +67,8 @@ Prepare the expected answer locally without writing it into this repository.
 4. Use only the hex digest as `VOICE_AGENT_E2E_EXPECTED_HASH`.
 
 Use a high-entropy, unpredictable private fact for this test. A SHA-256 digest of a short, common, or guessable answer
-can be brute-forced offline from the debug APK, build output, or logcat artifact. Low-entropy private facts are not safe
-for this verification even though the raw answer is never logged.
+can be brute-forced offline from the shell environment, command output, or logcat artifact. Low-entropy private facts are
+not safe for this verification even though the raw answer is never logged.
 
 For example, if the harmless expected text were two words separated by arbitrary whitespace, the normalized input to the
 hash function would be `alpha beta`. Do not paste the private expected answer into the runbook, scripts, committed test
@@ -99,27 +95,29 @@ From the repository root:
 scripts/voice-agent-hermes-gbrain-e2e.sh
 ```
 
-The script requires all secret inputs except `VOICE_AGENT_E2E_HERMES_BASE_URL`, verifies the PCM file exists, lowercases
-the expected hash for marker matching, and writes a local scoped log to `build/voice-agent-e2e/logcat.txt`.
+The script requires the three secret inputs listed above, verifies the expected hash format, verifies the PCM file
+exists, lowercases the expected hash for marker matching, checks ADB readiness, checks that the target package is already
+installed, and writes a local scoped log to `build/voice-agent-e2e/logcat.txt`.
 
 Before running, verify that the selected ADB socket and serial still refer to the intended operator device. After a run,
-do not distribute the debug APK, copied build outputs, or device state because this run embeds credential material into
-the debug app build and writes private E2E data into app storage.
+do not distribute device state or logs because this run exercises configured provider credentials and writes private E2E
+data into app storage while it is active.
 
 The current script behavior is:
 
-1. Builds the credentialed debug APK with the Cloudflare credentials and expected hash supplied through environment
-   variables.
-2. Installs the debug APK and grants debug audio/notification permissions when available.
-3. Clears logcat and starts scoped log capture before the Hermes seed step.
-4. Seeds the Hermes provider in debug settings with the Hermes API key and base URL.
-5. Verifies `VoiceAgentDebugSeed` reports seed success before continuing; seed failure stops the run.
-6. Copies the private PCM prompt into app-private files with `run-as`.
+1. Checks ADB readiness for the selected device.
+2. Verifies the configured package is already installed.
+3. Clears logcat and starts scoped log capture.
+4. Copies the private PCM prompt to `/data/local/tmp/rikkahub-voice-agent-e2e-prompt.pcm`.
+5. Copies that temporary PCM into app-private files at `files/voice-e2e/prompt.pcm` with `run-as`.
+6. Removes the public temporary PCM after the app-private copy succeeds.
 7. Starts the Voice Agent foreground service for `VOICE_AGENT_E2E_CONVERSATION_ID`.
-8. Waits for Gemini setup, injects the PCM prompt in chunks, then waits for the E2E markers.
-9. Checks forbidden markers during each wait and again at the end, so auth, crash, hash mismatch, and playback write
+8. Waits for Gemini setup, injects the app-private PCM prompt in chunks, then waits for the E2E markers.
+9. Matches the app-emitted `actualHash` to `VOICE_AGENT_E2E_EXPECTED_HASH` in the shell.
+10. Checks forbidden markers during each wait and again at the end, so auth, crash, hash mismatch, and playback write
    failures fail fast.
-10. Ends the foreground service and stops log capture during cleanup.
+11. On exit, stops log capture, removes any remaining public temporary PCM, removes the app-private PCM, and ends the
+    foreground service. These trap cleanup actions are best-effort and are not expected to appear in the scoped log.
 
 ## Pass Criteria
 
@@ -128,7 +126,7 @@ The script passes only when all of these markers appear in the same run:
 - Gemini setup completes.
 - Debug PCM injection delivered.
 - Gemini emits tool call.
-- App emits `hermes_tool_response_hash` with expected hash and `expectedHashMatch=true`.
+- App emits `hermes_tool_response_hash` with an `actualHash` equal to `VOICE_AGENT_E2E_EXPECTED_HASH`.
 - App sends tool response back to Gemini.
 - Gemini emits output audio.
 - Android playback queues audio.
@@ -141,25 +139,29 @@ The script fails when any of these markers or conditions appear:
 - `Voice Lab request failed 403`
 - Cloudflare/auth access markers such as Cloudflare error or access denied content.
 - `FATAL EXCEPTION`
-- `expectedHashMatch=false`
 - playback write failure
-- Hermes debug seed failure
+- installed package missing
+- missing required input, invalid expected hash, or missing PCM file
+- ADB readiness or command timeout failure
+- PCM copy failure
+- required marker timeout
+- any Hermes response hash whose `actualHash` differs from `VOICE_AGENT_E2E_EXPECTED_HASH`
 
 ## Safe Artifacts
 
 `build/voice-agent-e2e/logcat.txt` is a local artifact and must not be committed. It is scoped to app-relevant tags:
-`VoiceAgentGemini`, `VoiceAgentE2E`, `VoiceAudioDebugInjection`, `AndroidVoiceAudioEngine`, `VoiceAgentDebugSeed`, and
-`AndroidRuntime`, but still treat it as local only.
+`VoiceAgentCallService`, `VoiceAgentCallSession`, `VoiceAgentGemini`, `VoiceAgentE2E`, `VoiceAudioDebugInjection`,
+`AndroidVoiceAudioEngine`, and `AndroidRuntime`, but still treat it as local only.
 
-The E2E hash diagnostic log only includes call id, raw and normalized character counts, SHA-256 hash, match result, and
-timing. It does not log the Hermes answer, but the hash can still reveal low-entropy answers through offline guessing.
+The E2E hash diagnostic log only includes call id, raw and normalized character counts, SHA-256 hash, and timing. It
+does not log the Hermes answer, but the hash can still reveal low-entropy answers through offline guessing.
 
 The Hermes failure E2E log preserves bounded failure summaries such as `Voice Lab request failed 403` and redacts or
 drops response previews. Do not paste unredacted runtime logs into issues, commits, docs, or chat.
 
-Post-run device cleanup must remove both installed code and app data that the script changes. Clear app data, uninstall
-the debug app, or explicitly remove the seeded Hermes provider/settings and copied PCM prompt. An `adb install -r`
-replacement alone can preserve app data, so it is not a sufficient cleanup step for this run.
+Post-run script cleanup removes the public temporary PCM and app-private PCM. It does not remove the installed app, clear
+app data, or clear provider/settings that were configured before the run. If the device should not retain those
+credentials, clear app data, uninstall the app, or manually remove the configured provider credentials.
 
 ## Security And Privacy
 
