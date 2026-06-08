@@ -27,8 +27,6 @@ sealed interface VoiceAgentConfigResult {
 class VoiceAgentConfigResolver(
     private val defaultVoiceModelId: String = DEFAULT_VOICE_MODEL_ID,
     private val baseUrlOverride: String = BuildConfig.VOICE_AGENT_BASE_URL_OVERRIDE,
-    private val defaultCloudflareClientId: String = BuildConfig.VOICE_AGENT_CF_ACCESS_CLIENT_ID,
-    private val defaultCloudflareClientSecret: String = BuildConfig.VOICE_AGENT_CF_ACCESS_CLIENT_SECRET,
 ) {
     fun resolve(settings: Settings, conversation: Conversation): VoiceAgentConfigResult {
         val assistant = settings.assistants.find { it.id == conversation.assistantId }
@@ -48,9 +46,7 @@ class VoiceAgentConfigResolver(
 
         val headers = assistant.customHeaders + model.customHeaders
         val cloudflareClientId = headers.valueFor("CF-Access-Client-Id")
-            ?: defaultCloudflareClientId.takeIf { it.isNotBlank() }
         val cloudflareClientSecret = headers.valueFor("CF-Access-Client-Secret")
-            ?: defaultCloudflareClientSecret.takeIf { it.isNotBlank() }
         if ((cloudflareClientId == null) != (cloudflareClientSecret == null)) {
             return VoiceAgentConfigResult.Unavailable(
                 "Voice Agent Cloudflare Access headers must include both client id and secret."
