@@ -20,6 +20,7 @@ import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import me.rerere.rikkahub.BuildConfig
 import me.rerere.rikkahub.data.model.Conversation
 import me.rerere.rikkahub.voiceagent.audio.VoiceAudioEngine
 import me.rerere.rikkahub.voiceagent.gemini.GeminiLiveEvent
@@ -40,7 +41,7 @@ class VoiceAgentCoordinator(
     private val toolApi: VoiceToolApi,
     private val audio: VoiceAudioEngine,
     private val diagnostics: VoiceDiagnostics = VoiceDiagnostics(),
-    private val hermesResponseExpectedHash: String? = null,
+    private val hermesResponseExpectedHash: String? = BuildConfig.VOICE_AGENT_HERMES_E2E_EXPECTED_HASH,
     private val logHermesRequestHash: (String) -> Unit = { detail ->
         Log.i(E2E_TAG, "hermes_tool_request_hash $detail")
     },
