@@ -89,9 +89,15 @@ class VoiceAgentCallService : Service() {
                             "config available voiceModelId=${result.config.voiceModelId} " +
                                 "baseUrl=${result.config.voiceLabBaseUrl}",
                         )
+                        val config = result.config.copy(
+                            enableVoiceE2EArtifacts = intent.getBooleanExtra(
+                                VoiceAgentCallContract.EXTRA_ENABLE_VOICE_E2E_ARTIFACTS,
+                                false,
+                            )
+                        )
                         val startedNewSession = manager.start(
                             conversationId = id,
-                            config = result.config,
+                            config = config,
                             scope = serviceScope,
                         )
                         VoiceAgentLog.d(TAG, "manager start returned startedNewSession=$startedNewSession")
@@ -186,6 +192,7 @@ class VoiceAgentCallService : Service() {
         }
         callGeneration += 1
         val endGeneration = callGeneration
+        val endingConversationId = manager.activeConversationId.value
         val session = manager.detachForEndAndDrain()
         endJob = serviceScope.launch {
             if (endGeneration != callGeneration) {
@@ -195,6 +202,7 @@ class VoiceAgentCallService : Service() {
                 telecomConversationId = null
                 telecomCallRegistry.disconnectActive()
                 session?.endAndDrain()
+                VoiceAgentLog.d(TAG, "end completed conversationId=${endingConversationId ?: "none"}")
             } finally {
                 if (endGeneration == callGeneration) {
                     stopForeground(STOP_FOREGROUND_REMOVE)

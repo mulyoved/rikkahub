@@ -381,7 +381,7 @@ class VoiceAgentCoordinator(
     }
 
     private fun appendInputTranscript(text: String, sessionId: Long?) {
-        synchronized(toolJobsLock) {
+        val artifactSnapshot = synchronized(toolJobsLock) {
             if (shouldIgnoreStaleSession(sessionId, GeminiLiveEvent.InputTranscript(text))) return
             if (activeTranscriptSpeaker != TranscriptSpeaker.User) {
                 inputTurnTranscript = ""
@@ -389,7 +389,6 @@ class VoiceAgentCoordinator(
             }
             activeTranscriptSpeaker = TranscriptSpeaker.User
             inputTurnTranscript += text
-            writeArtifactSafely(name = "input-transcript.txt", content = inputTurnTranscript)
             diagnostics.record("input_transcript_delta", "turnId=$inputTurnId, text=$text")
             synchronized(playbackSuppressionLock) {
                 outputAudioSuppressed = false
@@ -406,11 +405,13 @@ class VoiceAgentCoordinator(
                     status = VoiceTranscriptStatus.Partial,
                 )
             }
+            transcript
         }
+        writeArtifactSafely(name = "input-transcript.txt", content = artifactSnapshot)
     }
 
     private fun appendOutputTranscript(text: String, sessionId: Long?) {
-        synchronized(toolJobsLock) {
+        val artifactSnapshot = synchronized(toolJobsLock) {
             if (shouldIgnoreStaleSession(sessionId, GeminiLiveEvent.OutputTranscript(text))) return
             if (activeTranscriptSpeaker != TranscriptSpeaker.Assistant) {
                 outputTurnTranscript = ""
@@ -419,11 +420,12 @@ class VoiceAgentCoordinator(
             }
             activeTranscriptSpeaker = TranscriptSpeaker.Assistant
             outputTurnTranscript += text
-            writeArtifactSafely(name = "output-transcript.txt", content = outputTurnTranscript)
             diagnostics.record("output_transcript_delta", "turnId=$outputTurnId, text=$text")
             _state.update { it.copy(outputTranscript = it.outputTranscript + text) }
             persistAssistantTranscript()
+            outputTurnTranscript
         }
+        writeArtifactSafely(name = "output-transcript.txt", content = artifactSnapshot)
     }
 
     private fun playOutputAudio(base64Pcm16: String, sessionId: Long?) {

@@ -17,6 +17,7 @@ data class VoiceAgentLaunchConfig(
     val voiceModelId: String,
     val assistantName: String,
     val assistantPrompt: String,
+    val enableVoiceE2EArtifacts: Boolean = false,
 )
 
 sealed interface VoiceAgentConfigResult {

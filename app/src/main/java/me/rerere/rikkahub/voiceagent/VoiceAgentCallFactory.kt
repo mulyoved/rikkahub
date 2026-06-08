@@ -61,12 +61,22 @@ class DefaultVoiceAgentCallFactory(
                 settingsStore = settingsStore,
                 voiceModelName = config.voiceModelId,
             ),
-            writeVoiceE2EArtifact = { name, content ->
-                val directory = File(context.filesDir, "voice-e2e")
-                directory.mkdirs()
-                File(directory, name).writeText(content)
-            },
+            voiceE2EArtifacts = createDefaultVoiceE2EArtifactWriter(
+                config = config,
+                noBackupFilesDir = context.noBackupFilesDir,
+                scope = scope,
+            ),
             scope = scope,
         )
     }
 }
+
+internal fun createDefaultVoiceE2EArtifactWriter(
+    config: VoiceAgentLaunchConfig,
+    noBackupFilesDir: File,
+    scope: CoroutineScope,
+): VoiceE2EArtifactWriter = VoiceE2EArtifactWriter.create(
+    enabled = config.enableVoiceE2EArtifacts,
+    rootDirectory = noBackupFilesDir,
+    scope = scope,
+)

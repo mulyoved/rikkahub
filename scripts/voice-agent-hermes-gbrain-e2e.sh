@@ -8,9 +8,14 @@ INJECT_ACTION="me.rerere.rikkahub.debug.voiceagent.INJECT_PCM"
 CALL_START_ACTION="me.rerere.rikkahub.voiceagent.action.START"
 CALL_END_ACTION="me.rerere.rikkahub.voiceagent.action.END"
 APP_PCM_PATH="voice-e2e/prompt.pcm"
+APP_MANUAL_ANSWER_PATH="no_backup/voice-e2e/hermes-answer.txt"
+APP_INPUT_TRANSCRIPT_PATH="no_backup/voice-e2e/input-transcript.txt"
+APP_OUTPUT_TRANSCRIPT_PATH="no_backup/voice-e2e/output-transcript.txt"
+APP_HERMES_CALL_PATH="no_backup/voice-e2e/hermes-call.txt"
 DEVICE_TMP_PCM="/data/local/tmp/rikkahub-voice-agent-e2e-prompt.pcm"
 LOG_DIR="${VOICE_AGENT_E2E_LOG_DIR:-build/voice-agent-e2e}"
 LOG_FILE="$LOG_DIR/logcat.txt"
+MANUAL_REVIEW_ANSWER_FILE="${VOICE_AGENT_E2E_MANUAL_REVIEW_ANSWER_PATH:-$LOG_DIR/manual-hermes-answer.txt}"
 LOG_SEARCH_START_LINE=1
 ADB_TIMEOUT_SECONDS="${VOICE_AGENT_E2E_ADB_TIMEOUT_SECONDS:-20}"
 ADB_LONG_TIMEOUT_SECONDS="${VOICE_AGENT_E2E_ADB_LONG_TIMEOUT_SECONDS:-120}"
@@ -21,11 +26,26 @@ CALL_STARTED=0
 DEVICE_TMP_PCM_CLEANUP_NEEDED=0
 APP_PCM_CLEANUP_NEEDED=0
 COMMON_FORBIDDEN_PATTERN='Voice Lab request failed 403|Cloudflare|cf-error|Access denied|FATAL EXCEPTION|Voice playback write failed|AudioTrack write failed|AudioTrack write error'
+MANUAL_REVIEW=0
+
+case "${VOICE_AGENT_E2E_MANUAL_REVIEW:-0}" in
+  1|true|TRUE|yes|YES|on|ON)
+    MANUAL_REVIEW=1
+    ;;
+esac
 
 require_env() {
   local name="$1"
   if [[ -z "${!name:-}" ]]; then
     printf 'Missing required environment variable: %s\n' "$name" >&2
+    exit 2
+  fi
+}
+
+require_command() {
+  local name="$1"
+  if ! command -v "$name" >/dev/null 2>&1; then
+    printf 'Missing required command for manual review mode: %s\n' "$name" >&2
     exit 2
   fi
 }
@@ -43,6 +63,23 @@ adb_cmd_with_timeout() {
   set -e
   if [[ "$status" -eq 124 ]]; then
     printf 'ADB command timed out after %ss.\n' "$timeout_seconds" >&2
+  fi
+  return "$status"
+}
+
+adb_exec_out_to_file() {
+  local output_file="$1"
+  shift
+  set +e
+  if [[ -n "${VOICE_AGENT_E2E_SERIAL:-}" ]]; then
+    timeout "${ADB_LONG_TIMEOUT_SECONDS}s" adb -s "$VOICE_AGENT_E2E_SERIAL" exec-out "$@" > "$output_file"
+  else
+    timeout "${ADB_LONG_TIMEOUT_SECONDS}s" adb exec-out "$@" > "$output_file"
+  fi
+  local status=$?
+  set -e
+  if [[ "$status" -eq 124 ]]; then
+    printf 'ADB exec-out command timed out after %ss.\n' "$ADB_LONG_TIMEOUT_SECONDS" >&2
   fi
   return "$status"
 }
@@ -85,6 +122,19 @@ wait_for_log() {
   return 1
 }
 
+wait_for_cleanup_log() {
+  local pattern="$1"
+  local timeout_seconds="${2:-30}"
+  local deadline=$((SECONDS + timeout_seconds))
+  while (( SECONDS < deadline )); do
+    if awk -v pattern="$pattern" '$0 ~ pattern { found = 1 } END { exit found ? 0 : 1 }' "$LOG_FILE" 2>/dev/null; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
 fail_if_log() {
   local label="$1"
   local pattern="$2"
@@ -95,35 +145,71 @@ fail_if_log() {
   fi
 }
 
+extract_manual_review_answer() {
+  umask 077
+  mkdir -p "$(dirname "$MANUAL_REVIEW_ANSWER_FILE")"
+  local deadline=$((SECONDS + ${VOICE_AGENT_E2E_MANUAL_ANSWER_TIMEOUT_SECONDS:-10}))
+  while (( SECONDS < deadline )); do
+    if adb_exec_out_to_file "$MANUAL_REVIEW_ANSWER_FILE" \
+      run-as "$PACKAGE" cat "$APP_MANUAL_ANSWER_PATH" &&
+      [[ -s "$MANUAL_REVIEW_ANSWER_FILE" ]]; then
+      chmod 600 "$MANUAL_REVIEW_ANSWER_FILE"
+      printf 'Manual review answer artifact: %s\n' "$MANUAL_REVIEW_ANSWER_FILE"
+      return 0
+    fi
+    rm -f "$MANUAL_REVIEW_ANSWER_FILE"
+    sleep 1
+  done
+
+  printf 'Failed to pull app-private Hermes answer artifact: %s\n' "$APP_MANUAL_ANSWER_PATH" >&2
+  return 1
+}
+
+clear_app_text_artifacts() {
+  for app_path in \
+    "$APP_MANUAL_ANSWER_PATH" \
+    "$APP_INPUT_TRANSCRIPT_PATH" \
+    "$APP_OUTPUT_TRANSCRIPT_PATH" \
+    "$APP_HERMES_CALL_PATH"; do
+    adb_cmd shell "run-as $PACKAGE rm -f $app_path" >/dev/null 2>&1 || true
+  done
+}
+
 cleanup() {
   local status=$?
-  if [[ -n "${LOGCAT_PID:-}" ]]; then
-    kill "$LOGCAT_PID" >/dev/null 2>&1 || true
-    wait "$LOGCAT_PID" >/dev/null 2>&1 || true
-  fi
   if [[ "$DEVICE_TMP_PCM_CLEANUP_NEEDED" == "1" ]]; then
     adb_cmd shell rm -f "$DEVICE_TMP_PCM" >/dev/null 2>&1 || true
-  fi
-  if [[ "$APP_PCM_CLEANUP_NEEDED" == "1" ]]; then
-    adb_cmd shell "run-as $PACKAGE rm -f files/$APP_PCM_PATH" >/dev/null 2>&1 || true
   fi
   if [[ "$CALL_STARTED" == "1" ]]; then
     adb_cmd shell am start-foreground-service \
       -n "$SERVICE_COMPONENT" \
       -a "$CALL_END_ACTION" >/dev/null 2>&1 || true
+    wait_for_cleanup_log \
+      'VoiceAgentCallService.*end completed conversationId=' \
+      "${VOICE_AGENT_E2E_SERVICE_END_TIMEOUT_SECONDS:-30}" >/dev/null 2>&1 || true
+  fi
+  if [[ "$APP_PCM_CLEANUP_NEEDED" == "1" ]]; then
+    adb_cmd shell "run-as $PACKAGE rm -f files/$APP_PCM_PATH" >/dev/null 2>&1 || true
+  fi
+  clear_app_text_artifacts
+  if [[ -n "${LOGCAT_PID:-}" ]]; then
+    kill "$LOGCAT_PID" >/dev/null 2>&1 || true
+    wait "$LOGCAT_PID" >/dev/null 2>&1 || true
   fi
   exit "$status"
 }
 trap cleanup EXIT
 
-require_env VOICE_AGENT_E2E_EXPECTED_HASH
 require_env VOICE_AGENT_E2E_PCM_PATH
 require_env VOICE_AGENT_E2E_CONVERSATION_ID
 
-EXPECTED_HASH_LOWER="$(printf '%s' "$VOICE_AGENT_E2E_EXPECTED_HASH" | tr '[:upper:]' '[:lower:]')"
-if [[ ! "$EXPECTED_HASH_LOWER" =~ ^[0-9a-f]{64}$ ]]; then
-  printf 'VOICE_AGENT_E2E_EXPECTED_HASH must be a 64-character SHA-256 hex digest.\n' >&2
-  exit 2
+if [[ "$MANUAL_REVIEW" == "0" ]]; then
+  require_env VOICE_AGENT_E2E_EXPECTED_HASH
+  EXPECTED_HASH_LOWER="$(printf '%s' "$VOICE_AGENT_E2E_EXPECTED_HASH" | tr '[:upper:]' '[:lower:]')"
+  if [[ ! "$EXPECTED_HASH_LOWER" =~ ^[0-9a-f]{64}$ ]]; then
+    printf 'VOICE_AGENT_E2E_EXPECTED_HASH must be a 64-character SHA-256 hex digest.\n' >&2
+    exit 2
+  fi
 fi
 
 if [[ ! -f "$VOICE_AGENT_E2E_PCM_PATH" ]]; then
@@ -133,6 +219,8 @@ fi
 
 mkdir -p "$LOG_DIR"
 rm -f "$LOG_FILE"
+rm -f "$MANUAL_REVIEW_ANSWER_FILE"
+clear_app_text_artifacts
 
 printf 'Checking ADB device readiness...\n'
 if [[ -x "$ADB_READY_SCRIPT" ]]; then
@@ -180,7 +268,8 @@ printf 'Starting Voice Agent foreground service...\n'
 adb_cmd shell am start-foreground-service \
   -n "$SERVICE_COMPONENT" \
   -a "$CALL_START_ACTION" \
-  --es conversationId "$VOICE_AGENT_E2E_CONVERSATION_ID" >/dev/null
+  --es conversationId "$VOICE_AGENT_E2E_CONVERSATION_ID" \
+  --ez enableVoiceE2EArtifacts true >/dev/null
 CALL_STARTED=1
 
 wait_for_log "Gemini setup complete" 'VoiceAgentGemini.*event kind=SetupComplete' 120
@@ -197,7 +286,15 @@ adb_cmd shell am broadcast \
 
 wait_for_log "debug PCM delivered" 'VoiceAudioDebugInjection.*debug_audio_injection result delivered=true' 30
 wait_for_log "Gemini ask_hermes tool call received" 'VoiceAgentGemini.*receive kind=toolCall' "$GEMINI_TOOL_CALL_TIMEOUT_SECONDS"
-wait_for_log "Hermes response hash matched" "VoiceAgentE2E.*hermes_tool_response_hash .*actualHash=$EXPECTED_HASH_LOWER(,|$)" "$HERMES_RESPONSE_TIMEOUT_SECONDS"
+if [[ "$MANUAL_REVIEW" == "1" ]]; then
+  wait_for_log "Hermes response hash observed for manual review" \
+    'VoiceAgentE2E.*hermes_tool_response_hash .*actualHash=[0-9a-f]+(,|$)' \
+    "$HERMES_RESPONSE_TIMEOUT_SECONDS"
+else
+  wait_for_log "Hermes response hash matched" \
+    "VoiceAgentE2E.*hermes_tool_response_hash .*actualHash=$EXPECTED_HASH_LOWER(,|$)" \
+    "$HERMES_RESPONSE_TIMEOUT_SECONDS"
+fi
 wait_for_log "Gemini tool response sent" 'VoiceAgentGemini.*send kind=toolResponse sent=true' 60
 wait_for_log "Gemini output audio received" 'VoiceAgentGemini.*event kind=OutputAudio' 120
 wait_for_log "Voice playback queued" 'AndroidVoiceAudioEngine.*Voice playback queued' 60
@@ -207,11 +304,17 @@ fail_if_log "Voice Lab 403" 'Voice Lab request failed 403'
 fail_if_log "Cloudflare auth HTML" 'Cloudflare|cf-error|Access denied'
 fail_if_log "fatal exception" 'FATAL EXCEPTION'
 fail_if_log "playback write failure" 'Voice playback write failed|AudioTrack write failed|AudioTrack write error'
-if grep -E 'VoiceAgentE2E.*hermes_tool_response_hash .*actualHash=' "$LOG_FILE" |
+if [[ "$MANUAL_REVIEW" == "0" ]] &&
+  grep -E 'VoiceAgentE2E.*hermes_tool_response_hash .*actualHash=' "$LOG_FILE" |
   grep -Ev "actualHash=$EXPECTED_HASH_LOWER(,|$)" >/dev/null 2>&1; then
   printf 'Forbidden marker found: Hermes hash mismatch\n' >&2
   printf 'Expected actualHash=%s\n' "$EXPECTED_HASH_LOWER" >&2
   exit 1
 fi
 
-printf 'Voice Agent Hermes/Gbrain live E2E passed. Safe log: %s\n' "$LOG_FILE"
+if [[ "$MANUAL_REVIEW" == "1" ]]; then
+  extract_manual_review_answer
+  printf 'Voice Agent Hermes/Gbrain live E2E reached manual review gate. Safe log: %s\n' "$LOG_FILE"
+else
+  printf 'Voice Agent Hermes/Gbrain live E2E passed. Safe log: %s\n' "$LOG_FILE"
+fi

@@ -55,6 +55,7 @@ class VoiceAgentConfigResolverTest {
         assertEquals("cf-secret", config.credentials.cloudflareClientSecret)
         assertEquals("gemini-flash", config.voiceModelId)
         assertEquals("Hermes", config.assistantName)
+        assertEquals(false, config.enableVoiceE2EArtifacts)
     }
 
     @Test
