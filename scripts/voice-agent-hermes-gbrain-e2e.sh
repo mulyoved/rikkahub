@@ -144,6 +144,20 @@ wait_for_cleanup_log() {
   return 1
 }
 
+end_voice_agent_call_and_wait() {
+  if [[ "$CALL_STARTED" != "1" ]]; then
+    return 0
+  fi
+  adb_cmd shell am start-foreground-service \
+    -n "$SERVICE_COMPONENT" \
+    -a "$CALL_END_ACTION" >/dev/null
+  wait_for_log \
+    "Voice Agent service ended" \
+    'VoiceAgentCallService.*end completed conversationId=' \
+    "${VOICE_AGENT_E2E_SERVICE_END_TIMEOUT_SECONDS:-30}"
+  CALL_STARTED=0
+}
+
 fail_if_log() {
   local label="$1"
   local pattern="$2"
@@ -470,6 +484,7 @@ if [[ "$MANUAL_REVIEW" == "0" ]] &&
 fi
 
 if [[ "$MANUAL_REVIEW" == "1" ]]; then
+  end_voice_agent_call_and_wait
   extract_manual_review_answer
   write_e2e_report
   printf 'Voice Agent Hermes/Gbrain live E2E reached manual review gate. Safe log: %s\n' "$LOG_FILE"

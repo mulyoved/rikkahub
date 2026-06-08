@@ -176,8 +176,14 @@ LOGS
 06-08 12:00:05.000 D/VoiceAgentGemini(1): event kind=OutputAudio
 06-08 12:00:06.000 D/AndroidVoiceAudioEngine(1): Voice playback queued bytes=3200
 06-08 12:00:07.000 D/AndroidVoiceAudioEngine(1): Voice playback wrote bytes=3200
-06-08 12:00:08.000 D/VoiceAgentCallService(1): end completed conversationId=conversation-1
 LOGS
+    deadline=$((SECONDS + 5))
+    while [[ ! -f "${FAKE_ADB_END_MARKER:?}" && "$SECONDS" -lt "$deadline" ]]; do
+      sleep 0.1
+    done
+    if [[ -f "${FAKE_ADB_END_MARKER:?}" ]]; then
+      printf '06-08 12:00:08.000 D/VoiceAgentCallService(1): end completed conversationId=conversation-1\n'
+    fi
     sleep 2
     ;;
   "-s RZ push "*)
@@ -200,10 +206,13 @@ LOGS
   "-s RZ shell run-as me.rerere.rikkahub.debug rm -f no_backup/voice-e2e/hermes-call.txt")
     ;;
   "-s RZ shell am start-foreground-service -n me.rerere.rikkahub.debug/me.rerere.rikkahub.voiceagent.VoiceAgentCallService -a me.rerere.rikkahub.voiceagent.action.START --es conversationId conversation-1 --ez enableVoiceE2EArtifacts true")
+    rm -f "${FAKE_ADB_END_MARKER:?}"
     ;;
   "-s RZ shell am start-foreground-service -n me.rerere.rikkahub.debug/me.rerere.rikkahub.voiceagent.VoiceAgentCallService -a me.rerere.rikkahub.voiceagent.action.START --es conversationId conversation-1")
+    rm -f "${FAKE_ADB_END_MARKER:?}"
     ;;
   "-s RZ shell am start-foreground-service -n me.rerere.rikkahub.debug/me.rerere.rikkahub.voiceagent.VoiceAgentCallService -a me.rerere.rikkahub.voiceagent.action.END")
+    : > "${FAKE_ADB_END_MARKER:?}"
     ;;
   "-s RZ shell am broadcast "*)
     ;;
@@ -246,8 +255,10 @@ write_fake_adb
 printf 'pcm' > "$TMP_DIR/prompt.pcm"
 FAKE_ADB_ARGS_LOG="$TMP_DIR/adb-args.log"
 FAKE_FFMPEG_TEXTFILE_LOG="$TMP_DIR/ffmpeg-textfile.log"
+FAKE_ADB_END_MARKER="$TMP_DIR/adb-end-requested"
 export FAKE_ADB_ARGS_LOG
 export FAKE_FFMPEG_TEXTFILE_LOG
+export FAKE_ADB_END_MARKER
 
 expected_hash="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 manual_log_dir="$TMP_DIR/manual-log"
@@ -284,6 +295,9 @@ assert_file_contains "$FAKE_ADB_ARGS_LOG" "rm -f no_backup/voice-e2e/hermes-answ
 assert_file_contains "$FAKE_ADB_ARGS_LOG" "rm -f no_backup/voice-e2e/input-transcript.txt"
 assert_file_contains "$FAKE_ADB_ARGS_LOG" "rm -f no_backup/voice-e2e/output-transcript.txt"
 assert_file_contains "$FAKE_ADB_ARGS_LOG" "rm -f no_backup/voice-e2e/hermes-call.txt"
+assert_last_line_after "$FAKE_ADB_ARGS_LOG" \
+  "-a me.rerere.rikkahub.voiceagent.action.END" \
+  "exec-out run-as me.rerere.rikkahub.debug cat no_backup/voice-e2e/hermes-answer.txt"
 assert_last_line_after "$FAKE_ADB_ARGS_LOG" \
   "-a me.rerere.rikkahub.voiceagent.action.END" \
   "rm -f no_backup/voice-e2e/hermes-answer.txt"
@@ -407,6 +421,15 @@ assert_contains "$report_contents" "manual answer from Hermes"
 assert_contains "$report_contents" "Gemini response to user:"
 assert_contains "$report_contents" "Yes, Hermes is connected to G-Brain."
 assert_contains "$generated_output" "Voice Agent E2E report: $report_path"
+assert_last_line_after "$FAKE_ADB_ARGS_LOG" \
+  "-a me.rerere.rikkahub.voiceagent.action.END" \
+  "exec-out run-as me.rerere.rikkahub.debug cat no_backup/voice-e2e/input-transcript.txt"
+assert_last_line_after "$FAKE_ADB_ARGS_LOG" \
+  "-a me.rerere.rikkahub.voiceagent.action.END" \
+  "exec-out run-as me.rerere.rikkahub.debug cat no_backup/voice-e2e/hermes-call.txt"
+assert_last_line_after "$FAKE_ADB_ARGS_LOG" \
+  "-a me.rerere.rikkahub.voiceagent.action.END" \
+  "exec-out run-as me.rerere.rikkahub.debug cat no_backup/voice-e2e/output-transcript.txt"
 assert_no_report_temp_files "$generated_log_dir"
 report_mode="$(stat -c '%a' "$report_path")"
 if [[ "$report_mode" != "600" ]]; then
