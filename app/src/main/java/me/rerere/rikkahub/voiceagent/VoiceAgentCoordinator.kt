@@ -47,6 +47,7 @@ class VoiceAgentCoordinator(
     private val logHermesResponseHash: (String) -> Unit = { detail ->
         Log.i(E2E_TAG, "hermes_tool_response_hash $detail")
     },
+    private val writeVoiceE2EArtifact: (String, String) -> Unit = { _, _ -> },
     private val logHermesToolFailure: (String) -> Unit = { detail ->
         Log.w(E2E_TAG, "hermes_tool_failed $detail")
     },
@@ -388,6 +389,7 @@ class VoiceAgentCoordinator(
             }
             activeTranscriptSpeaker = TranscriptSpeaker.User
             inputTurnTranscript += text
+            writeArtifactSafely(name = "input-transcript.txt", content = inputTurnTranscript)
             diagnostics.record("input_transcript_delta", "turnId=$inputTurnId, text=$text")
             synchronized(playbackSuppressionLock) {
                 outputAudioSuppressed = false
@@ -417,6 +419,7 @@ class VoiceAgentCoordinator(
             }
             activeTranscriptSpeaker = TranscriptSpeaker.Assistant
             outputTurnTranscript += text
+            writeArtifactSafely(name = "output-transcript.txt", content = outputTurnTranscript)
             diagnostics.record("output_transcript_delta", "turnId=$outputTurnId, text=$text")
             _state.update { it.copy(outputTranscript = it.outputTranscript + text) }
             persistAssistantTranscript()
@@ -483,6 +486,7 @@ class VoiceAgentCoordinator(
             )
             return
         }
+        writeArtifactSafely(name = "hermes-call.txt", content = call.prompt)
         recordHermesToolRequestHash(callId = call.callId, prompt = call.prompt)
 
         val handle = ToolJobHandle(callId = call.callId, prompt = call.prompt, sessionId = sessionId)
@@ -878,6 +882,17 @@ class VoiceAgentCoordinator(
         }.onFailure { error ->
             val message = error.message ?: error.javaClass.simpleName
             diagnostics.record("hermes_tool_response_hash_log_failed", "callId=$callId, message=$message")
+        }
+        writeArtifactSafely(name = "hermes-answer.txt", content = answer, callId = callId)
+    }
+
+    private fun writeArtifactSafely(name: String, content: String, callId: String? = null) {
+        runCatching {
+            writeVoiceE2EArtifact(name, content)
+        }.onFailure { error ->
+            val message = error.message ?: error.javaClass.simpleName
+            val callDetail = callId?.let { ", callId=$it" } ?: ""
+            diagnostics.record("voice_e2e_artifact_write_failed", "name=$name$callDetail, message=$message")
         }
     }
 

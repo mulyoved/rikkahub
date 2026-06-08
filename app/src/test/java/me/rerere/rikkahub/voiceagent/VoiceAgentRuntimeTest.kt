@@ -587,6 +587,68 @@ class VoiceAgentRuntimeTest {
     }
 
     @Test
+    fun `coordinator writes private e2e artifacts for transcript tool call and Hermes answer`() = runTest {
+        val gemini = FakeGeminiLiveVoiceClient()
+        val toolApi = FakeVoiceToolApi()
+        val artifacts = mutableMapOf<String, String>()
+        val coordinator = VoiceAgentCoordinator(
+            gemini = gemini,
+            toolApi = toolApi,
+            audio = FakeVoiceAudioEngine(),
+            writeVoiceE2EArtifact = { name, content -> artifacts[name] = content },
+            scope = this,
+        )
+
+        coordinator.onGeminiEvent(GeminiLiveEvent.InputTranscript("Please ask "))
+        coordinator.onGeminiEvent(GeminiLiveEvent.InputTranscript("Hermes."))
+        coordinator.onGeminiEvent(
+            GeminiLiveEvent.ToolCall(
+                callId = "call-report",
+                name = "ask_hermes",
+                prompt = "Is Hermes connected to G-Brain? Answer yes or no.",
+            )
+        )
+        assertEquals(
+            "call-report" to "Is Hermes connected to G-Brain? Answer yes or no.",
+            toolApi.awaitRequest("call-report"),
+        )
+        toolApi.complete(response(callId = "call-report", answer = "Yes.", elapsedMs = 123L))
+        coordinator.awaitToolJobsWithTimeout()
+        coordinator.onGeminiEvent(GeminiLiveEvent.OutputTranscript("Yes, Hermes is connected."))
+
+        assertEquals("Please ask Hermes.", artifacts["input-transcript.txt"])
+        assertEquals("Is Hermes connected to G-Brain? Answer yes or no.", artifacts["hermes-call.txt"])
+        assertEquals("Yes.", artifacts["hermes-answer.txt"])
+        assertEquals("Yes, Hermes is connected.", artifacts["output-transcript.txt"])
+    }
+
+    @Test
+    fun `Hermes response answer writer receives raw answer for private manual review artifact`() = runTest {
+        val gemini = FakeGeminiLiveVoiceClient()
+        val toolApi = FakeVoiceToolApi()
+        val diagnostics = VoiceDiagnostics()
+        val writtenArtifacts = mutableMapOf<String, String>()
+        val coordinator = VoiceAgentCoordinator(
+            gemini = gemini,
+            toolApi = toolApi,
+            audio = FakeVoiceAudioEngine(),
+            diagnostics = diagnostics,
+            writeVoiceE2EArtifact = { name, content -> writtenArtifacts[name] = content },
+            scope = this,
+        )
+
+        coordinator.onGeminiEvent(
+            GeminiLiveEvent.ToolCall(callId = "call-manual-answer", name = "ask_hermes", prompt = "private prompt")
+        )
+        assertEquals("call-manual-answer" to "private prompt", toolApi.awaitRequest("call-manual-answer"))
+        toolApi.complete(response(callId = "call-manual-answer", answer = "raw private answer"))
+        coordinator.awaitToolJobsWithTimeout()
+
+        assertEquals("raw private answer", writtenArtifacts["hermes-answer.txt"])
+        assertFalse(diagnostics.events.value.any { it.detail.contains("raw private answer") })
+    }
+
+    @Test
     fun `Hermes response hash diagnostic emits actual hash without expected hash`() = runTest {
         val gemini = FakeGeminiLiveVoiceClient()
         val toolApi = FakeVoiceToolApi()

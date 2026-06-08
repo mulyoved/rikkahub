@@ -25,6 +25,7 @@ class VoiceAgentCallSession(
     private val conversationStore: VoiceConversationStore,
     private val contextProvider: VoiceAgentContextProvider,
     diagnostics: VoiceDiagnostics = VoiceDiagnostics(),
+    writeVoiceE2EArtifact: (String, String) -> Unit = { _, _ -> },
     private val scope: CoroutineScope,
 ) : ManagedVoiceCallSession {
     private val coordinator = VoiceAgentCoordinator(
@@ -33,6 +34,7 @@ class VoiceAgentCallSession(
         audio = audio,
         diagnostics = diagnostics,
         conversationStore = conversationStore,
+        writeVoiceE2EArtifact = writeVoiceE2EArtifact,
         scope = scope,
     )
     private var startJob: Job? = null

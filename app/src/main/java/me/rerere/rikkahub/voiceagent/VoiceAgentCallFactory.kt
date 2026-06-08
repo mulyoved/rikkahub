@@ -9,6 +9,7 @@ import me.rerere.rikkahub.voiceagent.audio.AndroidVoiceAudioEngine
 import me.rerere.rikkahub.voiceagent.gemini.OkHttpGeminiLiveVoiceClient
 import me.rerere.rikkahub.voiceagent.voicelab.VoiceLabMobileApi
 import okhttp3.OkHttpClient
+import java.io.File
 import kotlin.uuid.Uuid
 
 interface ManagedVoiceCallSession {
@@ -60,6 +61,11 @@ class DefaultVoiceAgentCallFactory(
                 settingsStore = settingsStore,
                 voiceModelName = config.voiceModelId,
             ),
+            writeVoiceE2EArtifact = { name, content ->
+                val directory = File(context.filesDir, "voice-e2e")
+                directory.mkdirs()
+                File(directory, name).writeText(content)
+            },
             scope = scope,
         )
     }
