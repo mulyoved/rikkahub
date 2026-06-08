@@ -13,6 +13,8 @@ This runbook verifies the real Voice Agent pipeline:
 9. Android playback queues and writes the audio.
 
 This is a live, credentialed, device-backed check. It is not part of CI.
+There is no separate dry-run or script-contract wrapper for this check; use the live script below when asked to run the
+Voice Agent Hermes/Gbrain E2E.
 
 ## Secret Inputs
 
