@@ -8,6 +8,7 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.File
 import java.nio.file.Files
@@ -128,6 +129,34 @@ class VoiceE2EArtifactWriterTest {
             scope.cancel()
             root.deleteRecursively()
         }
+    }
+
+    @Test
+    fun `service start config enables voice e2e artifacts from start extra`() {
+        val config = voiceAgentServiceStartConfig(
+            resolvedConfig = launchConfig(enableVoiceE2EArtifacts = false),
+            readBooleanExtra = { name, default ->
+                assertEquals(VoiceAgentCallContract.EXTRA_ENABLE_VOICE_E2E_ARTIFACTS, name)
+                assertFalse(default)
+                true
+            },
+        )
+
+        assertTrue(config.enableVoiceE2EArtifacts)
+    }
+
+    @Test
+    fun `service start config keeps voice e2e artifacts disabled by default`() {
+        val config = voiceAgentServiceStartConfig(
+            resolvedConfig = launchConfig(enableVoiceE2EArtifacts = true),
+            readBooleanExtra = { name, default ->
+                assertEquals(VoiceAgentCallContract.EXTRA_ENABLE_VOICE_E2E_ARTIFACTS, name)
+                assertFalse(default)
+                false
+            },
+        )
+
+        assertFalse(config.enableVoiceE2EArtifacts)
     }
 
     private fun launchConfig(enableVoiceE2EArtifacts: Boolean) = VoiceAgentLaunchConfig(
