@@ -660,6 +660,14 @@ class VoiceAgentCoordinator(
                 toolJobs[callId]
             }
             if (currentHandle != null) {
+                synchronized(toolJobsLock) {
+                    if (!canAcceptToolHandle(callId, handle)) return false
+                    if (toolJobs[callId] !== currentHandle) return false
+                    if (currentHandle.sendStarted) {
+                        diagnostics.record("duplicate_tool_call_after_send_started", "callId=$callId")
+                        return false
+                    }
+                }
                 synchronized(currentHandle.sendLock) {
                     synchronized(toolJobsLock) {
                         if (!canAcceptToolHandle(callId, handle)) return false
