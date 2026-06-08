@@ -587,18 +587,19 @@ class VoiceAgentRuntimeTest {
     }
 
     @Test
-    fun `Hermes response hash diagnostic is skipped without expected hash`() = runTest {
+    fun `Hermes response hash diagnostic emits actual hash without expected hash`() = runTest {
         val gemini = FakeGeminiLiveVoiceClient()
         val toolApi = FakeVoiceToolApi()
         val diagnostics = VoiceDiagnostics()
-        var hashLogCalls = 0
+        var loggedDetail: String? = null
+        val expectedHash = HermesToolResponseHash.sha256HexNormalized("alpha beta")
         val coordinator = VoiceAgentCoordinator(
             gemini = gemini,
             toolApi = toolApi,
             audio = FakeVoiceAudioEngine(),
             diagnostics = diagnostics,
             hermesResponseExpectedHash = "",
-            logHermesResponseHash = { hashLogCalls++ },
+            logHermesResponseHash = { loggedDetail = it },
             scope = this,
         )
 
@@ -606,15 +607,21 @@ class VoiceAgentRuntimeTest {
             GeminiLiveEvent.ToolCall(callId = "call-no-hash", name = "ask_hermes", prompt = "private prompt")
         )
         assertEquals("call-no-hash" to "private prompt", toolApi.awaitRequest("call-no-hash"))
-        toolApi.complete(response(callId = "call-no-hash", answer = "alpha beta"))
+        toolApi.complete(response(callId = "call-no-hash", answer = " \nalpha\t  beta\r\n"))
         coordinator.awaitToolJobsWithTimeout()
 
-        assertEquals(listOf("call-no-hash" to "alpha beta"), gemini.toolResponses)
-        assertEquals(0, hashLogCalls)
-        assertFalse(diagnostics.events.value.any { it.name == "hermes_tool_response_hash" })
+        assertEquals(listOf("call-no-hash" to " \nalpha\t  beta\r\n"), gemini.toolResponses)
+        val hashEvent = diagnostics.events.value.single { it.name == "hermes_tool_response_hash" }
+        assertTrue(hashEvent.detail.contains("callId=call-no-hash"))
+        assertTrue(hashEvent.detail.contains("actualHash=$expectedHash"))
+        assertFalse(hashEvent.detail.contains("expectedHashMatch="))
+        assertFalse(hashEvent.detail.contains("alpha"))
+        assertFalse(hashEvent.detail.contains("beta"))
+        assertEquals(hashEvent.detail, loggedDetail)
+
         val successEvent = diagnostics.events.value.single { it.name == "hermes_tool_succeeded" }
         assertTrue(successEvent.detail.contains("callId=call-no-hash"))
-        assertTrue(successEvent.detail.contains("answerChars=10"))
+        assertTrue(successEvent.detail.contains("answerChars=16"))
         assertFalse(successEvent.detail.contains("alpha beta"))
     }
 
