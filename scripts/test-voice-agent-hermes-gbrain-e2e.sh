@@ -64,6 +64,23 @@ assert_last_line_after() {
   fi
 }
 
+assert_no_report_temp_files() {
+  local directory="$1"
+  local leaked
+  leaked="$(find "$directory" -maxdepth 1 -type f \
+    \( -name 'report-artifact.*' \
+    -o -name 'report-input-transcript.*' \
+    -o -name 'report-hermes-call.*' \
+    -o -name 'report-output-transcript.*' \
+    -o -name 'report-source-text.*' \
+    -o -name 'report.??????' \) \
+    -print)"
+  if [[ -n "$leaked" ]]; then
+    printf 'Expected no report temp files in %s, found:\n%s\n' "$directory" "$leaked" >&2
+    exit 1
+  fi
+}
+
 write_fake_readiness_script() {
   cat > "$TMP_DIR/adb-ready.sh" <<'FAKE_READY'
 #!/usr/bin/env bash
@@ -194,6 +211,24 @@ LOGS
     fi
     printf 'manual answer from Hermes'
     ;;
+  "-s RZ exec-out run-as me.rerere.rikkahub.debug cat no_backup/voice-e2e/input-transcript.txt")
+    if [[ "${FAKE_ADB_MISSING_REPORT_ARTIFACTS:-0}" == "1" ]]; then
+      exit 1
+    fi
+    printf 'Please ask Hermes if he is connected to G-Brain.'
+    ;;
+  "-s RZ exec-out run-as me.rerere.rikkahub.debug cat no_backup/voice-e2e/hermes-call.txt")
+    if [[ "${FAKE_ADB_MISSING_REPORT_ARTIFACTS:-0}" == "1" ]]; then
+      exit 1
+    fi
+    printf 'Is Hermes connected to G-Brain? Answer yes or no.'
+    ;;
+  "-s RZ exec-out run-as me.rerere.rikkahub.debug cat no_backup/voice-e2e/output-transcript.txt")
+    if [[ "${FAKE_ADB_MISSING_REPORT_ARTIFACTS:-0}" == "1" ]]; then
+      exit 1
+    fi
+    printf 'Yes, Hermes is connected to G-Brain.'
+    ;;
   *)
     printf 'unexpected adb args: %s\n' "$args" >&2
     exit 99
@@ -313,6 +348,16 @@ if [[ "$after_readiness_failure_adb_lines" != "$before_readiness_failure_adb_lin
 fi
 
 generated_log_dir="$TMP_DIR/generated-log"
+mkdir -p "$generated_log_dir"
+printf 'stale report' > "$generated_log_dir/report.txt"
+printf 'stale input' > "$generated_log_dir/input-transcript.txt"
+printf 'stale call' > "$generated_log_dir/hermes-call.txt"
+printf 'stale output' > "$generated_log_dir/output-transcript.txt"
+chmod 644 \
+  "$generated_log_dir/report.txt" \
+  "$generated_log_dir/input-transcript.txt" \
+  "$generated_log_dir/hermes-call.txt" \
+  "$generated_log_dir/output-transcript.txt"
 set +e
 generated_output="$(
   PATH="$TMP_DIR:$PATH" \
@@ -341,6 +386,88 @@ assert_contains "$generated_output" "Voice Agent Hermes/Gbrain live E2E reached 
 assert_file_contains_exactly "$generated_log_dir/generated-prompt.pcm" "generated pcm"
 assert_file_contains_exactly "$generated_log_dir/generated-prompt.txt" \
   "Please ask Hermes if he is connected to G-Brain. Please answer with yes or no."
+report_path="$generated_log_dir/report.txt"
+if [[ ! -f "$report_path" ]]; then
+  printf 'Expected report file to exist: %s\n' "$report_path" >&2
+  exit 1
+fi
+report_contents="$(cat "$report_path")"
+assert_contains "$report_contents" "Text used to generate voice:"
+assert_contains "$report_contents" "Please ask Hermes if he is connected to G-Brain. Please answer with yes or no."
+assert_contains "$report_contents" "Gemini understood from voice:"
+assert_contains "$report_contents" "Please ask Hermes if he is connected to G-Brain."
+assert_contains "$report_contents" "Hermes call:"
+assert_contains "$report_contents" "Is Hermes connected to G-Brain? Answer yes or no."
+assert_contains "$report_contents" "Hermes elapsed time:"
+assert_contains "$report_contents" "elapsedMs=100"
+assert_contains "$report_contents" "Hermes answer:"
+assert_contains "$report_contents" "manual answer from Hermes"
+assert_contains "$report_contents" "Gemini response to user:"
+assert_contains "$report_contents" "Yes, Hermes is connected to G-Brain."
+assert_contains "$generated_output" "Voice Agent E2E report: $report_path"
+assert_no_report_temp_files "$generated_log_dir"
+report_mode="$(stat -c '%a' "$report_path")"
+if [[ "$report_mode" != "600" ]]; then
+  printf 'Expected report mode 600, got %s\n' "$report_mode" >&2
+  exit 1
+fi
+for extra_artifact in input-transcript.txt hermes-call.txt output-transcript.txt; do
+  if [[ -e "$generated_log_dir/$extra_artifact" ]]; then
+    printf 'Expected report assembly to remove extra private artifact: %s\n' "$generated_log_dir/$extra_artifact" >&2
+    exit 1
+  fi
+done
+
+missing_report_log_dir="$TMP_DIR/missing-report-log"
+missing_report_path="$TMP_DIR/custom-report.txt"
+mkdir -p "$missing_report_log_dir"
+printf 'stale generated source' > "$missing_report_log_dir/generated-prompt.txt"
+set +e
+missing_report_output="$(
+  PATH="$TMP_DIR:$PATH" \
+  FAKE_ADB_MISSING_REPORT_ARTIFACTS=1 \
+  VOICE_AGENT_E2E_SERIAL=RZ \
+  VOICE_AGENT_E2E_ADB_READY_SCRIPT="$TMP_DIR/adb-ready.sh" \
+  VOICE_AGENT_E2E_PCM_PATH="$TMP_DIR/prompt.pcm" \
+  VOICE_AGENT_E2E_CONVERSATION_ID=conversation-1 \
+  VOICE_AGENT_E2E_LOG_DIR="$missing_report_log_dir" \
+  VOICE_AGENT_E2E_REPORT_PATH="$missing_report_path" \
+  VOICE_AGENT_E2E_MANUAL_REVIEW=1 \
+  VOICE_AGENT_E2E_GEMINI_TOOL_CALL_TIMEOUT_SECONDS=5 \
+  VOICE_AGENT_E2E_HERMES_RESPONSE_TIMEOUT_SECONDS=5 \
+  "$SCRIPT" 2>&1
+)"
+missing_report_status=$?
+set -e
+
+if [[ "$missing_report_status" -ne 0 ]]; then
+  printf 'Expected missing optional report artifact run to pass, got status %s.\n' "$missing_report_status" >&2
+  printf 'Actual output:\n%s\n' "$missing_report_output" >&2
+  exit 1
+fi
+if [[ ! -f "$missing_report_path" ]]; then
+  printf 'Expected custom report file to exist: %s\n' "$missing_report_path" >&2
+  exit 1
+fi
+missing_report_contents="$(cat "$missing_report_path")"
+assert_contains "$missing_report_output" "Voice Agent E2E report: $missing_report_path"
+assert_contains "$missing_report_contents" "Text used to generate voice:"
+assert_contains "$missing_report_contents" "missing"
+if [[ "$missing_report_contents" == *"stale generated source"* ]]; then
+  printf 'Expected explicit PCM report not to reuse stale generated prompt text.\n' >&2
+  printf 'Actual report:\n%s\n' "$missing_report_contents" >&2
+  exit 1
+fi
+assert_contains "$missing_report_contents" "Gemini understood from voice:"
+assert_contains "$missing_report_contents" "Hermes call:"
+assert_contains "$missing_report_contents" "Gemini response to user:"
+missing_count="$(grep -c '^missing$' "$missing_report_path")"
+if [[ "$missing_count" -lt 4 ]]; then
+  printf 'Expected missing source/input/call/output markers, got %s.\n' "$missing_count" >&2
+  printf 'Actual report:\n%s\n' "$missing_report_contents" >&2
+  exit 1
+fi
+assert_no_report_temp_files "$missing_report_log_dir"
 
 apostrophe_log_dir="$TMP_DIR/log-with-apostrophe's"
 set +e
@@ -470,6 +597,48 @@ assert_last_line_after "$FAKE_ADB_ARGS_LOG" \
   "rm -f no_backup/voice-e2e/hermes-answer.txt"
 
 strict_log_dir="$TMP_DIR/strict-log"
+strict_success_log_dir="$TMP_DIR/strict-success-log"
+strict_success_report_path="$strict_success_log_dir/report.txt"
+before_strict_success_report_pulls="$(
+  grep -c -E 'exec-out run-as me\.rerere\.rikkahub\.debug cat no_backup/voice-e2e/(input-transcript|hermes-call|output-transcript)\.txt' \
+    "$FAKE_ADB_ARGS_LOG" || true
+)"
+set +e
+strict_success_output="$(
+  PATH="$TMP_DIR:$PATH" \
+  VOICE_AGENT_E2E_SERIAL=RZ \
+  VOICE_AGENT_E2E_ADB_READY_SCRIPT="$TMP_DIR/adb-ready.sh" \
+  VOICE_AGENT_E2E_EXPECTED_HASH="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" \
+  VOICE_AGENT_E2E_PCM_PATH="$TMP_DIR/prompt.pcm" \
+  VOICE_AGENT_E2E_CONVERSATION_ID=conversation-1 \
+  VOICE_AGENT_E2E_LOG_DIR="$strict_success_log_dir" \
+  VOICE_AGENT_E2E_GEMINI_TOOL_CALL_TIMEOUT_SECONDS=5 \
+  VOICE_AGENT_E2E_HERMES_RESPONSE_TIMEOUT_SECONDS=5 \
+  "$SCRIPT" 2>&1
+)"
+strict_success_status=$?
+set -e
+
+if [[ "$strict_success_status" -ne 0 ]]; then
+  printf 'Expected strict success mode to pass, got status %s.\n' "$strict_success_status" >&2
+  printf 'Actual output:\n%s\n' "$strict_success_output" >&2
+  exit 1
+fi
+assert_contains "$strict_success_output" "Voice Agent Hermes/Gbrain live E2E passed."
+if [[ -e "$strict_success_report_path" ]]; then
+  printf 'Expected strict success mode not to write report: %s\n' "$strict_success_report_path" >&2
+  exit 1
+fi
+after_strict_success_report_pulls="$(
+  grep -c -E 'exec-out run-as me\.rerere\.rikkahub\.debug cat no_backup/voice-e2e/(input-transcript|hermes-call|output-transcript)\.txt' \
+    "$FAKE_ADB_ARGS_LOG" || true
+)"
+if [[ "$after_strict_success_report_pulls" != "$before_strict_success_report_pulls" ]]; then
+  printf 'Expected strict success mode not to pull report artifacts.\n' >&2
+  printf 'ADB args:\n%s\n' "$(cat "$FAKE_ADB_ARGS_LOG")" >&2
+  exit 1
+fi
+
 set +e
 strict_output="$(
   PATH="$TMP_DIR:$PATH" \

@@ -19,6 +19,8 @@ DEFAULT_PROMPT_TEXT="Please ask Hermes if he is connected to G-Brain. Please ans
 PROMPT_TEXT="${VOICE_AGENT_E2E_PROMPT_TEXT:-$DEFAULT_PROMPT_TEXT}"
 GENERATED_PCM_PATH="${VOICE_AGENT_E2E_GENERATED_PCM_PATH:-$LOG_DIR/generated-prompt.pcm}"
 MANUAL_REVIEW_ANSWER_FILE="${VOICE_AGENT_E2E_MANUAL_REVIEW_ANSWER_PATH:-$LOG_DIR/manual-hermes-answer.txt}"
+REPORT_FILE="${VOICE_AGENT_E2E_REPORT_PATH:-$LOG_DIR/report.txt}"
+PROMPT_SOURCE_TEXT_FILE="$LOG_DIR/generated-prompt.txt"
 LOG_SEARCH_START_LINE=1
 ADB_TIMEOUT_SECONDS="${VOICE_AGENT_E2E_ADB_TIMEOUT_SECONDS:-20}"
 ADB_LONG_TIMEOUT_SECONDS="${VOICE_AGENT_E2E_ADB_LONG_TIMEOUT_SECONDS:-120}"
@@ -30,6 +32,8 @@ DEVICE_TMP_PCM_CLEANUP_NEEDED=0
 APP_PCM_CLEANUP_NEEDED=0
 FFMPEG_PROMPT_TEXT_CLEANUP_PATH=""
 ADB_APP_CLEANUP_ENABLED=0
+REPORT_TEMP_CLEANUP_PATHS=()
+GENERATED_PCM_FROM_PROMPT=0
 COMMON_FORBIDDEN_PATTERN='Voice Lab request failed 403|Cloudflare|cf-error|Access denied|FATAL EXCEPTION|Voice playback write failed|AudioTrack write failed|AudioTrack write error'
 MANUAL_REVIEW=0
 
@@ -170,11 +174,98 @@ extract_manual_review_answer() {
   return 1
 }
 
+register_report_temp_file() {
+  REPORT_TEMP_CLEANUP_PATHS+=("$1")
+}
+
+pull_optional_app_artifact() {
+  local app_path="$1"
+  local local_path="$2"
+  umask 077
+  mkdir -p "$(dirname "$local_path")"
+  local temp_path
+  temp_path="$(mktemp "$LOG_DIR/report-artifact.XXXXXX")"
+  register_report_temp_file "$temp_path"
+  chmod 600 "$temp_path"
+  if adb_exec_out_to_file "$temp_path" run-as "$PACKAGE" cat "$app_path" &&
+    [[ -s "$temp_path" ]]; then
+    mv -f "$temp_path" "$local_path"
+    chmod 600 "$local_path"
+    return 0
+  fi
+  rm -f "$temp_path"
+  temp_path="$(mktemp "$LOG_DIR/report-artifact.XXXXXX")"
+  register_report_temp_file "$temp_path"
+  chmod 600 "$temp_path"
+  printf 'missing' > "$temp_path"
+  mv -f "$temp_path" "$local_path"
+  chmod 600 "$local_path"
+}
+
+extract_hermes_elapsed_detail() {
+  grep -E 'VoiceAgentE2E.*hermes_tool_response_hash .*actualHash=' "$LOG_FILE" |
+    tail -n 1 |
+    sed -E 's/^.*hermes_tool_response_hash //'
+}
+
+write_e2e_report() {
+  umask 077
+  mkdir -p "$LOG_DIR" "$(dirname "$REPORT_FILE")"
+  local source_text_file="$PROMPT_SOURCE_TEXT_FILE"
+  local input_transcript_file
+  local hermes_call_file
+  local output_transcript_file
+  local report_temp_file
+  input_transcript_file="$(mktemp "$LOG_DIR/report-input-transcript.XXXXXX")"
+  hermes_call_file="$(mktemp "$LOG_DIR/report-hermes-call.XXXXXX")"
+  output_transcript_file="$(mktemp "$LOG_DIR/report-output-transcript.XXXXXX")"
+  report_temp_file="$(mktemp "$LOG_DIR/report.XXXXXX")"
+  register_report_temp_file "$input_transcript_file"
+  register_report_temp_file "$hermes_call_file"
+  register_report_temp_file "$output_transcript_file"
+  register_report_temp_file "$report_temp_file"
+  chmod 600 "$input_transcript_file" "$hermes_call_file" "$output_transcript_file" "$report_temp_file"
+
+  if [[ ! -s "$source_text_file" ]]; then
+    local source_temp_file
+    source_temp_file="$(mktemp "$LOG_DIR/report-source-text.XXXXXX")"
+    register_report_temp_file "$source_temp_file"
+    chmod 600 "$source_temp_file"
+    printf 'missing' > "$source_temp_file"
+    mv -f "$source_temp_file" "$source_text_file"
+    chmod 600 "$source_text_file"
+  fi
+  pull_optional_app_artifact "$APP_INPUT_TRANSCRIPT_PATH" "$input_transcript_file"
+  pull_optional_app_artifact "$APP_HERMES_CALL_PATH" "$hermes_call_file"
+  pull_optional_app_artifact "$APP_OUTPUT_TRANSCRIPT_PATH" "$output_transcript_file"
+
+  {
+    printf 'Text used to generate voice:\n'
+    cat "$source_text_file"
+    printf '\n\nGemini understood from voice:\n'
+    cat "$input_transcript_file"
+    printf '\n\nHermes call:\n'
+    cat "$hermes_call_file"
+    printf '\n\nHermes elapsed time:\n'
+    extract_hermes_elapsed_detail || printf 'missing'
+    printf '\n\nHermes answer:\n'
+    cat "$MANUAL_REVIEW_ANSWER_FILE"
+    printf '\n\nGemini response to user:\n'
+    cat "$output_transcript_file"
+    printf '\n'
+  } > "$report_temp_file"
+  mv -f "$report_temp_file" "$REPORT_FILE"
+  chmod 600 "$REPORT_FILE"
+  rm -f "$input_transcript_file" "$hermes_call_file" "$output_transcript_file"
+  rm -f "$LOG_DIR/input-transcript.txt" "$LOG_DIR/hermes-call.txt" "$LOG_DIR/output-transcript.txt"
+  printf 'Voice Agent E2E report: %s\n' "$REPORT_FILE"
+}
+
 generate_pcm_prompt() {
   require_command ffmpeg
   umask 077
   mkdir -p "$LOG_DIR" "$(dirname "$GENERATED_PCM_PATH")"
-  local prompt_text_file="$LOG_DIR/generated-prompt.txt"
+  local prompt_text_file="$PROMPT_SOURCE_TEXT_FILE"
   local ffmpeg_prompt_text_file
   ffmpeg_prompt_text_file="$(mktemp /tmp/rikkahub-voice-agent-e2e-prompt.XXXXXX)"
   FFMPEG_PROMPT_TEXT_CLEANUP_PATH="$ffmpeg_prompt_text_file"
@@ -199,6 +290,7 @@ generate_pcm_prompt() {
     return "$ffmpeg_status"
   fi
   chmod 600 "$GENERATED_PCM_PATH"
+  GENERATED_PCM_FROM_PROMPT=1
 }
 
 clear_app_text_artifacts() {
@@ -213,6 +305,9 @@ clear_app_text_artifacts() {
 
 cleanup() {
   local status=$?
+  for temp_path in "${REPORT_TEMP_CLEANUP_PATHS[@]}"; do
+    rm -f "$temp_path"
+  done
   if [[ "$DEVICE_TMP_PCM_CLEANUP_NEEDED" == "1" ]]; then
     adb_cmd shell rm -f "$DEVICE_TMP_PCM" >/dev/null 2>&1 || true
   fi
@@ -266,6 +361,14 @@ fi
 mkdir -p "$LOG_DIR"
 rm -f "$LOG_FILE"
 rm -f "$MANUAL_REVIEW_ANSWER_FILE"
+if [[ -n "${VOICE_AGENT_E2E_PCM_PATH:-}" && "$GENERATED_PCM_FROM_PROMPT" == "0" ]]; then
+  if [[ -n "${VOICE_AGENT_E2E_PROMPT_TEXT:-}" ]]; then
+    printf '%s' "$PROMPT_TEXT" > "$PROMPT_SOURCE_TEXT_FILE"
+    chmod 600 "$PROMPT_SOURCE_TEXT_FILE"
+  else
+    rm -f "$PROMPT_SOURCE_TEXT_FILE"
+  fi
+fi
 
 printf 'Checking ADB device readiness...\n'
 if [[ -x "$ADB_READY_SCRIPT" ]]; then
@@ -361,6 +464,7 @@ fi
 
 if [[ "$MANUAL_REVIEW" == "1" ]]; then
   extract_manual_review_answer
+  write_e2e_report
   printf 'Voice Agent Hermes/Gbrain live E2E reached manual review gate. Safe log: %s\n' "$LOG_FILE"
 else
   printf 'Voice Agent Hermes/Gbrain live E2E passed. Safe log: %s\n' "$LOG_FILE"
