@@ -28,7 +28,10 @@ Set these values in your shell or source them from a local file outside the repo
 | Variable | Notes |
 | --- | --- |
 | `VOICE_AGENT_E2E_EXPECTED_HASH` | SHA-256 hex digest of the normalized expected Hermes answer. Required outside manual review mode. |
-| `VOICE_AGENT_E2E_PCM_PATH` | Absolute path to the private PCM prompt file. |
+| `VOICE_AGENT_E2E_PCM_PATH` | Optional absolute path to a private PCM prompt file. If unset, the script generates PCM from `VOICE_AGENT_E2E_PROMPT_TEXT`. |
+| `VOICE_AGENT_E2E_PROMPT_TEXT` | Optional text used to generate PCM when `VOICE_AGENT_E2E_PCM_PATH` is unset. Defaults to asking Hermes whether he is connected to G-Brain. |
+| `VOICE_AGENT_E2E_GENERATED_PCM_PATH` | Optional generated PCM output path. Defaults to `build/voice-agent-e2e/generated-prompt.pcm`. |
+| `VOICE_AGENT_E2E_REPORT_PATH` | Optional report output path. Defaults to `build/voice-agent-e2e/report.txt`. |
 | `VOICE_AGENT_E2E_CONVERSATION_ID` | Existing app conversation id used to start the Voice Agent service. |
 | `VOICE_AGENT_E2E_MANUAL_REVIEW` | Optional. Set to `1` to accept any Hermes response hash and write the raw Hermes answer to a private local artifact for manual review. |
 | `VOICE_AGENT_E2E_MANUAL_REVIEW_ANSWER_PATH` | Optional manual-review output path. Defaults to `build/voice-agent-e2e/manual-hermes-answer.txt`. |
@@ -78,16 +81,21 @@ data, shell history, or shared logs.
 
 ## Preparing The PCM Prompt
 
-`VOICE_AGENT_E2E_PCM_PATH` must point to signed 16-bit little-endian mono PCM at 16 kHz. Keep the PCM file outside the
-repository because it contains, or can reveal, the private local label.
+If `VOICE_AGENT_E2E_PCM_PATH` is unset, the script generates signed 16-bit little-endian mono PCM at 16 kHz from
+`VOICE_AGENT_E2E_PROMPT_TEXT` using local `ffmpeg` with `flite`.
 
-The spoken prompt shape is:
+The default generated prompt is:
 
 ```text
-Ask Hermes: retrieve the private Gbrain verification fact named <private local label>. Return the exact value only.
+Please ask Hermes if he is connected to G-Brain. Please answer with yes or no.
 ```
 
-Do not commit the PCM file or the real spoken prompt text.
+Set `VOICE_AGENT_E2E_PROMPT_TEXT` to change one string and regenerate the PCM for a different question.
+
+If `VOICE_AGENT_E2E_PCM_PATH` is set, it must point to signed 16-bit little-endian mono PCM at 16 kHz. Keep supplied PCM
+files outside the repository.
+
+Do not commit generated or supplied PCM files, generated prompt text, or the real spoken prompt text.
 
 ## Running
 
@@ -97,9 +105,10 @@ From the repository root:
 scripts/voice-agent-hermes-gbrain-e2e.sh
 ```
 
-Strict mode requires `VOICE_AGENT_E2E_EXPECTED_HASH`, `VOICE_AGENT_E2E_PCM_PATH`, and
-`VOICE_AGENT_E2E_CONVERSATION_ID`; manual review mode requires only the PCM path and conversation id. The script verifies
-the expected hash format in strict mode, verifies the PCM file exists, lowercases the expected hash for marker matching,
+Strict mode requires `VOICE_AGENT_E2E_EXPECTED_HASH` and `VOICE_AGENT_E2E_CONVERSATION_ID`; manual review mode requires
+the conversation id. If `VOICE_AGENT_E2E_PCM_PATH` is unset, the script also requires local `ffmpeg` with `flite` so it
+can generate PCM from `VOICE_AGENT_E2E_PROMPT_TEXT`. The script verifies the expected hash format in strict mode,
+verifies the PCM file exists after generation or explicit selection, lowercases the expected hash for marker matching,
 checks ADB readiness, checks that the target package is already installed, and writes a local scoped log to
 `build/voice-agent-e2e/logcat.txt`.
 
@@ -109,18 +118,19 @@ data into app storage while it is active.
 
 The current script behavior is:
 
-1. Checks ADB readiness for the selected device.
-2. Verifies the configured package is already installed.
-3. Clears logcat and starts scoped log capture.
-4. Copies the private PCM prompt to `/data/local/tmp/rikkahub-voice-agent-e2e-prompt.pcm`.
-5. Copies that temporary PCM into app-private files at `files/voice-e2e/prompt.pcm` with `run-as`.
-6. Removes the public temporary PCM after the app-private copy succeeds.
-7. Starts the Voice Agent foreground service for `VOICE_AGENT_E2E_CONVERSATION_ID`.
-8. Waits for Gemini setup, injects the app-private PCM prompt in chunks, then waits for the E2E markers.
-9. In strict mode, matches the app-emitted `actualHash` to `VOICE_AGENT_E2E_EXPECTED_HASH` in the shell.
-10. Checks forbidden markers during each wait and again at the end, so auth, crash, hash mismatch, and playback write
+1. Generates PCM from `VOICE_AGENT_E2E_PROMPT_TEXT` when `VOICE_AGENT_E2E_PCM_PATH` is unset.
+2. Checks ADB readiness for the selected device.
+3. Verifies the configured package is already installed.
+4. Clears logcat and starts scoped log capture.
+5. Copies the private PCM prompt to `/data/local/tmp/rikkahub-voice-agent-e2e-prompt.pcm`.
+6. Copies that temporary PCM into app-private files at `files/voice-e2e/prompt.pcm` with `run-as`.
+7. Removes the public temporary PCM after the app-private copy succeeds.
+8. Starts the Voice Agent foreground service for `VOICE_AGENT_E2E_CONVERSATION_ID`.
+9. Waits for Gemini setup, injects the app-private PCM prompt in chunks, then waits for the E2E markers.
+10. In strict mode, matches the app-emitted `actualHash` to `VOICE_AGENT_E2E_EXPECTED_HASH` in the shell.
+11. Checks forbidden markers during each wait and again at the end, so auth, crash, hash mismatch, and playback write
    failures fail fast.
-11. On exit, removes any remaining public temporary PCM, ends the foreground service, waits for the service end marker,
+12. On exit, removes any remaining public temporary PCM, ends the foreground service, waits for the service end marker,
     removes the app-private PCM, clears app-private text artifacts under `no_backup/voice-e2e/`, and then stops log
     capture. These trap cleanup actions are best-effort; the service end marker may appear in the scoped log.
 
@@ -151,6 +161,15 @@ run fails instead of pulling broader private app data.
 The local answer file is created with `0600` permissions and must stay local. The script prints the artifact path, not
 the raw answer. Read that file privately and decide whether the run passed. If the answer is correct, the live pipeline
 worked; if it is wrong, treat the run as failed even though the script reached the manual review gate.
+
+## E2E Report
+
+Manual review mode writes `build/voice-agent-e2e/report.txt` by default. The report includes the text used to generate
+voice, what Gemini understood from the injected voice, the raw Hermes tool call, Hermes timing/hash detail, Hermes's
+answer, and Gemini's text response to the user when output transcription is available.
+
+The script prints the report path but does not print report contents. Treat the report as local/private because it may
+contain raw prompts, transcripts, and Hermes answers.
 
 ## Pass Criteria
 
@@ -194,6 +213,12 @@ auth errors, crashes, playback write failures, or inability to extract the compl
 
 `build/voice-agent-e2e/manual-hermes-answer.txt` is created only in manual review mode. It contains the raw Hermes answer
 and must not be committed, pasted into shared logs, or distributed.
+
+`build/voice-agent-e2e/report.txt` is created only in manual review mode. It contains raw prompt, transcript, Hermes
+call, Hermes answer, and Gemini response text and must stay local/private.
+
+`build/voice-agent-e2e/generated-prompt.pcm` and `build/voice-agent-e2e/generated-prompt.txt` are created when the script
+generates PCM from text. They must not be committed, pasted into shared logs, or distributed.
 
 The E2E hash diagnostic log only includes call id, raw and normalized character counts, SHA-256 hash, and timing. It
 does not log the Hermes answer, but the hash can still reveal low-entropy answers through offline guessing.
