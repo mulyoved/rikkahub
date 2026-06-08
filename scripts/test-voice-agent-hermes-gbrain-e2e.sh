@@ -201,6 +201,8 @@ LOGS
     ;;
   "-s RZ shell am start-foreground-service -n me.rerere.rikkahub.debug/me.rerere.rikkahub.voiceagent.VoiceAgentCallService -a me.rerere.rikkahub.voiceagent.action.START --es conversationId conversation-1 --ez enableVoiceE2EArtifacts true")
     ;;
+  "-s RZ shell am start-foreground-service -n me.rerere.rikkahub.debug/me.rerere.rikkahub.voiceagent.VoiceAgentCallService -a me.rerere.rikkahub.voiceagent.action.START --es conversationId conversation-1")
+    ;;
   "-s RZ shell am start-foreground-service -n me.rerere.rikkahub.debug/me.rerere.rikkahub.voiceagent.VoiceAgentCallService -a me.rerere.rikkahub.voiceagent.action.END")
     ;;
   "-s RZ shell am broadcast "*)
@@ -599,6 +601,9 @@ assert_last_line_after "$FAKE_ADB_ARGS_LOG" \
 strict_log_dir="$TMP_DIR/strict-log"
 strict_success_log_dir="$TMP_DIR/strict-success-log"
 strict_success_report_path="$strict_success_log_dir/report.txt"
+before_strict_success_e2e_artifact_enables="$(
+  grep -c -F -- "--ez enableVoiceE2EArtifacts true" "$FAKE_ADB_ARGS_LOG" || true
+)"
 before_strict_success_report_pulls="$(
   grep -c -E 'exec-out run-as me\.rerere\.rikkahub\.debug cat no_backup/voice-e2e/(input-transcript|hermes-call|output-transcript)\.txt' \
     "$FAKE_ADB_ARGS_LOG" || true
@@ -638,7 +643,18 @@ if [[ "$after_strict_success_report_pulls" != "$before_strict_success_report_pul
   printf 'ADB args:\n%s\n' "$(cat "$FAKE_ADB_ARGS_LOG")" >&2
   exit 1
 fi
+after_strict_success_e2e_artifact_enables="$(
+  grep -c -F -- "--ez enableVoiceE2EArtifacts true" "$FAKE_ADB_ARGS_LOG" || true
+)"
+if [[ "$after_strict_success_e2e_artifact_enables" != "$before_strict_success_e2e_artifact_enables" ]]; then
+  printf 'Expected strict success mode not to enable raw E2E artifacts.\n' >&2
+  printf 'ADB args:\n%s\n' "$(cat "$FAKE_ADB_ARGS_LOG")" >&2
+  exit 1
+fi
 
+before_strict_failure_e2e_artifact_enables="$(
+  grep -c -F -- "--ez enableVoiceE2EArtifacts true" "$FAKE_ADB_ARGS_LOG" || true
+)"
 set +e
 strict_output="$(
   PATH="$TMP_DIR:$PATH" \
@@ -661,5 +677,13 @@ if [[ "$strict_status" -eq 0 ]]; then
   exit 1
 fi
 assert_contains "$strict_output" "Missing marker after 5s: Hermes response hash matched"
+after_strict_failure_e2e_artifact_enables="$(
+  grep -c -F -- "--ez enableVoiceE2EArtifacts true" "$FAKE_ADB_ARGS_LOG" || true
+)"
+if [[ "$after_strict_failure_e2e_artifact_enables" != "$before_strict_failure_e2e_artifact_enables" ]]; then
+  printf 'Expected strict failure mode not to enable raw E2E artifacts.\n' >&2
+  printf 'ADB args:\n%s\n' "$(cat "$FAKE_ADB_ARGS_LOG")" >&2
+  exit 1
+fi
 
 printf 'voice-agent-hermes-gbrain-e2e tests passed.\n'

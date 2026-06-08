@@ -8,6 +8,11 @@
 
 **Tech Stack:** Kotlin/JUnit for app-side behavior, Bash shell tests with fake `adb`, Android `run-as`, `ffmpeg` with `flite` for PCM generation, `jq`/`sqlite3` only for legacy fallback extraction.
 
+**Implementation note:** This document is the historical execution plan. The final implementation intentionally stores
+raw app E2E artifacts only under `no_backup/voice-e2e/`, keeps source prompt text as a local runner artifact
+(`generated-prompt.txt`), and enables raw artifact capture only in manual-review mode. Use
+`docs/voice-agent-hermes-gbrain-live-e2e.md` for the current operator runbook.
+
 ---
 
 ## File Structure
