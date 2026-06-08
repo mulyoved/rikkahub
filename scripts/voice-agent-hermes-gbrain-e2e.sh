@@ -15,6 +15,9 @@ APP_HERMES_CALL_PATH="no_backup/voice-e2e/hermes-call.txt"
 DEVICE_TMP_PCM="/data/local/tmp/rikkahub-voice-agent-e2e-prompt.pcm"
 LOG_DIR="${VOICE_AGENT_E2E_LOG_DIR:-build/voice-agent-e2e}"
 LOG_FILE="$LOG_DIR/logcat.txt"
+DEFAULT_PROMPT_TEXT="Please ask Hermes if he is connected to G-Brain. Please answer with yes or no."
+PROMPT_TEXT="${VOICE_AGENT_E2E_PROMPT_TEXT:-$DEFAULT_PROMPT_TEXT}"
+GENERATED_PCM_PATH="${VOICE_AGENT_E2E_GENERATED_PCM_PATH:-$LOG_DIR/generated-prompt.pcm}"
 MANUAL_REVIEW_ANSWER_FILE="${VOICE_AGENT_E2E_MANUAL_REVIEW_ANSWER_PATH:-$LOG_DIR/manual-hermes-answer.txt}"
 LOG_SEARCH_START_LINE=1
 ADB_TIMEOUT_SECONDS="${VOICE_AGENT_E2E_ADB_TIMEOUT_SECONDS:-20}"
@@ -25,6 +28,8 @@ HERMES_RESPONSE_TIMEOUT_SECONDS="${VOICE_AGENT_E2E_HERMES_RESPONSE_TIMEOUT_SECON
 CALL_STARTED=0
 DEVICE_TMP_PCM_CLEANUP_NEEDED=0
 APP_PCM_CLEANUP_NEEDED=0
+FFMPEG_PROMPT_TEXT_CLEANUP_PATH=""
+ADB_APP_CLEANUP_ENABLED=0
 COMMON_FORBIDDEN_PATTERN='Voice Lab request failed 403|Cloudflare|cf-error|Access denied|FATAL EXCEPTION|Voice playback write failed|AudioTrack write failed|AudioTrack write error'
 MANUAL_REVIEW=0
 
@@ -165,6 +170,37 @@ extract_manual_review_answer() {
   return 1
 }
 
+generate_pcm_prompt() {
+  require_command ffmpeg
+  umask 077
+  mkdir -p "$LOG_DIR" "$(dirname "$GENERATED_PCM_PATH")"
+  local prompt_text_file="$LOG_DIR/generated-prompt.txt"
+  local ffmpeg_prompt_text_file
+  ffmpeg_prompt_text_file="$(mktemp /tmp/rikkahub-voice-agent-e2e-prompt.XXXXXX)"
+  FFMPEG_PROMPT_TEXT_CLEANUP_PATH="$ffmpeg_prompt_text_file"
+  printf '%s' "$PROMPT_TEXT" > "$prompt_text_file"
+  printf '%s' "$PROMPT_TEXT" > "$ffmpeg_prompt_text_file"
+  chmod 600 "$prompt_text_file"
+  chmod 600 "$ffmpeg_prompt_text_file"
+  printf 'Generating PCM prompt from VOICE_AGENT_E2E_PROMPT_TEXT.\n'
+  set +e
+  ffmpeg -hide_banner \
+    -f lavfi \
+    -i "flite=textfile=$ffmpeg_prompt_text_file:voice=kal" \
+    -ar 16000 \
+    -ac 1 \
+    -f s16le \
+    -y "$GENERATED_PCM_PATH" >/dev/null
+  local ffmpeg_status=$?
+  set -e
+  rm -f "$ffmpeg_prompt_text_file"
+  FFMPEG_PROMPT_TEXT_CLEANUP_PATH=""
+  if [[ "$ffmpeg_status" -ne 0 ]]; then
+    return "$ffmpeg_status"
+  fi
+  chmod 600 "$GENERATED_PCM_PATH"
+}
+
 clear_app_text_artifacts() {
   for app_path in \
     "$APP_MANUAL_ANSWER_PATH" \
@@ -180,6 +216,10 @@ cleanup() {
   if [[ "$DEVICE_TMP_PCM_CLEANUP_NEEDED" == "1" ]]; then
     adb_cmd shell rm -f "$DEVICE_TMP_PCM" >/dev/null 2>&1 || true
   fi
+  if [[ -n "$FFMPEG_PROMPT_TEXT_CLEANUP_PATH" ]]; then
+    rm -f "$FFMPEG_PROMPT_TEXT_CLEANUP_PATH"
+    FFMPEG_PROMPT_TEXT_CLEANUP_PATH=""
+  fi
   if [[ "$CALL_STARTED" == "1" ]]; then
     adb_cmd shell am start-foreground-service \
       -n "$SERVICE_COMPONENT" \
@@ -191,7 +231,9 @@ cleanup() {
   if [[ "$APP_PCM_CLEANUP_NEEDED" == "1" ]]; then
     adb_cmd shell "run-as $PACKAGE rm -f files/$APP_PCM_PATH" >/dev/null 2>&1 || true
   fi
-  clear_app_text_artifacts
+  if [[ "$ADB_APP_CLEANUP_ENABLED" == "1" ]]; then
+    clear_app_text_artifacts
+  fi
   if [[ -n "${LOGCAT_PID:-}" ]]; then
     kill "$LOGCAT_PID" >/dev/null 2>&1 || true
     wait "$LOGCAT_PID" >/dev/null 2>&1 || true
@@ -200,8 +242,12 @@ cleanup() {
 }
 trap cleanup EXIT
 
-require_env VOICE_AGENT_E2E_PCM_PATH
 require_env VOICE_AGENT_E2E_CONVERSATION_ID
+
+if [[ -z "${VOICE_AGENT_E2E_PCM_PATH:-}" ]]; then
+  generate_pcm_prompt
+  VOICE_AGENT_E2E_PCM_PATH="$GENERATED_PCM_PATH"
+fi
 
 if [[ "$MANUAL_REVIEW" == "0" ]]; then
   require_env VOICE_AGENT_E2E_EXPECTED_HASH
@@ -220,7 +266,6 @@ fi
 mkdir -p "$LOG_DIR"
 rm -f "$LOG_FILE"
 rm -f "$MANUAL_REVIEW_ANSWER_FILE"
-clear_app_text_artifacts
 
 printf 'Checking ADB device readiness...\n'
 if [[ -x "$ADB_READY_SCRIPT" ]]; then
@@ -233,6 +278,8 @@ else
   printf 'ADB readiness helper is not executable: %s\n' "$ADB_READY_SCRIPT" >&2
   exit 2
 fi
+ADB_APP_CLEANUP_ENABLED=1
+clear_app_text_artifacts
 
 printf 'Checking installed app package...\n'
 if ! adb_cmd shell pm path "$PACKAGE" >/dev/null; then

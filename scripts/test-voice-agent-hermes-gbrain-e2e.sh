@@ -71,6 +71,61 @@ set -euo pipefail
 printf 'ADB ready: serial=%s state=device boot_completed=1 bootanim=stopped model=SM-S711B android=16\n' "${1:-RZ}"
 FAKE_READY
   chmod +x "$TMP_DIR/adb-ready.sh"
+
+  cat > "$TMP_DIR/adb-not-ready.sh" <<'FAKE_NOT_READY'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'ADB not ready\n' >&2
+exit 91
+FAKE_NOT_READY
+  chmod +x "$TMP_DIR/adb-not-ready.sh"
+}
+
+write_fake_ffmpeg() {
+  cat > "$TMP_DIR/ffmpeg" <<'FAKE_FFMPEG'
+#!/usr/bin/env bash
+set -euo pipefail
+
+output="${@: -1}"
+input=""
+if [[ "$#" -ne 13 || "$1" != "-hide_banner" || "$2" != "-f" || "$3" != "lavfi" ||
+  "$4" != "-i" || "$6" != "-ar" || "$7" != "16000" || "$8" != "-ac" ||
+  "$9" != "1" || "${10}" != "-f" || "${11}" != "s16le" || "${12}" != "-y" ||
+  "${13}" != "$output" ]]; then
+  printf 'unexpected ffmpeg argv order: %s\n' "$*" >&2
+  exit 99
+fi
+input="$5"
+if [[ "$input" != flite=textfile=*":voice=kal" ]]; then
+  printf 'unexpected ffmpeg flite input: %s\n' "$input" >&2
+  exit 98
+fi
+if [[ -n "${FAKE_FFMPEG_EXPECTED_OUTPUT:-}" && "$output" != "$FAKE_FFMPEG_EXPECTED_OUTPUT" ]]; then
+  printf 'unexpected ffmpeg output path: %s\n' "$output" >&2
+  exit 94
+fi
+textfile="${input#flite=textfile=}"
+textfile="${textfile%:voice=kal}"
+if [[ "${FAKE_FFMPEG_REJECT_FILTER_META_PATH:-0}" == "1" && "$textfile" == *[:\']* ]]; then
+  printf 'ffmpeg textfile path contains unescaped filter metacharacters: %s\n' "$textfile" >&2
+  exit 93
+fi
+if [[ ! -f "$textfile" ]]; then
+  printf 'ffmpeg textfile does not exist: %s\n' "$textfile" >&2
+  exit 97
+fi
+if [[ "$(cat "$textfile")" != "${FAKE_FFMPEG_EXPECTED_PROMPT:-}" ]]; then
+  printf 'unexpected ffmpeg prompt text: %s\n' "$(cat "$textfile")" >&2
+  exit 96
+fi
+printf '%s\n' "$textfile" > "${FAKE_FFMPEG_TEXTFILE_LOG:?}"
+if [[ "${FAKE_FFMPEG_FAIL:-0}" == "1" ]]; then
+  exit 95
+fi
+printf 'generated pcm' > "$output"
+printf 'fake ffmpeg generated %s\n' "$output" >&2
+FAKE_FFMPEG
+  chmod +x "$TMP_DIR/ffmpeg"
 }
 
 write_fake_adb() {
@@ -149,10 +204,13 @@ FAKE_ADB
 }
 
 write_fake_readiness_script
+write_fake_ffmpeg
 write_fake_adb
 printf 'pcm' > "$TMP_DIR/prompt.pcm"
 FAKE_ADB_ARGS_LOG="$TMP_DIR/adb-args.log"
+FAKE_FFMPEG_TEXTFILE_LOG="$TMP_DIR/ffmpeg-textfile.log"
 export FAKE_ADB_ARGS_LOG
+export FAKE_FFMPEG_TEXTFILE_LOG
 
 expected_hash="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 manual_log_dir="$TMP_DIR/manual-log"
@@ -225,6 +283,128 @@ if [[ "$manual_no_hash_status" -ne 0 ]]; then
   exit 1
 fi
 assert_contains "$manual_no_hash_output" "Voice Agent Hermes/Gbrain live E2E reached manual review gate."
+
+readiness_failure_log_dir="$TMP_DIR/readiness-failure-log"
+before_readiness_failure_adb_lines="$(wc -l < "$FAKE_ADB_ARGS_LOG")"
+set +e
+readiness_failure_output="$(
+  PATH="$TMP_DIR:$PATH" \
+  VOICE_AGENT_E2E_SERIAL=RZ \
+  VOICE_AGENT_E2E_ADB_READY_SCRIPT="$TMP_DIR/adb-not-ready.sh" \
+  VOICE_AGENT_E2E_PCM_PATH="$TMP_DIR/prompt.pcm" \
+  VOICE_AGENT_E2E_CONVERSATION_ID=conversation-1 \
+  VOICE_AGENT_E2E_LOG_DIR="$readiness_failure_log_dir" \
+  VOICE_AGENT_E2E_MANUAL_REVIEW=1 \
+  "$SCRIPT" 2>&1
+)"
+readiness_failure_status=$?
+set -e
+
+if [[ "$readiness_failure_status" -eq 0 ]]; then
+  printf 'Expected readiness failure run to fail.\n' >&2
+  printf 'Actual output:\n%s\n' "$readiness_failure_output" >&2
+  exit 1
+fi
+after_readiness_failure_adb_lines="$(wc -l < "$FAKE_ADB_ARGS_LOG")"
+if [[ "$after_readiness_failure_adb_lines" != "$before_readiness_failure_adb_lines" ]]; then
+  printf 'Expected readiness failure to skip ADB cleanup before readiness.\n' >&2
+  printf 'ADB args:\n%s\n' "$(cat "$FAKE_ADB_ARGS_LOG")" >&2
+  exit 1
+fi
+
+generated_log_dir="$TMP_DIR/generated-log"
+set +e
+generated_output="$(
+  PATH="$TMP_DIR:$PATH" \
+  FAKE_FFMPEG_EXPECTED_PROMPT="Please ask Hermes if he is connected to G-Brain. Please answer with yes or no." \
+  FAKE_FFMPEG_EXPECTED_OUTPUT="$generated_log_dir/generated-prompt.pcm" \
+  VOICE_AGENT_E2E_SERIAL=RZ \
+  VOICE_AGENT_E2E_ADB_READY_SCRIPT="$TMP_DIR/adb-ready.sh" \
+  VOICE_AGENT_E2E_EXPECTED_HASH="$expected_hash" \
+  VOICE_AGENT_E2E_CONVERSATION_ID=conversation-1 \
+  VOICE_AGENT_E2E_LOG_DIR="$generated_log_dir" \
+  VOICE_AGENT_E2E_MANUAL_REVIEW=1 \
+  VOICE_AGENT_E2E_GEMINI_TOOL_CALL_TIMEOUT_SECONDS=5 \
+  VOICE_AGENT_E2E_HERMES_RESPONSE_TIMEOUT_SECONDS=5 \
+  "$SCRIPT" 2>&1
+)"
+generated_status=$?
+set -e
+
+if [[ "$generated_status" -ne 0 ]]; then
+  printf 'Expected generated PCM mode to pass, got status %s.\n' "$generated_status" >&2
+  printf 'Actual output:\n%s\n' "$generated_output" >&2
+  exit 1
+fi
+assert_contains "$generated_output" "Generating PCM prompt from VOICE_AGENT_E2E_PROMPT_TEXT."
+assert_contains "$generated_output" "Voice Agent Hermes/Gbrain live E2E reached manual review gate."
+assert_file_contains_exactly "$generated_log_dir/generated-prompt.pcm" "generated pcm"
+assert_file_contains_exactly "$generated_log_dir/generated-prompt.txt" \
+  "Please ask Hermes if he is connected to G-Brain. Please answer with yes or no."
+
+apostrophe_log_dir="$TMP_DIR/log-with-apostrophe's"
+set +e
+apostrophe_output="$(
+  PATH="$TMP_DIR:$PATH" \
+  FAKE_FFMPEG_EXPECTED_PROMPT="Prompt with apostrophe log dir." \
+  FAKE_FFMPEG_EXPECTED_OUTPUT="$apostrophe_log_dir/generated-prompt.pcm" \
+  FAKE_FFMPEG_REJECT_FILTER_META_PATH=1 \
+  TMPDIR="$TMP_DIR/tmp:with'apostrophe" \
+  VOICE_AGENT_E2E_SERIAL=RZ \
+  VOICE_AGENT_E2E_ADB_READY_SCRIPT="$TMP_DIR/adb-ready.sh" \
+  VOICE_AGENT_E2E_PROMPT_TEXT="Prompt with apostrophe log dir." \
+  VOICE_AGENT_E2E_CONVERSATION_ID=conversation-1 \
+  VOICE_AGENT_E2E_LOG_DIR="$apostrophe_log_dir" \
+  VOICE_AGENT_E2E_MANUAL_REVIEW=1 \
+  VOICE_AGENT_E2E_GEMINI_TOOL_CALL_TIMEOUT_SECONDS=5 \
+  VOICE_AGENT_E2E_HERMES_RESPONSE_TIMEOUT_SECONDS=5 \
+  "$SCRIPT" 2>&1
+)"
+apostrophe_status=$?
+set -e
+
+if [[ "$apostrophe_status" -ne 0 ]]; then
+  printf 'Expected generated PCM mode with apostrophe log dir to pass, got status %s.\n' "$apostrophe_status" >&2
+  printf 'Actual output:\n%s\n' "$apostrophe_output" >&2
+  exit 1
+fi
+assert_file_contains_exactly "$apostrophe_log_dir/generated-prompt.pcm" "generated pcm"
+
+failing_ffmpeg_log_dir="$TMP_DIR/failing-ffmpeg-log"
+before_failing_ffmpeg_adb_lines="$(wc -l < "$FAKE_ADB_ARGS_LOG")"
+set +e
+failing_ffmpeg_output="$(
+  PATH="$TMP_DIR:$PATH" \
+  FAKE_FFMPEG_EXPECTED_PROMPT="Prompt that fails ffmpeg." \
+  FAKE_FFMPEG_EXPECTED_OUTPUT="$failing_ffmpeg_log_dir/generated-prompt.pcm" \
+  FAKE_FFMPEG_FAIL=1 \
+  VOICE_AGENT_E2E_SERIAL=RZ \
+  VOICE_AGENT_E2E_ADB_READY_SCRIPT="$TMP_DIR/adb-ready.sh" \
+  VOICE_AGENT_E2E_PROMPT_TEXT="Prompt that fails ffmpeg." \
+  VOICE_AGENT_E2E_CONVERSATION_ID=conversation-1 \
+  VOICE_AGENT_E2E_LOG_DIR="$failing_ffmpeg_log_dir" \
+  VOICE_AGENT_E2E_MANUAL_REVIEW=1 \
+  "$SCRIPT" 2>&1
+)"
+failing_ffmpeg_status=$?
+set -e
+
+if [[ "$failing_ffmpeg_status" -eq 0 ]]; then
+  printf 'Expected failing ffmpeg run to fail.\n' >&2
+  printf 'Actual output:\n%s\n' "$failing_ffmpeg_output" >&2
+  exit 1
+fi
+ffmpeg_temp_textfile="$(tail -n 1 "$FAKE_FFMPEG_TEXTFILE_LOG")"
+if [[ -e "$ffmpeg_temp_textfile" ]]; then
+  printf 'Expected ffmpeg temp prompt file to be removed: %s\n' "$ffmpeg_temp_textfile" >&2
+  exit 1
+fi
+after_failing_ffmpeg_adb_lines="$(wc -l < "$FAKE_ADB_ARGS_LOG")"
+if [[ "$after_failing_ffmpeg_adb_lines" != "$before_failing_ffmpeg_adb_lines" ]]; then
+  printf 'Expected ffmpeg failure to skip ADB cleanup before readiness.\n' >&2
+  printf 'ADB args:\n%s\n' "$(cat "$FAKE_ADB_ARGS_LOG")" >&2
+  exit 1
+fi
 
 manual_missing_answer_log_dir="$TMP_DIR/manual-missing-answer-log"
 set +e
