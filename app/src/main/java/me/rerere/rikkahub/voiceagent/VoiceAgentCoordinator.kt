@@ -21,15 +21,10 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import me.rerere.rikkahub.BuildConfig
-import me.rerere.rikkahub.data.datastore.SettingsStore
-import me.rerere.rikkahub.data.datastore.getAssistantById
 import me.rerere.rikkahub.data.model.Conversation
-import me.rerere.rikkahub.service.ChatService
 import me.rerere.rikkahub.voiceagent.audio.VoiceAudioEngine
 import me.rerere.rikkahub.voiceagent.gemini.GeminiLiveEvent
 import me.rerere.rikkahub.voiceagent.gemini.GeminiLiveVoiceClient
-import me.rerere.rikkahub.voiceagent.persistence.VoiceContext
-import me.rerere.rikkahub.voiceagent.persistence.VoiceContextBuilder
 import me.rerere.rikkahub.voiceagent.persistence.VoiceConversationPersister
 import me.rerere.rikkahub.voiceagent.persistence.VoiceToolRecordStatus
 import me.rerere.rikkahub.voiceagent.persistence.VoiceTranscriptStatus
@@ -37,89 +32,9 @@ import me.rerere.rikkahub.voiceagent.telemetry.HermesToolResponseHash
 import me.rerere.rikkahub.voiceagent.telemetry.VoiceDiagnosticEvent
 import me.rerere.rikkahub.voiceagent.telemetry.VoiceDiagnostics
 import me.rerere.rikkahub.voiceagent.voicelab.MobileHermesResponse
-import me.rerere.rikkahub.voiceagent.voicelab.MobileVoiceSessionResponse
-import me.rerere.rikkahub.voiceagent.voicelab.VoiceLabMobileApi
-import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.EmptyCoroutineContext
 import kotlin.time.Clock
 import kotlin.uuid.Uuid
-
-interface VoiceSessionApi {
-    suspend fun createSession(modelId: String): MobileVoiceSessionResponse
-}
-
-class VoiceLabVoiceSessionApi(
-    private val api: VoiceLabMobileApi,
-) : VoiceSessionApi {
-    override suspend fun createSession(modelId: String): MobileVoiceSessionResponse =
-        api.createSession(modelId = modelId)
-}
-
-interface VoiceToolApi {
-    suspend fun askHermes(callId: String, prompt: String): MobileHermesResponse
-}
-
-class VoiceLabHermesToolApi(
-    private val api: VoiceLabMobileApi,
-    private val profileId: String? = null,
-) : VoiceToolApi {
-    override suspend fun askHermes(callId: String, prompt: String): MobileHermesResponse =
-        api.askHermes(callId = callId, prompt = prompt, profileId = profileId)
-}
-
-interface VoiceConversationStore {
-    val conversation: StateFlow<Conversation>
-    suspend fun update(transform: (Conversation) -> Conversation)
-    fun close() = Unit
-}
-
-class ChatServiceVoiceConversationStore(
-    private val conversationId: Uuid,
-    private val chatService: ChatService,
-) : VoiceConversationStore {
-    private val closed = AtomicBoolean(false)
-
-    init {
-        chatService.addConversationReference(conversationId)
-    }
-
-    override val conversation: StateFlow<Conversation> = chatService.getConversationFlow(conversationId)
-
-    override suspend fun update(transform: (Conversation) -> Conversation) {
-        val updatedConversation = transform(chatService.getConversationFlow(conversationId).value)
-        chatService.saveConversation(conversationId = conversationId, conversation = updatedConversation)
-    }
-
-    override fun close() {
-        if (closed.compareAndSet(false, true)) {
-            chatService.removeConversationReference(conversationId)
-        }
-    }
-}
-
-interface VoiceAgentContextProvider {
-    fun build(conversation: Conversation): VoiceContext
-}
-
-class SettingsVoiceAgentContextProvider(
-    private val settingsStore: SettingsStore,
-    private val voiceModelName: String = "Gemini Live",
-    private val contextBuilder: VoiceContextBuilder = VoiceContextBuilder(),
-) : VoiceAgentContextProvider {
-    override fun build(conversation: Conversation): VoiceContext {
-        val settings = settingsStore.settingsFlow.value
-        val assistant = settings.getAssistantById(conversation.assistantId)
-        return contextBuilder.build(
-            assistantName = assistant?.name?.takeIf { it.isNotBlank() } ?: "RikkaHub",
-            assistantPrompt = conversation.customSystemPrompt
-                ?: assistant?.systemPrompt
-                ?: "",
-            conversation = conversation,
-            voiceModelName = voiceModelName,
-            userNickname = settings.displaySetting.userNickname,
-        )
-    }
-}
 
 class VoiceAgentCoordinator(
     private val gemini: GeminiLiveVoiceClient,

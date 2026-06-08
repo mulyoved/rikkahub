@@ -1014,7 +1014,7 @@ class VoiceAgentRuntimeTest {
         withTimeout(500) {
             interruptJob.join()
         }
-        assertEquals(1, audio.suppressPlaybackCalls)
+        audio.awaitSuppressPlaybackCalls(1)
         assertEquals(VoiceAudioStatus.PlaybackSuppressed, coordinator.state.value.audio)
 
         blockedPlayback.release.countDown()
