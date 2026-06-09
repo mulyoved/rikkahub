@@ -1,7 +1,10 @@
 package me.rerere.rikkahub.voiceagent
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Test
+import kotlin.uuid.Uuid
 
 class VoiceAgentCallContractTest {
     @Test
@@ -19,14 +22,14 @@ class VoiceAgentCallContractTest {
     }
 
     @Test
-    fun `end foreground id uses active conversation id`() {
-        val activeConversationId = "11111111-1111-4111-8111-111111111111"
+    fun `end foreground promotion is used for active conversation`() {
+        val activeConversationId = Uuid.parse("11111111-1111-4111-8111-111111111111")
 
-        assertEquals(activeConversationId, voiceAgentEndForegroundConversationId(activeConversationId))
+        assertTrue(shouldStartForegroundForVoiceAgentEnd(activeConversationId))
     }
 
     @Test
-    fun `end foreground id uses stable placeholder when idle`() {
-        assertEquals("ending", voiceAgentEndForegroundConversationId(null))
+    fun `end foreground promotion is skipped when idle`() {
+        assertFalse(shouldStartForegroundForVoiceAgentEnd(null))
     }
 }

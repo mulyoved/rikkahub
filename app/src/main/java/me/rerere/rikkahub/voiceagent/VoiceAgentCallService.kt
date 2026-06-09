@@ -183,19 +183,29 @@ class VoiceAgentCallService : Service() {
     }
 
     private fun endCall() {
+        if (endJob?.isActive == true) {
+            return
+        }
         notificationJob?.cancel()
         notificationJob = null
         val endingConversationId = manager.activeConversationId.value
-        startForegroundFor(
-            conversationId = voiceAgentEndForegroundConversationId(endingConversationId?.toString()),
-            state = manager.state.value.copy(call = VoiceCallStatus.Ending),
-        )
-        if (endJob?.isActive == true) {
-            return
+        if (shouldStartForegroundForVoiceAgentEnd(endingConversationId)) {
+            startForegroundFor(
+                conversationId = endingConversationId.toString(),
+                state = manager.state.value.copy(call = VoiceCallStatus.Ending),
+            )
         }
         callGeneration += 1
         val endGeneration = callGeneration
         val session = manager.detachForEndAndDrain()
+        if (session == null && endingConversationId == null) {
+            telecomConversationId = null
+            telecomCallRegistry.disconnectActive()
+            VoiceAgentLog.d(TAG, "end completed conversationId=none")
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+            return
+        }
         endJob = serviceScope.launch {
             if (endGeneration != callGeneration) {
                 return@launch
@@ -293,8 +303,8 @@ internal fun voiceAgentServiceStartConfig(
     )
 )
 
-internal fun voiceAgentEndForegroundConversationId(activeConversationId: String?): String =
-    activeConversationId ?: "ending"
+internal fun shouldStartForegroundForVoiceAgentEnd(activeConversationId: Uuid?): Boolean =
+    activeConversationId != null
 
 internal fun Throwable.toVoiceAgentLogDetail(): String =
     "${javaClass.simpleName}: ${(message ?: "").redactForVoiceAgentLog()}"
