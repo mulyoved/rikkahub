@@ -168,6 +168,10 @@ case "$args" in
 06-08 12:00:00.000 D/VoiceAgentGemini(1): event kind=SetupComplete
 06-08 12:00:01.000 I/VoiceAudioDebugInjection(1): debug_audio_injection result delivered=true
 LOGS
+    if [[ "${FAKE_ADB_FORBIDDEN_AFTER_DEBUG:-0}" == "1" ]]; then
+      sleep "${FAKE_ADB_FORBIDDEN_AFTER_DEBUG_DELAY_SECONDS:-1}"
+      printf '06-08 12:00:01.500 E/VoiceAgentCallService(1): Voice Lab request failed 403\n'
+    fi
     if [[ "${FAKE_ADB_SKIP_TOOL_CALL:-0}" != "1" ]]; then
       printf '06-08 12:00:02.000 D/VoiceAgentGemini(1): receive kind=toolCall\n'
     fi
@@ -695,6 +699,38 @@ assert_contains "$missing_tool_call_output" "Is Hermes connected to G-Brain? Ans
 if grep -F -- "databases/rikka_hub" "$FAKE_ADB_ARGS_LOG" >/dev/null; then
   printf 'Expected no database fallback for missing tool-call diagnostics.\n' >&2
   printf 'Actual ADB log:\n%s\n' "$(cat "$FAKE_ADB_ARGS_LOG")" >&2
+  exit 1
+fi
+
+tool_wait_forbidden_log_dir="$TMP_DIR/tool-wait-forbidden-log"
+set +e
+tool_wait_forbidden_output="$(
+  PATH="$TMP_DIR:$PATH" \
+  FAKE_ADB_SKIP_TOOL_CALL=1 \
+  FAKE_ADB_FORBIDDEN_AFTER_DEBUG=1 \
+  VOICE_AGENT_E2E_SERIAL=RZ \
+  VOICE_AGENT_E2E_ADB_READY_SCRIPT="$TMP_DIR/adb-ready.sh" \
+  VOICE_AGENT_E2E_PCM_PATH="$TMP_DIR/prompt.pcm" \
+  VOICE_AGENT_E2E_CONVERSATION_ID=conversation-1 \
+  VOICE_AGENT_E2E_LOG_DIR="$tool_wait_forbidden_log_dir" \
+  VOICE_AGENT_E2E_MANUAL_REVIEW=1 \
+  VOICE_AGENT_E2E_GEMINI_TOOL_CALL_TIMEOUT_SECONDS=5 \
+  VOICE_AGENT_E2E_HERMES_RESPONSE_TIMEOUT_SECONDS=1 \
+  "$SCRIPT" 2>&1
+)"
+tool_wait_forbidden_status=$?
+set -e
+
+if [[ "$tool_wait_forbidden_status" -eq 0 ]]; then
+  printf 'Expected forbidden marker during tool-call wait to fail.\n' >&2
+  printf 'Actual output:\n%s\n' "$tool_wait_forbidden_output" >&2
+  exit 1
+fi
+assert_contains "$tool_wait_forbidden_output" "PASS marker: debug PCM delivered"
+assert_contains "$tool_wait_forbidden_output" "Forbidden marker found: common forbidden marker"
+if [[ "$tool_wait_forbidden_output" == *"Voice Agent E2E diagnostic artifacts after missing tool call"* ]]; then
+  printf 'Expected forbidden marker during tool-call wait not to print missing tool-call diagnostics.\n' >&2
+  printf 'Actual output:\n%s\n' "$tool_wait_forbidden_output" >&2
   exit 1
 fi
 
