@@ -113,8 +113,10 @@ if [[ "$#" -ne 13 || "$1" != "-hide_banner" || "$2" != "-f" || "$3" != "lavfi" |
   exit 99
 fi
 input="$5"
-if [[ "$input" != flite=textfile=*":voice=kal" ]]; then
+expected_voice="${FAKE_FFMPEG_EXPECTED_VOICE:-slt}"
+if [[ "$input" != flite=textfile=*":voice=$expected_voice" ]]; then
   printf 'unexpected ffmpeg flite input: %s\n' "$input" >&2
+  printf 'expected voice: %s\n' "$expected_voice" >&2
   exit 98
 fi
 if [[ -n "${FAKE_FFMPEG_EXPECTED_OUTPUT:-}" && "$output" != "$FAKE_FFMPEG_EXPECTED_OUTPUT" ]]; then
@@ -122,7 +124,7 @@ if [[ -n "${FAKE_FFMPEG_EXPECTED_OUTPUT:-}" && "$output" != "$FAKE_FFMPEG_EXPECT
   exit 94
 fi
 textfile="${input#flite=textfile=}"
-textfile="${textfile%:voice=kal}"
+textfile="${textfile%:voice=$expected_voice}"
 if [[ "${FAKE_FFMPEG_REJECT_FILTER_META_PATH:-0}" == "1" && "$textfile" == *[:\']* ]]; then
   printf 'ffmpeg textfile path contains unescaped filter metacharacters: %s\n' "$textfile" >&2
   exit 93
@@ -377,7 +379,8 @@ chmod 644 \
 set +e
 generated_output="$(
   PATH="$TMP_DIR:$PATH" \
-  FAKE_FFMPEG_EXPECTED_PROMPT="Please ask Hermes if he is connected to G-Brain. Please answer with yes or no." \
+  FAKE_FFMPEG_EXPECTED_PROMPT="Ask Hermes. Are you connected to G Brain? Answer yes or no." \
+  FAKE_FFMPEG_EXPECTED_VOICE=slt \
   FAKE_FFMPEG_EXPECTED_OUTPUT="$generated_log_dir/generated-prompt.pcm" \
   VOICE_AGENT_E2E_SERIAL=RZ \
   VOICE_AGENT_E2E_ADB_READY_SCRIPT="$TMP_DIR/adb-ready.sh" \
@@ -401,7 +404,7 @@ assert_contains "$generated_output" "Generating PCM prompt from VOICE_AGENT_E2E_
 assert_contains "$generated_output" "Voice Agent Hermes/Gbrain live E2E reached manual review gate."
 assert_file_contains_exactly "$generated_log_dir/generated-prompt.pcm" "generated pcm"
 assert_file_contains_exactly "$generated_log_dir/generated-prompt.txt" \
-  "Please ask Hermes if he is connected to G-Brain. Please answer with yes or no."
+  "Ask Hermes. Are you connected to G Brain? Answer yes or no."
 report_path="$generated_log_dir/report.txt"
 if [[ ! -f "$report_path" ]]; then
   printf 'Expected report file to exist: %s\n' "$report_path" >&2
@@ -409,7 +412,7 @@ if [[ ! -f "$report_path" ]]; then
 fi
 report_contents="$(cat "$report_path")"
 assert_contains "$report_contents" "Text used to generate voice:"
-assert_contains "$report_contents" "Please ask Hermes if he is connected to G-Brain. Please answer with yes or no."
+assert_contains "$report_contents" "Ask Hermes. Are you connected to G Brain? Answer yes or no."
 assert_contains "$report_contents" "Gemini understood from voice:"
 assert_contains "$report_contents" "Please ask Hermes if he is connected to G-Brain."
 assert_contains "$report_contents" "Hermes call:"
@@ -442,6 +445,34 @@ for extra_artifact in input-transcript.txt hermes-call.txt output-transcript.txt
     exit 1
   fi
 done
+
+override_voice_log_dir="$TMP_DIR/override-voice-log"
+set +e
+override_voice_output="$(
+  PATH="$TMP_DIR:$PATH" \
+  FAKE_FFMPEG_EXPECTED_PROMPT="Prompt with override voice." \
+  FAKE_FFMPEG_EXPECTED_VOICE=kal16 \
+  FAKE_FFMPEG_EXPECTED_OUTPUT="$override_voice_log_dir/generated-prompt.pcm" \
+  VOICE_AGENT_E2E_SERIAL=RZ \
+  VOICE_AGENT_E2E_ADB_READY_SCRIPT="$TMP_DIR/adb-ready.sh" \
+  VOICE_AGENT_E2E_PROMPT_TEXT="Prompt with override voice." \
+  VOICE_AGENT_E2E_FLITE_VOICE=kal16 \
+  VOICE_AGENT_E2E_CONVERSATION_ID=conversation-1 \
+  VOICE_AGENT_E2E_LOG_DIR="$override_voice_log_dir" \
+  VOICE_AGENT_E2E_MANUAL_REVIEW=1 \
+  VOICE_AGENT_E2E_GEMINI_TOOL_CALL_TIMEOUT_SECONDS=5 \
+  VOICE_AGENT_E2E_HERMES_RESPONSE_TIMEOUT_SECONDS=5 \
+  "$SCRIPT" 2>&1
+)"
+override_voice_status=$?
+set -e
+
+if [[ "$override_voice_status" -ne 0 ]]; then
+  printf 'Expected generated PCM mode with override voice to pass, got status %s.\n' "$override_voice_status" >&2
+  printf 'Actual output:\n%s\n' "$override_voice_output" >&2
+  exit 1
+fi
+assert_file_contains_exactly "$override_voice_log_dir/generated-prompt.pcm" "generated pcm"
 
 missing_report_log_dir="$TMP_DIR/missing-report-log"
 missing_report_path="$TMP_DIR/custom-report.txt"

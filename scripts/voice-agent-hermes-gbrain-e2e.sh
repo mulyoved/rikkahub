@@ -15,7 +15,8 @@ APP_HERMES_CALL_PATH="no_backup/voice-e2e/hermes-call.txt"
 DEVICE_TMP_PCM="/data/local/tmp/rikkahub-voice-agent-e2e-prompt.pcm"
 LOG_DIR="${VOICE_AGENT_E2E_LOG_DIR:-build/voice-agent-e2e}"
 LOG_FILE="$LOG_DIR/logcat.txt"
-DEFAULT_PROMPT_TEXT="Please ask Hermes if he is connected to G-Brain. Please answer with yes or no."
+DEFAULT_PROMPT_TEXT="Ask Hermes. Are you connected to G Brain? Answer yes or no."
+FLITE_VOICE="${VOICE_AGENT_E2E_FLITE_VOICE:-slt}"
 PROMPT_TEXT="${VOICE_AGENT_E2E_PROMPT_TEXT:-$DEFAULT_PROMPT_TEXT}"
 GENERATED_PCM_PATH="${VOICE_AGENT_E2E_GENERATED_PCM_PATH:-$LOG_DIR/generated-prompt.pcm}"
 MANUAL_REVIEW_ANSWER_FILE="${VOICE_AGENT_E2E_MANUAL_REVIEW_ANSWER_PATH:-$LOG_DIR/manual-hermes-answer.txt}"
@@ -277,6 +278,10 @@ write_e2e_report() {
 
 generate_pcm_prompt() {
   require_command ffmpeg
+  if [[ ! "$FLITE_VOICE" =~ ^[A-Za-z0-9_-]+$ ]]; then
+    printf 'VOICE_AGENT_E2E_FLITE_VOICE contains unsupported characters: %s\n' "$FLITE_VOICE" >&2
+    return 2
+  fi
   umask 077
   mkdir -p "$LOG_DIR" "$(dirname "$GENERATED_PCM_PATH")"
   local prompt_text_file="$PROMPT_SOURCE_TEXT_FILE"
@@ -291,7 +296,7 @@ generate_pcm_prompt() {
   set +e
   ffmpeg -hide_banner \
     -f lavfi \
-    -i "flite=textfile=$ffmpeg_prompt_text_file:voice=kal" \
+    -i "flite=textfile=$ffmpeg_prompt_text_file:voice=$FLITE_VOICE" \
     -ar 16000 \
     -ac 1 \
     -f s16le \
