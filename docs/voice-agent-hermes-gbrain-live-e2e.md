@@ -188,7 +188,15 @@ PIPELINE: passed
 CLEANUP: passed
 ```
 
-If the pipeline passes but cleanup cannot observe the service end marker, the script exits nonzero and prints:
+In strict mode, the script reports that cleanup is left to the best-effort exit trap:
+
+```text
+PIPELINE: passed
+CLEANUP: skipped - strict mode leaves cleanup to exit trap
+```
+
+In manual review mode, if the pipeline passes but cleanup cannot observe the service end marker, the script exits
+nonzero and prints:
 
 ```text
 PIPELINE: passed
