@@ -21,6 +21,7 @@ PROMPT_TEXT="${VOICE_AGENT_E2E_PROMPT_TEXT:-$DEFAULT_PROMPT_TEXT}"
 GENERATED_PCM_PATH="${VOICE_AGENT_E2E_GENERATED_PCM_PATH:-$LOG_DIR/generated-prompt.pcm}"
 MANUAL_REVIEW_ANSWER_FILE="${VOICE_AGENT_E2E_MANUAL_REVIEW_ANSWER_PATH:-$LOG_DIR/manual-hermes-answer.txt}"
 REPORT_FILE="${VOICE_AGENT_E2E_REPORT_PATH:-$LOG_DIR/report.txt}"
+MISSING_TOOL_CALL_DIAGNOSTICS_FILE="$LOG_DIR/missing-tool-call-diagnostics.txt"
 PROMPT_SOURCE_TEXT_FILE="$LOG_DIR/generated-prompt.txt"
 LOG_SEARCH_START_LINE=1
 WAIT_FOR_LOG_FAILURE=""
@@ -47,6 +48,11 @@ case "${VOICE_AGENT_E2E_MANUAL_REVIEW:-0}" in
     MANUAL_REVIEW=1
     ;;
 esac
+
+if [[ ! "$PACKAGE" =~ ^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+$ ]]; then
+  printf 'VOICE_AGENT_E2E_PACKAGE must be an Android package name: %s\n' "$PACKAGE" >&2
+  exit 2
+fi
 
 require_env() {
   local name="$1"
@@ -257,29 +263,39 @@ pull_optional_app_artifact() {
   chmod 600 "$local_path"
 }
 
-print_artifact_preview() {
+append_artifact_preview_to_file() {
   local label="$1"
   local app_path="$2"
+  local output_file="$3"
   local temp_path
   temp_path="$(mktemp "$LOG_DIR/report-artifact.XXXXXX")"
   register_report_temp_file "$temp_path"
   chmod 600 "$temp_path"
-  if adb_exec_out_to_file "$temp_path" run-as "$PACKAGE" sh -c "head -c 240 $app_path" &&
+  if adb_exec_out_to_file "$temp_path" run-as "$PACKAGE" head -c 240 "$app_path" &&
     [[ -s "$temp_path" ]]; then
-    printf '%s: ' "$label" >&2
-    tr '\r\n' ' ' < "$temp_path" | cut -c 1-240 >&2
-    printf '\n' >&2
+    printf '%s: ' "$label" >> "$output_file"
+    tr '\r\n' ' ' < "$temp_path" | cut -c 1-240 >> "$output_file"
+    printf '\n' >> "$output_file"
   else
-    printf '%s: missing\n' "$label" >&2
+    printf '%s: missing\n' "$label" >> "$output_file"
   fi
   rm -f "$temp_path"
 }
 
-print_missing_tool_call_diagnostics() {
-  printf 'Voice Agent E2E diagnostic artifacts after missing tool call:\n' >&2
-  print_artifact_preview "Gemini understood from voice" "$APP_INPUT_TRANSCRIPT_PATH"
-  print_artifact_preview "Gemini response to user" "$APP_OUTPUT_TRANSCRIPT_PATH"
-  print_artifact_preview "Hermes call" "$APP_HERMES_CALL_PATH"
+write_missing_tool_call_diagnostics() {
+  umask 077
+  mkdir -p "$LOG_DIR" "$(dirname "$MISSING_TOOL_CALL_DIAGNOSTICS_FILE")"
+  local temp_path
+  temp_path="$(mktemp "$LOG_DIR/missing-tool-call-diagnostics.XXXXXX")"
+  register_report_temp_file "$temp_path"
+  chmod 600 "$temp_path"
+  printf 'Voice Agent E2E diagnostic artifacts after missing tool call:\n' > "$temp_path"
+  append_artifact_preview_to_file "Gemini understood from voice" "$APP_INPUT_TRANSCRIPT_PATH" "$temp_path"
+  append_artifact_preview_to_file "Gemini response to user" "$APP_OUTPUT_TRANSCRIPT_PATH" "$temp_path"
+  append_artifact_preview_to_file "Hermes call" "$APP_HERMES_CALL_PATH" "$temp_path"
+  mv -f "$temp_path" "$MISSING_TOOL_CALL_DIAGNOSTICS_FILE"
+  chmod 600 "$MISSING_TOOL_CALL_DIAGNOSTICS_FILE"
+  printf 'Voice Agent E2E diagnostic artifact: %s\n' "$MISSING_TOOL_CALL_DIAGNOSTICS_FILE" >&2
 }
 
 extract_hermes_elapsed_detail() {
@@ -531,7 +547,7 @@ if ! wait_for_log "Gemini ask_hermes tool call received" \
   "$GEMINI_TOOL_CALL_TIMEOUT_SECONDS"; then
   if [[ "$MANUAL_REVIEW" == "1" && "$WAIT_FOR_LOG_FAILURE" == "timeout" ]]; then
     fail_if_log "common forbidden marker" "$COMMON_FORBIDDEN_PATTERN" || exit 1
-    print_missing_tool_call_diagnostics
+    write_missing_tool_call_diagnostics
     fail_if_log "common forbidden marker" "$COMMON_FORBIDDEN_PATTERN" || exit 1
   fi
   exit 1

@@ -239,9 +239,10 @@ The script fails when any of these markers or conditions appear:
 In manual review mode, a hash mismatch is not a failure by itself. The run still fails on missing pipeline markers,
 auth errors, crashes, playback write failures, or inability to extract the completed `ask_hermes` answer.
 
-When the `ask_hermes` tool-call marker is missing in manual-review mode, the script prints bounded diagnostics from the
-app-private E2E artifacts when available: what Gemini understood from voice, Gemini's response to the user, and the
-Hermes call artifact. The script does not fall back to reading the app database.
+When the `ask_hermes` tool-call marker is missing in manual-review mode, the script writes bounded diagnostics from the
+app-private E2E artifacts to `build/voice-agent-e2e/missing-tool-call-diagnostics.txt` and prints only that path. The
+diagnostic artifact includes what Gemini understood from voice, Gemini's response to the user, and the Hermes call
+artifact when available. The script does not fall back to reading the app database.
 
 ## Safe Artifacts
 
@@ -254,6 +255,9 @@ and must not be committed, pasted into shared logs, or distributed.
 
 `build/voice-agent-e2e/report.txt` is created only in manual review mode. It contains raw prompt, transcript, Hermes
 call, Hermes answer, and Gemini response text and must stay local/private.
+
+`build/voice-agent-e2e/missing-tool-call-diagnostics.txt` is created only for manual-review missing-tool-call failures.
+It contains bounded raw transcript/Hermes-call previews and must stay local/private.
 
 `build/voice-agent-e2e/generated-prompt.pcm` and `build/voice-agent-e2e/generated-prompt.txt` are created when the script
 generates PCM from text. They must not be committed, pasted into shared logs, or distributed.
