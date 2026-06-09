@@ -217,6 +217,31 @@ pull_optional_app_artifact() {
   chmod 600 "$local_path"
 }
 
+print_artifact_preview() {
+  local label="$1"
+  local app_path="$2"
+  local temp_path
+  temp_path="$(mktemp "$LOG_DIR/report-artifact.XXXXXX")"
+  register_report_temp_file "$temp_path"
+  chmod 600 "$temp_path"
+  if adb_exec_out_to_file "$temp_path" run-as "$PACKAGE" cat "$app_path" &&
+    [[ -s "$temp_path" ]]; then
+    printf '%s: ' "$label" >&2
+    tr '\r\n' ' ' < "$temp_path" | cut -c 1-240 >&2
+    printf '\n' >&2
+  else
+    printf '%s: missing\n' "$label" >&2
+  fi
+  rm -f "$temp_path"
+}
+
+print_missing_tool_call_diagnostics() {
+  printf 'Voice Agent E2E diagnostic artifacts after missing tool call:\n' >&2
+  print_artifact_preview "Gemini understood from voice" "$APP_INPUT_TRANSCRIPT_PATH"
+  print_artifact_preview "Gemini response to user" "$APP_OUTPUT_TRANSCRIPT_PATH"
+  print_artifact_preview "Hermes call" "$APP_HERMES_CALL_PATH"
+}
+
 extract_hermes_elapsed_detail() {
   grep -E 'VoiceAgentE2E.*hermes_tool_response_hash .*actualHash=' "$LOG_FILE" |
     tail -n 1 |
@@ -461,7 +486,14 @@ adb_cmd shell am broadcast \
   --el trailing_silence_ms "${VOICE_AGENT_E2E_TRAILING_SILENCE_MS:-200}" >/dev/null
 
 wait_for_log "debug PCM delivered" 'VoiceAudioDebugInjection.*debug_audio_injection result delivered=true' 30
-wait_for_log "Gemini ask_hermes tool call received" 'VoiceAgentGemini.*receive kind=toolCall' "$GEMINI_TOOL_CALL_TIMEOUT_SECONDS"
+if ! wait_for_log "Gemini ask_hermes tool call received" \
+  'VoiceAgentGemini.*receive kind=toolCall' \
+  "$GEMINI_TOOL_CALL_TIMEOUT_SECONDS"; then
+  if [[ "$MANUAL_REVIEW" == "1" ]]; then
+    print_missing_tool_call_diagnostics
+  fi
+  exit 1
+fi
 if [[ "$MANUAL_REVIEW" == "1" ]]; then
   wait_for_log "Hermes response hash observed for manual review" \
     'VoiceAgentE2E.*hermes_tool_response_hash .*actualHash=[0-9a-f]+(,|$)' \

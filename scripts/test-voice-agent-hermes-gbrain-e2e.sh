@@ -167,18 +167,22 @@ case "$args" in
     cat <<'LOGS'
 06-08 12:00:00.000 D/VoiceAgentGemini(1): event kind=SetupComplete
 06-08 12:00:01.000 I/VoiceAudioDebugInjection(1): debug_audio_injection result delivered=true
-06-08 12:00:02.000 D/VoiceAgentGemini(1): receive kind=toolCall
 LOGS
+    if [[ "${FAKE_ADB_SKIP_TOOL_CALL:-0}" != "1" ]]; then
+      printf '06-08 12:00:02.000 D/VoiceAgentGemini(1): receive kind=toolCall\n'
+    fi
     if [[ "${FAKE_ADB_FORBIDDEN_MARKER:-0}" == "1" ]]; then
       printf '06-08 12:00:02.500 E/VoiceAgentCallService(1): Voice Lab request failed 403\n'
     fi
-    cat <<'LOGS'
+    if [[ "${FAKE_ADB_SKIP_TOOL_CALL:-0}" != "1" ]]; then
+      cat <<'LOGS'
 06-08 12:00:03.000 D/VoiceAgentE2E(1): hermes_tool_response_hash callId=call-1, actualHash=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa, responseChars=25, normalizedChars=25, elapsedMs=100
 06-08 12:00:04.000 D/VoiceAgentGemini(1): send kind=toolResponse sent=true
 06-08 12:00:05.000 D/VoiceAgentGemini(1): event kind=OutputAudio
 06-08 12:00:06.000 D/AndroidVoiceAudioEngine(1): Voice playback queued bytes=3200
 06-08 12:00:07.000 D/AndroidVoiceAudioEngine(1): Voice playback wrote bytes=3200
 LOGS
+    fi
     deadline=$((SECONDS + 5))
     while [[ ! -f "${FAKE_ADB_END_MARKER:?}" && "$SECONDS" -lt "$deadline" ]]; do
       sleep 0.1
@@ -654,6 +658,42 @@ assert_last_line_after "$FAKE_ADB_ARGS_LOG" \
   "rm -f no_backup/voice-e2e/hermes-answer.txt"
 if grep -F -- "databases/rikka_hub" "$FAKE_ADB_ARGS_LOG" >/dev/null; then
   printf 'Expected no database fallback when answer artifact is missing.\n' >&2
+  printf 'Actual ADB log:\n%s\n' "$(cat "$FAKE_ADB_ARGS_LOG")" >&2
+  exit 1
+fi
+
+missing_tool_call_log_dir="$TMP_DIR/missing-tool-call-log"
+set +e
+missing_tool_call_output="$(
+  PATH="$TMP_DIR:$PATH" \
+  FAKE_ADB_SKIP_TOOL_CALL=1 \
+  VOICE_AGENT_E2E_SERIAL=RZ \
+  VOICE_AGENT_E2E_ADB_READY_SCRIPT="$TMP_DIR/adb-ready.sh" \
+  VOICE_AGENT_E2E_PCM_PATH="$TMP_DIR/prompt.pcm" \
+  VOICE_AGENT_E2E_CONVERSATION_ID=conversation-1 \
+  VOICE_AGENT_E2E_LOG_DIR="$missing_tool_call_log_dir" \
+  VOICE_AGENT_E2E_MANUAL_REVIEW=1 \
+  VOICE_AGENT_E2E_GEMINI_TOOL_CALL_TIMEOUT_SECONDS=1 \
+  VOICE_AGENT_E2E_HERMES_RESPONSE_TIMEOUT_SECONDS=1 \
+  "$SCRIPT" 2>&1
+)"
+missing_tool_call_status=$?
+set -e
+
+if [[ "$missing_tool_call_status" -eq 0 ]]; then
+  printf 'Expected missing tool-call run to fail.\n' >&2
+  printf 'Actual output:\n%s\n' "$missing_tool_call_output" >&2
+  exit 1
+fi
+assert_contains "$missing_tool_call_output" "Missing marker after 1s: Gemini ask_hermes tool call received"
+assert_contains "$missing_tool_call_output" "Gemini understood from voice:"
+assert_contains "$missing_tool_call_output" "Please ask Hermes if he is connected to G-Brain."
+assert_contains "$missing_tool_call_output" "Gemini response to user:"
+assert_contains "$missing_tool_call_output" "Yes, Hermes is connected to G-Brain."
+assert_contains "$missing_tool_call_output" "Hermes call:"
+assert_contains "$missing_tool_call_output" "Is Hermes connected to G-Brain? Answer yes or no."
+if grep -F -- "databases/rikka_hub" "$FAKE_ADB_ARGS_LOG" >/dev/null; then
+  printf 'Expected no database fallback for missing tool-call diagnostics.\n' >&2
   printf 'Actual ADB log:\n%s\n' "$(cat "$FAKE_ADB_ARGS_LOG")" >&2
   exit 1
 fi
