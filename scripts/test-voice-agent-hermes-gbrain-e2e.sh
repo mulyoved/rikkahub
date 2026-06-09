@@ -20,6 +20,17 @@ assert_contains() {
   fi
 }
 
+assert_contains_in_order() {
+  local haystack="$1"
+  local earlier="$2"
+  local later="$3"
+  if [[ "$haystack" != *"$earlier"*"$later"* ]]; then
+    printf 'Expected output to contain "%s" before "%s"\n' "$earlier" "$later" >&2
+    printf 'Actual output:\n%s\n' "$haystack" >&2
+    exit 1
+  fi
+}
+
 assert_file_contains_exactly() {
   local path="$1"
   local expected="$2"
@@ -230,7 +241,9 @@ LOGS
     rm -f "${FAKE_ADB_END_MARKER:?}"
     ;;
   "-s RZ shell am start-foreground-service -n me.rerere.rikkahub.debug/me.rerere.rikkahub.voiceagent.VoiceAgentCallService -a me.rerere.rikkahub.voiceagent.action.END")
-    : > "${FAKE_ADB_END_MARKER:?}"
+    if [[ "${FAKE_ADB_SKIP_END_MARKER:-0}" != "1" ]]; then
+      : > "${FAKE_ADB_END_MARKER:?}"
+    fi
     ;;
   "-s RZ shell am broadcast "*)
     ;;
@@ -357,6 +370,8 @@ fi
 
 assert_contains "$manual_output" "PASS marker: Hermes response hash observed for manual review"
 assert_contains "$manual_output" "Manual review answer artifact: $manual_log_dir/manual-hermes-answer.txt"
+assert_contains "$manual_output" "PIPELINE: passed"
+assert_contains "$manual_output" "CLEANUP: passed"
 assert_contains "$manual_output" "Voice Agent Hermes/Gbrain live E2E reached manual review gate."
 assert_file_contains_exactly "$manual_log_dir/manual-hermes-answer.txt" "manual answer from Hermes"
 assert_file_contains "$FAKE_ADB_ARGS_LOG" "--ez enableVoiceE2EArtifacts true"
@@ -365,8 +380,8 @@ assert_file_contains "$FAKE_ADB_ARGS_LOG" "rm -f no_backup/voice-e2e/input-trans
 assert_file_contains "$FAKE_ADB_ARGS_LOG" "rm -f no_backup/voice-e2e/output-transcript.txt"
 assert_file_contains "$FAKE_ADB_ARGS_LOG" "rm -f no_backup/voice-e2e/hermes-call.txt"
 assert_last_line_after "$FAKE_ADB_ARGS_LOG" \
-  "-a me.rerere.rikkahub.voiceagent.action.END" \
-  "exec-out run-as me.rerere.rikkahub.debug cat no_backup/voice-e2e/hermes-answer.txt"
+  "exec-out run-as me.rerere.rikkahub.debug cat no_backup/voice-e2e/hermes-answer.txt" \
+  "-a me.rerere.rikkahub.voiceagent.action.END"
 assert_last_line_after "$FAKE_ADB_ARGS_LOG" \
   "-a me.rerere.rikkahub.voiceagent.action.END" \
   "rm -f no_backup/voice-e2e/hermes-answer.txt"
@@ -403,6 +418,48 @@ if [[ "$manual_no_hash_status" -ne 0 ]]; then
   exit 1
 fi
 assert_contains "$manual_no_hash_output" "Voice Agent Hermes/Gbrain live E2E reached manual review gate."
+
+cleanup_failure_log_dir="$TMP_DIR/cleanup-failure-log"
+rm -f "$FAKE_ADB_END_MARKER"
+set +e
+cleanup_failure_output="$(
+  PATH="$TMP_DIR:$PATH" \
+  FAKE_ADB_SKIP_END_MARKER=1 \
+  VOICE_AGENT_E2E_SERIAL=RZ \
+  VOICE_AGENT_E2E_ADB_READY_SCRIPT="$TMP_DIR/adb-ready.sh" \
+  VOICE_AGENT_E2E_PCM_PATH="$TMP_DIR/prompt.pcm" \
+  VOICE_AGENT_E2E_CONVERSATION_ID=conversation-1 \
+  VOICE_AGENT_E2E_LOG_DIR="$cleanup_failure_log_dir" \
+  VOICE_AGENT_E2E_MANUAL_REVIEW=1 \
+  VOICE_AGENT_E2E_SERVICE_END_TIMEOUT_SECONDS=1 \
+  VOICE_AGENT_E2E_GEMINI_TOOL_CALL_TIMEOUT_SECONDS=5 \
+  VOICE_AGENT_E2E_HERMES_RESPONSE_TIMEOUT_SECONDS=5 \
+  "$SCRIPT" 2>&1
+)"
+cleanup_failure_status=$?
+set -e
+
+if [[ "$cleanup_failure_status" -eq 0 ]]; then
+  printf 'Expected cleanup failure run to exit nonzero.\n' >&2
+  printf 'Actual output:\n%s\n' "$cleanup_failure_output" >&2
+  exit 1
+fi
+assert_contains "$cleanup_failure_output" "PASS marker: Voice playback wrote"
+assert_contains "$cleanup_failure_output" "Manual review answer artifact: $cleanup_failure_log_dir/manual-hermes-answer.txt"
+assert_contains "$cleanup_failure_output" "Voice Agent E2E report: $cleanup_failure_log_dir/report.txt"
+assert_contains "$cleanup_failure_output" "PIPELINE: passed"
+assert_contains "$cleanup_failure_output" "CLEANUP: failed - service end marker not observed"
+assert_contains_in_order "$cleanup_failure_output" \
+  "PASS marker: Voice playback wrote" \
+  "Manual review answer artifact: $cleanup_failure_log_dir/manual-hermes-answer.txt"
+assert_contains_in_order "$cleanup_failure_output" \
+  "Manual review answer artifact: $cleanup_failure_log_dir/manual-hermes-answer.txt" \
+  "Voice Agent E2E report: $cleanup_failure_log_dir/report.txt"
+assert_contains_in_order "$cleanup_failure_output" \
+  "Voice Agent E2E report: $cleanup_failure_log_dir/report.txt" \
+  "CLEANUP: failed - service end marker not observed"
+assert_file_contains_exactly "$cleanup_failure_log_dir/manual-hermes-answer.txt" "manual answer from Hermes"
+assert_file_contains "$cleanup_failure_log_dir/report.txt" "Hermes answer:"
 
 readiness_failure_log_dir="$TMP_DIR/readiness-failure-log"
 before_readiness_failure_adb_lines="$(wc -l < "$FAKE_ADB_ARGS_LOG")"
@@ -492,14 +549,14 @@ assert_contains "$report_contents" "Gemini response to user:"
 assert_contains "$report_contents" "Yes, Hermes is connected to G-Brain."
 assert_contains "$generated_output" "Voice Agent E2E report: $report_path"
 assert_last_line_after "$FAKE_ADB_ARGS_LOG" \
-  "-a me.rerere.rikkahub.voiceagent.action.END" \
-  "exec-out run-as me.rerere.rikkahub.debug cat no_backup/voice-e2e/input-transcript.txt"
+  "exec-out run-as me.rerere.rikkahub.debug cat no_backup/voice-e2e/input-transcript.txt" \
+  "-a me.rerere.rikkahub.voiceagent.action.END"
 assert_last_line_after "$FAKE_ADB_ARGS_LOG" \
-  "-a me.rerere.rikkahub.voiceagent.action.END" \
-  "exec-out run-as me.rerere.rikkahub.debug cat no_backup/voice-e2e/hermes-call.txt"
+  "exec-out run-as me.rerere.rikkahub.debug cat no_backup/voice-e2e/hermes-call.txt" \
+  "-a me.rerere.rikkahub.voiceagent.action.END"
 assert_last_line_after "$FAKE_ADB_ARGS_LOG" \
-  "-a me.rerere.rikkahub.voiceagent.action.END" \
-  "exec-out run-as me.rerere.rikkahub.debug cat no_backup/voice-e2e/output-transcript.txt"
+  "exec-out run-as me.rerere.rikkahub.debug cat no_backup/voice-e2e/output-transcript.txt" \
+  "-a me.rerere.rikkahub.voiceagent.action.END"
 assert_no_report_temp_files "$generated_log_dir"
 report_mode="$(stat -c '%a' "$report_path")"
 if [[ "$report_mode" != "600" ]]; then

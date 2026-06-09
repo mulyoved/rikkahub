@@ -30,6 +30,9 @@ ADB_READY_SCRIPT="${VOICE_AGENT_E2E_ADB_READY_SCRIPT:-scripts/adb-device-ready.s
 GEMINI_TOOL_CALL_TIMEOUT_SECONDS="${VOICE_AGENT_E2E_GEMINI_TOOL_CALL_TIMEOUT_SECONDS:-240}"
 HERMES_RESPONSE_TIMEOUT_SECONDS="${VOICE_AGENT_E2E_HERMES_RESPONSE_TIMEOUT_SECONDS:-360}"
 CALL_STARTED=0
+PIPELINE_STATUS="not_started"
+CLEANUP_STATUS="not_started"
+CLEANUP_DETAIL=""
 DEVICE_TMP_PCM_CLEANUP_NEEDED=0
 APP_PCM_CLEANUP_NEEDED=0
 FFMPEG_PROMPT_TEXT_CLEANUP_PATH=""
@@ -153,16 +156,51 @@ wait_for_cleanup_log() {
 
 end_voice_agent_call_and_wait() {
   if [[ "$CALL_STARTED" != "1" ]]; then
+    CLEANUP_STATUS="skipped"
+    CLEANUP_DETAIL="call was not started"
     return 0
   fi
+  set +e
   adb_cmd shell am start-foreground-service \
     -n "$SERVICE_COMPONENT" \
     -a "$CALL_END_ACTION" >/dev/null
-  wait_for_log \
+  local end_command_status=$?
+  set -e
+  if [[ "$end_command_status" -ne 0 ]]; then
+    CLEANUP_STATUS="failed"
+    CLEANUP_DETAIL="service end command failed"
+    return 1
+  fi
+  if wait_for_log \
     "Voice Agent service ended" \
     'VoiceAgentCallService.*end completed conversationId=' \
-    "${VOICE_AGENT_E2E_SERVICE_END_TIMEOUT_SECONDS:-30}"
-  CALL_STARTED=0
+    "${VOICE_AGENT_E2E_SERVICE_END_TIMEOUT_SECONDS:-30}"; then
+    CALL_STARTED=0
+    CLEANUP_STATUS="passed"
+    CLEANUP_DETAIL="service end marker observed"
+    return 0
+  fi
+  CLEANUP_STATUS="failed"
+  CLEANUP_DETAIL="service end marker not observed"
+  return 1
+}
+
+print_result_summary() {
+  printf 'PIPELINE: %s\n' "$PIPELINE_STATUS"
+  case "$CLEANUP_STATUS" in
+    passed)
+      printf 'CLEANUP: passed\n'
+      ;;
+    failed)
+      printf 'CLEANUP: failed - %s\n' "$CLEANUP_DETAIL"
+      ;;
+    skipped)
+      printf 'CLEANUP: skipped - %s\n' "$CLEANUP_DETAIL"
+      ;;
+    *)
+      printf 'CLEANUP: %s\n' "$CLEANUP_STATUS"
+      ;;
+  esac
 }
 
 fail_if_log() {
@@ -528,11 +566,21 @@ if [[ "$MANUAL_REVIEW" == "0" ]] &&
   exit 1
 fi
 
+PIPELINE_STATUS="passed"
 if [[ "$MANUAL_REVIEW" == "1" ]]; then
-  end_voice_agent_call_and_wait
   extract_manual_review_answer
   write_e2e_report
+  cleanup_status=0
+  end_voice_agent_call_and_wait || cleanup_status=$?
+  print_result_summary
+  if [[ "$cleanup_status" -ne 0 ]]; then
+    printf 'Voice Agent Hermes/Gbrain live E2E pipeline passed but cleanup failed. Safe log: %s\n' "$LOG_FILE"
+    exit "$cleanup_status"
+  fi
   printf 'Voice Agent Hermes/Gbrain live E2E reached manual review gate. Safe log: %s\n' "$LOG_FILE"
 else
+  CLEANUP_STATUS="skipped"
+  CLEANUP_DETAIL="strict mode leaves cleanup to exit trap"
+  print_result_summary
   printf 'Voice Agent Hermes/Gbrain live E2E passed. Safe log: %s\n' "$LOG_FILE"
 fi
