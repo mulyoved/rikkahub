@@ -1013,6 +1013,7 @@ if [[ "$strict_success_status" -ne 0 ]]; then
   exit 1
 fi
 assert_contains "$strict_success_output" "Voice Agent Hermes/Gbrain live E2E passed."
+assert_contains "$strict_success_output" "CLEANUP: skipped - strict mode leaves cleanup to exit trap"
 if [[ -e "$strict_success_report_path" ]]; then
   printf 'Expected strict success mode not to write report: %s\n' "$strict_success_report_path" >&2
   exit 1
