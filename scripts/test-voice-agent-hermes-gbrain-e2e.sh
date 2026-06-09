@@ -474,6 +474,40 @@ if [[ "$override_voice_status" -ne 0 ]]; then
 fi
 assert_file_contains_exactly "$override_voice_log_dir/generated-prompt.pcm" "generated pcm"
 
+invalid_voice_log_dir="$TMP_DIR/invalid-voice-log"
+adb_log_lines_before_invalid_voice="$(wc -l < "$FAKE_ADB_ARGS_LOG")"
+set +e
+invalid_voice_output="$(
+  PATH="$TMP_DIR:$PATH" \
+  VOICE_AGENT_E2E_SERIAL=RZ \
+  VOICE_AGENT_E2E_ADB_READY_SCRIPT="$TMP_DIR/adb-ready.sh" \
+  VOICE_AGENT_E2E_PROMPT_TEXT="Prompt with invalid voice." \
+  VOICE_AGENT_E2E_FLITE_VOICE='kal:bad' \
+  VOICE_AGENT_E2E_CONVERSATION_ID=conversation-1 \
+  VOICE_AGENT_E2E_LOG_DIR="$invalid_voice_log_dir" \
+  VOICE_AGENT_E2E_MANUAL_REVIEW=1 \
+  "$SCRIPT" 2>&1
+)"
+invalid_voice_status=$?
+set -e
+
+if [[ "$invalid_voice_status" -eq 0 ]]; then
+  printf 'Expected generated PCM mode with invalid override voice to fail.\n' >&2
+  printf 'Actual output:\n%s\n' "$invalid_voice_output" >&2
+  exit 1
+fi
+assert_contains "$invalid_voice_output" "VOICE_AGENT_E2E_FLITE_VOICE contains unsupported characters: kal:bad"
+adb_log_lines_after_invalid_voice="$(wc -l < "$FAKE_ADB_ARGS_LOG")"
+if [[ "$adb_log_lines_after_invalid_voice" != "$adb_log_lines_before_invalid_voice" ]]; then
+  printf 'Expected invalid voice failure before ADB calls.\n' >&2
+  printf 'Actual ADB log:\n%s\n' "$(cat "$FAKE_ADB_ARGS_LOG")" >&2
+  exit 1
+fi
+if [[ -e "$invalid_voice_log_dir/generated-prompt.pcm" ]]; then
+  printf 'Expected invalid voice failure not to write PCM output.\n' >&2
+  exit 1
+fi
+
 missing_report_log_dir="$TMP_DIR/missing-report-log"
 missing_report_path="$TMP_DIR/custom-report.txt"
 mkdir -p "$missing_report_log_dir"
