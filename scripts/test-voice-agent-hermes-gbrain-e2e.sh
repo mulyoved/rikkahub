@@ -152,6 +152,14 @@ write_fake_adb() {
 #!/usr/bin/env bash
 set -euo pipefail
 
+print_large_artifact() {
+  printf '%240sdiagnostic-tail' '' | tr ' ' A
+}
+
+print_large_artifact_preview() {
+  printf '%240s' '' | tr ' ' A
+}
+
 if [[ -n "${FAKE_ADB_ARGS_LOG:-}" ]]; then
   printf '%s\n' "$*" >> "$FAKE_ADB_ARGS_LOG"
 fi
@@ -236,17 +244,68 @@ LOGS
     if [[ "${FAKE_ADB_MISSING_REPORT_ARTIFACTS:-0}" == "1" ]]; then
       exit 1
     fi
+    if [[ "${FAKE_ADB_LARGE_DIAGNOSTIC_ARTIFACTS:-0}" == "1" ]]; then
+      print_large_artifact
+      exit 0
+    fi
     printf 'Please ask Hermes if he is connected to G-Brain.'
     ;;
   "-s RZ exec-out run-as me.rerere.rikkahub.debug cat no_backup/voice-e2e/hermes-call.txt")
     if [[ "${FAKE_ADB_MISSING_REPORT_ARTIFACTS:-0}" == "1" ]]; then
       exit 1
     fi
+    if [[ "${FAKE_ADB_LARGE_DIAGNOSTIC_ARTIFACTS:-0}" == "1" ]]; then
+      print_large_artifact
+      exit 0
+    fi
     printf 'Is Hermes connected to G-Brain? Answer yes or no.'
     ;;
   "-s RZ exec-out run-as me.rerere.rikkahub.debug cat no_backup/voice-e2e/output-transcript.txt")
     if [[ "${FAKE_ADB_MISSING_REPORT_ARTIFACTS:-0}" == "1" ]]; then
       exit 1
+    fi
+    if [[ "${FAKE_ADB_LARGE_DIAGNOSTIC_ARTIFACTS:-0}" == "1" ]]; then
+      print_large_artifact
+      exit 0
+    fi
+    printf 'Yes, Hermes is connected to G-Brain.'
+    ;;
+  "-s RZ exec-out run-as me.rerere.rikkahub.debug sh -c head -c 240 no_backup/voice-e2e/input-transcript.txt")
+    if [[ "${FAKE_ADB_MISSING_REPORT_ARTIFACTS:-0}" == "1" ]]; then
+      exit 1
+    fi
+    if [[ -n "${FAKE_ADB_DIAGNOSTIC_DELAY_SECONDS:-}" ]]; then
+      sleep "$FAKE_ADB_DIAGNOSTIC_DELAY_SECONDS"
+    fi
+    if [[ "${FAKE_ADB_LARGE_DIAGNOSTIC_ARTIFACTS:-0}" == "1" ]]; then
+      print_large_artifact_preview
+      exit 0
+    fi
+    printf 'Please ask Hermes if he is connected to G-Brain.'
+    ;;
+  "-s RZ exec-out run-as me.rerere.rikkahub.debug sh -c head -c 240 no_backup/voice-e2e/hermes-call.txt")
+    if [[ "${FAKE_ADB_MISSING_REPORT_ARTIFACTS:-0}" == "1" ]]; then
+      exit 1
+    fi
+    if [[ -n "${FAKE_ADB_DIAGNOSTIC_DELAY_SECONDS:-}" ]]; then
+      sleep "$FAKE_ADB_DIAGNOSTIC_DELAY_SECONDS"
+    fi
+    if [[ "${FAKE_ADB_LARGE_DIAGNOSTIC_ARTIFACTS:-0}" == "1" ]]; then
+      print_large_artifact_preview
+      exit 0
+    fi
+    printf 'Is Hermes connected to G-Brain? Answer yes or no.'
+    ;;
+  "-s RZ exec-out run-as me.rerere.rikkahub.debug sh -c head -c 240 no_backup/voice-e2e/output-transcript.txt")
+    if [[ "${FAKE_ADB_MISSING_REPORT_ARTIFACTS:-0}" == "1" ]]; then
+      exit 1
+    fi
+    if [[ -n "${FAKE_ADB_DIAGNOSTIC_DELAY_SECONDS:-}" ]]; then
+      sleep "$FAKE_ADB_DIAGNOSTIC_DELAY_SECONDS"
+    fi
+    if [[ "${FAKE_ADB_LARGE_DIAGNOSTIC_ARTIFACTS:-0}" == "1" ]]; then
+      print_large_artifact_preview
+      exit 0
     fi
     printf 'Yes, Hermes is connected to G-Brain.'
     ;;
@@ -702,6 +761,39 @@ if grep -F -- "databases/rikka_hub" "$FAKE_ADB_ARGS_LOG" >/dev/null; then
   exit 1
 fi
 
+large_diagnostic_log_dir="$TMP_DIR/large-diagnostic-log"
+set +e
+large_diagnostic_output="$(
+  PATH="$TMP_DIR:$PATH" \
+  FAKE_ADB_SKIP_TOOL_CALL=1 \
+  FAKE_ADB_LARGE_DIAGNOSTIC_ARTIFACTS=1 \
+  VOICE_AGENT_E2E_SERIAL=RZ \
+  VOICE_AGENT_E2E_ADB_READY_SCRIPT="$TMP_DIR/adb-ready.sh" \
+  VOICE_AGENT_E2E_PCM_PATH="$TMP_DIR/prompt.pcm" \
+  VOICE_AGENT_E2E_CONVERSATION_ID=conversation-1 \
+  VOICE_AGENT_E2E_LOG_DIR="$large_diagnostic_log_dir" \
+  VOICE_AGENT_E2E_MANUAL_REVIEW=1 \
+  VOICE_AGENT_E2E_GEMINI_TOOL_CALL_TIMEOUT_SECONDS=1 \
+  VOICE_AGENT_E2E_HERMES_RESPONSE_TIMEOUT_SECONDS=1 \
+  "$SCRIPT" 2>&1
+)"
+large_diagnostic_status=$?
+set -e
+
+if [[ "$large_diagnostic_status" -eq 0 ]]; then
+  printf 'Expected large diagnostic artifact run to fail.\n' >&2
+  printf 'Actual output:\n%s\n' "$large_diagnostic_output" >&2
+  exit 1
+fi
+assert_contains "$large_diagnostic_output" "Gemini understood from voice: AAAAAAAAAAAAAAAA"
+if [[ "$large_diagnostic_output" == *"diagnostic-tail"* ]]; then
+  printf 'Expected diagnostic preview not to print content past 240 bytes.\n' >&2
+  printf 'Actual output:\n%s\n' "$large_diagnostic_output" >&2
+  exit 1
+fi
+assert_file_contains "$FAKE_ADB_ARGS_LOG" \
+  "exec-out run-as me.rerere.rikkahub.debug sh -c head -c 240 no_backup/voice-e2e/input-transcript.txt"
+
 tool_wait_forbidden_log_dir="$TMP_DIR/tool-wait-forbidden-log"
 set +e
 tool_wait_forbidden_output="$(
@@ -733,6 +825,36 @@ if [[ "$tool_wait_forbidden_output" == *"Voice Agent E2E diagnostic artifacts af
   printf 'Actual output:\n%s\n' "$tool_wait_forbidden_output" >&2
   exit 1
 fi
+
+diagnostic_boundary_forbidden_log_dir="$TMP_DIR/diagnostic-boundary-forbidden-log"
+set +e
+diagnostic_boundary_forbidden_output="$(
+  PATH="$TMP_DIR:$PATH" \
+  FAKE_ADB_SKIP_TOOL_CALL=1 \
+  FAKE_ADB_FORBIDDEN_AFTER_DEBUG=1 \
+  FAKE_ADB_FORBIDDEN_AFTER_DEBUG_DELAY_SECONDS=3 \
+  FAKE_ADB_DIAGNOSTIC_DELAY_SECONDS=4 \
+  VOICE_AGENT_E2E_SERIAL=RZ \
+  VOICE_AGENT_E2E_ADB_READY_SCRIPT="$TMP_DIR/adb-ready.sh" \
+  VOICE_AGENT_E2E_PCM_PATH="$TMP_DIR/prompt.pcm" \
+  VOICE_AGENT_E2E_CONVERSATION_ID=conversation-1 \
+  VOICE_AGENT_E2E_LOG_DIR="$diagnostic_boundary_forbidden_log_dir" \
+  VOICE_AGENT_E2E_MANUAL_REVIEW=1 \
+  VOICE_AGENT_E2E_GEMINI_TOOL_CALL_TIMEOUT_SECONDS=1 \
+  VOICE_AGENT_E2E_HERMES_RESPONSE_TIMEOUT_SECONDS=1 \
+  "$SCRIPT" 2>&1
+)"
+diagnostic_boundary_forbidden_status=$?
+set -e
+
+if [[ "$diagnostic_boundary_forbidden_status" -eq 0 ]]; then
+  printf 'Expected forbidden marker during diagnostics to fail.\n' >&2
+  printf 'Actual output:\n%s\n' "$diagnostic_boundary_forbidden_output" >&2
+  exit 1
+fi
+assert_contains "$diagnostic_boundary_forbidden_output" "Missing marker after 1s: Gemini ask_hermes tool call received"
+assert_contains "$diagnostic_boundary_forbidden_output" "Gemini understood from voice:"
+assert_contains "$diagnostic_boundary_forbidden_output" "Forbidden marker found: common forbidden marker"
 
 forbidden_marker_log_dir="$TMP_DIR/forbidden-marker-log"
 set +e

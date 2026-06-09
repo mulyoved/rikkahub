@@ -230,7 +230,7 @@ print_artifact_preview() {
   temp_path="$(mktemp "$LOG_DIR/report-artifact.XXXXXX")"
   register_report_temp_file "$temp_path"
   chmod 600 "$temp_path"
-  if adb_exec_out_to_file "$temp_path" run-as "$PACKAGE" cat "$app_path" &&
+  if adb_exec_out_to_file "$temp_path" run-as "$PACKAGE" sh -c "head -c 240 $app_path" &&
     [[ -s "$temp_path" ]]; then
     printf '%s: ' "$label" >&2
     tr '\r\n' ' ' < "$temp_path" | cut -c 1-240 >&2
@@ -496,7 +496,9 @@ if ! wait_for_log "Gemini ask_hermes tool call received" \
   'VoiceAgentGemini.*receive kind=toolCall' \
   "$GEMINI_TOOL_CALL_TIMEOUT_SECONDS"; then
   if [[ "$MANUAL_REVIEW" == "1" && "$WAIT_FOR_LOG_FAILURE" == "timeout" ]]; then
+    fail_if_log "common forbidden marker" "$COMMON_FORBIDDEN_PATTERN" || exit 1
     print_missing_tool_call_diagnostics
+    fail_if_log "common forbidden marker" "$COMMON_FORBIDDEN_PATTERN" || exit 1
   fi
   exit 1
 fi
