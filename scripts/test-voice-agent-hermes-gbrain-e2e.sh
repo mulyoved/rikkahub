@@ -241,6 +241,9 @@ LOGS
     rm -f "${FAKE_ADB_END_MARKER:?}"
     ;;
   "-s RZ shell am start-foreground-service -n me.rerere.rikkahub.debug/me.rerere.rikkahub.voiceagent.VoiceAgentCallService -a me.rerere.rikkahub.voiceagent.action.END")
+    if [[ "${FAKE_ADB_FAIL_END_COMMAND:-0}" == "1" ]]; then
+      exit 73
+    fi
     if [[ "${FAKE_ADB_SKIP_END_MARKER:-0}" != "1" ]]; then
       : > "${FAKE_ADB_END_MARKER:?}"
     fi
@@ -460,6 +463,38 @@ assert_contains_in_order "$cleanup_failure_output" \
   "CLEANUP: failed - service end marker not observed"
 assert_file_contains_exactly "$cleanup_failure_log_dir/manual-hermes-answer.txt" "manual answer from Hermes"
 assert_file_contains "$cleanup_failure_log_dir/report.txt" "Hermes answer:"
+
+cleanup_command_failure_log_dir="$TMP_DIR/cleanup-command-failure-log"
+rm -f "$FAKE_ADB_END_MARKER"
+set +e
+cleanup_command_failure_output="$(
+  PATH="$TMP_DIR:$PATH" \
+  FAKE_ADB_FAIL_END_COMMAND=1 \
+  VOICE_AGENT_E2E_SERIAL=RZ \
+  VOICE_AGENT_E2E_ADB_READY_SCRIPT="$TMP_DIR/adb-ready.sh" \
+  VOICE_AGENT_E2E_PCM_PATH="$TMP_DIR/prompt.pcm" \
+  VOICE_AGENT_E2E_CONVERSATION_ID=conversation-1 \
+  VOICE_AGENT_E2E_LOG_DIR="$cleanup_command_failure_log_dir" \
+  VOICE_AGENT_E2E_MANUAL_REVIEW=1 \
+  VOICE_AGENT_E2E_GEMINI_TOOL_CALL_TIMEOUT_SECONDS=5 \
+  VOICE_AGENT_E2E_HERMES_RESPONSE_TIMEOUT_SECONDS=5 \
+  "$SCRIPT" 2>&1
+)"
+cleanup_command_failure_status=$?
+set -e
+
+if [[ "$cleanup_command_failure_status" -eq 0 ]]; then
+  printf 'Expected cleanup command failure run to exit nonzero.\n' >&2
+  printf 'Actual output:\n%s\n' "$cleanup_command_failure_output" >&2
+  exit 1
+fi
+assert_contains "$cleanup_command_failure_output" "PASS marker: Voice playback wrote"
+assert_contains "$cleanup_command_failure_output" "Manual review answer artifact: $cleanup_command_failure_log_dir/manual-hermes-answer.txt"
+assert_contains "$cleanup_command_failure_output" "Voice Agent E2E report: $cleanup_command_failure_log_dir/report.txt"
+assert_contains "$cleanup_command_failure_output" "PIPELINE: passed"
+assert_contains "$cleanup_command_failure_output" "CLEANUP: failed - service end command failed"
+assert_file_contains_exactly "$cleanup_command_failure_log_dir/manual-hermes-answer.txt" "manual answer from Hermes"
+assert_file_contains "$cleanup_command_failure_log_dir/report.txt" "Hermes answer:"
 
 readiness_failure_log_dir="$TMP_DIR/readiness-failure-log"
 before_readiness_failure_adb_lines="$(wc -l < "$FAKE_ADB_ARGS_LOG")"

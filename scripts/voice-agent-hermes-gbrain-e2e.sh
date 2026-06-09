@@ -160,13 +160,9 @@ end_voice_agent_call_and_wait() {
     CLEANUP_DETAIL="call was not started"
     return 0
   fi
-  set +e
-  adb_cmd shell am start-foreground-service \
+  if ! adb_cmd shell am start-foreground-service \
     -n "$SERVICE_COMPONENT" \
-    -a "$CALL_END_ACTION" >/dev/null
-  local end_command_status=$?
-  set -e
-  if [[ "$end_command_status" -ne 0 ]]; then
+    -a "$CALL_END_ACTION" >/dev/null; then
     CLEANUP_STATUS="failed"
     CLEANUP_DETAIL="service end command failed"
     return 1
