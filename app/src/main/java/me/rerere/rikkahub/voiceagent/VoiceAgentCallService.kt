@@ -185,12 +185,16 @@ class VoiceAgentCallService : Service() {
     private fun endCall() {
         notificationJob?.cancel()
         notificationJob = null
+        val endingConversationId = manager.activeConversationId.value
+        startForegroundFor(
+            conversationId = voiceAgentEndForegroundConversationId(endingConversationId?.toString()),
+            state = manager.state.value.copy(call = VoiceCallStatus.Ending),
+        )
         if (endJob?.isActive == true) {
             return
         }
         callGeneration += 1
         val endGeneration = callGeneration
-        val endingConversationId = manager.activeConversationId.value
         val session = manager.detachForEndAndDrain()
         endJob = serviceScope.launch {
             if (endGeneration != callGeneration) {
@@ -288,6 +292,9 @@ internal fun voiceAgentServiceStartConfig(
         false,
     )
 )
+
+internal fun voiceAgentEndForegroundConversationId(activeConversationId: String?): String =
+    activeConversationId ?: "ending"
 
 internal fun Throwable.toVoiceAgentLogDetail(): String =
     "${javaClass.simpleName}: ${(message ?: "").redactForVoiceAgentLog()}"

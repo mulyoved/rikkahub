@@ -17,4 +17,16 @@ class VoiceAgentCallContractTest {
     fun `notification route extra matches RouteActivity contract`() {
         assertEquals("voiceAgentConversationId", VoiceAgentCallContract.EXTRA_ROUTE_VOICE_AGENT_CONVERSATION_ID)
     }
+
+    @Test
+    fun `end foreground id uses active conversation id`() {
+        val activeConversationId = "11111111-1111-4111-8111-111111111111"
+
+        assertEquals(activeConversationId, voiceAgentEndForegroundConversationId(activeConversationId))
+    }
+
+    @Test
+    fun `end foreground id uses stable placeholder when idle`() {
+        assertEquals("ending", voiceAgentEndForegroundConversationId(null))
+    }
 }
