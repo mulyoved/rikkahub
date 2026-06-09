@@ -23,6 +23,7 @@ MANUAL_REVIEW_ANSWER_FILE="${VOICE_AGENT_E2E_MANUAL_REVIEW_ANSWER_PATH:-$LOG_DIR
 REPORT_FILE="${VOICE_AGENT_E2E_REPORT_PATH:-$LOG_DIR/report.txt}"
 PROMPT_SOURCE_TEXT_FILE="$LOG_DIR/generated-prompt.txt"
 LOG_SEARCH_START_LINE=1
+WAIT_FOR_LOG_FAILURE=""
 ADB_TIMEOUT_SECONDS="${VOICE_AGENT_E2E_ADB_TIMEOUT_SECONDS:-20}"
 ADB_LONG_TIMEOUT_SECONDS="${VOICE_AGENT_E2E_ADB_LONG_TIMEOUT_SECONDS:-120}"
 ADB_READY_SCRIPT="${VOICE_AGENT_E2E_ADB_READY_SCRIPT:-scripts/adb-device-ready.sh}"
@@ -116,8 +117,12 @@ wait_for_log() {
   local timeout_seconds="${3:-90}"
   local deadline=$((SECONDS + timeout_seconds))
   local matched_line
+  WAIT_FOR_LOG_FAILURE=""
   while (( SECONDS < deadline )); do
-    fail_if_log "common forbidden marker" "$COMMON_FORBIDDEN_PATTERN" || return 1
+    if ! fail_if_log "common forbidden marker" "$COMMON_FORBIDDEN_PATTERN"; then
+      WAIT_FOR_LOG_FAILURE="forbidden"
+      return 1
+    fi
     matched_line="$(awk -v start="$LOG_SEARCH_START_LINE" -v pattern="$pattern" \
       'NR >= start && $0 ~ pattern { print NR; exit }' "$LOG_FILE" 2>/dev/null || true)"
     if [[ -n "$matched_line" ]]; then
@@ -129,6 +134,7 @@ wait_for_log() {
   done
   printf 'Missing marker after %ss: %s\n' "$timeout_seconds" "$label" >&2
   printf 'Pattern: %s\n' "$pattern" >&2
+  WAIT_FOR_LOG_FAILURE="timeout"
   return 1
 }
 
@@ -489,7 +495,7 @@ wait_for_log "debug PCM delivered" 'VoiceAudioDebugInjection.*debug_audio_inject
 if ! wait_for_log "Gemini ask_hermes tool call received" \
   'VoiceAgentGemini.*receive kind=toolCall' \
   "$GEMINI_TOOL_CALL_TIMEOUT_SECONDS"; then
-  if [[ "$MANUAL_REVIEW" == "1" ]]; then
+  if [[ "$MANUAL_REVIEW" == "1" && "$WAIT_FOR_LOG_FAILURE" == "timeout" ]]; then
     print_missing_tool_call_diagnostics
   fi
   exit 1

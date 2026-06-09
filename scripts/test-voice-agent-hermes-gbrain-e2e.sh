@@ -722,6 +722,11 @@ if [[ "$forbidden_marker_status" -eq 0 ]]; then
   exit 1
 fi
 assert_contains "$forbidden_marker_output" "Forbidden marker found: common forbidden marker"
+if [[ "$forbidden_marker_output" == *"Voice Agent E2E diagnostic artifacts after missing tool call"* ]]; then
+  printf 'Expected forbidden-marker failure not to print missing tool-call diagnostics.\n' >&2
+  printf 'Actual output:\n%s\n' "$forbidden_marker_output" >&2
+  exit 1
+fi
 assert_last_line_after "$FAKE_ADB_ARGS_LOG" \
   "-a me.rerere.rikkahub.voiceagent.action.END" \
   "rm -f no_backup/voice-e2e/hermes-answer.txt"
