@@ -67,12 +67,22 @@ class VoiceContextBuilder(
         assistantPrompt: String,
         voiceModelName: String,
         userNickname: String,
-    ): String = "You are $assistantName in RikkaHub voice mode.\n" +
-        assistantPrompt.renderVoicePlaceholders(
+    ): String {
+        val renderedAssistantPrompt = assistantPrompt.renderVoicePlaceholders(
             assistantName = assistantName,
             voiceModelName = voiceModelName,
             userNickname = userNickname,
         )
+        return buildString {
+            appendLine("You are $assistantName in RikkaHub voice mode.")
+            append(VOICE_HERMES_TOOL_POLICY)
+            if (renderedAssistantPrompt.isNotBlank()) {
+                appendLine()
+                appendLine()
+                append(renderedAssistantPrompt)
+            }
+        }
+    }
 
     private fun UIMessage.toGeminiTurn(): GeminiContentTurn? {
         val text = parts
@@ -180,5 +190,13 @@ class VoiceContextBuilder(
         const val GEMINI_USER_ROLE = "user"
         const val GEMINI_MODEL_ROLE = "model"
         const val SUMMARY_DETECTION_PREFIX_LENGTH = 240
+        private const val VOICE_HERMES_TOOL_POLICY =
+            "Hermes is your primary knowledge and reasoning backend in voice mode.\n" +
+                "For most substantive user requests, call ask_hermes before answering.\n" +
+                "Use ask_hermes for facts, memory, project state, plans, decisions, debugging, " +
+                "current context, or anything where Hermes may know more than you.\n" +
+                "Answer directly only for greetings, brief acknowledgements, voice controls, " +
+                "or when asking a short clarification.\n" +
+                "After Hermes responds, summarize the answer naturally and briefly."
     }
 }

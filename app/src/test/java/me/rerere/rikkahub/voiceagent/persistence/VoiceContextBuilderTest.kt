@@ -26,7 +26,7 @@ class VoiceContextBuilderTest {
         )
 
         assertEquals(
-            "You are Hermes in RikkaHub voice mode.\nAnswer briefly.",
+            expectedVoiceSystemInstruction("Answer briefly."),
             context.systemInstruction,
         )
         assertEquals(20, context.turns.size)
@@ -278,16 +278,17 @@ class VoiceContextBuilderTest {
         )
 
         assertEquals(
-            """
-                You are Hermes in RikkaHub voice mode.
-                You are Hermes on gemini-flash.
-                Time: Jun 5, 2026, 2:30:00 PM
-                Locale: English (United States)
-                Timezone: Coordinated Universal Time
-                Device: Samsung SM-X730
-                System: Android SDK v36 (16)
-                User: Muly
-            """.trimIndent(),
+            expectedVoiceSystemInstruction(
+                """
+                    You are Hermes on gemini-flash.
+                    Time: Jun 5, 2026, 2:30:00 PM
+                    Locale: English (United States)
+                    Timezone: Coordinated Universal Time
+                    Device: Samsung SM-X730
+                    System: Android SDK v36 (16)
+                    User: Muly
+                """.trimIndent()
+            ),
             context.systemInstruction.replace('\u202f', ' '),
         )
     }
@@ -302,7 +303,7 @@ class VoiceContextBuilderTest {
         )
 
         assertEquals(
-            "You are Hermes in RikkaHub voice mode.\nUser: Muly\nNickname: Muly",
+            expectedVoiceSystemInstruction("User: Muly\nNickname: Muly"),
             context.systemInstruction,
         )
     }
@@ -320,13 +321,28 @@ class VoiceContextBuilderTest {
         )
 
         assertEquals(
-            "You are Hermes in RikkaHub voice mode.\nBattery: 72%",
+            expectedVoiceSystemInstruction("Battery: 72%"),
             context.systemInstruction,
         )
     }
+
+    private fun expectedVoiceSystemInstruction(assistantPrompt: String): String =
+        "$EXPECTED_VOICE_SYSTEM_PREFIX\n\n$assistantPrompt"
 
     private fun conversationWith(messages: List<UIMessage>): Conversation = Conversation.ofId(
         id = Uuid.random(),
         messages = messages.map(MessageNode::of),
     )
+
+    private companion object {
+        const val EXPECTED_VOICE_SYSTEM_PREFIX =
+            "You are Hermes in RikkaHub voice mode.\n" +
+                "Hermes is your primary knowledge and reasoning backend in voice mode.\n" +
+                "For most substantive user requests, call ask_hermes before answering.\n" +
+                "Use ask_hermes for facts, memory, project state, plans, decisions, debugging, " +
+                "current context, or anything where Hermes may know more than you.\n" +
+                "Answer directly only for greetings, brief acknowledgements, voice controls, " +
+                "or when asking a short clarification.\n" +
+                "After Hermes responds, summarize the answer naturally and briefly."
+    }
 }
