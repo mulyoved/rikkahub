@@ -535,6 +535,7 @@ fi
 print_preflight_summary "$SELECTED_SERIAL"
 
 ADB_APP_CLEANUP_ENABLED=1
+printf 'Clearing previous app-private E2E artifacts...\n'
 clear_app_text_artifacts
 
 printf 'Starting scoped log capture...\n'

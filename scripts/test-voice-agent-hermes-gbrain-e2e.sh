@@ -543,6 +543,10 @@ if [[ "$unset_serial_status" -ne 0 ]]; then
 fi
 assert_contains "$unset_serial_output" "E2E preflight:"
 assert_contains "$unset_serial_output" "  selected serial: RZ"
+assert_contains "$unset_serial_output" "  package: me.rerere.rikkahub.debug installed"
+assert_contains_in_order "$unset_serial_output" \
+  "  package: me.rerere.rikkahub.debug installed" \
+  "Clearing previous app-private E2E artifacts..."
 assert_file_contains "$FAKE_ADB_ARGS_LOG" "devices -l"
 assert_file_contains "$FAKE_ADB_ARGS_LOG" "-s RZ shell getprop ro.product.model"
 assert_file_contains "$FAKE_ADB_ARGS_LOG" "-s RZ shell pm path me.rerere.rikkahub.debug"
