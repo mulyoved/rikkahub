@@ -75,6 +75,21 @@ assert_last_line_after() {
   fi
 }
 
+assert_first_line_after() {
+  local path="$1"
+  local earlier="$2"
+  local later="$3"
+  local earlier_line
+  local later_line
+  earlier_line="$(grep -n -F -- "$earlier" "$path" | head -n 1 | cut -d: -f1)"
+  later_line="$(grep -n -F -- "$later" "$path" | head -n 1 | cut -d: -f1)"
+  if [[ -z "$earlier_line" || -z "$later_line" || "$later_line" -le "$earlier_line" ]]; then
+    printf 'Expected first "%s" to appear after first "%s" in %s\n' "$later" "$earlier" "$path" >&2
+    printf 'Actual contents:\n%s\n' "$(cat "$path")" >&2
+    exit 1
+  fi
+}
+
 assert_no_report_temp_files() {
   local directory="$1"
   local leaked
@@ -472,6 +487,37 @@ assert_contains "$manual_no_hash_output" "  selected serial: RZ"
 assert_contains "$manual_no_hash_output" "  device: model=SM-S711B android=16"
 assert_contains "$manual_no_hash_output" "  package: me.rerere.rikkahub.debug installed"
 
+explicit_serial_multiple_devices_log_dir="$TMP_DIR/explicit-serial-multiple-devices-log"
+: > "$FAKE_ADB_ARGS_LOG"
+set +e
+explicit_serial_multiple_devices_output="$(
+  PATH="$TMP_DIR:$PATH" \
+  FAKE_ADB_DEVICES_MODE=multiple \
+  VOICE_AGENT_E2E_SERIAL=RZ \
+  VOICE_AGENT_E2E_ADB_READY_SCRIPT="$TMP_DIR/adb-ready.sh" \
+  VOICE_AGENT_E2E_PCM_PATH="$TMP_DIR/prompt.pcm" \
+  VOICE_AGENT_E2E_CONVERSATION_ID=conversation-1 \
+  VOICE_AGENT_E2E_LOG_DIR="$explicit_serial_multiple_devices_log_dir" \
+  VOICE_AGENT_E2E_MANUAL_REVIEW=1 \
+  VOICE_AGENT_E2E_GEMINI_TOOL_CALL_TIMEOUT_SECONDS=5 \
+  VOICE_AGENT_E2E_HERMES_RESPONSE_TIMEOUT_SECONDS=5 \
+  "$SCRIPT" 2>&1
+)"
+explicit_serial_multiple_devices_status=$?
+set -e
+
+if [[ "$explicit_serial_multiple_devices_status" -ne 0 ]]; then
+  printf 'Expected explicit serial run with multiple authorized devices to pass.\n' >&2
+  printf 'Actual output:\n%s\n' "$explicit_serial_multiple_devices_output" >&2
+  printf 'ADB args:\n%s\n' "$(cat "$FAKE_ADB_ARGS_LOG")" >&2
+  exit 1
+fi
+if grep -F -- "devices -l" "$FAKE_ADB_ARGS_LOG" >/dev/null; then
+  printf 'Expected explicit serial run to skip ADB device discovery.\n' >&2
+  printf 'ADB args:\n%s\n' "$(cat "$FAKE_ADB_ARGS_LOG")" >&2
+  exit 1
+fi
+
 unset_serial_log_dir="$TMP_DIR/unset-serial-log"
 : > "$FAKE_ADB_ARGS_LOG"
 set +e
@@ -501,6 +547,9 @@ assert_file_contains "$FAKE_ADB_ARGS_LOG" "devices -l"
 assert_file_contains "$FAKE_ADB_ARGS_LOG" "-s RZ shell getprop ro.product.model"
 assert_file_contains "$FAKE_ADB_ARGS_LOG" "-s RZ shell pm path me.rerere.rikkahub.debug"
 assert_file_contains "$FAKE_ADB_ARGS_LOG" "-s RZ logcat -c"
+assert_first_line_after "$FAKE_ADB_ARGS_LOG" \
+  "-s RZ shell getprop ro.build.version.release" \
+  "-s RZ shell run-as me.rerere.rikkahub.debug rm -f no_backup/voice-e2e/hermes-answer.txt"
 
 multiple_serials_log_dir="$TMP_DIR/multiple-serials-log"
 : > "$FAKE_ADB_ARGS_LOG"

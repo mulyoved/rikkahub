@@ -526,9 +526,6 @@ if [[ -z "$SELECTED_SERIAL" ]]; then
 fi
 VOICE_AGENT_E2E_SERIAL="$SELECTED_SERIAL"
 
-ADB_APP_CLEANUP_ENABLED=1
-clear_app_text_artifacts
-
 printf 'Checking installed app package...\n'
 if ! adb_cmd shell pm path "$PACKAGE" >/dev/null; then
   printf 'Installed app package was not found: %s\n' "$PACKAGE" >&2
@@ -536,6 +533,9 @@ if ! adb_cmd shell pm path "$PACKAGE" >/dev/null; then
   exit 2
 fi
 print_preflight_summary "$SELECTED_SERIAL"
+
+ADB_APP_CLEANUP_ENABLED=1
+clear_app_text_artifacts
 
 printf 'Starting scoped log capture...\n'
 adb_cmd logcat -c
