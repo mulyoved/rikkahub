@@ -180,6 +180,12 @@ case "$args" in
   "-s RZ shell pm path me.rerere.rikkahub.debug")
     printf 'package:/data/app/test/base.apk\n'
     ;;
+  "-s RZ shell getprop ro.product.model")
+    printf 'SM-S711B\r\n'
+    ;;
+  "-s RZ shell getprop ro.build.version.release")
+    printf '16\r\n'
+    ;;
   "-s RZ logcat -c")
     ;;
   "-s RZ logcat -v time "*)
@@ -446,6 +452,11 @@ if [[ "$manual_no_hash_status" -ne 0 ]]; then
   exit 1
 fi
 assert_contains "$manual_no_hash_output" "Voice Agent Hermes/Gbrain live E2E reached manual review gate."
+assert_contains "$manual_no_hash_output" "E2E preflight:"
+assert_contains "$manual_no_hash_output" "  adb server: ${ADB_SERVER_SOCKET:-default local adb server}"
+assert_contains "$manual_no_hash_output" "  selected serial: RZ"
+assert_contains "$manual_no_hash_output" "  device: model=SM-S711B android=16"
+assert_contains "$manual_no_hash_output" "  package: me.rerere.rikkahub.debug installed"
 
 cleanup_failure_log_dir="$TMP_DIR/cleanup-failure-log"
 rm -f "$FAKE_ADB_END_MARKER"

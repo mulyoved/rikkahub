@@ -112,6 +112,31 @@ adb_long_cmd() {
   adb_cmd_with_timeout "$ADB_LONG_TIMEOUT_SECONDS" "$@"
 }
 
+selected_adb_serial() {
+  if [[ -n "${VOICE_AGENT_E2E_SERIAL:-}" ]]; then
+    printf '%s' "$VOICE_AGENT_E2E_SERIAL"
+    return 0
+  fi
+
+  adb_cmd devices -l |
+    awk '$2 == "device" { print $1; exit }'
+}
+
+print_preflight_summary() {
+  local serial="$1"
+  local model
+  local android
+
+  model="$(adb_cmd shell getprop ro.product.model | tr -d '\r' || true)"
+  android="$(adb_cmd shell getprop ro.build.version.release | tr -d '\r' || true)"
+
+  printf 'E2E preflight:\n'
+  printf '  adb server: %s\n' "${ADB_SERVER_SOCKET:-default local adb server}"
+  printf '  selected serial: %s\n' "${serial:-unknown}"
+  printf '  device: model=%s android=%s\n' "${model:-unknown}" "${android:-unknown}"
+  printf '  package: %s installed\n' "$PACKAGE"
+}
+
 adb_logcat() {
   if [[ -n "${VOICE_AGENT_E2E_SERIAL:-}" ]]; then
     adb -s "$VOICE_AGENT_E2E_SERIAL" "$@"
@@ -481,6 +506,13 @@ else
   printf 'ADB readiness helper is not executable: %s\n' "$ADB_READY_SCRIPT" >&2
   exit 2
 fi
+
+SELECTED_SERIAL="$(selected_adb_serial)"
+if [[ -z "$SELECTED_SERIAL" ]]; then
+  printf 'Could not determine selected ADB serial after readiness check.\n' >&2
+  exit 6
+fi
+
 ADB_APP_CLEANUP_ENABLED=1
 clear_app_text_artifacts
 
@@ -490,6 +522,7 @@ if ! adb_cmd shell pm path "$PACKAGE" >/dev/null; then
   printf 'Install and configure the app on the phone before running this E2E.\n' >&2
   exit 2
 fi
+print_preflight_summary "$SELECTED_SERIAL"
 
 printf 'Starting scoped log capture...\n'
 adb_cmd logcat -c

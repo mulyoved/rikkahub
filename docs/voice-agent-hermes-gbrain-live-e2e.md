@@ -118,6 +118,19 @@ verifies the PCM file exists after generation or explicit selection, lowercases 
 checks ADB readiness, checks that the target package is already installed, and writes a local scoped log to
 `build/voice-agent-e2e/logcat.txt`.
 
+Before starting log capture, the script prints a preflight summary:
+
+```text
+E2E preflight:
+  adb server: tcp:100.69.79.32:5037
+  selected serial: RZCX71NXRPB
+  device: model=SM-S711B android=16
+  package: me.rerere.rikkahub.debug installed
+```
+
+If the selected serial, model, or package line is not the device/app you intended to test, stop the run and correct
+`ADB_SERVER_SOCKET`, `VOICE_AGENT_E2E_SERIAL`, or `VOICE_AGENT_E2E_PACKAGE`.
+
 Before running, verify that the selected ADB socket and serial still refer to the intended operator device. After a run,
 do not distribute device state or logs because this run exercises configured provider credentials and writes private E2E
 data into app storage while it is active.
