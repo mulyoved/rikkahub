@@ -512,6 +512,7 @@ if [[ -z "$SELECTED_SERIAL" ]]; then
   printf 'Could not determine selected ADB serial after readiness check.\n' >&2
   exit 6
 fi
+VOICE_AGENT_E2E_SERIAL="$SELECTED_SERIAL"
 
 ADB_APP_CLEANUP_ENABLED=1
 clear_app_text_artifacts

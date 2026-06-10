@@ -177,6 +177,10 @@ fi
 
 args="$*"
 case "$args" in
+  "devices -l")
+    printf 'List of devices attached\n'
+    printf 'RZ device product:r11q model:SM-S711B device:r11q transport_id:1\n'
+    ;;
   "-s RZ shell pm path me.rerere.rikkahub.debug")
     printf 'package:/data/app/test/base.apk\n'
     ;;
@@ -457,6 +461,36 @@ assert_contains "$manual_no_hash_output" "  adb server: ${ADB_SERVER_SOCKET:-def
 assert_contains "$manual_no_hash_output" "  selected serial: RZ"
 assert_contains "$manual_no_hash_output" "  device: model=SM-S711B android=16"
 assert_contains "$manual_no_hash_output" "  package: me.rerere.rikkahub.debug installed"
+
+unset_serial_log_dir="$TMP_DIR/unset-serial-log"
+: > "$FAKE_ADB_ARGS_LOG"
+set +e
+unset_serial_output="$(
+  PATH="$TMP_DIR:$PATH" \
+  VOICE_AGENT_E2E_ADB_READY_SCRIPT="$TMP_DIR/adb-ready.sh" \
+  VOICE_AGENT_E2E_PCM_PATH="$TMP_DIR/prompt.pcm" \
+  VOICE_AGENT_E2E_CONVERSATION_ID=conversation-1 \
+  VOICE_AGENT_E2E_LOG_DIR="$unset_serial_log_dir" \
+  VOICE_AGENT_E2E_MANUAL_REVIEW=1 \
+  VOICE_AGENT_E2E_GEMINI_TOOL_CALL_TIMEOUT_SECONDS=5 \
+  VOICE_AGENT_E2E_HERMES_RESPONSE_TIMEOUT_SECONDS=5 \
+  "$SCRIPT" 2>&1
+)"
+unset_serial_status=$?
+set -e
+
+if [[ "$unset_serial_status" -ne 0 ]]; then
+  printf 'Expected unset serial manual mode to pass, got status %s.\n' "$unset_serial_status" >&2
+  printf 'Actual output:\n%s\n' "$unset_serial_output" >&2
+  printf 'ADB args:\n%s\n' "$(cat "$FAKE_ADB_ARGS_LOG")" >&2
+  exit 1
+fi
+assert_contains "$unset_serial_output" "E2E preflight:"
+assert_contains "$unset_serial_output" "  selected serial: RZ"
+assert_file_contains "$FAKE_ADB_ARGS_LOG" "devices -l"
+assert_file_contains "$FAKE_ADB_ARGS_LOG" "-s RZ shell getprop ro.product.model"
+assert_file_contains "$FAKE_ADB_ARGS_LOG" "-s RZ shell pm path me.rerere.rikkahub.debug"
+assert_file_contains "$FAKE_ADB_ARGS_LOG" "-s RZ logcat -c"
 
 cleanup_failure_log_dir="$TMP_DIR/cleanup-failure-log"
 rm -f "$FAKE_ADB_END_MARKER"
