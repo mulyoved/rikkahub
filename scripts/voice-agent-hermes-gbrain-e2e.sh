@@ -118,7 +118,19 @@ selected_adb_serial() {
     return 0
   fi
 
-  adb_cmd devices -l |
+  local devices_output
+  local device_count
+
+  devices_output="$(adb_cmd devices -l)"
+  device_count="$(printf '%s\n' "$devices_output" | awk '$2 == "device" { count++ } END { print count + 0 }')"
+  if [[ "$device_count" != "1" ]]; then
+    printf 'Expected exactly one authorized ADB device, found %s. Set VOICE_AGENT_E2E_SERIAL.\n' \
+      "$device_count" >&2
+    printf '%s\n' "$devices_output" >&2
+    return 1
+  fi
+
+  printf '%s\n' "$devices_output" |
     awk '$2 == "device" { print $1; exit }'
 }
 

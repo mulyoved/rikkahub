@@ -179,7 +179,17 @@ args="$*"
 case "$args" in
   "devices -l")
     printf 'List of devices attached\n'
-    printf 'RZ device product:r11q model:SM-S711B device:r11q transport_id:1\n'
+    case "${FAKE_ADB_DEVICES_MODE:-single}" in
+      none)
+        ;;
+      multiple)
+        printf 'RZ device product:r11q model:SM-S711B device:r11q transport_id:1\n'
+        printf 'R2 device product:r11q model:SM-S711B device:r11q transport_id:2\n'
+        ;;
+      *)
+        printf 'RZ device product:r11q model:SM-S711B device:r11q transport_id:1\n'
+        ;;
+    esac
     ;;
   "-s RZ shell pm path me.rerere.rikkahub.debug")
     printf 'package:/data/app/test/base.apk\n'
@@ -491,6 +501,76 @@ assert_file_contains "$FAKE_ADB_ARGS_LOG" "devices -l"
 assert_file_contains "$FAKE_ADB_ARGS_LOG" "-s RZ shell getprop ro.product.model"
 assert_file_contains "$FAKE_ADB_ARGS_LOG" "-s RZ shell pm path me.rerere.rikkahub.debug"
 assert_file_contains "$FAKE_ADB_ARGS_LOG" "-s RZ logcat -c"
+
+multiple_serials_log_dir="$TMP_DIR/multiple-serials-log"
+: > "$FAKE_ADB_ARGS_LOG"
+set +e
+multiple_serials_output="$(
+  PATH="$TMP_DIR:$PATH" \
+  FAKE_ADB_DEVICES_MODE=multiple \
+  VOICE_AGENT_E2E_ADB_READY_SCRIPT="$TMP_DIR/adb-ready.sh" \
+  VOICE_AGENT_E2E_PCM_PATH="$TMP_DIR/prompt.pcm" \
+  VOICE_AGENT_E2E_CONVERSATION_ID=conversation-1 \
+  VOICE_AGENT_E2E_LOG_DIR="$multiple_serials_log_dir" \
+  VOICE_AGENT_E2E_MANUAL_REVIEW=1 \
+  "$SCRIPT" 2>&1
+)"
+multiple_serials_status=$?
+set -e
+
+if [[ "$multiple_serials_status" -eq 0 ]]; then
+  printf 'Expected unset serial run with multiple authorized devices to fail.\n' >&2
+  printf 'Actual output:\n%s\n' "$multiple_serials_output" >&2
+  printf 'ADB args:\n%s\n' "$(cat "$FAKE_ADB_ARGS_LOG")" >&2
+  exit 1
+fi
+assert_contains "$multiple_serials_output" \
+  "Expected exactly one authorized ADB device, found 2. Set VOICE_AGENT_E2E_SERIAL."
+if grep -F -- "shell pm path" "$FAKE_ADB_ARGS_LOG" >/dev/null; then
+  printf 'Expected multiple-device serial failure before package checks.\n' >&2
+  printf 'ADB args:\n%s\n' "$(cat "$FAKE_ADB_ARGS_LOG")" >&2
+  exit 1
+fi
+if grep -F -- "logcat" "$FAKE_ADB_ARGS_LOG" >/dev/null; then
+  printf 'Expected multiple-device serial failure before logcat.\n' >&2
+  printf 'ADB args:\n%s\n' "$(cat "$FAKE_ADB_ARGS_LOG")" >&2
+  exit 1
+fi
+
+missing_serial_log_dir="$TMP_DIR/missing-serial-log"
+: > "$FAKE_ADB_ARGS_LOG"
+set +e
+missing_serial_output="$(
+  PATH="$TMP_DIR:$PATH" \
+  FAKE_ADB_DEVICES_MODE=none \
+  VOICE_AGENT_E2E_ADB_READY_SCRIPT="$TMP_DIR/adb-ready.sh" \
+  VOICE_AGENT_E2E_PCM_PATH="$TMP_DIR/prompt.pcm" \
+  VOICE_AGENT_E2E_CONVERSATION_ID=conversation-1 \
+  VOICE_AGENT_E2E_LOG_DIR="$missing_serial_log_dir" \
+  VOICE_AGENT_E2E_MANUAL_REVIEW=1 \
+  "$SCRIPT" 2>&1
+)"
+missing_serial_status=$?
+set -e
+
+if [[ "$missing_serial_status" -eq 0 ]]; then
+  printf 'Expected unset serial run without authorized devices to fail.\n' >&2
+  printf 'Actual output:\n%s\n' "$missing_serial_output" >&2
+  printf 'ADB args:\n%s\n' "$(cat "$FAKE_ADB_ARGS_LOG")" >&2
+  exit 1
+fi
+assert_contains "$missing_serial_output" \
+  "Expected exactly one authorized ADB device, found 0. Set VOICE_AGENT_E2E_SERIAL."
+if grep -F -- "shell pm path" "$FAKE_ADB_ARGS_LOG" >/dev/null; then
+  printf 'Expected missing-device serial failure before package checks.\n' >&2
+  printf 'ADB args:\n%s\n' "$(cat "$FAKE_ADB_ARGS_LOG")" >&2
+  exit 1
+fi
+if grep -F -- "logcat" "$FAKE_ADB_ARGS_LOG" >/dev/null; then
+  printf 'Expected missing-device serial failure before logcat.\n' >&2
+  printf 'ADB args:\n%s\n' "$(cat "$FAKE_ADB_ARGS_LOG")" >&2
+  exit 1
+fi
 
 cleanup_failure_log_dir="$TMP_DIR/cleanup-failure-log"
 rm -f "$FAKE_ADB_END_MARKER"
