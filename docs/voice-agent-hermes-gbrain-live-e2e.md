@@ -88,12 +88,13 @@ If `VOICE_AGENT_E2E_PCM_PATH` is unset, the script generates signed 16-bit littl
 The default generated prompt is:
 
 ```text
-Ask Hermes. Are you connected to G Brain? Answer yes or no.
+Ask Hermes. Use the ask Hermes tool now. Ask Hermes: Are you connected to G Brain? Answer yes or no.
 ```
 
-The generated prompt uses Flite voice `slt` by default because live testing showed the previous `kal` voice was
-transcribed unreliably by Gemini Live. Set `VOICE_AGENT_E2E_FLITE_VOICE` to another installed Flite voice when comparing
-ASR behavior.
+The generated prompt repeats the Ask Hermes instruction because live testing showed the shorter prompt could be
+misrecognized as a greeting-like fragment and fail to trigger a tool call. The generated prompt uses Flite voice `slt`
+by default because live testing showed the previous `kal` voice was transcribed unreliably by Gemini Live.
+Set `VOICE_AGENT_E2E_FLITE_VOICE` to another installed Flite voice when comparing ASR behavior.
 
 Set `VOICE_AGENT_E2E_PROMPT_TEXT` to change one string and regenerate the PCM for a different question.
 

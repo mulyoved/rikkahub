@@ -563,7 +563,7 @@ chmod 644 \
 set +e
 generated_output="$(
   PATH="$TMP_DIR:$PATH" \
-  FAKE_FFMPEG_EXPECTED_PROMPT="Ask Hermes. Are you connected to G Brain? Answer yes or no." \
+  FAKE_FFMPEG_EXPECTED_PROMPT="Ask Hermes. Use the ask Hermes tool now. Ask Hermes: Are you connected to G Brain? Answer yes or no." \
   FAKE_FFMPEG_EXPECTED_VOICE=slt \
   FAKE_FFMPEG_EXPECTED_OUTPUT="$generated_log_dir/generated-prompt.pcm" \
   VOICE_AGENT_E2E_SERIAL=RZ \
@@ -588,7 +588,7 @@ assert_contains "$generated_output" "Generating PCM prompt from VOICE_AGENT_E2E_
 assert_contains "$generated_output" "Voice Agent Hermes/Gbrain live E2E reached manual review gate."
 assert_file_contains_exactly "$generated_log_dir/generated-prompt.pcm" "generated pcm"
 assert_file_contains_exactly "$generated_log_dir/generated-prompt.txt" \
-  "Ask Hermes. Are you connected to G Brain? Answer yes or no."
+  "Ask Hermes. Use the ask Hermes tool now. Ask Hermes: Are you connected to G Brain? Answer yes or no."
 report_path="$generated_log_dir/report.txt"
 if [[ ! -f "$report_path" ]]; then
   printf 'Expected report file to exist: %s\n' "$report_path" >&2
@@ -596,7 +596,7 @@ if [[ ! -f "$report_path" ]]; then
 fi
 report_contents="$(cat "$report_path")"
 assert_contains "$report_contents" "Text used to generate voice:"
-assert_contains "$report_contents" "Ask Hermes. Are you connected to G Brain? Answer yes or no."
+assert_contains "$report_contents" "Ask Hermes. Use the ask Hermes tool now. Ask Hermes: Are you connected to G Brain? Answer yes or no."
 assert_contains "$report_contents" "Gemini understood from voice:"
 assert_contains "$report_contents" "Please ask Hermes if he is connected to G-Brain."
 assert_contains "$report_contents" "Hermes call:"
