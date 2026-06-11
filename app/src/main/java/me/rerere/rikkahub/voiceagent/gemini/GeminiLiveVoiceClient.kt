@@ -17,6 +17,7 @@ sealed interface GeminiLiveDebugEvent {
         val allowedFunctionNames: List<String>,
         val responseModalities: List<String>,
         val systemInstructionChars: Int,
+        val realtimeInputConfig: String?,
     ) : GeminiLiveDebugEvent
 
     data class Send(
@@ -549,8 +550,26 @@ private fun String.geminiDebugSetupEvent(): GeminiLiveDebugEvent.Setup? = runCat
                 part.jsonObject["text"]?.jsonPrimitive?.contentOrNull?.length ?: 0
             }
             ?: 0,
+        realtimeInputConfig = setup.geminiDebugRealtimeInputConfig(),
     )
 }.getOrNull()
+
+private fun JsonObject.geminiDebugRealtimeInputConfig(): String? {
+    val config = this["realtimeInputConfig"]?.jsonObject ?: return null
+    val activityDetection = config["automaticActivityDetection"]?.jsonObject
+    return if (activityDetection != null) {
+        "automaticActivityDetection.disabled=${activityDetection.stringValue("disabled") ?: "n/a"} " +
+            "start=${activityDetection.stringValue("startOfSpeechSensitivity") ?: "n/a"} " +
+            "end=${activityDetection.stringValue("endOfSpeechSensitivity") ?: "n/a"} " +
+            "prefixPaddingMs=${activityDetection.stringValue("prefixPaddingMs") ?: "n/a"} " +
+            "silenceDurationMs=${activityDetection.stringValue("silenceDurationMs") ?: "n/a"}"
+    } else {
+        "automaticActivityDetection=missing"
+    }
+}
+
+private fun JsonObject.stringValue(name: String): String? =
+    get(name)?.jsonPrimitive?.contentOrNull
 
 private fun JsonObject.declaresAskHermesTool(): Boolean =
     this["tools"]

@@ -83,7 +83,8 @@ class OkHttpGeminiLiveVoiceClient(
                     "toolConfigMode=${event.toolConfigMode ?: "none"} " +
                     "allowedFunctionNames=${event.allowedFunctionNames.joinToString()} " +
                     "responseModalities=${event.responseModalities.joinToString()} " +
-                    "systemInstructionChars=${event.systemInstructionChars}",
+                    "systemInstructionChars=${event.systemInstructionChars} " +
+                    "realtimeInputConfig=${event.realtimeInputConfig ?: "none"}",
             )
             is GeminiLiveDebugEvent.Send -> Log.d(
                 TAG,
