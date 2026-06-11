@@ -145,10 +145,74 @@ class VoiceE2EArtifactWriterTest {
     }
 
     @Test
+    fun `enabled writer clears stale append-only hermes events before writing`() = runBlocking {
+        val root = Files.createTempDirectory("voice-e2e-hermes-events-stale").toFile()
+        val scope = CoroutineScope(coroutineContext + SupervisorJob())
+        try {
+            val eventsFile = File(root, "voice-e2e/hermes-events.ndjson")
+            requireNotNull(eventsFile.parentFile).mkdirs()
+            eventsFile.writeText("""{"event":"old-private-row"}""" + "\n")
+
+            val writer = VoiceE2EArtifactWriter.create(
+                enabled = true,
+                rootDirectory = root,
+                scope = scope,
+            )
+
+            writer(VoiceE2EArtifact.HermesEvents, """{"event":"new-row"}""")
+            writer.drain()
+
+            assertEquals(
+                listOf("""{"event":"new-row"}"""),
+                eventsFile.readLines(),
+            )
+        } finally {
+            scope.cancel()
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `append-only writer rejects multiline hermes events`() = runBlocking {
+        val root = Files.createTempDirectory("voice-e2e-hermes-events-multiline").toFile()
+        val scope = CoroutineScope(coroutineContext + SupervisorJob())
+        try {
+            val writer = VoiceE2EArtifactWriter.create(
+                enabled = true,
+                rootDirectory = root,
+                scope = scope,
+            )
+
+            writer(VoiceE2EArtifact.HermesEvents, """{"event":"queued"}""")
+            writer(VoiceE2EArtifact.HermesEvents, "{\"event\":\"bad\\nobject\"}\n")
+            writer(VoiceE2EArtifact.HermesEvents, "{\"event\":\"bad\\robject\"}\r")
+            writer(VoiceE2EArtifact.HermesEvents, """{"event":"completed"}""")
+            writer(VoiceE2EArtifact.HermesAnswer, "answer\nwith newline")
+            writer.drain()
+
+            assertEquals(
+                listOf(
+                    """{"event":"queued"}""",
+                    """{"event":"completed"}""",
+                ),
+                File(root, "voice-e2e/hermes-events.ndjson").readLines(),
+            )
+            assertEquals("answer\nwith newline", File(root, "voice-e2e/hermes-answer.txt").readText())
+        } finally {
+            scope.cancel()
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
     fun `disabled writer does not persist hermes events`() = runBlocking {
         val root = Files.createTempDirectory("voice-e2e-hermes-events-disabled").toFile()
         val scope = CoroutineScope(coroutineContext + SupervisorJob())
         try {
+            val eventsFile = File(root, "voice-e2e/hermes-events.ndjson")
+            requireNotNull(eventsFile.parentFile).mkdirs()
+            eventsFile.writeText("""{"event":"existing-private-row"}""" + "\n")
+
             val writer = VoiceE2EArtifactWriter.create(
                 enabled = false,
                 rootDirectory = root,
@@ -158,7 +222,7 @@ class VoiceE2EArtifactWriterTest {
             writer(VoiceE2EArtifact.HermesEvents, """{"event":"queued"}""")
             writer.drain()
 
-            assertFalse(File(root, "voice-e2e/hermes-events.ndjson").exists())
+            assertEquals(listOf("""{"event":"existing-private-row"}"""), eventsFile.readLines())
         } finally {
             scope.cancel()
             root.deleteRecursively()

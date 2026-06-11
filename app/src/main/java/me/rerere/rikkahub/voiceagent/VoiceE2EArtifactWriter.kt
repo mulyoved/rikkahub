@@ -36,6 +36,9 @@ class VoiceE2EArtifactWriter private constructor(
 
     init {
         val queue = commands
+        if (queue != null) {
+            clearAppendOnlyArtifacts()
+        }
         if (queue != null && scope != null) {
             scope.launch(Dispatchers.IO) {
                 for (command in queue) {
@@ -55,6 +58,10 @@ class VoiceE2EArtifactWriter private constructor(
 
     fun write(artifact: VoiceE2EArtifact, content: String) {
         val queue = commands ?: return
+        if (artifact.appendOnly && content.containsLineBreak()) {
+            VoiceAgentLog.w(TAG, "artifact append rejected multiline name=${artifact.fileName}")
+            return
+        }
         var shouldQueueFlush = false
         synchronized(pendingLock) {
             if (artifact.appendOnly) {
@@ -77,6 +84,17 @@ class VoiceE2EArtifactWriter private constructor(
         val completed = CompletableDeferred<Unit>()
         queue.send(WriteCommand.Drain(completed))
         completed.await()
+    }
+
+    private fun clearAppendOnlyArtifacts() {
+        runCatching {
+            VoiceE2EArtifact.entries.filter { it.appendOnly }.forEach { artifact ->
+                File(directory, artifact.fileName).delete()
+            }
+        }.onFailure { error ->
+            val message = error.message ?: error.javaClass.simpleName
+            VoiceAgentLog.w(TAG, "artifact append cleanup failed message=$message")
+        }
     }
 
     private fun writeArtifact(artifact: VoiceE2EArtifact, content: String, append: Boolean) {
@@ -144,5 +162,7 @@ class VoiceE2EArtifactWriter private constructor(
         )
     }
 }
+
+private fun String.containsLineBreak(): Boolean = contains('\n') || contains('\r')
 
 private const val TAG = "VoiceE2EArtifactWriter"
