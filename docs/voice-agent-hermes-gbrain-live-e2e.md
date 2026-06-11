@@ -16,6 +16,7 @@ This runbook verifies the real Voice Agent pipeline:
 This is a live, credentialed, device-backed check. It is not part of CI.
 `scripts/test-voice-agent-hermes-gbrain-e2e.sh` only tests the shell harness with fake ADB; it does not replace the live
 device-backed verification. Use the live script below when asked to run the Voice Agent Hermes/Gbrain E2E.
+For the multi-request queued Hermes stress test, use `docs/voice-agent-hermes-queue-e2e.md`.
 
 Before running this script, the installed Android app must already be configured with the Hermes/MS-agent provider API
 key and any Cloudflare Access headers required by the Hermes endpoint. The script validates that installed-app
