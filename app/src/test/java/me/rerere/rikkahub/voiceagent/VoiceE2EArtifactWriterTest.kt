@@ -114,6 +114,58 @@ class VoiceE2EArtifactWriterTest {
     }
 
     @Test
+    fun `enabled writer appends hermes events without coalescing them`() = runBlocking {
+        val root = Files.createTempDirectory("voice-e2e-hermes-events-enabled").toFile()
+        val scope = CoroutineScope(coroutineContext + SupervisorJob())
+        try {
+            val writer = VoiceE2EArtifactWriter.create(
+                enabled = true,
+                rootDirectory = root,
+                scope = scope,
+            )
+
+            writer(VoiceE2EArtifact.HermesEvents, """{"event":"queued"}""")
+            writer(VoiceE2EArtifact.HermesEvents, """{"event":"started"}""")
+            writer(VoiceE2EArtifact.HermesEvents, """{"event":"completed"}""")
+            writer.drain()
+
+            val eventsFile = File(root, "voice-e2e/hermes-events.ndjson")
+            assertEquals(
+                listOf(
+                    """{"event":"queued"}""",
+                    """{"event":"started"}""",
+                    """{"event":"completed"}""",
+                ),
+                eventsFile.readLines(),
+            )
+        } finally {
+            scope.cancel()
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `disabled writer does not persist hermes events`() = runBlocking {
+        val root = Files.createTempDirectory("voice-e2e-hermes-events-disabled").toFile()
+        val scope = CoroutineScope(coroutineContext + SupervisorJob())
+        try {
+            val writer = VoiceE2EArtifactWriter.create(
+                enabled = false,
+                rootDirectory = root,
+                scope = scope,
+            )
+
+            writer(VoiceE2EArtifact.HermesEvents, """{"event":"queued"}""")
+            writer.drain()
+
+            assertFalse(File(root, "voice-e2e/hermes-events.ndjson").exists())
+        } finally {
+            scope.cancel()
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
     fun `default factory writer boundary keeps artifacts disabled unless launch config enables them`() = runBlocking {
         val root = Files.createTempDirectory("voice-e2e-factory-disabled").toFile()
         val scope = CoroutineScope(coroutineContext + SupervisorJob())
