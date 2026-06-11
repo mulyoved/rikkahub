@@ -537,6 +537,10 @@ class VoiceAgentCoordinator(
         try {
             val submitted = toolApi.submitHermesJob(callId = callId, prompt = prompt)
             handle.jobId = submitted.jobId
+            if (!isToolHandleActive(callId, handle)) {
+                cancelRemoteHermesJobs(listOf(handle))
+                return
+            }
             diagnostics.record(
                 "hermes_job_created",
                 "callId=$callId, jobId=${submitted.jobId}, status=${submitted.status}",
@@ -547,7 +551,6 @@ class VoiceAgentCoordinator(
                 status = VoiceToolRecordStatus.Pending,
                 jobId = submitted.jobId,
             )
-            if (!isToolHandleActive(callId, handle)) return
             updateToolStatus(callId, VoiceToolStatus.QueuedHermes(callId = callId, jobId = submitted.jobId))
             if (!sendQueuedHermesAcknowledgement(callId = callId, prompt = prompt, handle = handle)) return
             pollHermesJob(callId = callId, prompt = prompt, jobId = submitted.jobId, handle = handle)

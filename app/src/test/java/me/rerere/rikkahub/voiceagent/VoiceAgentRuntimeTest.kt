@@ -826,6 +826,34 @@ class VoiceAgentRuntimeTest {
     }
 
     @Test
+    fun `close while Hermes submit is in flight cancels remote job after submit returns`() = runTest {
+        val gemini = FakeGeminiLiveVoiceClient()
+        val toolApi = FakeVoiceToolApi()
+        val blockedSubmit = toolApi.blockSubmit("call-close-inflight")
+        val coordinator = VoiceAgentCoordinator(
+            gemini = gemini,
+            toolApi = toolApi,
+            audio = FakeVoiceAudioEngine(),
+            scope = this,
+            dispatcher = Dispatchers.Default,
+        )
+
+        coordinator.onGeminiEvent(
+            GeminiLiveEvent.ToolCall(callId = "call-close-inflight", name = "ask_hermes", prompt = "slow")
+        )
+        assertEquals("call-close-inflight" to "slow", toolApi.awaitRequest("call-close-inflight"))
+        assertTrue(blockedSubmit.started.await(500, TimeUnit.MILLISECONDS))
+
+        coordinator.close()
+        blockedSubmit.release.countDown()
+
+        toolApi.awaitRemoteCancelled("call-close-inflight")
+        coordinator.awaitToolJobsWithTimeout()
+        assertEquals(emptyList<Pair<String, String>>(), gemini.toolResponses)
+        assertEquals(VoiceToolStatus.Idle, coordinator.state.value.tool)
+    }
+
+    @Test
     fun `duplicate tool call id after queued acknowledgement keeps original job`() = runTest {
         val gemini = FakeGeminiLiveVoiceClient()
         val toolApi = FakeVoiceToolApi()
