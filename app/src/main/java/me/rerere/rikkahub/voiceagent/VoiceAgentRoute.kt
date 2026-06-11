@@ -641,10 +641,13 @@ private fun VoiceAudioStatus.statusLabel(): String = when (this) {
 
 internal fun VoiceToolStatus.visibleStatusLabel(): String = when (this) {
     VoiceToolStatus.Idle -> "Idle"
+    is VoiceToolStatus.QueuedHermes -> "Hermes/MS agent queued (${callId.withJob(jobId)})"
     is VoiceToolStatus.CallingHermes -> "Calling Hermes/MS agent... (${callId.withElapsed(elapsedMs)})"
     is VoiceToolStatus.HermesAnswered -> "Hermes/MS agent answered (${callId.withElapsed(elapsedMs)})"
     is VoiceToolStatus.HermesFailed -> "Hermes/MS agent failed ($callId): $message"
 }
+
+private fun String.withJob(jobId: String): String = "$this / $jobId"
 
 private fun String.withElapsed(elapsedMs: Long): String =
     if (elapsedMs > 0L) "$this, ${elapsedMs}ms" else this

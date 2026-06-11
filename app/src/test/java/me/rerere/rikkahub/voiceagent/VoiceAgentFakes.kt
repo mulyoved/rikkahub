@@ -13,6 +13,8 @@ import me.rerere.rikkahub.voiceagent.gemini.GeminiContentTurn
 import me.rerere.rikkahub.voiceagent.gemini.GeminiLiveEvent
 import me.rerere.rikkahub.voiceagent.gemini.GeminiLiveVoiceClient
 import me.rerere.rikkahub.voiceagent.persistence.VoiceContext
+import me.rerere.rikkahub.voiceagent.voicelab.MobileHermesJobPollResponse
+import me.rerere.rikkahub.voiceagent.voicelab.MobileHermesJobSubmitResponse
 import me.rerere.rikkahub.voiceagent.voicelab.MobileHermesResponse
 import me.rerere.rikkahub.voiceagent.voicelab.MobileVoiceSessionResponse
 import java.util.concurrent.CountDownLatch
@@ -178,32 +180,93 @@ class BlockedConnect {
 
 class FakeVoiceToolApi : VoiceToolApi {
     val requests = mutableListOf<Pair<String, String>>()
-    private val calls = mutableMapOf<String, MutableList<PendingHermesCall>>()
+    private val lock = Any()
+    private val calls = mutableMapOf<String, PendingHermesJob>()
+    private val scriptedPolls = mutableMapOf<String, ArrayDeque<Any>>()
+    private var jobCounter = 0
 
-    override suspend fun askHermes(callId: String, prompt: String): MobileHermesResponse {
-        val call = nextCallForRequest(callId)
-        requests += callId to prompt
-        call.request.complete(callId to prompt)
-        return try {
-            call.result.await()
-        } catch (error: kotlinx.coroutines.CancellationException) {
-            call.cancelled.complete(Unit)
-            throw error
-        }
-    }
-
-    suspend fun awaitRequest(callId: String? = null): Pair<String, String> {
-        return withTimeout(500) {
-            if (callId == null) {
-                firstCall().request.await()
-            } else {
-                call(callId).request.await()
+    override suspend fun submitHermesJob(callId: String, prompt: String): MobileHermesJobSubmitResponse {
+        val job = synchronized(lock) {
+            requests += callId to prompt
+            val jobId = "job-${++jobCounter}"
+            PendingHermesJob(callId = callId, prompt = prompt, jobId = jobId).also {
+                calls[jobId] = it
             }
         }
+        job.request.complete(callId to prompt)
+        return MobileHermesJobSubmitResponse(
+            jobId = job.jobId,
+            callId = callId,
+            status = "queued",
+            createdAt = "2026-06-11T00:00:00.000Z",
+        )
+    }
+
+    override suspend fun getHermesJob(jobId: String): MobileHermesJobPollResponse {
+        val job = synchronized(lock) { calls.getValue(jobId) }
+        try {
+            while (true) {
+                val scripted = synchronized(lock) {
+                    scriptedPolls[jobId]?.removeFirstOrNull()
+                }
+                when (scripted) {
+                    is MobileHermesJobPollResponse -> return scripted
+                    is Throwable -> throw scripted
+                }
+                if (job.result.isCompleted) {
+                    return job.result.await()
+                }
+                delay(10)
+            }
+        } catch (error: kotlinx.coroutines.CancellationException) {
+            job.cancelled.complete(Unit)
+            throw error
+        }
+        error("unreachable")
+    }
+
+    override suspend fun cancelHermesJob(jobId: String): MobileHermesJobPollResponse {
+        val job = synchronized(lock) { calls.getValue(jobId) }
+        job.remoteCancelled.complete(Unit)
+        job.result.cancel()
+        return MobileHermesJobPollResponse(
+            jobId = job.jobId,
+            callId = job.callId,
+            status = "failed",
+            error = "Hermes job canceled",
+            createdAt = "2026-06-11T00:00:00.000Z",
+            completedAt = "2026-06-11T00:00:01.000Z",
+        )
+    }
+
+    suspend fun awaitRequest(callId: String? = null): Pair<String, String> = withTimeout(500) {
+        while (true) {
+            val job = synchronized(lock) {
+                if (callId == null) calls.values.firstOrNull()
+                else calls.values.firstOrNull { it.callId == callId }
+            }
+            if (job != null) return@withTimeout job.request.await()
+            delay(10)
+        }
+        error("unreachable")
     }
 
     fun complete(response: MobileHermesResponse) {
-        call(response.callId).result.complete(response)
+        val job = call(response.callId)
+        job.result.complete(
+            MobileHermesJobPollResponse(
+                jobId = job.jobId,
+                callId = response.callId,
+                status = "succeeded",
+                answer = response.answer,
+                model = response.model,
+                profileId = response.profileId,
+                profileLabel = response.profileLabel,
+                elapsedMs = response.elapsedMs,
+                createdAt = "2026-06-11T00:00:00.000Z",
+                completedAt = "2026-06-11T00:00:01.000Z",
+            )
+        )
     }
 
     fun fail(error: Throwable) {
@@ -214,37 +277,102 @@ class FakeVoiceToolApi : VoiceToolApi {
         call(callId).result.completeExceptionally(error)
     }
 
+    fun failJob(callId: String, message: String) {
+        val job = call(callId)
+        job.result.complete(
+            MobileHermesJobPollResponse(
+                jobId = job.jobId,
+                callId = callId,
+                status = "failed",
+                error = message,
+                createdAt = "2026-06-11T00:00:00.000Z",
+                completedAt = "2026-06-11T00:00:01.000Z",
+            )
+        )
+    }
+
+    fun expireJob(callId: String, message: String? = null) {
+        val job = call(callId)
+        job.result.complete(
+            MobileHermesJobPollResponse(
+                jobId = job.jobId,
+                callId = callId,
+                status = "expired",
+                error = message,
+                createdAt = "2026-06-11T00:00:00.000Z",
+                completedAt = "2026-06-11T00:00:01.000Z",
+            )
+        )
+    }
+
+    fun scriptPoll(callId: String, response: MobileHermesJobPollResponse) {
+        val job = call(callId)
+        synchronized(lock) {
+            scriptedPolls.getOrPut(job.jobId) { ArrayDeque() } += response
+        }
+    }
+
+    fun scriptPollFailure(callId: String, error: Throwable) {
+        val job = call(callId)
+        synchronized(lock) {
+            scriptedPolls.getOrPut(job.jobId) { ArrayDeque() } += error
+        }
+    }
+
+    fun scriptQueuedPolls(callId: String, count: Int) {
+        repeat(count) {
+            val job = call(callId)
+            scriptPoll(
+                callId = callId,
+                response = MobileHermesJobPollResponse(
+                    jobId = job.jobId,
+                    callId = callId,
+                    status = "queued",
+                    createdAt = "2026-06-11T00:00:00.000Z",
+                ),
+            )
+        }
+    }
+
     suspend fun awaitCancelled(callId: String) {
         withTimeout(500) {
             call(callId).cancelled.await()
         }
     }
 
+    suspend fun awaitRemoteCancelled(callId: String) {
+        withTimeout(500) {
+            call(callId).remoteCancelled.await()
+        }
+    }
+
     fun wasCancelled(callId: String): Boolean = call(callId).cancelled.isCompleted
 
-    private fun nextCallForRequest(callId: String): PendingHermesCall = synchronized(calls) {
-        val callList = calls.getOrPut(callId) { mutableListOf() }
-        callList.firstOrNull { !it.request.isCompleted }
-            ?: PendingHermesCall().also(callList::add)
+    private fun call(callId: String): PendingHermesJob = synchronized(lock) {
+        calls.values.firstOrNull { it.callId == callId && !it.result.isCompleted && !it.cancelled.isCompleted }
+            ?: calls.values.lastOrNull { it.callId == callId }
+            ?: PendingHermesJob(callId = callId, prompt = "", jobId = "job-${++jobCounter}").also {
+                calls[it.jobId] = it
+            }
     }
 
-    private fun call(callId: String): PendingHermesCall = synchronized(calls) {
-        val callList = calls.getOrPut(callId) { mutableListOf() }
-        callList.firstOrNull { !it.result.isCompleted && !it.cancelled.isCompleted }
-            ?: callList.lastOrNull()
-            ?: PendingHermesCall().also(callList::add)
-    }
-
-    private fun firstCall(): PendingHermesCall = synchronized(calls) {
-        calls.values.flatten().firstOrNull { !it.result.isCompleted && !it.cancelled.isCompleted }
-            ?: PendingHermesCall().also { calls.getOrPut("") { mutableListOf() } += it }
+    private fun firstCall(): PendingHermesJob = synchronized(lock) {
+        calls.values.firstOrNull { !it.result.isCompleted && !it.cancelled.isCompleted }
+            ?: PendingHermesJob(callId = "", prompt = "", jobId = "job-${++jobCounter}").also {
+                calls[it.jobId] = it
+            }
     }
 }
 
-class PendingHermesCall {
+class PendingHermesJob(
+    val callId: String,
+    val prompt: String,
+    val jobId: String,
+) {
     val request = CompletableDeferred<Pair<String, String>>()
-    val result = CompletableDeferred<MobileHermesResponse>()
+    val result = CompletableDeferred<MobileHermesJobPollResponse>()
     val cancelled = CompletableDeferred<Unit>()
+    val remoteCancelled = CompletableDeferred<Unit>()
 }
 
 class FakeVoiceAudioEngine : VoiceAudioEngine {

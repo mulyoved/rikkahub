@@ -31,10 +31,16 @@ import me.rerere.rikkahub.voiceagent.persistence.VoiceTranscriptStatus
 import me.rerere.rikkahub.voiceagent.telemetry.HermesToolResponseHash
 import me.rerere.rikkahub.voiceagent.telemetry.VoiceDiagnosticEvent
 import me.rerere.rikkahub.voiceagent.telemetry.VoiceDiagnostics
-import me.rerere.rikkahub.voiceagent.voicelab.MobileHermesResponse
+import me.rerere.rikkahub.voiceagent.voicelab.MobileHermesJobPollResponse
 import kotlin.coroutines.EmptyCoroutineContext
 import kotlin.time.Clock
 import kotlin.uuid.Uuid
+
+const val HERMES_QUEUED_ACKNOWLEDGEMENT =
+    "Hermes request queued. I will notify the user when the answer is ready."
+const val HERMES_JOB_POLL_INTERVAL_MS = 10_000L
+private const val HERMES_JOB_MAX_ELAPSED_MS = 10 * 60 * 1000L
+private const val HERMES_JOB_POLL_RETRY_DELAY_MS = 2_000L
 
 class VoiceAgentCoordinator(
     private val gemini: GeminiLiveVoiceClient,
@@ -54,6 +60,9 @@ class VoiceAgentCoordinator(
     },
     private val conversationStore: VoiceConversationStore? = null,
     private val persister: VoiceConversationPersister = VoiceConversationPersister(),
+    private val hermesJobPollIntervalMs: Long = HERMES_JOB_POLL_INTERVAL_MS,
+    private val hermesJobMaxElapsedMs: Long = HERMES_JOB_MAX_ELAPSED_MS,
+    private val hermesJobPollRetryDelayMs: Long = HERMES_JOB_POLL_RETRY_DELAY_MS,
     scope: CoroutineScope? = null,
     dispatcher: CoroutineDispatcher? = null,
 ) {
@@ -71,7 +80,6 @@ class VoiceAgentCoordinator(
     private var lastPersistenceJob: Job? = null
     private var activeSessionId = 0L
     private var acceptsUnscopedGeminiEvents = true
-    private val staleToolSendFailureMessages = mutableMapOf<Long, String>()
     private val toolJobs = mutableMapOf<String, ToolJobHandle>()
     private val toolCallLocks = mutableMapOf<String, Any>()
     private val cancelledToolCallIds = mutableSetOf<ToolCallKey>()
@@ -132,14 +140,10 @@ class VoiceAgentCoordinator(
         activeSessionId
     }
 
-    fun invalidateActiveSession(staleToolSendFailureMessage: String? = null) {
+    fun invalidateActiveSession() {
         synchronized(toolJobsLock) {
-            val staleSessionId = activeSessionId
             activeSessionId += 1
             acceptsUnscopedGeminiEvents = false
-            if (staleToolSendFailureMessage != null) {
-                staleToolSendFailureMessages[staleSessionId] = staleToolSendFailureMessage
-            }
         }
     }
 
@@ -290,21 +294,17 @@ class VoiceAgentCoordinator(
                 if (closed || closing) return
                 closing = true
                 diagnostics.record("coordinator_closing")
-                removeAllToolHandlesForCleanup(
-                    staleSendingFailureMessage = if (waitForStartedSends) null else TOOL_CALL_CANCELED_BY_SESSION_END,
-                )
+                removeAllToolHandlesForCleanup()
             }
             val handlesToPersistCanceled = if (waitForStartedSends) {
                 cleanup.cancelableHandles
             } else {
                 cleanup.cancelableHandles + cleanup.sendingHandles
             }
-            if (waitForStartedSends) {
-                cleanup.sendingHandles.forEach { it.allowInactiveSendCompletion = true }
-            }
             handlesToPersistCanceled.forEach {
                 persistToolCanceled(it, TOOL_CALL_CANCELED_BY_SESSION_END)
             }
+            cancelRemoteHermesJobs(handlesToPersistCanceled)
             val jobs = cleanup.cancelableHandles.map { it.job }
             jobs.forEach { it.cancel() }
             synchronized(eventLock) {
@@ -316,6 +316,10 @@ class VoiceAgentCoordinator(
                         // Wait for any already-started Gemini tool response write to return.
                     }
                 }
+                cleanup.sendingHandles.forEach {
+                    persistToolCanceled(it, TOOL_CALL_CANCELED_BY_SESSION_END)
+                }
+                cancelRemoteHermesJobs(cleanup.sendingHandles)
             }
             persistAssistantTranscriptForSessionClose()
             persistUserTranscript(status = VoiceTranscriptStatus.SessionClosedBeforeFinal)
@@ -342,13 +346,14 @@ class VoiceAgentCoordinator(
 
     fun prepareForReconnect() {
         diagnostics.record("prepare_for_reconnect")
-        invalidateActiveSession(staleToolSendFailureMessage = TOOL_CALL_CANCELED_BY_RECONNECT)
+        invalidateActiveSession()
         val handles = synchronized(toolJobsLock) {
-            removeAllToolHandlesForCleanup(staleSendingFailureMessage = TOOL_CALL_CANCELED_BY_RECONNECT)
+            removeAllToolHandlesForCleanup()
         }
         (handles.cancelableHandles + handles.sendingHandles).forEach {
             persistToolCanceled(it, TOOL_CALL_CANCELED_BY_RECONNECT)
         }
+        cancelRemoteHermesJobs(handles.cancelableHandles + handles.sendingHandles)
         val jobs = handles.cancelableHandles.map { it.job }
         jobs.forEach { it.cancel() }
         synchronized(playbackSuppressionLock) {
@@ -364,13 +369,14 @@ class VoiceAgentCoordinator(
 
     fun prepareForSessionEnd() {
         diagnostics.record("prepare_for_session_end")
-        invalidateActiveSession(staleToolSendFailureMessage = TOOL_CALL_CANCELED_BY_SESSION_END)
+        invalidateActiveSession()
         val handles = synchronized(toolJobsLock) {
-            removeAllToolHandlesForCleanup(staleSendingFailureMessage = TOOL_CALL_CANCELED_BY_SESSION_END)
+            removeAllToolHandlesForCleanup()
         }
         (handles.cancelableHandles + handles.sendingHandles).forEach {
             persistToolCanceled(it, TOOL_CALL_CANCELED_BY_SESSION_END)
         }
+        cancelRemoteHermesJobs(handles.cancelableHandles + handles.sendingHandles)
         val jobs = handles.cancelableHandles.map { it.job }
         jobs.forEach { it.cancel() }
         _state.update {
@@ -526,76 +532,22 @@ class VoiceAgentCoordinator(
 
     private suspend fun runHermesToolCall(callId: String, prompt: String, handle: ToolJobHandle) {
         try {
-            val response = toolApi.askHermes(callId = callId, prompt = prompt)
-            val coroutineContext = currentCoroutineContext()
-            synchronized(handle.sendLock) {
-                if (!isToolHandleActive(callId, handle)) return
-                coroutineContext.ensureActive()
-                synchronized(toolJobsLock) {
-                    if (!isToolHandleActive(callId, handle)) return
-                    handle.sendStarted = true
-                }
-                recordHermesToolResponseHash(
-                    callId = callId,
-                    answer = response.answer,
-                    expectedHash = hermesResponseExpectedHash,
-                    elapsedMs = handle.elapsedMs(),
-                    serverElapsedMs = response.elapsedMs,
-                )
-                val sent = gemini.sendToolResponse(
-                    callId = callId,
-                    answer = response.answer,
-                    sessionId = handle.sessionId,
-                )
-                val activeAfterSend = isToolHandleActive(callId, handle)
-                val staleSendingFailureMessage = if (activeAfterSend) null else staleSendingFailureMessage(handle)
-                val canPersistInactiveSend = activeAfterSend || handle.allowInactiveSendCompletion
-                val elapsedMs = handle.elapsedMs()
-                if (sent) {
-                    if (canPersistInactiveSend) {
-                        diagnostics.record(
-                            "hermes_tool_succeeded",
-                            "callId=$callId, elapsedMs=$elapsedMs${response.serverElapsedDiagnostic()}, " +
-                                "answerChars=${response.answer.length}",
-                        )
-                        persistToolStatus(
-                            callId = callId,
-                            prompt = prompt,
-                            status = VoiceToolRecordStatus.Complete(response.answer),
-                        )
-                    } else if (staleSendingFailureMessage != null) {
-                        diagnostics.record(
-                            "stale_hermes_tool_send_completed",
-                            "callId=$callId, message=$staleSendingFailureMessage",
-                        )
-                    } else {
-                        diagnostics.record("inactive_hermes_tool_send_completed", "callId=$callId")
-                    }
-                    if (activeAfterSend) {
-                        updateToolStatus(callId, VoiceToolStatus.HermesAnswered(callId = callId, elapsedMs = elapsedMs))
-                    }
-                } else {
-                    val message = "Failed to send Gemini tool response message"
-                    if (canPersistInactiveSend) {
-                        diagnostics.record("hermes_tool_failed", "callId=$callId, elapsedMs=$elapsedMs, message=$message")
-                        persistToolStatus(
-                            callId = callId,
-                            prompt = prompt,
-                            status = VoiceToolRecordStatus.Failed(message),
-                        )
-                    } else if (staleSendingFailureMessage != null) {
-                        diagnostics.record(
-                            "stale_hermes_tool_send_failed",
-                            "callId=$callId, message=$staleSendingFailureMessage",
-                        )
-                    } else {
-                        diagnostics.record("inactive_hermes_tool_send_failed", "callId=$callId, message=$message")
-                    }
-                    if (activeAfterSend) {
-                        updateToolStatus(callId, VoiceToolStatus.HermesFailed(callId = callId, message = message))
-                    }
-                }
-            }
+            val submitted = toolApi.submitHermesJob(callId = callId, prompt = prompt)
+            handle.jobId = submitted.jobId
+            diagnostics.record(
+                "hermes_job_created",
+                "callId=$callId, jobId=${submitted.jobId}, status=${submitted.status}",
+            )
+            persistToolStatus(
+                callId = callId,
+                prompt = prompt,
+                status = VoiceToolRecordStatus.Pending,
+                jobId = submitted.jobId,
+            )
+            if (!isToolHandleActive(callId, handle)) return
+            updateToolStatus(callId, VoiceToolStatus.QueuedHermes(callId = callId, jobId = submitted.jobId))
+            if (!sendQueuedHermesAcknowledgement(callId = callId, prompt = prompt, handle = handle)) return
+            pollHermesJob(callId = callId, prompt = prompt, jobId = submitted.jobId, handle = handle)
         } catch (error: CancellationException) {
             throw error
         } catch (error: Throwable) {
@@ -604,8 +556,9 @@ class VoiceAgentCoordinator(
                 val active = isToolHandleActive(callId, handle)
                 if (!active && !hasToolResponseSendStarted(handle)) return
                 val elapsedMs = handle.elapsedMs()
-                val detail = "callId=$callId, elapsedMs=$elapsedMs, message=$message"
-                diagnostics.record("hermes_tool_failed", detail)
+                val jobDetail = handle.jobId?.let { ", jobId=$it" }.orEmpty()
+                val detail = "callId=$callId$jobDetail, elapsedMs=$elapsedMs, message=$message"
+                diagnostics.record("hermes_job_failed", detail)
                 val e2eDetail = "callId=$callId, elapsedMs=$elapsedMs, " +
                     "message=${message.e2eSafeHermesFailureMessage()}"
                 runCatching {
@@ -615,11 +568,205 @@ class VoiceAgentCoordinator(
                     callId = callId,
                     prompt = prompt,
                     status = VoiceToolRecordStatus.Failed(message),
+                    jobId = handle.jobId,
                 )
                 if (active) {
                     updateToolStatus(callId, VoiceToolStatus.HermesFailed(callId = callId, message = message))
                 }
             }
+        }
+    }
+
+    private suspend fun sendQueuedHermesAcknowledgement(
+        callId: String,
+        prompt: String,
+        handle: ToolJobHandle,
+    ): Boolean {
+        val coroutineContext = currentCoroutineContext()
+        synchronized(handle.sendLock) {
+            if (!isToolHandleActive(callId, handle)) return false
+            coroutineContext.ensureActive()
+            synchronized(toolJobsLock) {
+                if (!isToolHandleActive(callId, handle)) return false
+                handle.sendStarted = true
+            }
+            val sent = try {
+                gemini.sendToolResponse(
+                    callId = callId,
+                    answer = HERMES_QUEUED_ACKNOWLEDGEMENT,
+                    sessionId = handle.sessionId,
+                )
+            } finally {
+                synchronized(toolJobsLock) {
+                    handle.sendStarted = false
+                }
+            }
+            val activeAfterSend = isToolHandleActive(callId, handle)
+            val elapsedMs = handle.elapsedMs()
+            if (sent) {
+                synchronized(toolJobsLock) {
+                    handle.acknowledgementSent = true
+                }
+                return true
+            }
+            val message = "Failed to send Gemini tool response message"
+            diagnostics.record("hermes_job_failed", "callId=$callId, elapsedMs=$elapsedMs, message=$message")
+            persistToolStatus(
+                callId = callId,
+                prompt = prompt,
+                status = VoiceToolRecordStatus.Failed(message),
+                jobId = handle.jobId,
+            )
+            if (activeAfterSend) {
+                updateToolStatus(callId, VoiceToolStatus.HermesFailed(callId = callId, message = message))
+            }
+            return false
+        }
+    }
+
+    private suspend fun pollHermesJob(
+        callId: String,
+        prompt: String,
+        jobId: String,
+        handle: ToolJobHandle,
+    ) {
+        var pollFailures = 0
+        while (true) {
+            if (!isToolHandleActive(callId, handle)) return
+            val poll = try {
+                toolApi.getHermesJob(jobId = jobId)
+            } catch (error: Throwable) {
+                if (error is CancellationException) throw error
+                pollFailures += 1
+                val message = error.message ?: error.javaClass.simpleName
+                diagnostics.record(
+                    "hermes_job_poll_failed",
+                    "callId=$callId, jobId=$jobId, attempt=$pollFailures, message=$message",
+                )
+                if (error.isTerminalHermesPollFailure()) throw error
+                if (handle.elapsedMs() >= hermesJobMaxElapsedMs) {
+                    completeHermesJobFailure(
+                        callId = callId,
+                        prompt = prompt,
+                        jobId = jobId,
+                        handle = handle,
+                        status = "expired",
+                        message = "Hermes job polling timed out.",
+                    )
+                    return
+                }
+                delay(nextPollRetryDelayMs(pollFailures))
+                continue
+            }
+            pollFailures = 0
+            currentCoroutineContext().ensureActive()
+            when (poll.status.lowercase()) {
+                "queued" -> {
+                    if (isToolHandleActive(callId, handle)) {
+                        updateToolStatus(callId, VoiceToolStatus.QueuedHermes(callId = callId, jobId = jobId))
+                    }
+                }
+
+                "running" -> {
+                    if (isToolHandleActive(callId, handle)) {
+                        updateToolStatus(callId, VoiceToolStatus.CallingHermes(callId = callId, elapsedMs = handle.elapsedMs()))
+                    }
+                }
+
+                "succeeded" -> {
+                    val answer = requireNotNull(poll.answer) { "Hermes job succeeded without an answer" }
+                    val elapsedMs = handle.elapsedMs()
+                    recordHermesToolResponseHash(
+                        callId = callId,
+                        answer = answer,
+                        expectedHash = hermesResponseExpectedHash,
+                        elapsedMs = elapsedMs,
+                        serverElapsedMs = poll.elapsedMs,
+                    )
+                    diagnostics.record(
+                        "hermes_job_completed",
+                        "callId=$callId, jobId=$jobId, elapsedMs=$elapsedMs${poll.serverElapsedDiagnostic()}, " +
+                            "answerChars=${answer.length}",
+                    )
+                    persistToolStatus(
+                        callId = callId,
+                        prompt = prompt,
+                        status = VoiceToolRecordStatus.Complete(answer),
+                        jobId = jobId,
+                    )
+                    if (isToolHandleActive(callId, handle)) {
+                        updateToolStatus(callId, VoiceToolStatus.HermesAnswered(callId = callId, elapsedMs = elapsedMs))
+                    }
+                    return
+                }
+
+                "failed", "expired" -> {
+                    val message = poll.error ?: "Hermes job was no longer available."
+                    completeHermesJobFailure(
+                        callId = callId,
+                        prompt = prompt,
+                        jobId = jobId,
+                        handle = handle,
+                        status = poll.status,
+                        message = message,
+                    )
+                    return
+                }
+
+                else -> throw IllegalStateException("Unknown Hermes job status: ${poll.status}")
+            }
+            if (handle.elapsedMs() >= hermesJobMaxElapsedMs) {
+                completeHermesJobFailure(
+                    callId = callId,
+                    prompt = prompt,
+                    jobId = jobId,
+                    handle = handle,
+                    status = "expired",
+                    message = "Hermes job polling timed out.",
+                )
+                return
+            }
+            delay(hermesJobPollIntervalMs)
+        }
+    }
+
+    private fun nextPollRetryDelayMs(failures: Int): Long {
+        val multiplier = when {
+            failures <= 1 -> 1L
+            failures >= 7 -> 64L
+            else -> 1L shl (failures - 1)
+        }
+        return (hermesJobPollRetryDelayMs * multiplier)
+            .coerceAtMost(hermesJobPollIntervalMs)
+            .coerceAtLeast(1L)
+    }
+
+    private fun completeHermesJobFailure(
+        callId: String,
+        prompt: String,
+        jobId: String,
+        handle: ToolJobHandle,
+        status: String,
+        message: String,
+    ) {
+        val elapsedMs = handle.elapsedMs()
+        diagnostics.record(
+            "hermes_job_failed",
+            "callId=$callId, jobId=$jobId, status=$status, elapsedMs=$elapsedMs, message=$message",
+        )
+        val e2eDetail = "callId=$callId, elapsedMs=$elapsedMs, " +
+            "message=${message.e2eSafeHermesFailureMessage()}"
+        runCatching {
+            logHermesToolFailure(e2eDetail)
+        }
+        persistToolStatus(
+            callId = callId,
+            prompt = prompt,
+            status = VoiceToolRecordStatus.Failed(message),
+            jobId = jobId,
+        )
+        if (isToolHandleActive(callId, handle)) {
+            updateToolStatus(callId, VoiceToolStatus.HermesFailed(callId = callId, message = message))
         }
     }
 
@@ -667,7 +814,7 @@ class VoiceAgentCoordinator(
                 synchronized(toolJobsLock) {
                     if (!canAcceptToolHandle(callId, handle)) return false
                     if (toolJobs[callId] !== currentHandle) return false
-                    if (currentHandle.sendStarted) {
+                    if (currentHandle.sendStarted || currentHandle.acknowledgementSent) {
                         diagnostics.record("duplicate_tool_call_after_send_started", "callId=$callId")
                         return false
                     }
@@ -676,18 +823,12 @@ class VoiceAgentCoordinator(
                     synchronized(toolJobsLock) {
                         if (!canAcceptToolHandle(callId, handle)) return false
                         if (toolJobs[callId] !== currentHandle) return false
-                        if (currentHandle.sendStarted) {
+                        if (currentHandle.sendStarted || currentHandle.acknowledgementSent) {
                             diagnostics.record("duplicate_tool_call_after_send_started", "callId=$callId")
                             return false
                         }
                         currentHandle.superseded = true
-                        persistToolStatus(
-                            callId = handle.callId,
-                            prompt = handle.prompt,
-                            status = VoiceToolRecordStatus.Pending,
-                        )
                         toolJobs[callId] = handle
-                        updateToolStatus(callId, VoiceToolStatus.CallingHermes(callId))
                         currentHandle.job.cancel()
                         return true
                     }
@@ -697,13 +838,7 @@ class VoiceAgentCoordinator(
                 if (!canAcceptToolHandle(callId, handle)) return false
                 toolJobs[callId]
                     ?.let { return false }
-                persistToolStatus(
-                    callId = handle.callId,
-                    prompt = handle.prompt,
-                    status = VoiceToolRecordStatus.Pending,
-                )
                 toolJobs[callId] = handle
-                updateToolStatus(callId, VoiceToolStatus.CallingHermes(callId))
                 return true
             }
         }
@@ -728,11 +863,12 @@ class VoiceAgentCoordinator(
             detail = event.callIds.joinToString(","),
         )
         val handlesToCancel = event.callIds.mapNotNull { cancelToolCall(callId = it, sessionId = sessionId) }
-        handlesToCancel.flatMap { it.cancelableHandles }.forEach {
+        handlesToCancel.flatMap { it.cancelableHandles + it.sendingHandles }.forEach {
             persistToolCanceled(it, TOOL_CALL_CANCELED_BY_GEMINI)
         }
+        cancelRemoteHermesJobs(handlesToCancel.flatMap { it.cancelableHandles + it.sendingHandles })
         removeToolStatuses(event.callIds)
-        handlesToCancel.flatMap { it.cancelableHandles }.forEach { it.job.cancel() }
+        handlesToCancel.flatMap { it.cancelableHandles + it.sendingHandles }.forEach { it.job.cancel() }
     }
 
     private fun cancelToolCall(callId: String, sessionId: Long?): ToolCleanup? {
@@ -750,18 +886,13 @@ class VoiceAgentCoordinator(
                 if (handle != null) {
                     handle.superseded = true
                 }
-                handle?.toCleanup(allowInactiveSendCompletion = true)
+                handle?.toCleanup()
             }
         }
     }
 
-    private fun removeAllToolHandlesForCleanup(staleSendingFailureMessage: String? = null): ToolCleanup {
+    private fun removeAllToolHandlesForCleanup(): ToolCleanup {
         val cleanup = toolJobs.values.toList().toCleanup()
-        if (staleSendingFailureMessage != null) {
-            cleanup.sendingHandles.forEach {
-                it.staleSendingFailureMessage = staleSendingFailureMessage
-            }
-        }
         toolJobs.clear()
         toolCallLocks.clear()
         cancelledToolCallIds.clear()
@@ -777,11 +908,8 @@ class VoiceAgentCoordinator(
         )
     }
 
-    private fun ToolJobHandle.toCleanup(allowInactiveSendCompletion: Boolean = false): ToolCleanup {
+    private fun ToolJobHandle.toCleanup(): ToolCleanup {
         superseded = true
-        if (allowInactiveSendCompletion) {
-            this.allowInactiveSendCompletion = true
-        }
         return if (sendStarted) {
             ToolCleanup(cancelableHandles = emptyList(), sendingHandles = listOf(this))
         } else {
@@ -791,10 +919,6 @@ class VoiceAgentCoordinator(
 
     private fun hasToolResponseSendStarted(handle: ToolJobHandle): Boolean = synchronized(toolJobsLock) {
         handle.sendStarted
-    }
-
-    private fun staleSendingFailureMessage(handle: ToolJobHandle): String? = synchronized(toolJobsLock) {
-        handle.staleSendingFailureMessage ?: handle.sessionId?.let(staleToolSendFailureMessages::get)
     }
 
     private fun toolCallLock(callId: String): Any = synchronized(toolJobsLock) {
@@ -843,7 +967,9 @@ class VoiceAgentCoordinator(
     ): VoiceToolStatus {
         return when (fallback) {
             is VoiceToolStatus.CallingHermes -> fallback
+            is VoiceToolStatus.QueuedHermes -> fallback
             else -> toolCalls.values.filterIsInstance<VoiceToolStatus.CallingHermes>().firstOrNull()
+                ?: toolCalls.values.filterIsInstance<VoiceToolStatus.QueuedHermes>().firstOrNull()
                 ?: toolCalls.values.filterIsInstance<VoiceToolStatus.HermesFailed>().firstOrNull()
                 ?: fallback
         }
@@ -901,7 +1027,12 @@ class VoiceAgentCoordinator(
         }
     }
 
-    private fun persistToolStatus(callId: String, prompt: String, status: VoiceToolRecordStatus) {
+    private fun persistToolStatus(
+        callId: String,
+        prompt: String,
+        status: VoiceToolRecordStatus,
+        jobId: String? = null,
+    ) {
         persistConversation { conversation ->
             persister.upsertHermesTool(
                 conversation = conversation,
@@ -909,6 +1040,7 @@ class VoiceAgentCoordinator(
                 prompt = prompt,
                 status = status,
                 sessionId = voiceArtifactSessionId,
+                jobId = jobId,
             )
         }
     }
@@ -918,7 +1050,28 @@ class VoiceAgentCoordinator(
             callId = handle.callId,
             prompt = handle.prompt,
             status = VoiceToolRecordStatus.Failed(message),
+            jobId = handle.jobId,
         )
+    }
+
+    private fun cancelRemoteHermesJobs(handles: Iterable<ToolJobHandle>) {
+        handles.forEach { handle ->
+            val jobId = handle.jobId ?: return@forEach
+            launchBackgroundJob {
+                runCatching {
+                    toolApi.cancelHermesJob(jobId = jobId)
+                }.onSuccess {
+                    diagnostics.record("hermes_job_cancelled", "callId=${handle.callId}, jobId=$jobId")
+                }.onFailure { error ->
+                    if (error is CancellationException) throw error
+                    val message = error.message ?: error.javaClass.simpleName
+                    diagnostics.record(
+                        "hermes_job_cancel_failed",
+                        "callId=${handle.callId}, jobId=$jobId, message=$message",
+                    )
+                }
+            }
+        }
     }
 
     private fun persistAssistantTranscript(statusOverride: VoiceTranscriptStatus? = null) {
@@ -997,6 +1150,22 @@ class VoiceAgentCoordinator(
         job.start()
     }
 
+    private fun launchBackgroundJob(block: suspend () -> Unit) {
+        lateinit var job: Job
+        synchronized(persistenceJobsLock) {
+            job = persistenceScope.launch(start = CoroutineStart.LAZY) {
+                block()
+            }
+            persistenceJobs += job
+        }
+        job.invokeOnCompletion {
+            synchronized(persistenceJobsLock) {
+                persistenceJobs -= job
+            }
+        }
+        job.start()
+    }
+
     private suspend fun persistConversationNow(
         store: VoiceConversationStore,
         transform: (Conversation) -> Conversation,
@@ -1063,12 +1232,22 @@ class VoiceAgentCoordinator(
         Assistant,
     }
 
-    private fun MobileHermesResponse.serverElapsedDiagnostic(): String =
+    private fun MobileHermesJobPollResponse.serverElapsedDiagnostic(): String =
         elapsedMs?.let { ", serverElapsedMs=$it" }.orEmpty()
 
     private fun String.e2eSafeHermesFailureMessage(): String {
         Regex("Voice Lab request failed \\d+").find(this)?.let { return it.value }
         return substringBefore(':').take(120).ifBlank { "Hermes tool failed" }
+    }
+
+    private fun Throwable.isTerminalHermesPollFailure(): Boolean {
+        val statusCode = Regex("Voice Lab request failed (\\d{3})")
+            .find(message.orEmpty())
+            ?.groupValues
+            ?.getOrNull(1)
+            ?.toIntOrNull()
+            ?: return false
+        return statusCode in 400..499 && statusCode != 408 && statusCode != 429
     }
 
     private class ToolJobHandle(
@@ -1080,10 +1259,10 @@ class VoiceAgentCoordinator(
         private val startedAt = Clock.System.now()
         lateinit var job: Job
         var elapsedJob: Job? = null
+        var jobId: String? = null
         var superseded: Boolean = false
         var sendStarted: Boolean = false
-        var staleSendingFailureMessage: String? = null
-        var allowInactiveSendCompletion: Boolean = false
+        var acknowledgementSent: Boolean = false
         val key: ToolCallKey get() = ToolCallKey(sessionId = sessionId, callId = callId)
 
         fun elapsedMs(): Long = (Clock.System.now() - startedAt).inWholeMilliseconds.coerceAtLeast(0L)

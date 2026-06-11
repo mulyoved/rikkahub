@@ -119,6 +119,7 @@ class VoiceConversationPersister {
         prompt: String,
         status: VoiceToolRecordStatus,
         sessionId: String? = null,
+        jobId: String? = null,
     ): Conversation {
         val tool = UIMessagePart.Tool(
             toolCallId = callId,
@@ -128,8 +129,8 @@ class VoiceConversationPersister {
                     put("prompt", prompt)
                 }
             ),
-            output = status.toOutputParts(sessionId = sessionId, callId = callId),
-            metadata = status.toMetadata(sessionId = sessionId, callId = callId),
+            output = status.toOutputParts(sessionId = sessionId, callId = callId, jobId = jobId),
+            metadata = status.toMetadata(sessionId = sessionId, callId = callId, jobId = jobId),
         )
 
         val currentMessages = conversation.currentMessages
@@ -196,19 +197,23 @@ class VoiceConversationPersister {
         return updateCurrentMessages(currentMessages + message)
     }
 
-    private fun VoiceToolRecordStatus.toOutputParts(sessionId: String?, callId: String): List<UIMessagePart> {
+    private fun VoiceToolRecordStatus.toOutputParts(
+        sessionId: String?,
+        callId: String,
+        jobId: String?,
+    ): List<UIMessagePart> {
         return when (this) {
             VoiceToolRecordStatus.Pending -> emptyList()
             is VoiceToolRecordStatus.Complete -> listOf(
                 UIMessagePart.Text(
                     answer,
-                    metadata = toMetadata(sessionId = sessionId, callId = callId),
+                    metadata = toMetadata(sessionId = sessionId, callId = callId, jobId = jobId),
                 )
             )
             is VoiceToolRecordStatus.Failed -> listOf(
                 UIMessagePart.Text(
                     message,
-                    metadata = toMetadata(sessionId = sessionId, callId = callId),
+                    metadata = toMetadata(sessionId = sessionId, callId = callId, jobId = jobId),
                 )
             )
         }
@@ -223,9 +228,10 @@ class VoiceConversationPersister {
             metadata?.get(HERMES_TOOL_STATUS_KEY)?.jsonPrimitive?.content == VoiceToolRecordStatus.Pending.statusName
     }
 
-    private fun VoiceToolRecordStatus.toMetadata(sessionId: String?, callId: String) = buildJsonObject {
+    private fun VoiceToolRecordStatus.toMetadata(sessionId: String?, callId: String, jobId: String?) = buildJsonObject {
         put(HERMES_TOOL_SOURCE_KEY, VoiceAgentToolNames.ASK_HERMES)
         put(HERMES_TOOL_STATUS_KEY, statusName)
+        jobId?.let { put(HERMES_TOOL_JOB_ID_KEY, it) }
         putVoiceArtifactMetadata(
             sessionId = sessionId,
             eventId = callId,
@@ -305,6 +311,7 @@ class VoiceConversationPersister {
     private companion object {
         const val HERMES_TOOL_SOURCE_KEY = "voice_tool_source"
         const val HERMES_TOOL_STATUS_KEY = "voice_tool_status"
+        const val HERMES_TOOL_JOB_ID_KEY = "voice_tool_job_id"
         const val VOICE_SOURCE_KEY = "voice_source"
         const val VOICE_SOURCE_AGENT = "voice_agent"
         const val VOICE_SESSION_ID_KEY = "voice_session_id"

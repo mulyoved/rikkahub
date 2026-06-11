@@ -453,6 +453,38 @@ class VoiceConversationPersisterTest {
     }
 
     @Test
+    fun `Hermes tool records preserve job id metadata across statuses`() {
+        val persister = VoiceConversationPersister()
+
+        val pending = persister.upsertHermesTool(
+            conversation = emptyConversation(),
+            callId = "call-1",
+            prompt = "Prompt",
+            status = VoiceToolRecordStatus.Pending,
+            jobId = "job-1",
+        )
+        assertHermesToolJobId(pending, "job-1")
+
+        val complete = persister.upsertHermesTool(
+            conversation = pending,
+            callId = "call-1",
+            prompt = "Prompt",
+            status = VoiceToolRecordStatus.Complete("Answer"),
+            jobId = "job-1",
+        )
+        assertHermesToolJobId(complete, "job-1")
+
+        val failed = persister.upsertHermesTool(
+            conversation = emptyConversation(),
+            callId = "call-2",
+            prompt = "Prompt",
+            status = VoiceToolRecordStatus.Failed("Hermes job expired"),
+            jobId = "job-2",
+        )
+        assertHermesToolJobId(failed, "job-2")
+    }
+
+    @Test
     fun `interrupted assistant turn records voice status metadata while preserving text`() {
         val persister = VoiceConversationPersister()
 
@@ -551,6 +583,17 @@ class VoiceConversationPersisterTest {
         assertTrue(metadata["voice_updated_at"]!!.jsonPrimitive.content.isNotBlank())
         if (callId != null) {
             assertEquals(callId, metadata["voice_call_id"]!!.jsonPrimitive.content)
+        }
+    }
+
+    private fun assertHermesToolJobId(conversation: Conversation, jobId: String) {
+        val tool = conversation.currentMessages
+            .flatMap { it.parts }
+            .filterIsInstance<UIMessagePart.Tool>()
+            .last()
+        assertEquals(jobId, tool.metadata!!["voice_tool_job_id"]!!.jsonPrimitive.content)
+        tool.output.filterIsInstance<UIMessagePart.Text>().forEach { output ->
+            assertEquals(jobId, output.metadata!!["voice_tool_job_id"]!!.jsonPrimitive.content)
         }
     }
 
