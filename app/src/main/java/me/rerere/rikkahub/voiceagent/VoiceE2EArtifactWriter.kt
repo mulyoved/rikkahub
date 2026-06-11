@@ -6,6 +6,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.launch
 import java.io.File
+import java.nio.file.Files
 
 enum class VoiceE2EArtifact(
     val fileName: String,
@@ -24,7 +25,7 @@ class VoiceE2EArtifactWriter private constructor(
     scope: CoroutineScope?,
 ) {
     private val commands = if (enabled) {
-        Channel<WriteCommand>(capacity = 1)
+        Channel<WriteCommand>(capacity = Channel.UNLIMITED)
     } else {
         null
     }
@@ -36,13 +37,11 @@ class VoiceE2EArtifactWriter private constructor(
 
     init {
         val queue = commands
-        if (queue != null) {
-            clearAppendOnlyArtifacts()
-        }
         if (queue != null && scope != null) {
             scope.launch(Dispatchers.IO) {
                 for (command in queue) {
                     when (command) {
+                        WriteCommand.ClearAppendOnlyArtifacts -> clearAppendOnlyArtifacts()
                         WriteCommand.Flush -> flushPendingWrites()
                         is WriteCommand.Drain -> {
                             flushPendingWrites()
@@ -50,6 +49,9 @@ class VoiceE2EArtifactWriter private constructor(
                         }
                     }
                 }
+            }
+            if (queue.trySend(WriteCommand.ClearAppendOnlyArtifacts).isFailure) {
+                VoiceAgentLog.w(TAG, "artifact append cleanup queue rejected")
             }
         }
     }
@@ -87,13 +89,13 @@ class VoiceE2EArtifactWriter private constructor(
     }
 
     private fun clearAppendOnlyArtifacts() {
-        runCatching {
-            VoiceE2EArtifact.entries.filter { it.appendOnly }.forEach { artifact ->
-                File(directory, artifact.fileName).delete()
+        VoiceE2EArtifact.entries.filter { it.appendOnly }.forEach { artifact ->
+            runCatching {
+                Files.deleteIfExists(File(directory, artifact.fileName).toPath())
+            }.onFailure { error ->
+                val message = (error.message ?: error.javaClass.simpleName).redactForVoiceAgentLog()
+                VoiceAgentLog.w(TAG, "artifact append cleanup failed name=${artifact.fileName} message=$message")
             }
-        }.onFailure { error ->
-            val message = error.message ?: error.javaClass.simpleName
-            VoiceAgentLog.w(TAG, "artifact append cleanup failed message=$message")
         }
     }
 
@@ -140,6 +142,7 @@ class VoiceE2EArtifactWriter private constructor(
     )
 
     private sealed interface WriteCommand {
+        object ClearAppendOnlyArtifacts : WriteCommand
         object Flush : WriteCommand
         data class Drain(val completed: CompletableDeferred<Unit>) : WriteCommand
     }
