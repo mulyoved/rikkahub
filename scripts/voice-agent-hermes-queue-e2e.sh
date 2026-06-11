@@ -34,6 +34,7 @@ ADB_LONG_TIMEOUT_SECONDS="${VOICE_AGENT_E2E_ADB_LONG_TIMEOUT_SECONDS:-120}"
 ADB_READY_SCRIPT="${VOICE_AGENT_E2E_ADB_READY_SCRIPT:-scripts/adb-device-ready.sh}"
 TOOL_CALL_TIMEOUT_SECONDS="${VOICE_AGENT_QUEUE_E2E_TOOL_CALL_TIMEOUT_SECONDS:-240}"
 COMPLETION_TIMEOUT_SECONDS="${VOICE_AGENT_QUEUE_E2E_COMPLETION_TIMEOUT_SECONDS:-600}"
+OUTPUT_TIMEOUT_SECONDS="${VOICE_AGENT_QUEUE_E2E_OUTPUT_TIMEOUT_SECONDS:-120}"
 EXPECTED_COMPLETIONS="${VOICE_AGENT_QUEUE_E2E_EXPECTED_COMPLETIONS:-2}"
 CALL_STARTED=0
 PIPELINE_STATUS="not_started"
@@ -187,6 +188,15 @@ wait_for_log_count() {
   return 1
 }
 
+advance_log_search_after_last_match() {
+  local pattern="$1"
+  local matched_line
+  matched_line="$(awk -v pattern="$pattern" '$0 ~ pattern { line = NR } END { if (line) print line }' "$LOG_FILE" 2>/dev/null || true)"
+  if [[ -n "$matched_line" ]]; then
+    LOG_SEARCH_START_LINE=$((matched_line + 1))
+  fi
+}
+
 wait_for_log() {
   local label="$1"
   local pattern="$2"
@@ -237,7 +247,7 @@ assert_distinct_created_jobs() {
   local ids
   local total_count
   local unique_count
-  ids="$(grep -E 'hermes_job_created|diagnostic name=hermes_job_created' "$LOG_FILE" 2>/dev/null | extract_log_value jobId || true)"
+  ids="$(grep -E 'hermes_queue_event type=job_created|hermes_job_created|diagnostic name=hermes_job_created' "$LOG_FILE" 2>/dev/null | extract_log_value jobId || true)"
   total_count="$(printf '%s\n' "$ids" | awk 'NF { count++ } END { print count + 0 }')"
   unique_count="$(printf '%s\n' "$ids" | awk 'NF && seen[$0]++ == 0 { count++ } END { print count + 0 }')"
   if (( total_count < minimum )); then
@@ -253,24 +263,17 @@ assert_distinct_created_jobs() {
 }
 
 assert_completed_jobs_match_created_jobs() {
-  local minimum="$1"
   local created_ids
   local completed_ids
-  local completed_count
-  created_ids="$(grep -E 'hermes_job_created|diagnostic name=hermes_job_created' "$LOG_FILE" 2>/dev/null | extract_log_value jobId || true)"
-  completed_ids="$(grep -E 'hermes_job_completed|diagnostic name=hermes_job_completed' "$LOG_FILE" 2>/dev/null | extract_log_value jobId || true)"
-  completed_count="$(printf '%s\n' "$completed_ids" | awk 'NF { count++ } END { print count + 0 }')"
-  if (( completed_count < minimum )); then
-    printf 'Expected at least %s completed Hermes jobs, found %s.\n' "$minimum" "$completed_count" >&2
-    return 1
-  fi
-  local missing_id
-  missing_id="$(comm -23 \
+  created_ids="$(grep -E 'hermes_queue_event type=job_created|hermes_job_created|diagnostic name=hermes_job_created' "$LOG_FILE" 2>/dev/null | extract_log_value jobId || true)"
+  completed_ids="$(grep -E 'hermes_queue_event type=job_completed|hermes_job_completed|diagnostic name=hermes_job_completed' "$LOG_FILE" 2>/dev/null | extract_log_value jobId || true)"
+  local unknown_id
+  unknown_id="$(comm -13 \
     <(printf '%s\n' "$created_ids" | awk 'NF' | sort -u) \
     <(printf '%s\n' "$completed_ids" | awk 'NF' | sort -u) |
     head -n 1)"
-  if [[ -n "$missing_id" ]]; then
-    printf 'Queued Hermes job did not complete: %s\n' "$missing_id" >&2
+  if [[ -n "$unknown_id" ]]; then
+    printf 'Completed Hermes job was not queued: %s\n' "$unknown_id" >&2
     return 1
   fi
 }
@@ -286,7 +289,7 @@ wait_for_completed_jobs() {
       WAIT_FOR_LOG_FAILURE="forbidden"
       return 1
     fi
-    completed_count="$(grep -E 'hermes_job_completed|diagnostic name=hermes_job_completed' "$LOG_FILE" 2>/dev/null | wc -l | tr -d ' ')"
+    completed_count="$(grep -E 'hermes_queue_event type=job_completed|hermes_job_completed|diagnostic name=hermes_job_completed' "$LOG_FILE" 2>/dev/null | wc -l | tr -d ' ')"
     if (( completed_count >= minimum )); then
       printf 'PASS marker: at least %s Hermes jobs completed\n' "$minimum"
       return 0
@@ -585,30 +588,34 @@ adb_cmd shell am broadcast \
   --el trailing_silence_ms "${VOICE_AGENT_QUEUE_E2E_TRAILING_SILENCE_MS:-200}" >/dev/null
 
 wait_for_log "debug PCM delivered" 'VoiceAudioDebugInjection.*debug_audio_injection result delivered=true' 30
-wait_for_log_count "at least $EXPECTED_COMPLETIONS ask_hermes tool calls" 'VoiceAgentGemini.*receive kind=toolCall' "$EXPECTED_COMPLETIONS" "$TOOL_CALL_TIMEOUT_SECONDS"
-wait_for_log_count "at least $EXPECTED_COMPLETIONS queued Hermes jobs" 'hermes_job_created|diagnostic name=hermes_job_created' "$EXPECTED_COMPLETIONS" "$TOOL_CALL_TIMEOUT_SECONDS"
+wait_for_log_count "at least $EXPECTED_COMPLETIONS ask_hermes tool calls" 'VoiceAgentE2E.*hermes_tool_call_received' "$EXPECTED_COMPLETIONS" "$TOOL_CALL_TIMEOUT_SECONDS"
+wait_for_log_count "at least $EXPECTED_COMPLETIONS queued Hermes jobs" 'hermes_queue_event type=job_created|hermes_job_created|diagnostic name=hermes_job_created' "$EXPECTED_COMPLETIONS" "$TOOL_CALL_TIMEOUT_SECONDS"
 assert_distinct_created_jobs "$EXPECTED_COMPLETIONS"
 wait_for_log_count "at least $EXPECTED_COMPLETIONS queued Hermes tool responses" 'VoiceAgentGemini.*send kind=toolResponse sent=true' "$EXPECTED_COMPLETIONS" 60
-wait_for_log "first Gemini output audio received" 'VoiceAgentGemini.*event kind=OutputAudio' 120
+wait_for_log "first Gemini output audio received" 'VoiceAgentGemini.*event kind=OutputAudio' "$OUTPUT_TIMEOUT_SECONDS"
 wait_for_log "first voice playback queued" 'AndroidVoiceAudioEngine.*Voice playback queued' 60
 wait_for_log "first voice playback wrote" 'AndroidVoiceAudioEngine.*Voice playback wrote' 60
 wait_for_completed_jobs "$EXPECTED_COMPLETIONS" "$COMPLETION_TIMEOUT_SECONDS"
-assert_completed_jobs_match_created_jobs "$EXPECTED_COMPLETIONS"
+assert_completed_jobs_match_created_jobs
 wait_for_log_count "at least $EXPECTED_COMPLETIONS Hermes response hashes" 'VoiceAgentE2E.*hermes_tool_response_hash .*actualHash=[0-9a-f]+' "$EXPECTED_COMPLETIONS" "$COMPLETION_TIMEOUT_SECONDS"
-wait_for_log_count "at least $EXPECTED_COMPLETIONS Hermes completion follow-ups" 'hermes_completion_follow_up_sent|late_text_turn_sent' "$EXPECTED_COMPLETIONS" 120
-wait_for_log_count "at least $EXPECTED_COMPLETIONS late Gemini text turns sent" 'late_text_turn_sent|hermes_completion_follow_up_sent' "$EXPECTED_COMPLETIONS" 120
-wait_for_log "second Gemini output audio received" 'VoiceAgentGemini.*event kind=OutputAudio' 120
+wait_for_log_count "at least $EXPECTED_COMPLETIONS Hermes completion follow-ups" 'hermes_queue_event type=late_text_turn_sent|hermes_completion_follow_up_sent|late_text_turn_sent' "$EXPECTED_COMPLETIONS" 120
+wait_for_log_count "at least $EXPECTED_COMPLETIONS late Gemini text turns sent" 'hermes_queue_event type=late_text_turn_sent|late_text_turn_sent|hermes_completion_follow_up_sent' "$EXPECTED_COMPLETIONS" 120
+advance_log_search_after_last_match 'hermes_queue_event type=late_text_turn_sent|late_text_turn_sent|hermes_completion_follow_up_sent'
+wait_for_log "second Gemini output audio received" 'VoiceAgentGemini.*event kind=OutputAudio' "$OUTPUT_TIMEOUT_SECONDS"
 wait_for_log "second voice playback queued" 'AndroidVoiceAudioEngine.*Voice playback queued' 60
 wait_for_log "second voice playback wrote" 'AndroidVoiceAudioEngine.*Voice playback wrote' 60
 fail_if_log "common forbidden marker" "$COMMON_FORBIDDEN_PATTERN"
 
 PIPELINE_STATUS="passed"
-write_e2e_report
 cleanup_status=0
 end_voice_agent_call_and_wait || cleanup_status=$?
-print_result_summary
 if [[ "$cleanup_status" -ne 0 ]]; then
+  ADB_APP_CLEANUP_ENABLED=0
+  print_result_summary
+  printf 'Skipping report pull because service drain was not observed.\n' >&2
   printf 'Voice Agent Hermes queue E2E pipeline passed but cleanup failed. Safe log: %s\n' "$LOG_FILE"
   exit "$cleanup_status"
 fi
+write_e2e_report
+print_result_summary
 printf 'Voice Agent Hermes queue E2E reached manual review gate. Safe log: %s\n' "$LOG_FILE"

@@ -99,6 +99,13 @@ if [[ -n "${FAKE_ADB_ARGS_LOG:-}" ]]; then
   printf '%s\n' "$*" >> "$FAKE_ADB_ARGS_LOG"
 fi
 
+require_drain_before_artifact_pull() {
+  if [[ ! -f "${FAKE_ADB_DRAINED_MARKER:?}" ]]; then
+    printf 'artifact pulled before service drain: %s\n' "$*" >&2
+    exit 97
+  fi
+}
+
 args="$*"
 case "$args" in
   "devices -l")
@@ -120,10 +127,10 @@ case "$args" in
     cat <<'LOGS'
 06-11 12:00:00.000 D/VoiceAgentGemini(1): event kind=SetupComplete
 06-11 12:00:01.000 I/VoiceAudioDebugInjection(1): debug_audio_injection result delivered=true
-06-11 12:00:02.000 D/VoiceAgentGemini(1): receive kind=toolCall
-06-11 12:00:03.000 D/VoiceAgentGemini(1): receive kind=toolCall
-06-11 12:00:04.000 D/VoiceAgentCallSession(1): diagnostic name=hermes_job_created detail=callId=call-a, jobId=job-a, status=queued
-06-11 12:00:05.000 D/VoiceAgentCallSession(1): diagnostic name=hermes_job_created detail=callId=call-b, jobId=job-b, status=queued
+06-11 12:00:02.000 D/VoiceAgentE2E(1): hermes_tool_call_received callId=call-a promptChars=5
+06-11 12:00:03.000 D/VoiceAgentE2E(1): hermes_tool_call_received callId=call-b promptChars=6
+06-11 12:00:04.000 D/VoiceAgentE2E(1): hermes_queue_event type=job_created callId=call-a jobId=job-a status=queued sent=n/a
+06-11 12:00:05.000 D/VoiceAgentE2E(1): hermes_queue_event type=job_created callId=call-b jobId=job-b status=queued sent=n/a
 06-11 12:00:06.000 D/VoiceAgentGemini(1): send kind=toolResponse sent=true
 06-11 12:00:07.000 D/VoiceAgentGemini(1): send kind=toolResponse sent=true
 06-11 12:00:08.000 D/VoiceAgentGemini(1): event kind=OutputAudio
@@ -134,26 +141,66 @@ LOGS
       one-complete)
         cat <<'LOGS'
 06-11 12:01:00.000 D/VoiceAgentE2E(1): hermes_tool_response_hash callId=call-a, responseChars=5, normalizedChars=5, actualHash=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa, elapsedMs=1000, serverElapsedMs=900
-06-11 12:01:01.000 D/VoiceAgentCallSession(1): diagnostic name=hermes_job_completed detail=callId=call-a, jobId=job-a, elapsedMs=1000, serverElapsedMs=900, answerChars=5
-06-11 12:01:02.000 D/VoiceAgentCallSession(1): diagnostic name=hermes_completion_follow_up_sent detail=callId=call-a, jobId=job-a, answerChars=5
+06-11 12:01:01.000 D/VoiceAgentE2E(1): hermes_queue_event type=job_completed callId=call-a jobId=job-a status=succeeded sent=n/a
+06-11 12:01:02.000 D/VoiceAgentE2E(1): hermes_queue_event type=late_text_turn_sent callId=call-a jobId=job-a status=none sent=true
 LOGS
         ;;
       duplicate-job)
         cat <<'LOGS'
-06-11 12:01:00.000 D/VoiceAgentCallSession(1): diagnostic name=hermes_job_created detail=callId=call-c, jobId=job-a, status=queued
+06-11 12:01:00.000 D/VoiceAgentE2E(1): hermes_queue_event type=job_created callId=call-c jobId=job-a status=queued sent=n/a
 LOGS
         ;;
       forbidden-524)
         printf '06-11 12:01:00.000 E/VoiceAgentCallSession(1): Voice Lab request failed 524\n'
         ;;
+      extra-created)
+        cat <<'LOGS'
+06-11 12:00:11.000 D/VoiceAgentE2E(1): hermes_queue_event type=job_created callId=call-c jobId=job-c status=queued sent=n/a
+06-11 12:01:00.000 D/VoiceAgentE2E(1): hermes_tool_response_hash callId=call-a, responseChars=5, normalizedChars=5, actualHash=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa, elapsedMs=1000, serverElapsedMs=900
+06-11 12:01:01.000 D/VoiceAgentE2E(1): hermes_queue_event type=job_completed callId=call-a jobId=job-a status=succeeded sent=n/a
+06-11 12:01:02.000 D/VoiceAgentE2E(1): hermes_queue_event type=late_text_turn_sent callId=call-a jobId=job-a status=none sent=true
+06-11 12:01:03.000 D/VoiceAgentE2E(1): hermes_tool_response_hash callId=call-b, responseChars=6, normalizedChars=6, actualHash=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb, elapsedMs=2000, serverElapsedMs=1900
+06-11 12:01:04.000 D/VoiceAgentE2E(1): hermes_queue_event type=job_completed callId=call-b jobId=job-b status=succeeded sent=n/a
+06-11 12:01:05.000 D/VoiceAgentE2E(1): hermes_queue_event type=late_text_turn_sent callId=call-b jobId=job-b status=none sent=true
+06-11 12:01:06.000 D/VoiceAgentGemini(1): event kind=OutputAudio
+06-11 12:01:07.000 D/AndroidVoiceAudioEngine(1): Voice playback queued bytes=3200
+06-11 12:01:08.000 D/AndroidVoiceAudioEngine(1): Voice playback wrote bytes=3200
+LOGS
+        ;;
+      unknown-completed)
+        cat <<'LOGS'
+06-11 12:01:00.000 D/VoiceAgentE2E(1): hermes_tool_response_hash callId=call-a, responseChars=5, normalizedChars=5, actualHash=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa, elapsedMs=1000, serverElapsedMs=900
+06-11 12:01:01.000 D/VoiceAgentE2E(1): hermes_queue_event type=job_completed callId=call-a jobId=job-a status=succeeded sent=n/a
+06-11 12:01:02.000 D/VoiceAgentE2E(1): hermes_queue_event type=late_text_turn_sent callId=call-a jobId=job-a status=none sent=true
+06-11 12:01:03.000 D/VoiceAgentE2E(1): hermes_tool_response_hash callId=call-x, responseChars=6, normalizedChars=6, actualHash=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb, elapsedMs=2000, serverElapsedMs=1900
+06-11 12:01:04.000 D/VoiceAgentE2E(1): hermes_queue_event type=job_completed callId=call-x jobId=job-x status=succeeded sent=n/a
+06-11 12:01:05.000 D/VoiceAgentE2E(1): hermes_queue_event type=late_text_turn_sent callId=call-x jobId=job-x status=none sent=true
+06-11 12:01:06.000 D/VoiceAgentGemini(1): event kind=OutputAudio
+06-11 12:01:07.000 D/AndroidVoiceAudioEngine(1): Voice playback queued bytes=3200
+06-11 12:01:08.000 D/AndroidVoiceAudioEngine(1): Voice playback wrote bytes=3200
+LOGS
+        ;;
+      stale-audio)
+        cat <<'LOGS'
+06-11 12:00:11.000 D/VoiceAgentGemini(1): event kind=OutputAudio
+06-11 12:00:12.000 D/AndroidVoiceAudioEngine(1): Voice playback queued bytes=3200
+06-11 12:00:13.000 D/AndroidVoiceAudioEngine(1): Voice playback wrote bytes=3200
+06-11 12:01:00.000 D/VoiceAgentE2E(1): hermes_tool_response_hash callId=call-a, responseChars=5, normalizedChars=5, actualHash=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa, elapsedMs=1000, serverElapsedMs=900
+06-11 12:01:01.000 D/VoiceAgentE2E(1): hermes_queue_event type=job_completed callId=call-a jobId=job-a status=succeeded sent=n/a
+06-11 12:01:02.000 D/VoiceAgentE2E(1): hermes_queue_event type=late_text_turn_sent callId=call-a jobId=job-a status=none sent=true
+06-11 12:01:03.000 D/VoiceAgentE2E(1): hermes_tool_response_hash callId=call-b, responseChars=6, normalizedChars=6, actualHash=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb, elapsedMs=2000, serverElapsedMs=1900
+06-11 12:01:04.000 D/VoiceAgentE2E(1): hermes_queue_event type=job_completed callId=call-b jobId=job-b status=succeeded sent=n/a
+06-11 12:01:05.000 D/VoiceAgentE2E(1): hermes_queue_event type=late_text_turn_sent callId=call-b jobId=job-b status=none sent=true
+LOGS
+        ;;
       *)
         cat <<'LOGS'
 06-11 12:01:00.000 D/VoiceAgentE2E(1): hermes_tool_response_hash callId=call-a, responseChars=5, normalizedChars=5, actualHash=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa, elapsedMs=1000, serverElapsedMs=900
-06-11 12:01:01.000 D/VoiceAgentCallSession(1): diagnostic name=hermes_job_completed detail=callId=call-a, jobId=job-a, elapsedMs=1000, serverElapsedMs=900, answerChars=5
-06-11 12:01:02.000 D/VoiceAgentCallSession(1): diagnostic name=hermes_completion_follow_up_sent detail=callId=call-a, jobId=job-a, answerChars=5
+06-11 12:01:01.000 D/VoiceAgentE2E(1): hermes_queue_event type=job_completed callId=call-a jobId=job-a status=succeeded sent=n/a
+06-11 12:01:02.000 D/VoiceAgentE2E(1): hermes_queue_event type=late_text_turn_sent callId=call-a jobId=job-a status=none sent=true
 06-11 12:01:03.000 D/VoiceAgentE2E(1): hermes_tool_response_hash callId=call-b, responseChars=6, normalizedChars=6, actualHash=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb, elapsedMs=2000, serverElapsedMs=1900
-06-11 12:01:04.000 D/VoiceAgentCallSession(1): diagnostic name=hermes_job_completed detail=callId=call-b, jobId=job-b, elapsedMs=2000, serverElapsedMs=1900, answerChars=6
-06-11 12:01:05.000 D/VoiceAgentCallSession(1): diagnostic name=hermes_completion_follow_up_sent detail=callId=call-b, jobId=job-b, answerChars=6
+06-11 12:01:04.000 D/VoiceAgentE2E(1): hermes_queue_event type=job_completed callId=call-b jobId=job-b status=succeeded sent=n/a
+06-11 12:01:05.000 D/VoiceAgentE2E(1): hermes_queue_event type=late_text_turn_sent callId=call-b jobId=job-b status=none sent=true
 06-11 12:01:06.000 D/VoiceAgentGemini(1): event kind=OutputAudio
 06-11 12:01:07.000 D/AndroidVoiceAudioEngine(1): Voice playback queued bytes=3200
 06-11 12:01:08.000 D/AndroidVoiceAudioEngine(1): Voice playback wrote bytes=3200
@@ -164,8 +211,9 @@ LOGS
     while [[ ! -f "${FAKE_ADB_END_MARKER:?}" && "$SECONDS" -lt "$deadline" ]]; do
       sleep 0.1
     done
-    if [[ -f "${FAKE_ADB_END_MARKER:?}" ]]; then
+    if [[ -f "${FAKE_ADB_END_MARKER:?}" && "${FAKE_QUEUE_SCENARIO:-pass}" != "cleanup-timeout" ]]; then
       printf '06-11 12:02:00.000 D/VoiceAgentCallService(1): end completed conversationId=conversation-1\n'
+      : > "${FAKE_ADB_DRAINED_MARKER:?}"
     fi
     sleep 1
     ;;
@@ -192,6 +240,7 @@ LOGS
     ;;
   "-s RZ shell am start-foreground-service -n me.rerere.rikkahub.debug/me.rerere.rikkahub.voiceagent.VoiceAgentCallService -a me.rerere.rikkahub.voiceagent.action.START --es conversationId conversation-1 --ez enableVoiceE2EArtifacts true")
     rm -f "${FAKE_ADB_END_MARKER:?}"
+    rm -f "${FAKE_ADB_DRAINED_MARKER:?}"
     ;;
   "-s RZ shell am start-foreground-service -n me.rerere.rikkahub.debug/me.rerere.rikkahub.voiceagent.VoiceAgentCallService -a me.rerere.rikkahub.voiceagent.action.END")
     : > "${FAKE_ADB_END_MARKER:?}"
@@ -199,25 +248,30 @@ LOGS
   "-s RZ shell am broadcast "*)
     ;;
   "-s RZ exec-out run-as me.rerere.rikkahub.debug cat no_backup/voice-e2e/hermes-events.ndjson")
+    require_drain_before_artifact_pull "$args"
     cat <<'EVENTS'
 {"type":"job_created","callId":"call-a","jobId":"job-a","status":"queued"}
 {"type":"job_created","callId":"call-b","jobId":"job-b","status":"queued"}
-{"type":"job_completed","callId":"call-a","jobId":"job-a","status":"succeeded","hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","elapsedMs":1000,"serverElapsedMs":900,"answer":"private answer one"}
+{"type":"job_completed","callId":"call-a","jobId":"job-a","status":"succeeded","hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","elapsedMs":1000,"serverElapsedMs":900,"answerChars":18}
 {"type":"late_text_turn_sent","callId":"call-a","jobId":"job-a","sent":true}
-{"type":"job_completed","callId":"call-b","jobId":"job-b","status":"succeeded","hash":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","elapsedMs":2000,"serverElapsedMs":1900,"answer":"private answer two"}
+{"type":"job_completed","callId":"call-b","jobId":"job-b","status":"succeeded","hash":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","elapsedMs":2000,"serverElapsedMs":1900,"answerChars":18}
 {"type":"late_text_turn_sent","callId":"call-b","jobId":"job-b","sent":true}
 EVENTS
     ;;
   "-s RZ exec-out run-as me.rerere.rikkahub.debug cat no_backup/voice-e2e/input-transcript.txt")
+    require_drain_before_artifact_pull "$args"
     printf 'Ask Hermes three separate questions now.'
     ;;
   "-s RZ exec-out run-as me.rerere.rikkahub.debug cat no_backup/voice-e2e/output-transcript.txt")
+    require_drain_before_artifact_pull "$args"
     printf 'I queued the Hermes work and now have two answers.'
     ;;
   "-s RZ exec-out run-as me.rerere.rikkahub.debug cat no_backup/voice-e2e/hermes-call.txt")
+    require_drain_before_artifact_pull "$args"
     printf 'latest Hermes prompt snapshot'
     ;;
   "-s RZ exec-out run-as me.rerere.rikkahub.debug cat no_backup/voice-e2e/hermes-answer.txt")
+    require_drain_before_artifact_pull "$args"
     printf 'latest Hermes answer snapshot'
     ;;
   *)
@@ -235,8 +289,10 @@ write_fake_adb
 printf 'queue pcm' > "$TMP_DIR/queue-prompt.pcm"
 FAKE_ADB_ARGS_LOG="$TMP_DIR/adb-args.log"
 FAKE_ADB_END_MARKER="$TMP_DIR/end-requested"
+FAKE_ADB_DRAINED_MARKER="$TMP_DIR/end-drained"
 export FAKE_ADB_ARGS_LOG
 export FAKE_ADB_END_MARKER
+export FAKE_ADB_DRAINED_MARKER
 : > "$FAKE_ADB_ARGS_LOG"
 
 default_prompt="Ask Hermes three separate questions now. First, ask whether he is connected to G Brain. Second, ask him to recall the private queue test fact. Third, ask him to summarize the latest Arthur status. Keep talking with me while those Hermes requests run, and tell me each answer when it is ready."
@@ -270,9 +326,10 @@ assert_contains "$pass_output" "Voice Agent Hermes queue E2E reached manual revi
 assert_contains "$pass_output" "PIPELINE: passed"
 assert_contains "$pass_output" "CLEANUP: passed"
 assert_not_contains "$pass_output" "private answer one"
-assert_file_contains "$pass_log_dir/report.txt" "private answer one"
-assert_file_contains "$pass_log_dir/report.txt" "private answer two"
+assert_not_contains "$(cat "$pass_log_dir/report.txt")" "private answer one"
+assert_not_contains "$(cat "$pass_log_dir/report.txt")" "private answer two"
 assert_file_contains "$pass_log_dir/hermes-events.ndjson" "\"jobId\":\"job-a\""
+assert_not_contains "$(cat "$pass_log_dir/hermes-events.ndjson")" "\"answer\""
 
 one_complete_log_dir="$TMP_DIR/one-complete-log"
 set +e
@@ -342,6 +399,105 @@ if [[ "$forbidden_status" -eq 0 ]]; then
   exit 1
 fi
 assert_contains "$forbidden_output" "Forbidden marker found: common forbidden marker"
+
+extra_created_log_dir="$TMP_DIR/extra-created-log"
+set +e
+extra_created_output="$(
+  PATH="$TMP_DIR:$PATH" \
+  FAKE_QUEUE_SCENARIO=extra-created \
+  VOICE_AGENT_E2E_SERIAL=RZ \
+  VOICE_AGENT_E2E_ADB_READY_SCRIPT="$TMP_DIR/adb-ready.sh" \
+  VOICE_AGENT_QUEUE_E2E_PCM_PATH="$TMP_DIR/queue-prompt.pcm" \
+  VOICE_AGENT_E2E_CONVERSATION_ID=conversation-1 \
+  VOICE_AGENT_QUEUE_E2E_LOG_DIR="$extra_created_log_dir" \
+  VOICE_AGENT_QUEUE_E2E_TOOL_CALL_TIMEOUT_SECONDS=5 \
+  VOICE_AGENT_QUEUE_E2E_COMPLETION_TIMEOUT_SECONDS=5 \
+  "$SCRIPT" 2>&1
+)"
+extra_created_status=$?
+set -e
+if [[ "$extra_created_status" -ne 0 ]]; then
+  printf 'Expected extra-created scenario to pass, got %s.\n' "$extra_created_status" >&2
+  printf 'Actual output:\n%s\n' "$extra_created_output" >&2
+  exit 1
+fi
+assert_contains "$extra_created_output" "Voice Agent Hermes queue E2E reached manual review gate."
+
+unknown_completed_log_dir="$TMP_DIR/unknown-completed-log"
+set +e
+unknown_completed_output="$(
+  PATH="$TMP_DIR:$PATH" \
+  FAKE_QUEUE_SCENARIO=unknown-completed \
+  VOICE_AGENT_E2E_SERIAL=RZ \
+  VOICE_AGENT_E2E_ADB_READY_SCRIPT="$TMP_DIR/adb-ready.sh" \
+  VOICE_AGENT_QUEUE_E2E_PCM_PATH="$TMP_DIR/queue-prompt.pcm" \
+  VOICE_AGENT_E2E_CONVERSATION_ID=conversation-1 \
+  VOICE_AGENT_QUEUE_E2E_LOG_DIR="$unknown_completed_log_dir" \
+  VOICE_AGENT_QUEUE_E2E_TOOL_CALL_TIMEOUT_SECONDS=5 \
+  VOICE_AGENT_QUEUE_E2E_COMPLETION_TIMEOUT_SECONDS=5 \
+  "$SCRIPT" 2>&1
+)"
+unknown_completed_status=$?
+set -e
+if [[ "$unknown_completed_status" -eq 0 ]]; then
+  printf 'Expected unknown-completed scenario to fail.\n' >&2
+  printf 'Actual output:\n%s\n' "$unknown_completed_output" >&2
+  exit 1
+fi
+assert_contains "$unknown_completed_output" "Completed Hermes job was not queued: job-x"
+
+cleanup_timeout_log_dir="$TMP_DIR/cleanup-timeout-log"
+set +e
+cleanup_timeout_output="$(
+  PATH="$TMP_DIR:$PATH" \
+  FAKE_QUEUE_SCENARIO=cleanup-timeout \
+  VOICE_AGENT_E2E_SERIAL=RZ \
+  VOICE_AGENT_E2E_ADB_READY_SCRIPT="$TMP_DIR/adb-ready.sh" \
+  VOICE_AGENT_QUEUE_E2E_PCM_PATH="$TMP_DIR/queue-prompt.pcm" \
+  VOICE_AGENT_E2E_CONVERSATION_ID=conversation-1 \
+  VOICE_AGENT_QUEUE_E2E_LOG_DIR="$cleanup_timeout_log_dir" \
+  VOICE_AGENT_QUEUE_E2E_TOOL_CALL_TIMEOUT_SECONDS=5 \
+  VOICE_AGENT_QUEUE_E2E_COMPLETION_TIMEOUT_SECONDS=5 \
+  VOICE_AGENT_E2E_SERVICE_END_TIMEOUT_SECONDS=1 \
+  "$SCRIPT" 2>&1
+)"
+cleanup_timeout_status=$?
+set -e
+if [[ "$cleanup_timeout_status" -eq 0 ]]; then
+  printf 'Expected cleanup-timeout scenario to fail.\n' >&2
+  printf 'Actual output:\n%s\n' "$cleanup_timeout_output" >&2
+  exit 1
+fi
+assert_contains "$cleanup_timeout_output" "Skipping report pull because service drain was not observed."
+assert_not_contains "$cleanup_timeout_output" "Voice Agent Hermes queue E2E report:"
+if [[ -f "$cleanup_timeout_log_dir/report.txt" ]]; then
+  printf 'Expected cleanup-timeout scenario not to write report.txt.\n' >&2
+  exit 1
+fi
+
+stale_audio_log_dir="$TMP_DIR/stale-audio-log"
+set +e
+stale_audio_output="$(
+  PATH="$TMP_DIR:$PATH" \
+  FAKE_QUEUE_SCENARIO=stale-audio \
+  VOICE_AGENT_E2E_SERIAL=RZ \
+  VOICE_AGENT_E2E_ADB_READY_SCRIPT="$TMP_DIR/adb-ready.sh" \
+  VOICE_AGENT_QUEUE_E2E_PCM_PATH="$TMP_DIR/queue-prompt.pcm" \
+  VOICE_AGENT_E2E_CONVERSATION_ID=conversation-1 \
+  VOICE_AGENT_QUEUE_E2E_LOG_DIR="$stale_audio_log_dir" \
+  VOICE_AGENT_QUEUE_E2E_TOOL_CALL_TIMEOUT_SECONDS=5 \
+  VOICE_AGENT_QUEUE_E2E_COMPLETION_TIMEOUT_SECONDS=5 \
+  VOICE_AGENT_QUEUE_E2E_OUTPUT_TIMEOUT_SECONDS=2 \
+  "$SCRIPT" 2>&1
+)"
+stale_audio_status=$?
+set -e
+if [[ "$stale_audio_status" -eq 0 ]]; then
+  printf 'Expected stale-audio scenario to fail.\n' >&2
+  printf 'Actual output:\n%s\n' "$stale_audio_output" >&2
+  exit 1
+fi
+assert_contains "$stale_audio_output" "Missing marker after 2s: second Gemini output audio received"
 
 supplied_log_dir="$TMP_DIR/supplied-log"
 set +e

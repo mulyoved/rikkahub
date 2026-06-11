@@ -122,7 +122,7 @@ The script fails on:
 - missing ADB device or wrong installed package;
 - missing Gemini setup, tool-call, queued-job, completion, follow-up, output audio, or playback markers;
 - duplicate queued Hermes job ids;
-- completed jobs that do not match queued jobs;
+- completed job ids that were not observed as queued jobs;
 - fewer completed Hermes jobs than `VOICE_AGENT_QUEUE_E2E_EXPECTED_COMPLETIONS`;
 - `Voice Lab request failed 403`;
 - Cloudflare or access-denied content;
@@ -145,7 +145,7 @@ Important files:
 - `logcat.txt`: scoped logcat.
 - `generated-prompt.txt`: prompt text used for generated PCM.
 - `generated-prompt.pcm`: generated PCM when used.
-- `hermes-events.ndjson`: queue event rows pulled from app-private storage.
+- `hermes-events.ndjson`: queue event rows pulled from app-private storage. These rows contain ids, status, hashes, timing, and answer sizes, not raw Hermes answers.
 - `input-transcript.txt`: what Gemini understood from the injected voice.
 - `output-transcript.txt`: Gemini response text when available.
 - `hermes-call.txt`: latest Hermes call artifact snapshot.

@@ -500,6 +500,9 @@ class VoiceAgentCoordinator(
             )
             return
         }
+        runCatching {
+            Log.d(E2E_TAG, "hermes_tool_call_received callId=${call.callId} promptChars=${call.prompt.length}")
+        }
         val handle = ToolJobHandle(callId = call.callId, prompt = call.prompt, sessionId = sessionId)
         val job = coordinatorScope.launch(toolLaunchContext, start = CoroutineStart.LAZY) {
             runHermesToolCall(callId = call.callId, prompt = call.prompt, handle = handle)
@@ -712,7 +715,7 @@ class VoiceAgentCoordinator(
                         elapsedMs = elapsedMs,
                         serverElapsedMs = poll.elapsedMs,
                         hash = HermesToolResponseHash.sha256HexNormalized(answer),
-                        answer = answer,
+                        answerChars = answer.length,
                     )
                     persistToolStatus(
                         callId = callId,
@@ -1130,7 +1133,7 @@ class VoiceAgentCoordinator(
         elapsedMs: Long? = null,
         serverElapsedMs: Long? = null,
         hash: String? = null,
-        answer: String? = null,
+        answerChars: Int? = null,
         sent: Boolean? = null,
     ) {
         val content = buildJsonObject {
@@ -1141,9 +1144,16 @@ class VoiceAgentCoordinator(
             elapsedMs?.let { put("elapsedMs", it) }
             serverElapsedMs?.let { put("serverElapsedMs", it) }
             hash?.let { put("hash", it) }
-            answer?.let { put("answer", it) }
+            answerChars?.let { put("answerChars", it) }
             sent?.let { put("sent", it) }
         }.toString()
+        runCatching {
+            Log.d(
+                E2E_TAG,
+                "hermes_queue_event type=$type callId=$callId jobId=$jobId " +
+                    "status=${status ?: "none"} sent=${sent ?: "n/a"}",
+            )
+        }
         writeArtifactSafely(artifact = VoiceE2EArtifact.HermesEvents, content = content, callId = callId)
     }
 

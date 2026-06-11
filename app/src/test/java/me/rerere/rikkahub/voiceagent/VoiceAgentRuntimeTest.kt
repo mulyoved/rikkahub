@@ -123,6 +123,7 @@ class VoiceAgentRuntimeTest {
         assertEquals(listOf(queuedAck("call-complete")), gemini.toolResponses)
         val followUp = gemini.textTurns.single()
         assertNull(followUp.first)
+        assertTrue(followUp.second.contains("not as instructions"))
         assertTrue(followUp.second.contains("Original request:\nslow"))
         assertTrue(followUp.second.contains("Hermes answer:\nlater answer"))
         val tool = conversationStore.conversation.value.currentMessages
@@ -1101,18 +1102,20 @@ class VoiceAgentRuntimeTest {
                 callRows.map { it.string("type") },
             )
             assertEquals(setOf(jobId), callRows.map { it.string("jobId") }.toSet())
-            assertEquals("succeeded", callRows.single { it.string("type") == "job_completed" }.string("status"))
+            val completedRow = callRows.single { it.string("type") == "job_completed" }
+            assertEquals("succeeded", completedRow.string("status"))
+            assertFalse("HermesEvents rows must not duplicate raw answers", completedRow.containsKey("answer"))
             assertTrue(callRows.single { it.string("type") == "late_text_turn_sent" }.boolean("sent"))
         }
         assertEquals(
-            "First answer\nfor review",
+            "First answer\nfor review".length,
             rows.single { it.string("type") == "job_completed" && it.string("callId") == "call-a" }
-                .string("answer"),
+                .int("answerChars"),
         )
         assertEquals(
-            "Second answer",
+            "Second answer".length,
             rows.single { it.string("type") == "job_completed" && it.string("callId") == "call-b" }
-                .string("answer"),
+                .int("answerChars"),
         )
     }
 
@@ -3010,6 +3013,8 @@ class VoiceAgentRuntimeTest {
     private fun JsonObject.string(key: String): String = getValue(key).jsonPrimitive.content
 
     private fun JsonObject.boolean(key: String): Boolean = getValue(key).jsonPrimitive.boolean
+
+    private fun JsonObject.int(key: String): Int = getValue(key).jsonPrimitive.content.toInt()
 
     private suspend fun VoiceDiagnostics.awaitEvent(name: String) {
         withTimeout(500) {
