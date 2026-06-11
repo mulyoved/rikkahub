@@ -7,6 +7,10 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.boolean
+import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import me.rerere.ai.ui.UIMessagePart
 import me.rerere.rikkahub.voiceagent.gemini.GeminiContentTurn
@@ -1041,6 +1045,74 @@ class VoiceAgentRuntimeTest {
             diagnostics.events.value.any {
                 it.name == "hermes_tool_started" && it.detail.contains("callId=call-b")
             }
+        )
+    }
+
+    @Test
+    fun `coordinator writes queue e2e events for multiple Hermes jobs`() = runTest {
+        val gemini = FakeGeminiLiveVoiceClient()
+        val toolApi = FakeVoiceToolApi()
+        val artifacts = mutableListOf<Pair<VoiceE2EArtifact, String>>()
+        val coordinator = VoiceAgentCoordinator(
+            gemini = gemini,
+            toolApi = toolApi,
+            audio = FakeVoiceAudioEngine(),
+            writeVoiceE2EArtifact = { name, content -> artifacts += name to content },
+            scope = this,
+        )
+
+        coordinator.onGeminiEvent(
+            GeminiLiveEvent.ToolCalls(
+                listOf(
+                    GeminiLiveEvent.ToolCall(callId = "call-a", name = "ask_hermes", prompt = "First"),
+                    GeminiLiveEvent.ToolCall(callId = "call-b", name = "ask_hermes", prompt = "Second"),
+                )
+            )
+        )
+        assertEquals("call-a" to "First", toolApi.awaitRequest("call-a"))
+        assertEquals("call-b" to "Second", toolApi.awaitRequest("call-b"))
+
+        toolApi.complete(response(callId = "call-a", answer = "First answer\nfor review"))
+        toolApi.complete(response(callId = "call-b", answer = "Second answer"))
+        coordinator.awaitToolJobsWithTimeout()
+
+        assertEquals(
+            setOf(queuedAck("call-a"), queuedAck("call-b")),
+            gemini.toolResponses.toSet(),
+        )
+        assertEquals(2, gemini.textTurns.size)
+
+        val rows = artifacts
+            .filter { it.first == VoiceE2EArtifact.HermesEvents }
+            .map { (_, content) ->
+                assertFalse("HermesEvents rows must not contain literal LF", content.contains('\n'))
+                assertFalse("HermesEvents rows must not contain literal CR", content.contains('\r'))
+                Json.parseToJsonElement(content).jsonObject
+            }
+
+        assertEquals(6, rows.size)
+        assertEquals(setOf("call-a", "call-b"), rows.map { it.string("callId") }.toSet())
+        assertEquals(setOf("job-1", "job-2"), rows.map { it.string("jobId") }.toSet())
+
+        listOf("call-a" to "job-1", "call-b" to "job-2").forEach { (callId, jobId) ->
+            val callRows = rows.filter { it.string("callId") == callId }
+            assertEquals(
+                listOf("job_created", "job_completed", "late_text_turn_sent"),
+                callRows.map { it.string("type") },
+            )
+            assertEquals(setOf(jobId), callRows.map { it.string("jobId") }.toSet())
+            assertEquals("succeeded", callRows.single { it.string("type") == "job_completed" }.string("status"))
+            assertTrue(callRows.single { it.string("type") == "late_text_turn_sent" }.boolean("sent"))
+        }
+        assertEquals(
+            "First answer\nfor review",
+            rows.single { it.string("type") == "job_completed" && it.string("callId") == "call-a" }
+                .string("answer"),
+        )
+        assertEquals(
+            "Second answer",
+            rows.single { it.string("type") == "job_completed" && it.string("callId") == "call-b" }
+                .string("answer"),
         )
     }
 
@@ -2934,6 +3006,10 @@ class VoiceAgentRuntimeTest {
 
     private fun List<UIMessagePart>.text(): String =
         filterIsInstance<UIMessagePart.Text>().joinToString("") { it.text }
+
+    private fun JsonObject.string(key: String): String = getValue(key).jsonPrimitive.content
+
+    private fun JsonObject.boolean(key: String): Boolean = getValue(key).jsonPrimitive.boolean
 
     private suspend fun VoiceDiagnostics.awaitEvent(name: String) {
         withTimeout(500) {

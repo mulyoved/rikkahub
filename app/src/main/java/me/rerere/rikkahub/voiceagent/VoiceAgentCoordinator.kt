@@ -20,6 +20,8 @@ import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
 import me.rerere.rikkahub.BuildConfig
 import me.rerere.rikkahub.data.model.Conversation
 import me.rerere.rikkahub.voiceagent.audio.VoiceAudioEngine
@@ -545,6 +547,12 @@ class VoiceAgentCoordinator(
                 "hermes_job_created",
                 "callId=$callId, jobId=${submitted.jobId}, status=${submitted.status}",
             )
+            writeHermesQueueEvent(
+                type = "job_created",
+                callId = callId,
+                jobId = submitted.jobId,
+                status = submitted.status,
+            )
             persistToolStatus(
                 callId = callId,
                 prompt = prompt,
@@ -696,6 +704,16 @@ class VoiceAgentCoordinator(
                         "callId=$callId, jobId=$jobId, elapsedMs=$elapsedMs${poll.serverElapsedDiagnostic()}, " +
                             "answerChars=${answer.length}",
                     )
+                    writeHermesQueueEvent(
+                        type = "job_completed",
+                        callId = callId,
+                        jobId = jobId,
+                        status = "succeeded",
+                        elapsedMs = elapsedMs,
+                        serverElapsedMs = poll.elapsedMs,
+                        hash = HermesToolResponseHash.sha256HexNormalized(answer),
+                        answer = answer,
+                    )
                     persistToolStatus(
                         callId = callId,
                         prompt = prompt,
@@ -796,6 +814,12 @@ class VoiceAgentCoordinator(
             val sent = gemini.sendTextTurn(
                 text = hermesCompletionFollowUpText(prompt = prompt, answer = answer),
                 sessionId = handle.sessionId,
+            )
+            writeHermesQueueEvent(
+                type = "late_text_turn_sent",
+                callId = callId,
+                jobId = handle.jobId ?: "none",
+                sent = sent,
             )
             val detail = "callId=$callId, jobId=${handle.jobId ?: "none"}, answerChars=${answer.length}"
             if (sent) {
@@ -1096,6 +1120,31 @@ class VoiceAgentCoordinator(
                 "name=${artifact.fileName}$callDetail, message=$message",
             )
         }
+    }
+
+    private fun writeHermesQueueEvent(
+        type: String,
+        callId: String,
+        jobId: String,
+        status: String? = null,
+        elapsedMs: Long? = null,
+        serverElapsedMs: Long? = null,
+        hash: String? = null,
+        answer: String? = null,
+        sent: Boolean? = null,
+    ) {
+        val content = buildJsonObject {
+            put("type", type)
+            put("callId", callId)
+            put("jobId", jobId)
+            status?.let { put("status", it) }
+            elapsedMs?.let { put("elapsedMs", it) }
+            serverElapsedMs?.let { put("serverElapsedMs", it) }
+            hash?.let { put("hash", it) }
+            answer?.let { put("answer", it) }
+            sent?.let { put("sent", it) }
+        }.toString()
+        writeArtifactSafely(artifact = VoiceE2EArtifact.HermesEvents, content = content, callId = callId)
     }
 
     private fun persistToolStatus(
