@@ -94,7 +94,7 @@ class VoiceAgentRuntimeTest {
     }
 
     @Test
-    fun `Hermes queued job completion updates history without second Gemini response`() = runTest {
+    fun `Hermes queued job completion updates history and asks Gemini to explain answer`() = runTest {
         val gemini = FakeGeminiLiveVoiceClient()
         val conversationStore = FakeVoiceConversationStore()
         val toolApi = FakeVoiceToolApi()
@@ -117,6 +117,10 @@ class VoiceAgentRuntimeTest {
         coordinator.awaitPersistenceJobsWithTimeout()
 
         assertEquals(listOf(queuedAck("call-complete")), gemini.toolResponses)
+        val followUp = gemini.textTurns.single()
+        assertNull(followUp.first)
+        assertTrue(followUp.second.contains("Original request:\nslow"))
+        assertTrue(followUp.second.contains("Hermes answer:\nlater answer"))
         val tool = conversationStore.conversation.value.currentMessages
             .flatMap { it.parts }
             .filterIsInstance<UIMessagePart.Tool>()
@@ -129,6 +133,95 @@ class VoiceAgentRuntimeTest {
                     it.detail.contains("answerChars=12")
             }
         )
+    }
+
+    @Test
+    fun `Hermes completion follow up failure surfaces answer in local transcript`() = runTest {
+        val gemini = FakeGeminiLiveVoiceClient().apply {
+            failTextTurns = true
+        }
+        val conversationStore = FakeVoiceConversationStore()
+        val toolApi = FakeVoiceToolApi()
+        val diagnostics = VoiceDiagnostics()
+        val coordinator = VoiceAgentCoordinator(
+            gemini = gemini,
+            toolApi = toolApi,
+            audio = FakeVoiceAudioEngine(),
+            conversationStore = conversationStore,
+            diagnostics = diagnostics,
+            scope = this,
+        )
+
+        coordinator.onGeminiEvent(
+            GeminiLiveEvent.ToolCall(callId = "call-follow-up-fails", name = "ask_hermes", prompt = "slow")
+        )
+        assertEquals("call-follow-up-fails" to "slow", toolApi.awaitRequest("call-follow-up-fails"))
+        toolApi.complete(response(callId = "call-follow-up-fails", answer = "fallback answer"))
+        coordinator.awaitToolJobsWithTimeout()
+        coordinator.awaitPersistenceJobsWithTimeout()
+
+        assertEquals(listOf(queuedAck("call-follow-up-fails")), gemini.toolResponses)
+        assertEquals(emptyList<Pair<Long?, String>>(), gemini.textTurns)
+        assertTrue(coordinator.state.value.outputTranscript.contains("Hermes answer: fallback answer"))
+        assertHermesAnswered(callId = "call-follow-up-fails", status = coordinator.state.value.tool)
+        assertTrue(
+            diagnostics.events.value.any {
+                it.name == "hermes_completion_follow_up_failed" &&
+                    it.detail.contains("callId=call-follow-up-fails")
+            }
+        )
+        val assistantText = conversationStore.conversation.value.currentMessages
+            .flatMap { it.parts }
+            .filterIsInstance<UIMessagePart.Text>()
+            .map { it.text }
+        assertTrue(assistantText.any { it.contains("Hermes answer: fallback answer") })
+    }
+
+    @Test
+    fun `Hermes job submission failure persists failure without acknowledgement or job id`() = runTest {
+        val gemini = FakeGeminiLiveVoiceClient()
+        val conversationStore = FakeVoiceConversationStore()
+        val toolApi = FakeVoiceToolApi()
+        val failures = mutableListOf<String>()
+        toolApi.failSubmit(
+            callId = "call-submit-fails",
+            error = IllegalStateException("Voice Lab request failed 429: private prompt detail"),
+        )
+        val coordinator = VoiceAgentCoordinator(
+            gemini = gemini,
+            toolApi = toolApi,
+            audio = FakeVoiceAudioEngine(),
+            conversationStore = conversationStore,
+            logHermesToolFailure = failures::add,
+            scope = this,
+        )
+
+        coordinator.onGeminiEvent(
+            GeminiLiveEvent.ToolCall(callId = "call-submit-fails", name = "ask_hermes", prompt = "slow")
+        )
+        coordinator.awaitToolJobsWithTimeout()
+        coordinator.awaitPersistenceJobsWithTimeout()
+
+        assertEquals(emptyList<Pair<String, String>>(), gemini.toolResponses)
+        assertEquals(emptyList<Pair<Long?, String>>(), gemini.textTurns)
+        assertEquals(emptyList<Pair<String, String>>(), toolApi.requests)
+        assertEquals(
+            VoiceToolStatus.HermesFailed(
+                callId = "call-submit-fails",
+                message = "Voice Lab request failed 429: private prompt detail",
+            ),
+            coordinator.state.value.tool,
+        )
+        assertEquals(1, failures.size)
+        assertTrue(failures.single().contains("callId=call-submit-fails"))
+        assertTrue(failures.single().contains("message=Voice Lab request failed 429"))
+        assertFalse(failures.single().contains("private prompt detail"))
+        val tool = conversationStore.conversation.value.currentMessages
+            .flatMap { it.parts }
+            .filterIsInstance<UIMessagePart.Tool>()
+            .single { it.toolCallId == "call-submit-fails" }
+        assertEquals("failed", tool.metadata?.get("voice_tool_status")?.jsonPrimitive?.content)
+        assertNull(tool.metadata?.get("voice_tool_job_id"))
     }
 
     @Test
@@ -277,6 +370,41 @@ class VoiceAgentRuntimeTest {
             diagnostics.events.value.any {
                 it.name == "hermes_job_poll_failed" && it.detail.contains("attempt=5")
             }
+        )
+    }
+
+    @Test
+    fun `Hermes local poll timeout cancels remote job`() = runTest {
+        val gemini = FakeGeminiLiveVoiceClient()
+        val toolApi = FakeVoiceToolApi()
+        val coordinator = VoiceAgentCoordinator(
+            gemini = gemini,
+            toolApi = toolApi,
+            audio = FakeVoiceAudioEngine(),
+            hermesJobPollIntervalMs = 1,
+            hermesJobMaxElapsedMs = 0,
+            scope = this,
+        )
+
+        coordinator.onGeminiEvent(
+            GeminiLiveEvent.ToolCall(callId = "call-local-timeout", name = "ask_hermes", prompt = "slow")
+        )
+        assertEquals("call-local-timeout" to "slow", toolApi.awaitRequest("call-local-timeout"))
+        toolApi.scriptPoll(
+            "call-local-timeout",
+            jobPoll(callId = "call-local-timeout", jobId = "job-1", status = "queued"),
+        )
+        coordinator.awaitToolJobsWithTimeout()
+
+        toolApi.awaitRemoteCancelled("call-local-timeout")
+        assertEquals(listOf(queuedAck("call-local-timeout")), gemini.toolResponses)
+        assertEquals(emptyList<Pair<Long?, String>>(), gemini.textTurns)
+        assertEquals(
+            VoiceToolStatus.HermesFailed(
+                callId = "call-local-timeout",
+                message = "Hermes job polling timed out.",
+            ),
+            coordinator.state.value.tool,
         )
     }
 
@@ -724,6 +852,47 @@ class VoiceAgentRuntimeTest {
 
         assertEquals(listOf(queuedAck("call-replay")), gemini.toolResponses)
         assertHermesAnswered(callId = "call-replay", status = coordinator.state.value.tool)
+    }
+
+    @Test
+    fun `duplicate tool call id while submit is in flight keeps original job`() = runTest {
+        val gemini = FakeGeminiLiveVoiceClient()
+        val toolApi = FakeVoiceToolApi()
+        val blockedSubmit = toolApi.blockSubmit("call-submit-inflight")
+        val diagnostics = VoiceDiagnostics()
+        val coordinator = VoiceAgentCoordinator(
+            gemini = gemini,
+            toolApi = toolApi,
+            audio = FakeVoiceAudioEngine(),
+            diagnostics = diagnostics,
+            scope = this,
+            dispatcher = Dispatchers.Default,
+        )
+
+        coordinator.onGeminiEvent(
+            GeminiLiveEvent.ToolCall(callId = "call-submit-inflight", name = "ask_hermes", prompt = "old")
+        )
+        assertEquals("call-submit-inflight" to "old", toolApi.awaitRequest("call-submit-inflight"))
+        assertTrue(blockedSubmit.started.await(500, TimeUnit.MILLISECONDS))
+
+        coordinator.onGeminiEvent(
+            GeminiLiveEvent.ToolCall(callId = "call-submit-inflight", name = "ask_hermes", prompt = "new")
+        )
+        delay(50)
+        assertFalse(("call-submit-inflight" to "new") in toolApi.requests)
+        assertTrue(
+            diagnostics.events.value.any {
+                it.name == "duplicate_tool_call_before_job_id" &&
+                    it.detail.contains("callId=call-submit-inflight")
+            }
+        )
+
+        blockedSubmit.release.countDown()
+        toolApi.complete(response(callId = "call-submit-inflight", answer = "old answer"))
+        coordinator.awaitToolJobsWithTimeout()
+
+        assertEquals(listOf(queuedAck("call-submit-inflight")), gemini.toolResponses)
+        assertHermesAnswered(callId = "call-submit-inflight", status = coordinator.state.value.tool)
     }
 
     @Test
@@ -1195,6 +1364,7 @@ class VoiceAgentRuntimeTest {
         coordinator.awaitToolJobsWithTimeout()
 
         assertEquals(emptyList<Pair<String, String>>(), gemini.toolResponses)
+        toolApi.awaitRemoteCancelled("call-send-fails")
         assertEquals(
             VoiceToolStatus.HermesFailed(
                 callId = "call-send-fails",

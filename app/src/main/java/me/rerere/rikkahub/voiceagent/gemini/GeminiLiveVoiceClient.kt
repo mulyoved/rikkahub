@@ -59,6 +59,10 @@ interface GeminiLiveVoiceClient {
     fun sendToolResponse(callId: String, answer: String, sessionId: Long?): Boolean {
         return sendToolResponse(callId = callId, answer = answer)
     }
+    fun sendTextTurn(text: String): Boolean
+    fun sendTextTurn(text: String, sessionId: Long?): Boolean {
+        return sendTextTurn(text = text)
+    }
 
     fun close()
 }
@@ -234,6 +238,25 @@ class TestableGeminiLiveVoiceClient(
             return sendPostSetupMessage(
                 text = codec.toolResponseMessage(callId = callId, answer = answer),
                 errorMessage = "Failed to send Gemini tool response message",
+                queueBeforeSetup = false,
+                requiredOutboundSessionId = sessionId,
+            )
+        }
+    }
+
+    override fun sendTextTurn(text: String): Boolean {
+        return sendPostSetupMessage(
+            text = codec.clientContentMessage(listOf(GeminiContentTurn(role = "user", text = text))),
+            errorMessage = "Failed to send Gemini text turn message",
+            queueBeforeSetup = false,
+        )
+    }
+
+    override fun sendTextTurn(text: String, sessionId: Long?): Boolean {
+        synchronized(outboundSendLock) {
+            return sendPostSetupMessage(
+                text = codec.clientContentMessage(listOf(GeminiContentTurn(role = "user", text = text))),
+                errorMessage = "Failed to send Gemini text turn message",
                 queueBeforeSetup = false,
                 requiredOutboundSessionId = sessionId,
             )

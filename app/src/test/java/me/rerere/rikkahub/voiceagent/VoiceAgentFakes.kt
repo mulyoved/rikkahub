@@ -25,7 +25,9 @@ class FakeGeminiLiveVoiceClient : GeminiLiveVoiceClient {
     val audioMessages = mutableListOf<String>()
     val audioStreamEndSessionIds = mutableListOf<Long?>()
     val toolResponses = mutableListOf<Pair<String, String>>()
+    val textTurns = mutableListOf<Pair<Long?, String>>()
     val failToolResponses = mutableSetOf<String>()
+    var failTextTurns = false
     var closeCalls = 0
     var onBeforeToolResponseRecorded: (() -> Unit)? = null
     var onClose: (() -> Unit)? = null
@@ -161,6 +163,23 @@ class FakeGeminiLiveVoiceClient : GeminiLiveVoiceClient {
         }
     }
 
+    override fun sendTextTurn(text: String): Boolean {
+        return sendTextTurn(text = text, sessionId = null)
+    }
+
+    override fun sendTextTurn(text: String, sessionId: Long?): Boolean {
+        synchronized(outboundSendLock) {
+            if (sessionId != null && outboundSessionId != sessionId) {
+                return false
+            }
+            if (failTextTurns) {
+                return false
+            }
+            textTurns += sessionId to text
+            return true
+        }
+    }
+
     override fun close() {
         onClose?.invoke()
         outboundSessionId = null
@@ -178,14 +197,25 @@ class BlockedConnect {
     val release = CompletableDeferred<Unit>()
 }
 
+class BlockedSubmit {
+    val started = CountDownLatch(1)
+    val release = CountDownLatch(1)
+    var timeoutMillis: Long = 500
+}
+
 class FakeVoiceToolApi : VoiceToolApi {
     val requests = mutableListOf<Pair<String, String>>()
     private val lock = Any()
     private val calls = mutableMapOf<String, PendingHermesJob>()
     private val scriptedPolls = mutableMapOf<String, ArrayDeque<Any>>()
+    private val submitFailures = mutableMapOf<String, Throwable>()
+    private val blockedSubmissions = mutableMapOf<String, MutableList<BlockedSubmit>>()
     private var jobCounter = 0
 
     override suspend fun submitHermesJob(callId: String, prompt: String): MobileHermesJobSubmitResponse {
+        synchronized(lock) {
+            submitFailures.remove(callId)?.let { throw it }
+        }
         val job = synchronized(lock) {
             requests += callId to prompt
             val jobId = "job-${++jobCounter}"
@@ -194,6 +224,13 @@ class FakeVoiceToolApi : VoiceToolApi {
             }
         }
         job.request.complete(callId to prompt)
+        val blocked = synchronized(blockedSubmissions) {
+            blockedSubmissions[callId]?.removeFirstOrNull()
+        }
+        if (blocked != null) {
+            blocked.started.countDown()
+            blocked.release.await(blocked.timeoutMillis, TimeUnit.MILLISECONDS)
+        }
         return MobileHermesJobSubmitResponse(
             jobId = job.jobId,
             callId = callId,
@@ -316,6 +353,20 @@ class FakeVoiceToolApi : VoiceToolApi {
         val job = call(callId)
         synchronized(lock) {
             scriptedPolls.getOrPut(job.jobId) { ArrayDeque() } += error
+        }
+    }
+
+    fun failSubmit(callId: String, error: Throwable) {
+        synchronized(lock) {
+            submitFailures[callId] = error
+        }
+    }
+
+    fun blockSubmit(callId: String): BlockedSubmit {
+        return BlockedSubmit().also { blocked ->
+            synchronized(blockedSubmissions) {
+                blockedSubmissions.getOrPut(callId) { mutableListOf() } += blocked
+            }
         }
     }
 
