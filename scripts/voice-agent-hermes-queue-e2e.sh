@@ -46,7 +46,7 @@ ADB_APP_CLEANUP_ENABLED=0
 GENERATED_PCM_FROM_PROMPT=0
 FFMPEG_PROMPT_TEXT_CLEANUP_PATH=""
 REPORT_TEMP_CLEANUP_PATHS=()
-COMMON_FORBIDDEN_PATTERN='Voice Lab request failed 403|Cloudflare|cf-error|Access denied|FATAL EXCEPTION|Voice playback write failed|AudioTrack write failed|AudioTrack write error|Voice Lab request failed 524|\b524\b|Hermes job polling timed out|Hermes job was no longer available'
+COMMON_FORBIDDEN_PATTERN='VoiceAgentE2E.*hermes_tool_failed|Voice Lab request failed (403|524)|Cloudflare|cf-error|Access denied|FATAL EXCEPTION|Voice playback write failed|AudioTrack write failed|AudioTrack write error|HTTP[ /]524|status=524|code=524|Hermes job polling timed out|Hermes job was no longer available'
 
 if [[ ! "$PACKAGE" =~ ^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+$ ]]; then
   printf 'VOICE_AGENT_E2E_PACKAGE must be an Android package name: %s\n' "$PACKAGE" >&2
@@ -162,6 +162,11 @@ fail_if_log() {
   fi
 }
 
+count_log_matches() {
+  local pattern="$1"
+  awk -v pattern="$pattern" '$0 ~ pattern { count++ } END { print count + 0 }' "$LOG_FILE" 2>/dev/null || printf '0\n'
+}
+
 wait_for_log_count() {
   local label="$1"
   local pattern="$2"
@@ -175,7 +180,7 @@ wait_for_log_count() {
       WAIT_FOR_LOG_FAILURE="forbidden"
       return 1
     fi
-    actual_count="$(grep -E "$pattern" "$LOG_FILE" 2>/dev/null | wc -l | tr -d ' ')"
+    actual_count="$(count_log_matches "$pattern")"
     if (( actual_count >= expected_count )); then
       printf 'PASS marker: %s\n' "$label"
       return 0
@@ -289,7 +294,7 @@ wait_for_completed_jobs() {
       WAIT_FOR_LOG_FAILURE="forbidden"
       return 1
     fi
-    completed_count="$(grep -E 'hermes_queue_event type=job_completed|hermes_job_completed|diagnostic name=hermes_job_completed' "$LOG_FILE" 2>/dev/null | wc -l | tr -d ' ')"
+    completed_count="$(count_log_matches 'hermes_queue_event type=job_completed|hermes_job_completed|diagnostic name=hermes_job_completed')"
     if (( completed_count >= minimum )); then
       printf 'PASS marker: at least %s Hermes jobs completed\n' "$minimum"
       return 0

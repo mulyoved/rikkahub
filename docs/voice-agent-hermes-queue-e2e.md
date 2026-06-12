@@ -124,9 +124,10 @@ The script fails on:
 - duplicate queued Hermes job ids;
 - completed job ids that were not observed as queued jobs;
 - fewer completed Hermes jobs than `VOICE_AGENT_QUEUE_E2E_EXPECTED_COMPLETIONS`;
+- any `hermes_tool_failed` marker;
 - `Voice Lab request failed 403`;
 - Cloudflare or access-denied content;
-- `Voice Lab request failed 524` or `524`;
+- `Voice Lab request failed 524`, `HTTP 524`, `status=524`, or `code=524`;
 - Hermes job polling timeout;
 - Hermes job expiration;
 - `FATAL EXCEPTION`;
@@ -169,8 +170,8 @@ job timeout, expiry, or provider errors.
 If late answer playback is missing, inspect `hermes_completion_follow_up_sent`,
 Gemini output audio markers, and playback markers.
 
-If `524` appears, the queued path is not being used end to end or an unexpected
-synchronous path is still active.
+If a real 524 failure appears, the queued path is not being used end to end or
+an unexpected synchronous path is still active.
 
 ## Privacy Rules
 

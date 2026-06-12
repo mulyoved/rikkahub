@@ -127,6 +127,12 @@ case "$args" in
     cat <<'LOGS'
 06-11 12:00:00.000 D/VoiceAgentGemini(1): event kind=SetupComplete
 06-11 12:00:01.000 I/VoiceAudioDebugInjection(1): debug_audio_injection result delivered=true
+06-11 12:00:01.524 D/VoiceAgentGemini(1): event kind=SessionResumptionUpdate
+LOGS
+    if [[ "${FAKE_QUEUE_SCENARIO:-pass}" == "delayed-markers" ]]; then
+      sleep 2
+    fi
+    cat <<'LOGS'
 06-11 12:00:02.000 D/VoiceAgentE2E(1): hermes_tool_call_received callId=call-a promptChars=5
 06-11 12:00:03.000 D/VoiceAgentE2E(1): hermes_tool_call_received callId=call-b promptChars=6
 06-11 12:00:04.000 D/VoiceAgentE2E(1): hermes_queue_event type=job_created callId=call-a jobId=job-a status=queued sent=n/a
@@ -152,6 +158,9 @@ LOGS
         ;;
       forbidden-524)
         printf '06-11 12:01:00.000 E/VoiceAgentCallSession(1): Voice Lab request failed 524\n'
+        ;;
+      tool-failed-404)
+        printf '06-11 12:01:00.000 W/VoiceAgentE2E(1): hermes_tool_failed callId=call-a, elapsedMs=137, message=Voice Lab request failed 404\n'
         ;;
       extra-created)
         cat <<'LOGS'
@@ -331,6 +340,30 @@ assert_not_contains "$(cat "$pass_log_dir/report.txt")" "private answer two"
 assert_file_contains "$pass_log_dir/hermes-events.ndjson" "\"jobId\":\"job-a\""
 assert_not_contains "$(cat "$pass_log_dir/hermes-events.ndjson")" "\"answer\""
 
+delayed_markers_log_dir="$TMP_DIR/delayed-markers-log"
+set +e
+delayed_markers_output="$(
+  PATH="$TMP_DIR:$PATH" \
+  FAKE_QUEUE_SCENARIO=delayed-markers \
+  VOICE_AGENT_E2E_SERIAL=RZ \
+  VOICE_AGENT_E2E_ADB_READY_SCRIPT="$TMP_DIR/adb-ready.sh" \
+  VOICE_AGENT_QUEUE_E2E_PCM_PATH="$TMP_DIR/queue-prompt.pcm" \
+  VOICE_AGENT_E2E_CONVERSATION_ID=conversation-1 \
+  VOICE_AGENT_QUEUE_E2E_LOG_DIR="$delayed_markers_log_dir" \
+  VOICE_AGENT_QUEUE_E2E_TOOL_CALL_TIMEOUT_SECONDS=5 \
+  VOICE_AGENT_QUEUE_E2E_COMPLETION_TIMEOUT_SECONDS=5 \
+  "$SCRIPT" 2>&1
+)"
+delayed_markers_status=$?
+set -e
+if [[ "$delayed_markers_status" -ne 0 ]]; then
+  printf 'Expected delayed-markers scenario to pass, got %s.\n' "$delayed_markers_status" >&2
+  printf 'Actual output:\n%s\n' "$delayed_markers_output" >&2
+  exit 1
+fi
+assert_contains "$delayed_markers_output" "PASS marker: at least 2 ask_hermes tool calls"
+assert_contains "$delayed_markers_output" "Voice Agent Hermes queue E2E reached manual review gate."
+
 one_complete_log_dir="$TMP_DIR/one-complete-log"
 set +e
 one_complete_output="$(
@@ -399,6 +432,29 @@ if [[ "$forbidden_status" -eq 0 ]]; then
   exit 1
 fi
 assert_contains "$forbidden_output" "Forbidden marker found: common forbidden marker"
+
+tool_failed_log_dir="$TMP_DIR/tool-failed-log"
+set +e
+tool_failed_output="$(
+  PATH="$TMP_DIR:$PATH" \
+  FAKE_QUEUE_SCENARIO=tool-failed-404 \
+  VOICE_AGENT_E2E_SERIAL=RZ \
+  VOICE_AGENT_E2E_ADB_READY_SCRIPT="$TMP_DIR/adb-ready.sh" \
+  VOICE_AGENT_QUEUE_E2E_PCM_PATH="$TMP_DIR/queue-prompt.pcm" \
+  VOICE_AGENT_E2E_CONVERSATION_ID=conversation-1 \
+  VOICE_AGENT_QUEUE_E2E_LOG_DIR="$tool_failed_log_dir" \
+  VOICE_AGENT_QUEUE_E2E_TOOL_CALL_TIMEOUT_SECONDS=5 \
+  VOICE_AGENT_QUEUE_E2E_COMPLETION_TIMEOUT_SECONDS=5 \
+  "$SCRIPT" 2>&1
+)"
+tool_failed_status=$?
+set -e
+if [[ "$tool_failed_status" -eq 0 ]]; then
+  printf 'Expected tool-failed-404 scenario to fail.\n' >&2
+  printf 'Actual output:\n%s\n' "$tool_failed_output" >&2
+  exit 1
+fi
+assert_contains "$tool_failed_output" "Forbidden marker found: common forbidden marker"
 
 extra_created_log_dir="$TMP_DIR/extra-created-log"
 set +e
