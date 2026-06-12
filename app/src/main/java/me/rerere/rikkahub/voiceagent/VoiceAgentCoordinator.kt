@@ -402,9 +402,7 @@ class VoiceAgentCoordinator(
             activeTranscriptSpeaker = TranscriptSpeaker.User
             inputTurnTranscript += text
             diagnostics.record("input_transcript_delta", "turnId=$inputTurnId, text=$text")
-            synchronized(playbackSuppressionLock) {
-                outputAudioSuppressed = false
-            }
+            clearOutputAudioSuppressionForNewTurn()
             _state.update { it.copy(inputTranscript = it.inputTranscript + text) }
             val transcript = inputTurnTranscript
             val turnId = inputTurnId
@@ -467,6 +465,12 @@ class VoiceAgentCoordinator(
     private fun handleInterrupted(event: GeminiLiveEvent.Interrupted) {
         diagnostics.record("gemini_interrupted", event.reason)
         suppressPlayback()
+    }
+
+    private fun clearOutputAudioSuppressionForNewTurn() {
+        synchronized(playbackSuppressionLock) {
+            outputAudioSuppressed = false
+        }
     }
 
     private fun handleGenerationComplete() {
@@ -814,6 +818,7 @@ class VoiceAgentCoordinator(
     ) {
         synchronized(handle.sendLock) {
             if (!isToolHandleActive(callId, handle)) return
+            clearOutputAudioSuppressionForNewTurn()
             val sent = gemini.sendTextTurn(
                 text = hermesCompletionFollowUpText(prompt = prompt, answer = answer),
                 sessionId = handle.sessionId,
