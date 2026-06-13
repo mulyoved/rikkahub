@@ -9,6 +9,7 @@ import me.rerere.rikkahub.data.model.Conversation
 import me.rerere.rikkahub.utils.JsonInstant
 import me.rerere.rikkahub.voiceagent.hermes.HermesQueueStatus
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import kotlin.uuid.Uuid
