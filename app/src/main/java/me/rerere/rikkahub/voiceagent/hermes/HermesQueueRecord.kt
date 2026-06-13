@@ -16,6 +16,7 @@ const val HERMES_TOOL_UPDATED_AT_KEY = "voice_tool_updated_at"
 const val HERMES_TOOL_RESULT_ANNOUNCED_KEY = "voice_tool_result_announced"
 
 enum class HermesQueueStatus(val wireName: String) {
+    Pending("pending"),
     Queued("queued"),
     Running("running"),
     Complete("complete"),
@@ -73,6 +74,7 @@ data class HermesQueueSnapshot(
                                 "${record.prompt}\n  Reason: ${record.error.orEmpty()}"
                         )
 
+                    HermesQueueStatus.Pending,
                     HermesQueueStatus.Queued,
                     HermesQueueStatus.Running,
                         -> Unit

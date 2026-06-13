@@ -13,6 +13,31 @@ class HermesQueueRecordTest {
     private val persister = VoiceConversationPersister()
 
     @Test
+    fun `reads legacy pending Hermes records as active queue records`() {
+        val conversation = Conversation.ofId(Uuid.random())
+            .let {
+                persister.upsertHermesTool(
+                    conversation = it,
+                    callId = "call-pending",
+                    prompt = "legacy pending request",
+                    status = VoiceToolRecordStatus.Pending,
+                    jobId = "job-pending",
+                )
+            }
+
+        val records = conversation.hermesQueueRecords()
+        val snapshot = HermesQueueSnapshot.from(conversation)
+
+        assertEquals(listOf("call-pending"), records.map { it.callId })
+        assertEquals(HermesQueueStatus.Pending, records.single().status)
+        assertEquals("legacy pending request", records.single().prompt)
+        assertFalse(records.single().status.isTerminal)
+        assertEquals(listOf("call-pending"), snapshot.active.map { it.callId })
+        assertTrue(snapshot.unannouncedTerminal.isEmpty())
+        assertTrue(snapshot.announcedTerminal.isEmpty())
+    }
+
+    @Test
     fun `reads queued running and complete Hermes records from conversation`() {
         val conversation = Conversation.ofId(Uuid.random())
             .let {
