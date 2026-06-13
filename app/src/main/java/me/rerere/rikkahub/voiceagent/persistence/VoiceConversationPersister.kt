@@ -203,30 +203,40 @@ class VoiceConversationPersister {
         conversation: Conversation,
         callId: String,
     ): Conversation {
-        val updatedMessages = conversation.currentMessages.map { message ->
-            message.copy(
-                parts = message.parts.map { part ->
-                    if (part is UIMessagePart.Tool && part.isTerminalHermesTool(callId)) {
-                        part.copy(
-                            metadata = part.metadata.withBoolean(HERMES_TOOL_RESULT_ANNOUNCED_KEY, true),
-                            output = part.output.map { outputPart ->
-                                if (outputPart is UIMessagePart.Text) {
-                                    outputPart.copy(
-                                        metadata = outputPart.metadata.withBoolean(
-                                            HERMES_TOOL_RESULT_ANNOUNCED_KEY,
-                                            true,
-                                        ),
-                                    )
-                                } else {
-                                    outputPart
-                                }
-                            },
-                        )
-                    } else {
-                        part
+        val currentMessages = conversation.currentMessages
+        val messageIndex = currentMessages.indexOfLast { message ->
+            message.parts.any { part -> part is UIMessagePart.Tool && part.isTerminalHermesTool(callId) }
+        }
+        if (messageIndex < 0) return conversation
+
+        val partIndex = currentMessages[messageIndex].parts.indexOfLast { part ->
+            part is UIMessagePart.Tool && part.isTerminalHermesTool(callId)
+        }
+        if (partIndex < 0) return conversation
+
+        val updatedMessages = currentMessages.mapIndexed { currentMessageIndex, message ->
+            if (currentMessageIndex != messageIndex) {
+                message
+            } else {
+                message.copy(
+                    parts = message.parts.mapIndexed { currentPartIndex, part ->
+                        if (currentPartIndex == partIndex && part is UIMessagePart.Tool) {
+                            part.copy(
+                                metadata = part.metadata.withResultAnnounced(),
+                                output = part.output.map { outputPart ->
+                                    if (outputPart is UIMessagePart.Text) {
+                                        outputPart.copy(metadata = outputPart.metadata.withResultAnnounced())
+                                    } else {
+                                        outputPart
+                                    }
+                                },
+                            )
+                        } else {
+                            part
+                        }
                     }
-                }
-            )
+                )
+            }
         }
         return conversation.updateCurrentMessages(updatedMessages)
     }
@@ -397,9 +407,10 @@ class VoiceConversationPersister {
         }
     }
 
-    private fun JsonObject?.withBoolean(key: String, value: Boolean): JsonObject = buildJsonObject {
-        this@withBoolean?.forEach { (existingKey, existingValue) -> put(existingKey, existingValue) }
-        put(key, value)
+    private fun JsonObject?.withResultAnnounced(): JsonObject = buildJsonObject {
+        this@withResultAnnounced?.forEach { (existingKey, existingValue) -> put(existingKey, existingValue) }
+        put(HERMES_TOOL_RESULT_ANNOUNCED_KEY, true)
+        put(HERMES_TOOL_UPDATED_AT_KEY, Clock.System.now().toString())
     }
 
     private fun UIMessage.isVoiceTranscript(

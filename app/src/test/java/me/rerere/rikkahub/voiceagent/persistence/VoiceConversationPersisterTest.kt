@@ -660,6 +660,65 @@ class VoiceConversationPersisterTest {
         assertTrue(toolsByCallId.getValue("call-3").output.isEmpty())
     }
 
+    @Test
+    fun `mark Hermes result announced updates only latest terminal record for reused call id`() {
+        val persister = VoiceConversationPersister()
+        val conversation = emptyConversation()
+            .let {
+                persister.upsertHermesTool(
+                    conversation = it,
+                    callId = "call-1",
+                    prompt = "old prompt",
+                    status = VoiceToolRecordStatus.Complete("old answer"),
+                    jobId = "job-old",
+                    resultAnnounced = false,
+                )
+            }
+            .let {
+                persister.upsertHermesTool(
+                    conversation = it,
+                    callId = "call-1",
+                    prompt = "reused prompt",
+                    status = VoiceToolRecordStatus.Pending,
+                    jobId = "job-new",
+                )
+            }
+            .let {
+                persister.upsertHermesTool(
+                    conversation = it,
+                    callId = "call-1",
+                    prompt = "reused prompt",
+                    status = VoiceToolRecordStatus.Running,
+                    jobId = "job-new",
+                )
+            }
+            .let {
+                persister.upsertHermesTool(
+                    conversation = it,
+                    callId = "call-1",
+                    prompt = "new prompt",
+                    status = VoiceToolRecordStatus.Complete("new answer"),
+                    jobId = "job-new",
+                    resultAnnounced = false,
+                )
+            }
+            .let { persister.markHermesToolResultAnnounced(it, callId = "call-1") }
+
+        val tools = conversation.currentMessages
+            .flatMap { it.parts }
+            .filterIsInstance<UIMessagePart.Tool>()
+
+        assertEquals(2, tools.size)
+        assertEquals(listOf("old answer", "new answer"), tools.map { it.output.text() })
+        assertEquals("false", tools[0].metadata!!["voice_tool_result_announced"]!!.jsonPrimitive.content)
+        val oldOutput = tools[0].output.single() as UIMessagePart.Text
+        assertEquals("false", oldOutput.metadata!!["voice_tool_result_announced"]!!.jsonPrimitive.content)
+
+        assertEquals("true", tools[1].metadata!!["voice_tool_result_announced"]!!.jsonPrimitive.content)
+        val newOutput = tools[1].output.single() as UIMessagePart.Text
+        assertEquals("true", newOutput.metadata!!["voice_tool_result_announced"]!!.jsonPrimitive.content)
+    }
+
     private fun emptyConversation(): Conversation = Conversation.ofId(
         id = Uuid.random(),
         messages = emptyList(),
