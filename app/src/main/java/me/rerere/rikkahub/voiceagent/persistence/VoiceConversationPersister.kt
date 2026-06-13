@@ -322,7 +322,7 @@ class VoiceConversationPersister {
         } else if (newJobId != null) {
             existingJobId == newJobId || (existingJobId == null && isActiveHermesTool())
         } else {
-            true
+            isActiveHermesTool() || existingJobId == null
         }
     }
 

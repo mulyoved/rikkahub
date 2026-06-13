@@ -741,6 +741,39 @@ class VoiceConversationPersisterTest {
     }
 
     @Test
+    fun `terminal upsert without job id appends instead of replacing historical terminal record with job id`() {
+        val persister = VoiceConversationPersister()
+        val conversation = emptyConversation()
+            .let {
+                persister.upsertHermesTool(
+                    conversation = it,
+                    callId = "call-1",
+                    prompt = "old prompt",
+                    status = VoiceToolRecordStatus.Complete("old answer"),
+                    jobId = "job-old",
+                )
+            }
+            .let {
+                persister.upsertHermesTool(
+                    conversation = it,
+                    callId = "call-1",
+                    prompt = "submit failed prompt",
+                    status = VoiceToolRecordStatus.Failed("submit failed before job id"),
+                    jobId = null,
+                )
+            }
+
+        val tools = conversation.currentMessages
+            .flatMap { it.parts }
+            .filterIsInstance<UIMessagePart.Tool>()
+
+        assertEquals(2, tools.size)
+        assertEquals("job-old", tools[0].metadata!!["voice_tool_job_id"]!!.jsonPrimitive.content)
+        assertFalse(tools[1].metadata!!.containsKey("voice_tool_job_id"))
+        assertEquals(listOf("old answer", "submit failed before job id"), tools.map { it.output.text() })
+    }
+
+    @Test
     fun `terminal upsert with job id replaces matching active record not historical terminal record`() {
         val persister = VoiceConversationPersister()
         val conversation = emptyConversation()
