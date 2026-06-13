@@ -29,6 +29,10 @@ class HermesJobManager(
     private val pollIntervalMs: Long = DEFAULT_POLL_INTERVAL_MS,
     private val pollRetryDelayMs: Long = DEFAULT_POLL_RETRY_DELAY_MS,
     private val maxElapsedMs: Long = DEFAULT_MAX_ELAPSED_MS,
+    private val emitToolStatus: (VoiceToolStatus) -> Unit = {},
+    private val recordDiagnostic: (String, String) -> Unit = { _, _ -> },
+    private val writeQueueEvent: (String) -> Unit = {},
+    private val writeHermesAnswer: (String) -> Unit = {},
 ) {
     private val lock = Any()
     private val activeJobs = mutableMapOf<String, ManagedHermesJob>()
@@ -137,6 +141,11 @@ class HermesJobManager(
         try {
             val submitted = toolApi.submitHermesJob(callId = managedJob.callId, prompt = managedJob.prompt)
             managedJob.jobId = submitted.jobId
+            recordDiagnostic(
+                "hermes_job_created",
+                "callId=${managedJob.callId}, jobId=${submitted.jobId}, status=${submitted.status}",
+            )
+            writeQueueEvent("event=job_created,callId=${managedJob.callId},jobId=${submitted.jobId},status=${submitted.status}")
             if (managedJob.explicitlyCanceled) {
                 cancelRemoteJob(submitted.jobId)
                 return
@@ -219,6 +228,12 @@ class HermesJobManager(
 
                 "succeeded" -> {
                     val answer = requireNotNull(poll.answer) { "Hermes job succeeded without an answer" }
+                    recordDiagnostic(
+                        "hermes_job_completed",
+                        "callId=${managedJob.callId}, jobId=$jobId, answerChars=${answer.length}",
+                    )
+                    writeQueueEvent("event=job_completed,callId=${managedJob.callId},jobId=$jobId,status=succeeded")
+                    writeHermesAnswer(answer)
                     persistToolStatus(
                         callId = managedJob.callId,
                         prompt = managedJob.prompt,
@@ -347,6 +362,13 @@ class HermesJobManager(
         status: VoiceToolRecordStatus,
         visibleMessage: String,
     ) {
+        recordDiagnostic(
+            "hermes_job_failed",
+            "callId=$callId${jobId?.let { ", jobId=$it" }.orEmpty()}, message=$visibleMessage",
+        )
+        writeQueueEvent(
+            "event=job_failed,callId=$callId${jobId?.let { ",jobId=$it" }.orEmpty()},status=${status.queueEventStatus()}",
+        )
         persistToolStatus(
             callId = callId,
             prompt = prompt,
@@ -472,6 +494,17 @@ class HermesJobManager(
             summarizeToolStatus(toolCalls = toolCalls, fallback = status)
         }
         _toolStatus.value = visibleStatus
+        emitToolStatus(visibleStatus)
+    }
+
+    private fun VoiceToolRecordStatus.queueEventStatus(): String = when (this) {
+        VoiceToolRecordStatus.Pending -> HermesQueueStatus.Pending.wireName
+        VoiceToolRecordStatus.Queued -> HermesQueueStatus.Queued.wireName
+        VoiceToolRecordStatus.Running -> HermesQueueStatus.Running.wireName
+        is VoiceToolRecordStatus.Complete -> HermesQueueStatus.Complete.wireName
+        is VoiceToolRecordStatus.Failed -> HermesQueueStatus.Failed.wireName
+        is VoiceToolRecordStatus.Expired -> HermesQueueStatus.Expired.wireName
+        is VoiceToolRecordStatus.Canceled -> HermesQueueStatus.Canceled.wireName
     }
 
     private fun summarizeToolStatus(
