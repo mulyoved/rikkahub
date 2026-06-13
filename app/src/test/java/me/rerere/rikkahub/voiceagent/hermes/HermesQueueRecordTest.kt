@@ -104,6 +104,34 @@ class HermesQueueRecordTest {
     }
 
     @Test
+    fun `queue parser skips non-Hermes tools and defaults malformed input prompts`() {
+        val conversation = conversationOf(
+            legacyHermesTool(
+                callId = "not-hermes",
+                prompt = "unrelated request",
+                status = "running",
+                toolName = "other_tool",
+                metadata = buildJsonObject {
+                    put(HERMES_TOOL_SOURCE_KEY, VoiceAgentToolNames.ASK_HERMES)
+                    put(HERMES_TOOL_STATUS_KEY, "running")
+                },
+            ),
+            legacyHermesTool(
+                callId = "bad-input",
+                prompt = "ignored",
+                status = "running",
+                input = "not json",
+            )
+        )
+
+        val records = conversation.hermesQueueRecords()
+
+        assertEquals(listOf("bad-input"), records.map { it.callId })
+        assertEquals("", records.single().prompt)
+        assertEquals(HermesQueueStatus.Running, records.single().status)
+    }
+
+    @Test
     fun `snapshot summary renders expired and canceled terminal errors`() {
         val conversation = Conversation.ofId(Uuid.random())
             .let {
@@ -292,14 +320,16 @@ class HermesQueueRecordTest {
         callId: String,
         prompt: String,
         status: String? = null,
+        toolName: String = VoiceAgentToolNames.ASK_HERMES,
+        input: String = """{"prompt":"$prompt"}""",
         jobId: String? = null,
         outputText: String? = null,
         metadata: kotlinx.serialization.json.JsonObject? = null,
     ): UIMessagePart.Tool {
         return UIMessagePart.Tool(
             toolCallId = callId,
-            toolName = VoiceAgentToolNames.ASK_HERMES,
-            input = """{"prompt":"$prompt"}""",
+            toolName = toolName,
+            input = input,
             output = outputText?.let { listOf(UIMessagePart.Text(it)) }.orEmpty(),
             metadata = metadata ?: buildJsonObject {
                 put(HERMES_TOOL_SOURCE_KEY, VoiceAgentToolNames.ASK_HERMES)
