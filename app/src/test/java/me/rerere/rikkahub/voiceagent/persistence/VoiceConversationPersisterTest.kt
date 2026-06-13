@@ -774,6 +774,40 @@ class VoiceConversationPersisterTest {
     }
 
     @Test
+    fun `terminal upsert without job id does not replace active record with job id`() {
+        val persister = VoiceConversationPersister()
+        val conversation = emptyConversation()
+            .let {
+                persister.upsertHermesTool(
+                    conversation = it,
+                    callId = "call-1",
+                    prompt = "active prompt",
+                    status = VoiceToolRecordStatus.Running,
+                    jobId = "job-active",
+                )
+            }
+            .let {
+                persister.upsertHermesTool(
+                    conversation = it,
+                    callId = "call-1",
+                    prompt = "submit failed prompt",
+                    status = VoiceToolRecordStatus.Failed("submit failed before job id"),
+                    jobId = null,
+                )
+            }
+
+        val tools = conversation.currentMessages
+            .flatMap { it.parts }
+            .filterIsInstance<UIMessagePart.Tool>()
+
+        assertEquals(2, tools.size)
+        assertEquals("running", tools[0].metadata!!["voice_tool_status"]!!.jsonPrimitive.content)
+        assertEquals("job-active", tools[0].metadata!!["voice_tool_job_id"]!!.jsonPrimitive.content)
+        assertEquals("failed", tools[1].metadata!!["voice_tool_status"]!!.jsonPrimitive.content)
+        assertFalse(tools[1].metadata!!.containsKey("voice_tool_job_id"))
+    }
+
+    @Test
     fun `terminal upsert with job id replaces matching active record not historical terminal record`() {
         val persister = VoiceConversationPersister()
         val conversation = emptyConversation()
@@ -999,6 +1033,49 @@ class VoiceConversationPersisterTest {
             val output = tool.output.single() as UIMessagePart.Text
             assertEquals("true", output.metadata!!["voice_tool_result_announced"]!!.jsonPrimitive.content)
         }
+    }
+
+    @Test
+    fun `mark Hermes result announced can target reused call id without job id`() {
+        val persister = VoiceConversationPersister()
+        val conversation = emptyConversation()
+            .let {
+                persister.upsertHermesTool(
+                    conversation = it,
+                    callId = "call-1",
+                    prompt = "submit failed prompt",
+                    status = VoiceToolRecordStatus.Failed("submit failed before job id"),
+                    jobId = null,
+                    resultAnnounced = false,
+                )
+            }
+            .let {
+                persister.upsertHermesTool(
+                    conversation = it,
+                    callId = "call-1",
+                    prompt = "new prompt",
+                    status = VoiceToolRecordStatus.Complete("new answer"),
+                    jobId = "job-new",
+                    resultAnnounced = false,
+                )
+            }
+            .let {
+                persister.markHermesToolResultAnnounced(
+                    conversation = it,
+                    callId = "call-1",
+                    matchMissingJobId = true,
+                )
+            }
+
+        val tools = conversation.currentMessages
+            .flatMap { it.parts }
+            .filterIsInstance<UIMessagePart.Tool>()
+
+        assertEquals(2, tools.size)
+        assertFalse(tools[0].metadata!!.containsKey("voice_tool_job_id"))
+        assertEquals("true", tools[0].metadata!!["voice_tool_result_announced"]!!.jsonPrimitive.content)
+        assertEquals("job-new", tools[1].metadata!!["voice_tool_job_id"]!!.jsonPrimitive.content)
+        assertEquals("false", tools[1].metadata!!["voice_tool_result_announced"]!!.jsonPrimitive.content)
     }
 
     private fun emptyConversation(): Conversation = Conversation.ofId(

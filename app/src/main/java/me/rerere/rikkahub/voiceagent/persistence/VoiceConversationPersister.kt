@@ -209,15 +209,20 @@ class VoiceConversationPersister {
         conversation: Conversation,
         callId: String,
         jobId: String? = null,
+        matchMissingJobId: Boolean = false,
     ): Conversation {
         val currentMessages = conversation.currentMessages
         val messageIndex = currentMessages.indexOfLast { message ->
-            message.parts.any { part -> part is UIMessagePart.Tool && part.isTerminalHermesTool(callId, jobId) }
+            message.parts.any { part ->
+                part is UIMessagePart.Tool &&
+                    part.isTerminalHermesTool(callId = callId, jobId = jobId, matchMissingJobId = matchMissingJobId)
+            }
         }
         if (messageIndex < 0) return conversation
 
         val partIndex = currentMessages[messageIndex].parts.indexOfLast { part ->
-            part is UIMessagePart.Tool && part.isTerminalHermesTool(callId, jobId)
+            part is UIMessagePart.Tool &&
+                part.isTerminalHermesTool(callId = callId, jobId = jobId, matchMissingJobId = matchMissingJobId)
         }
         if (partIndex < 0) return conversation
 
@@ -322,7 +327,7 @@ class VoiceConversationPersister {
         } else if (newJobId != null) {
             existingJobId == newJobId || (existingJobId == null && isActiveHermesTool())
         } else {
-            isActiveHermesTool() || existingJobId == null
+            existingJobId == null
         }
     }
 
@@ -334,9 +339,15 @@ class VoiceConversationPersister {
         return metadata.queueStatus()?.isTerminal == false
     }
 
-    private fun UIMessagePart.Tool.isTerminalHermesTool(callId: String, jobId: String? = null): Boolean {
+    private fun UIMessagePart.Tool.isTerminalHermesTool(
+        callId: String,
+        jobId: String? = null,
+        matchMissingJobId: Boolean = false,
+    ): Boolean {
         if (!isHermesTool(callId)) return false
-        if (jobId != null && metadata.stringOrNull(HERMES_TOOL_JOB_ID_KEY) != jobId) return false
+        val existingJobId = metadata.stringOrNull(HERMES_TOOL_JOB_ID_KEY)
+        if (jobId != null && existingJobId != jobId) return false
+        if (matchMissingJobId && existingJobId != null) return false
         return metadata.queueStatus()?.isTerminal == true
     }
 
