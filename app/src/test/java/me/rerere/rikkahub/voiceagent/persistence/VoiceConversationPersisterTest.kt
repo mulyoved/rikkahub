@@ -12,6 +12,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.time.Instant
 import kotlin.uuid.Uuid
 
 class VoiceConversationPersisterTest {
@@ -808,6 +809,40 @@ class VoiceConversationPersisterTest {
     }
 
     @Test
+    fun `active upsert without job id does not replace active record with job id`() {
+        val persister = VoiceConversationPersister()
+        val conversation = emptyConversation()
+            .let {
+                persister.upsertHermesTool(
+                    conversation = it,
+                    callId = "call-1",
+                    prompt = "job prompt",
+                    status = VoiceToolRecordStatus.Running,
+                    jobId = "job-active",
+                )
+            }
+            .let {
+                persister.upsertHermesTool(
+                    conversation = it,
+                    callId = "call-1",
+                    prompt = "legacy active prompt",
+                    status = VoiceToolRecordStatus.Queued,
+                    jobId = null,
+                )
+            }
+
+        val tools = conversation.currentMessages
+            .flatMap { it.parts }
+            .filterIsInstance<UIMessagePart.Tool>()
+
+        assertEquals(2, tools.size)
+        assertEquals("running", tools[0].metadata!!["voice_tool_status"]!!.jsonPrimitive.content)
+        assertEquals("job-active", tools[0].metadata!!["voice_tool_job_id"]!!.jsonPrimitive.content)
+        assertEquals("queued", tools[1].metadata!!["voice_tool_status"]!!.jsonPrimitive.content)
+        assertFalse(tools[1].metadata!!.containsKey("voice_tool_job_id"))
+    }
+
+    @Test
     fun `terminal upsert with job id replaces matching active record not historical terminal record`() {
         val persister = VoiceConversationPersister()
         val conversation = emptyConversation()
@@ -883,7 +918,7 @@ class VoiceConversationPersisterTest {
     @Test
     fun `mark Hermes result announced updates only matching terminal tool`() {
         val persister = VoiceConversationPersister()
-        val conversation = emptyConversation()
+        val beforeAnnouncement = emptyConversation()
             .let {
                 persister.upsertHermesTool(
                     conversation = it,
@@ -914,6 +949,23 @@ class VoiceConversationPersisterTest {
                     resultAnnounced = false,
                 )
             }
+
+        val toolsBeforeAnnouncement = beforeAnnouncement.currentMessages
+            .flatMap { it.parts }
+            .filterIsInstance<UIMessagePart.Tool>()
+            .associateBy { it.toolCallId }
+        val call1UpdatedAtBefore = toolsBeforeAnnouncement.getValue("call-1")
+            .metadata!!["voice_tool_updated_at"]!!.jsonPrimitive.content
+        val call1OutputUpdatedAtBefore = (toolsBeforeAnnouncement.getValue("call-1").output.single() as UIMessagePart.Text)
+            .metadata!!["voice_tool_updated_at"]!!.jsonPrimitive.content
+        val call2UpdatedAtBefore = toolsBeforeAnnouncement.getValue("call-2")
+            .metadata!!["voice_tool_updated_at"]!!.jsonPrimitive.content
+        val call2OutputUpdatedAtBefore = (toolsBeforeAnnouncement.getValue("call-2").output.single() as UIMessagePart.Text)
+            .metadata!!["voice_tool_updated_at"]!!.jsonPrimitive.content
+
+        Thread.sleep(20)
+
+        val conversation = beforeAnnouncement
             .let { persister.markHermesToolResultAnnounced(it, callId = "call-1") }
             .let { persister.markHermesToolResultAnnounced(it, callId = "call-3") }
 
@@ -928,10 +980,20 @@ class VoiceConversationPersisterTest {
         assertEquals("true", toolsByCallId.getValue("call-1").metadata!!["voice_tool_result_announced"]!!.jsonPrimitive.content)
         val call1Output = toolsByCallId.getValue("call-1").output.single() as UIMessagePart.Text
         assertEquals("true", call1Output.metadata!!["voice_tool_result_announced"]!!.jsonPrimitive.content)
+        assertTrue(
+            toolsByCallId.getValue("call-1").metadata!!["voice_tool_updated_at"]!!.jsonPrimitive.content.asInstant() >
+                call1UpdatedAtBefore.asInstant(),
+        )
+        assertTrue(
+            call1Output.metadata!!["voice_tool_updated_at"]!!.jsonPrimitive.content.asInstant() >
+                call1OutputUpdatedAtBefore.asInstant(),
+        )
 
         assertEquals("false", toolsByCallId.getValue("call-2").metadata!!["voice_tool_result_announced"]!!.jsonPrimitive.content)
         val call2Output = toolsByCallId.getValue("call-2").output.single() as UIMessagePart.Text
         assertEquals("false", call2Output.metadata!!["voice_tool_result_announced"]!!.jsonPrimitive.content)
+        assertEquals(call2UpdatedAtBefore, toolsByCallId.getValue("call-2").metadata!!["voice_tool_updated_at"]!!.jsonPrimitive.content)
+        assertEquals(call2OutputUpdatedAtBefore, call2Output.metadata!!["voice_tool_updated_at"]!!.jsonPrimitive.content)
 
         assertEquals("false", toolsByCallId.getValue("call-3").metadata!!["voice_tool_result_announced"]!!.jsonPrimitive.content)
         assertTrue(toolsByCallId.getValue("call-3").output.isEmpty())
@@ -1120,4 +1182,6 @@ class VoiceConversationPersisterTest {
 
     private fun List<UIMessagePart>.text(): String = filterIsInstance<UIMessagePart.Text>()
         .joinToString("") { it.text }
+
+    private fun String.asInstant(): Instant = Instant.parse(this)
 }

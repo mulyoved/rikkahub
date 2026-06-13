@@ -323,7 +323,11 @@ class VoiceConversationPersister {
         if (!isHermesTool(callId)) return false
         val existingJobId = metadata.stringOrNull(HERMES_TOOL_JOB_ID_KEY)
         return if (!newStatus.queueStatus.isTerminal) {
-            isActiveHermesTool() && (newJobId == null || existingJobId == null || existingJobId == newJobId)
+            isActiveHermesTool() && if (newJobId == null) {
+                existingJobId == null
+            } else {
+                existingJobId == null || existingJobId == newJobId
+            }
         } else if (newJobId != null) {
             existingJobId == newJobId || (existingJobId == null && isActiveHermesTool())
         } else {
