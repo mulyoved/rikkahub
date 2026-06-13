@@ -8,6 +8,7 @@ import kotlinx.coroutines.withTimeout
 import me.rerere.rikkahub.data.model.Conversation
 import me.rerere.rikkahub.voiceagent.FakeVoiceConversationStore
 import me.rerere.rikkahub.voiceagent.FakeVoiceToolApi
+import me.rerere.rikkahub.voiceagent.VoiceToolStatus
 import me.rerere.rikkahub.voiceagent.persistence.VoiceConversationPersister
 import me.rerere.rikkahub.voiceagent.persistence.VoiceToolRecordStatus
 import me.rerere.rikkahub.voiceagent.voicelab.MobileHermesResponse
@@ -109,10 +110,46 @@ class HermesJobManagerTest {
         assertEquals("Hermes job canceled.", record.error)
     }
 
+    @Test
+    fun `tool status callback emits actual completed call while another job remains active`() = runTest {
+        val toolApi = FakeVoiceToolApi()
+        val conversationStore = FakeVoiceConversationStore()
+        val statuses = mutableListOf<VoiceToolStatus>()
+        val manager = manager(
+            toolApi = toolApi,
+            conversationStore = conversationStore,
+            scope = this,
+            updateToolStatus = statuses::add,
+        )
+
+        manager.submit(callId = "call-active", prompt = "active request")
+        assertEquals("call-active" to "active request", toolApi.awaitRequest("call-active"))
+        manager.submit(callId = "call-done", prompt = "done request")
+        assertEquals("call-done" to "done request", toolApi.awaitRequest("call-done"))
+
+        toolApi.scriptQueuedPolls(callId = "call-active", count = 1)
+        toolApi.complete(response(callId = "call-done", answer = "done answer"))
+        conversationStore.awaitHermesRecord("call-done") {
+            it.status == HermesQueueStatus.Complete
+        }
+
+        assertTrue(
+            statuses.any {
+                it is VoiceToolStatus.HermesAnswered && it.callId == "call-done"
+            },
+        )
+
+        toolApi.complete(response(callId = "call-active", answer = "active answer"))
+        conversationStore.awaitHermesRecord("call-active") {
+            it.status == HermesQueueStatus.Complete
+        }
+    }
+
     private fun manager(
         toolApi: FakeVoiceToolApi,
         conversationStore: FakeVoiceConversationStore,
         scope: CoroutineScope,
+        updateToolStatus: (VoiceToolStatus) -> Unit = {},
     ) = HermesJobManager(
         toolApi = toolApi,
         conversationStore = conversationStore,
@@ -122,6 +159,7 @@ class HermesJobManagerTest {
         pollIntervalMs = 10L,
         pollRetryDelayMs = 1L,
         maxElapsedMs = 1_000L,
+        updateToolStatus = updateToolStatus,
     )
 
     private fun response(callId: String, answer: String) = MobileHermesResponse(

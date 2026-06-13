@@ -29,7 +29,7 @@ class HermesJobManager(
     private val pollIntervalMs: Long = DEFAULT_POLL_INTERVAL_MS,
     private val pollRetryDelayMs: Long = DEFAULT_POLL_RETRY_DELAY_MS,
     private val maxElapsedMs: Long = DEFAULT_MAX_ELAPSED_MS,
-    private val emitToolStatus: (VoiceToolStatus) -> Unit = {},
+    private val updateToolStatus: (VoiceToolStatus) -> Unit = {},
     private val recordDiagnostic: (String, String) -> Unit = { _, _ -> },
     private val writeQueueEvent: (String) -> Unit = {},
     private val writeHermesAnswer: (String) -> Unit = {},
@@ -494,7 +494,7 @@ class HermesJobManager(
             summarizeToolStatus(toolCalls = toolCalls, fallback = status)
         }
         _toolStatus.value = visibleStatus
-        emitToolStatus(visibleStatus)
+        updateToolStatus(status)
     }
 
     private fun VoiceToolRecordStatus.queueEventStatus(): String = when (this) {
