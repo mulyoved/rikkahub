@@ -349,6 +349,22 @@ class FakeVoiceToolApi : VoiceToolApi {
         }
     }
 
+    fun scriptPollSucceeded(jobId: String, callId: String, answer: String) {
+        synchronized(lock) {
+            calls.getOrPut(jobId) {
+                PendingHermesJob(callId = callId, prompt = "", jobId = jobId)
+            }
+            scriptedPolls.getOrPut(jobId) { ArrayDeque() } += MobileHermesJobPollResponse(
+                jobId = jobId,
+                callId = callId,
+                status = "succeeded",
+                answer = answer,
+                createdAt = "2026-06-11T00:00:00.000Z",
+                completedAt = "2026-06-11T00:00:01.000Z",
+            )
+        }
+    }
+
     fun scriptPollFailure(callId: String, error: Throwable) {
         val job = call(callId)
         synchronized(lock) {
@@ -539,12 +555,12 @@ class BlockedPlayback {
     val release = CountDownLatch(1)
 }
 
-class FakeVoiceConversationStore : VoiceConversationStore {
+class FakeVoiceConversationStore(
+    initialConversation: Conversation = Conversation.ofId(id = Uuid.random()),
+) : VoiceConversationStore {
     private val updates = mutableListOf<Conversation>()
     private val blockedUpdates = mutableListOf<BlockedUpdate>()
-    override val conversation: StateFlow<Conversation> = MutableStateFlow(
-        Conversation.ofId(id = Uuid.random())
-    )
+    override val conversation: StateFlow<Conversation> = MutableStateFlow(initialConversation)
 
     override suspend fun update(transform: (Conversation) -> Conversation) {
         val blocked = synchronized(blockedUpdates) { blockedUpdates.removeFirstOrNull() }
