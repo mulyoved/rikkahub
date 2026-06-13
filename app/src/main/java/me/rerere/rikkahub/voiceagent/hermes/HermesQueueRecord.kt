@@ -1,7 +1,10 @@
 package me.rerere.rikkahub.voiceagent.hermes
 
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.booleanOrNull
+import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import me.rerere.ai.ui.UIMessagePart
@@ -109,7 +112,7 @@ fun Conversation.hermesQueueRecords(): List<HermesQueueRecord> {
 private fun UIMessagePart.Tool.toHermesQueueRecord(): HermesQueueRecord? {
     if (toolName != VoiceAgentToolNames.ASK_HERMES) return null
     val metadata = metadata ?: return null
-    val status = HermesQueueStatus.fromWireName(metadata[HERMES_TOOL_STATUS_KEY]?.jsonPrimitive?.content)
+    val status = HermesQueueStatus.fromWireName(metadata.stringOrNull(HERMES_TOOL_STATUS_KEY))
         ?: return null
     val prompt = runCatching {
         Json.parseToJsonElement(input).jsonObject["prompt"]?.jsonPrimitive?.content.orEmpty()
@@ -117,20 +120,26 @@ private fun UIMessagePart.Tool.toHermesQueueRecord(): HermesQueueRecord? {
     val outputText = output.filterIsInstance<UIMessagePart.Text>()
         .joinToString(separator = "\n") { it.text }
         .trim()
-    val resultAnnounced = metadata[HERMES_TOOL_RESULT_ANNOUNCED_KEY]
-        ?.jsonPrimitive
-        ?.booleanOrNull
-        ?: false
+    val resultAnnounced = metadata.booleanOrNull(HERMES_TOOL_RESULT_ANNOUNCED_KEY)
+        ?: status.isTerminal
 
     return HermesQueueRecord(
         callId = toolCallId,
-        jobId = metadata[HERMES_TOOL_JOB_ID_KEY]?.jsonPrimitive?.content,
+        jobId = metadata.stringOrNull(HERMES_TOOL_JOB_ID_KEY),
         prompt = prompt,
         status = status,
         answer = outputText.takeIf { status == HermesQueueStatus.Complete && it.isNotBlank() },
         error = outputText.takeIf { status != HermesQueueStatus.Complete && status.isTerminal && it.isNotBlank() },
         resultAnnounced = resultAnnounced,
-        createdAt = metadata[HERMES_TOOL_CREATED_AT_KEY]?.jsonPrimitive?.content,
-        updatedAt = metadata[HERMES_TOOL_UPDATED_AT_KEY]?.jsonPrimitive?.content,
+        createdAt = metadata.stringOrNull(HERMES_TOOL_CREATED_AT_KEY),
+        updatedAt = metadata.stringOrNull(HERMES_TOOL_UPDATED_AT_KEY),
     )
+}
+
+private fun JsonObject.stringOrNull(key: String): String? {
+    return (this[key] as? JsonPrimitive)?.contentOrNull
+}
+
+private fun JsonObject.booleanOrNull(key: String): Boolean? {
+    return (this[key] as? JsonPrimitive)?.booleanOrNull
 }

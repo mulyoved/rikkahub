@@ -2,7 +2,10 @@ package me.rerere.rikkahub.voiceagent.persistence
 
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonObjectBuilder
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import me.rerere.ai.core.MessageRole
@@ -17,6 +20,7 @@ import me.rerere.rikkahub.voiceagent.hermes.HERMES_TOOL_RESULT_ANNOUNCED_KEY
 import me.rerere.rikkahub.voiceagent.hermes.HERMES_TOOL_SOURCE_KEY
 import me.rerere.rikkahub.voiceagent.hermes.HERMES_TOOL_STATUS_KEY
 import me.rerere.rikkahub.voiceagent.hermes.HERMES_TOOL_UPDATED_AT_KEY
+import me.rerere.rikkahub.voiceagent.hermes.HermesQueueStatus
 import kotlin.time.Clock
 
 sealed interface VoiceToolRecordStatus {
@@ -132,23 +136,25 @@ class VoiceConversationPersister {
         status: VoiceToolRecordStatus,
         sessionId: String? = null,
         jobId: String? = null,
-        resultAnnounced: Boolean = false,
+        resultAnnounced: Boolean? = null,
     ): Conversation {
         val currentMessages = conversation.currentMessages
         val existingToolIndex = currentMessages.indexOfLast { message ->
             message.parts.any { part ->
-                part is UIMessagePart.Tool && part.shouldReplaceHermesTool(callId = callId, newStatus = status)
+                part is UIMessagePart.Tool &&
+                    part.shouldReplaceHermesTool(callId = callId, newStatus = status, newJobId = jobId)
             }
         }
         val existingTool = if (existingToolIndex >= 0) {
             currentMessages[existingToolIndex]
                 .parts
                 .filterIsInstance<UIMessagePart.Tool>()
-                .lastOrNull { it.shouldReplaceHermesTool(callId = callId, newStatus = status) }
+                .lastOrNull { it.shouldReplaceHermesTool(callId = callId, newStatus = status, newJobId = jobId) }
         } else {
             null
         }
-        val createdAt = existingTool?.metadata?.get(HERMES_TOOL_CREATED_AT_KEY)?.jsonPrimitive?.content
+        val createdAt = (existingTool?.metadata).stringOrNull(HERMES_TOOL_CREATED_AT_KEY)
+        val effectiveResultAnnounced = resultAnnounced ?: existingTool?.resultAnnouncedOrDefault() ?: false
         val tool = UIMessagePart.Tool(
             toolCallId = callId,
             toolName = VoiceAgentToolNames.ASK_HERMES,
@@ -161,14 +167,14 @@ class VoiceConversationPersister {
                 sessionId = sessionId,
                 callId = callId,
                 jobId = jobId,
-                resultAnnounced = resultAnnounced,
+                resultAnnounced = effectiveResultAnnounced,
                 createdAt = createdAt,
             ),
             metadata = status.toMetadata(
                 sessionId = sessionId,
                 callId = callId,
                 jobId = jobId,
-                resultAnnounced = resultAnnounced,
+                resultAnnounced = effectiveResultAnnounced,
                 createdAt = createdAt,
             ),
         )
@@ -180,7 +186,7 @@ class VoiceConversationPersister {
                 parts = existingMessage.parts.map { part ->
                     if (
                         part is UIMessagePart.Tool &&
-                        part.shouldReplaceHermesTool(callId = callId, newStatus = status)
+                        part.shouldReplaceHermesTool(callId = callId, newStatus = status, newJobId = jobId)
                     ) {
                         tool
                     } else {
@@ -306,19 +312,16 @@ class VoiceConversationPersister {
     private fun UIMessagePart.Tool.shouldReplaceHermesTool(
         callId: String,
         newStatus: VoiceToolRecordStatus,
+        newJobId: String?,
     ): Boolean {
         if (!isHermesTool(callId)) return false
-        return when (newStatus) {
-            VoiceToolRecordStatus.Pending,
-            VoiceToolRecordStatus.Queued,
-            VoiceToolRecordStatus.Running,
-                -> isActiveHermesTool()
-
-            is VoiceToolRecordStatus.Complete,
-            is VoiceToolRecordStatus.Failed,
-            is VoiceToolRecordStatus.Expired,
-            is VoiceToolRecordStatus.Canceled,
-                -> true
+        val existingJobId = metadata.stringOrNull(HERMES_TOOL_JOB_ID_KEY)
+        return if (!newStatus.queueStatus.isTerminal) {
+            isActiveHermesTool() && (newJobId == null || existingJobId == null || existingJobId == newJobId)
+        } else if (newJobId != null) {
+            existingJobId == newJobId
+        } else {
+            true
         }
     }
 
@@ -327,21 +330,17 @@ class VoiceConversationPersister {
     }
 
     private fun UIMessagePart.Tool.isActiveHermesTool(): Boolean {
-        return metadata?.get(HERMES_TOOL_STATUS_KEY)?.jsonPrimitive?.content in setOf(
-            VoiceToolRecordStatus.Pending.statusName,
-            VoiceToolRecordStatus.Queued.statusName,
-            VoiceToolRecordStatus.Running.statusName,
-        )
+        return metadata.queueStatus()?.isTerminal == false
     }
 
     private fun UIMessagePart.Tool.isTerminalHermesTool(callId: String): Boolean {
         if (!isHermesTool(callId)) return false
-        return metadata?.get(HERMES_TOOL_STATUS_KEY)?.jsonPrimitive?.content in setOf(
-            VoiceToolRecordStatus.Complete("").statusName,
-            VoiceToolRecordStatus.Failed("").statusName,
-            VoiceToolRecordStatus.Expired("").statusName,
-            VoiceToolRecordStatus.Canceled("").statusName,
-        )
+        return metadata.queueStatus()?.isTerminal == true
+    }
+
+    private fun UIMessagePart.Tool.resultAnnouncedOrDefault(): Boolean {
+        return metadata.booleanOrNull(HERMES_TOOL_RESULT_ANNOUNCED_KEY)
+            ?: (metadata.queueStatus()?.isTerminal == true)
     }
 
     private fun VoiceToolRecordStatus.toMetadata(
@@ -434,15 +433,30 @@ class VoiceConversationPersister {
     }
 
     private val VoiceToolRecordStatus.statusName: String
+        get() = queueStatus.wireName
+
+    private val VoiceToolRecordStatus.queueStatus: HermesQueueStatus
         get() = when (this) {
-            VoiceToolRecordStatus.Pending -> "pending"
-            VoiceToolRecordStatus.Queued -> "queued"
-            VoiceToolRecordStatus.Running -> "running"
-            is VoiceToolRecordStatus.Complete -> "complete"
-            is VoiceToolRecordStatus.Failed -> "failed"
-            is VoiceToolRecordStatus.Expired -> "expired"
-            is VoiceToolRecordStatus.Canceled -> "canceled"
+            VoiceToolRecordStatus.Pending -> HermesQueueStatus.Pending
+            VoiceToolRecordStatus.Queued -> HermesQueueStatus.Queued
+            VoiceToolRecordStatus.Running -> HermesQueueStatus.Running
+            is VoiceToolRecordStatus.Complete -> HermesQueueStatus.Complete
+            is VoiceToolRecordStatus.Failed -> HermesQueueStatus.Failed
+            is VoiceToolRecordStatus.Expired -> HermesQueueStatus.Expired
+            is VoiceToolRecordStatus.Canceled -> HermesQueueStatus.Canceled
         }
+
+    private fun JsonObject?.queueStatus(): HermesQueueStatus? {
+        return HermesQueueStatus.fromWireName(stringOrNull(HERMES_TOOL_STATUS_KEY))
+    }
+
+    private fun JsonObject?.stringOrNull(key: String): String? {
+        return (this?.get(key) as? JsonPrimitive)?.contentOrNull
+    }
+
+    private fun JsonObject?.booleanOrNull(key: String): Boolean? {
+        return (this?.get(key) as? JsonPrimitive)?.booleanOrNull
+    }
 
     private companion object {
         const val VOICE_SOURCE_KEY = "voice_source"

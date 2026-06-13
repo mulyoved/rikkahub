@@ -1,6 +1,12 @@
 package me.rerere.rikkahub.voiceagent.hermes
 
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
+import me.rerere.ai.core.MessageRole
+import me.rerere.ai.ui.UIMessage
+import me.rerere.ai.ui.UIMessagePart
 import me.rerere.rikkahub.data.model.Conversation
+import me.rerere.rikkahub.voiceagent.VoiceAgentToolNames
 import me.rerere.rikkahub.voiceagent.persistence.VoiceConversationPersister
 import me.rerere.rikkahub.voiceagent.persistence.VoiceToolRecordStatus
 import org.junit.Assert.assertEquals
@@ -13,17 +19,15 @@ class HermesQueueRecordTest {
     private val persister = VoiceConversationPersister()
 
     @Test
-    fun `reads legacy pending Hermes records as active queue records`() {
-        val conversation = Conversation.ofId(Uuid.random())
-            .let {
-                persister.upsertHermesTool(
-                    conversation = it,
-                    callId = "call-pending",
-                    prompt = "legacy pending request",
-                    status = VoiceToolRecordStatus.Pending,
-                    jobId = "job-pending",
-                )
-            }
+    fun `reads legacy pending Hermes records without announced metadata as active queue records`() {
+        val conversation = conversationOf(
+            legacyHermesTool(
+                callId = "call-pending",
+                prompt = "legacy pending request",
+                status = "pending",
+                jobId = "job-pending",
+            )
+        )
 
         val records = conversation.hermesQueueRecords()
         val snapshot = HermesQueueSnapshot.from(conversation)
@@ -35,6 +39,102 @@ class HermesQueueRecordTest {
         assertEquals(listOf("call-pending"), snapshot.active.map { it.callId })
         assertTrue(snapshot.unannouncedTerminal.isEmpty())
         assertTrue(snapshot.announcedTerminal.isEmpty())
+    }
+
+    @Test
+    fun `legacy terminal Hermes records without announced metadata are treated as announced`() {
+        val conversation = conversationOf(
+            legacyHermesTool(
+                callId = "call-complete",
+                prompt = "legacy complete request",
+                status = "complete",
+                outputText = "legacy complete answer",
+            ),
+            legacyHermesTool(
+                callId = "call-failed",
+                prompt = "legacy failed request",
+                status = "failed",
+                outputText = "legacy failed reason",
+            )
+        )
+
+        val snapshot = HermesQueueSnapshot.from(conversation)
+
+        assertTrue(snapshot.active.isEmpty())
+        assertTrue(snapshot.unannouncedTerminal.isEmpty())
+        assertEquals(listOf("call-complete", "call-failed"), snapshot.announcedTerminal.map { it.callId })
+        assertFalse(snapshot.toPromptSummary().contains("legacy complete answer"))
+        assertFalse(snapshot.toPromptSummary().contains("legacy failed reason"))
+    }
+
+    @Test
+    fun `malformed Hermes metadata is skipped or defaulted without crashing queue parsing`() {
+        val conversation = conversationOf(
+            legacyHermesTool(
+                callId = "bad-status",
+                prompt = "bad status request",
+                metadata = buildJsonObject {
+                    put(HERMES_TOOL_SOURCE_KEY, VoiceAgentToolNames.ASK_HERMES)
+                    put(HERMES_TOOL_STATUS_KEY, buildJsonObject { put("bad", "shape") })
+                },
+            ),
+            legacyHermesTool(
+                callId = "bad-optionals",
+                prompt = "bad optional request",
+                status = "running",
+                metadata = buildJsonObject {
+                    put(HERMES_TOOL_SOURCE_KEY, VoiceAgentToolNames.ASK_HERMES)
+                    put(HERMES_TOOL_STATUS_KEY, "running")
+                    put(HERMES_TOOL_JOB_ID_KEY, buildJsonObject { put("bad", "shape") })
+                    put(HERMES_TOOL_RESULT_ANNOUNCED_KEY, buildJsonObject { put("bad", "shape") })
+                    put(HERMES_TOOL_CREATED_AT_KEY, buildJsonObject { put("bad", "shape") })
+                    put(HERMES_TOOL_UPDATED_AT_KEY, buildJsonObject { put("bad", "shape") })
+                },
+            )
+        )
+
+        val records = conversation.hermesQueueRecords()
+
+        assertEquals(listOf("bad-optionals"), records.map { it.callId })
+        assertEquals(HermesQueueStatus.Running, records.single().status)
+        assertEquals(null, records.single().jobId)
+        assertFalse(records.single().resultAnnounced)
+        assertEquals(null, records.single().createdAt)
+        assertEquals(null, records.single().updatedAt)
+    }
+
+    @Test
+    fun `snapshot summary renders expired and canceled terminal errors`() {
+        val conversation = Conversation.ofId(Uuid.random())
+            .let {
+                persister.upsertHermesTool(
+                    conversation = it,
+                    callId = "call-expired",
+                    prompt = "expired request",
+                    status = VoiceToolRecordStatus.Expired("expired reason"),
+                    jobId = "job-expired",
+                    resultAnnounced = false,
+                )
+            }
+            .let {
+                persister.upsertHermesTool(
+                    conversation = it,
+                    callId = "call-canceled",
+                    prompt = "canceled request",
+                    status = VoiceToolRecordStatus.Canceled("canceled reason"),
+                    jobId = "job-canceled",
+                    resultAnnounced = false,
+                )
+            }
+
+        val snapshot = HermesQueueSnapshot.from(conversation)
+        val summary = snapshot.toPromptSummary()
+
+        assertEquals(listOf("call-expired", "call-canceled"), snapshot.unannouncedTerminal.map { it.callId })
+        assertTrue(summary.contains("Expired: expired request"))
+        assertTrue(summary.contains("Reason: expired reason"))
+        assertTrue(summary.contains("Canceled: canceled request"))
+        assertTrue(summary.contains("Reason: canceled reason"))
     }
 
     @Test
@@ -123,5 +223,38 @@ class HermesQueueRecordTest {
         assertTrue(snapshot.toPromptSummary().contains("active request"))
         assertTrue(snapshot.toPromptSummary().contains("new answer"))
         assertFalse(snapshot.toPromptSummary().contains("old answer"))
+    }
+
+    private fun conversationOf(vararg tools: UIMessagePart.Tool): Conversation {
+        return Conversation.ofId(Uuid.random())
+            .updateCurrentMessages(
+                listOf(
+                    UIMessage(
+                        role = MessageRole.ASSISTANT,
+                        parts = tools.toList(),
+                    )
+                )
+            )
+    }
+
+    private fun legacyHermesTool(
+        callId: String,
+        prompt: String,
+        status: String? = null,
+        jobId: String? = null,
+        outputText: String? = null,
+        metadata: kotlinx.serialization.json.JsonObject? = null,
+    ): UIMessagePart.Tool {
+        return UIMessagePart.Tool(
+            toolCallId = callId,
+            toolName = VoiceAgentToolNames.ASK_HERMES,
+            input = """{"prompt":"$prompt"}""",
+            output = outputText?.let { listOf(UIMessagePart.Text(it)) }.orEmpty(),
+            metadata = metadata ?: buildJsonObject {
+                put(HERMES_TOOL_SOURCE_KEY, VoiceAgentToolNames.ASK_HERMES)
+                status?.let { put(HERMES_TOOL_STATUS_KEY, it) }
+                jobId?.let { put(HERMES_TOOL_JOB_ID_KEY, it) }
+            },
+        )
     }
 }
