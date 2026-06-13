@@ -7,12 +7,15 @@ import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.runInterruptible
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
 import me.rerere.rikkahub.data.model.Conversation
 import me.rerere.rikkahub.voiceagent.VoiceConversationStore
 import me.rerere.rikkahub.voiceagent.VoiceToolApi
@@ -25,6 +28,28 @@ interface HermesSessionBridge {
     fun sendQueuedAcknowledgement(callId: String, sessionId: Long): Boolean
     fun sendCompletionFollowUp(callId: String, prompt: String, answer: String, sessionId: Long): Boolean
 }
+
+data class HermesJobCompletion(
+    val callId: String,
+    val jobId: String,
+    val answer: String,
+    val elapsedMs: Long,
+    val serverElapsedMs: Long?,
+)
+
+data class HermesJobFailure(
+    val callId: String,
+    val jobId: String?,
+    val message: String,
+    val elapsedMs: Long,
+)
+
+data class HermesPollFailure(
+    val callId: String,
+    val jobId: String,
+    val attempt: Int,
+    val message: String,
+)
 
 class HermesJobManager(
     private val toolApi: VoiceToolApi,
@@ -41,6 +66,10 @@ class HermesJobManager(
     private val recordDiagnostic: (String, String) -> Unit = { _, _ -> },
     private val writeQueueEvent: (String) -> Unit = {},
     private val writeHermesAnswer: (String) -> Unit = {},
+    private val persistenceSessionId: () -> String? = { null },
+    private val onJobCompleted: (HermesJobCompletion) -> Unit = {},
+    private val onJobFailed: (HermesJobFailure) -> Unit = {},
+    private val onPollFailed: (HermesPollFailure) -> Unit = {},
 ) {
     private val lock = Any()
     private val conversationUpdateMutex = Mutex()
@@ -51,9 +80,9 @@ class HermesJobManager(
     val toolStatus: StateFlow<VoiceToolStatus> = _toolStatus
     private var bridgeAttachment: BridgeAttachment? = null
 
-    fun submit(callId: String, prompt: String) {
+    fun submit(callId: String, prompt: String): Boolean {
         val managedJob = synchronized(lock) {
-            if (activeJobs.containsKey(callId)) return
+            if (activeJobs.containsKey(callId)) return false
             ManagedHermesJob(callId = callId, prompt = prompt).also {
                 activeJobs[callId] = it
             }
@@ -61,6 +90,7 @@ class HermesJobManager(
         launchManagedJob(managedJob) {
             submitAndPoll(managedJob)
         }
+        return true
     }
 
     fun resumeActiveJobs() {
@@ -115,6 +145,16 @@ class HermesJobManager(
                     pollHermesJobSafely(managedJob, jobId)
                 }
             }
+    }
+
+    suspend fun awaitJobs() {
+        while (true) {
+            val jobs = synchronized(lock) {
+                if (activeJobs.isEmpty()) return
+                activeJobs.values.mapNotNull { it.job }
+            }
+            jobs.joinAll()
+        }
     }
 
     private fun expireSupersededActiveRecord(record: HermesQueueRecord) {
@@ -254,7 +294,14 @@ class HermesJobManager(
                 "hermes_job_created",
                 "callId=${managedJob.callId}, jobId=${submitted.jobId}, status=${submitted.status}",
             )
-            safeWriteQueueEvent("event=job_created,callId=${managedJob.callId},jobId=${submitted.jobId},status=${submitted.status}")
+            safeWriteQueueEvent(
+                buildQueueEvent(
+                    type = "job_created",
+                    callId = managedJob.callId,
+                    jobId = submitted.jobId,
+                    status = submitted.status,
+                )
+            )
             sendQueuedAcknowledgementIfAttached(
                 callId = managedJob.callId,
                 shouldSend = { !managedJob.explicitlyCanceled },
@@ -304,6 +351,14 @@ class HermesJobManager(
                     return
                 }
                 pollFailures += 1
+                safeOnPollFailed(
+                    HermesPollFailure(
+                        callId = managedJob.callId,
+                        jobId = jobId,
+                        attempt = pollFailures,
+                        message = error.message ?: error.javaClass.simpleName,
+                    )
+                )
                 if (managedJob.hasTimedOut(maxElapsedMs)) {
                     expireTimedOutJob(managedJob = managedJob, jobId = jobId)
                     return
@@ -349,6 +404,7 @@ class HermesJobManager(
 
                 "succeeded" -> {
                     val answer = requireNotNull(poll.answer) { "Hermes job succeeded without an answer" }
+                    val elapsedMs = managedJob.elapsedMs()
                     val persisted = persistTerminalIfStillActive(
                         callId = managedJob.callId,
                         prompt = managedJob.prompt,
@@ -358,11 +414,31 @@ class HermesJobManager(
                         shouldPersist = { !managedJob.explicitlyCanceled },
                     )
                     if (!persisted) return
+                    safeOnJobCompleted(
+                        HermesJobCompletion(
+                            callId = managedJob.callId,
+                            jobId = jobId,
+                            answer = answer,
+                            elapsedMs = elapsedMs,
+                            serverElapsedMs = poll.elapsedMs,
+                        )
+                    )
                     safeRecordDiagnostic(
                         "hermes_job_completed",
-                        "callId=${managedJob.callId}, jobId=$jobId, answerChars=${answer.length}",
+                        "callId=${managedJob.callId}, jobId=$jobId, elapsedMs=$elapsedMs" +
+                            "${poll.elapsedMs?.let { ", serverElapsedMs=$it" }.orEmpty()}, answerChars=${answer.length}",
                     )
-                    safeWriteQueueEvent("event=job_completed,callId=${managedJob.callId},jobId=$jobId,status=succeeded")
+                    safeWriteQueueEvent(
+                        buildQueueEvent(
+                            type = "job_completed",
+                            callId = managedJob.callId,
+                            jobId = jobId,
+                            status = "succeeded",
+                            elapsedMs = elapsedMs,
+                            serverElapsedMs = poll.elapsedMs,
+                            answerChars = answer.length,
+                        )
+                    )
                     safeWriteHermesAnswer(answer)
                     updateToolStatus(
                         managedJob.callId,
@@ -371,7 +447,7 @@ class HermesJobManager(
                             elapsedMs = managedJob.elapsedMs(),
                         ),
                     )
-                    launchCompletedResultAnnouncement(
+                    announceCompletedResult(
                         callId = managedJob.callId,
                         jobId = jobId,
                     )
@@ -542,8 +618,21 @@ class HermesJobManager(
             "hermes_job_failed",
             "callId=$callId${jobId?.let { ", jobId=$it" }.orEmpty()}, message=$visibleMessage",
         )
+        safeOnJobFailed(
+            HermesJobFailure(
+                callId = callId,
+                jobId = jobId,
+                message = visibleMessage,
+                elapsedMs = 0L,
+            )
+        )
         safeWriteQueueEvent(
-            "event=job_failed,callId=$callId${jobId?.let { ",jobId=$it" }.orEmpty()},status=${status.queueEventStatus()}",
+            buildQueueEvent(
+                type = "job_failed",
+                callId = callId,
+                jobId = jobId ?: "none",
+                status = status.queueEventStatus(),
+            )
         )
         updateToolStatus(callId, VoiceToolStatus.HermesFailed(callId = callId, message = visibleMessage))
         return true
@@ -683,6 +772,24 @@ class HermesJobManager(
         }
     }
 
+    private fun safeOnJobCompleted(completion: HermesJobCompletion) {
+        runCatching {
+            onJobCompleted(completion)
+        }
+    }
+
+    private fun safeOnJobFailed(failure: HermesJobFailure) {
+        runCatching {
+            onJobFailed(failure)
+        }
+    }
+
+    private fun safeOnPollFailed(failure: HermesPollFailure) {
+        runCatching {
+            onPollFailed(failure)
+        }
+    }
+
     private suspend fun persistActiveIfStillActive(
         callId: String,
         prompt: String,
@@ -690,7 +797,7 @@ class HermesJobManager(
         jobId: String,
         shouldPersist: () -> Boolean = { true },
     ): Boolean {
-        val sessionId = currentBridgeAttachment()?.sessionId?.toString()
+        val sessionId = persistenceSessionId() ?: currentBridgeAttachment()?.sessionId?.toString()
         return updateConversationWithResult { conversation ->
             val latestRecord = conversation.hermesQueueRecords().lastOrNull { record ->
                 record.callId == callId && record.jobId == jobId
@@ -715,7 +822,7 @@ class HermesJobManager(
         prompt: String,
         shouldPersist: () -> Boolean = { true },
     ): Boolean {
-        val sessionId = currentBridgeAttachment()?.sessionId?.toString()
+        val sessionId = persistenceSessionId() ?: currentBridgeAttachment()?.sessionId?.toString()
         return updateConversationWithResult { conversation ->
             if (!shouldPersist()) {
                 conversation to false
@@ -737,7 +844,7 @@ class HermesJobManager(
         prompt: String,
         jobId: String?,
     ): Boolean {
-        val sessionId = currentBridgeAttachment()?.sessionId?.toString()
+        val sessionId = persistenceSessionId() ?: currentBridgeAttachment()?.sessionId?.toString()
         return updateConversationWithResult { conversation ->
             val latestRecord = conversation.hermesQueueRecords().lastOrNull { record ->
                 record.callId == callId && when {
@@ -768,7 +875,7 @@ class HermesJobManager(
         resultAnnounced: Boolean? = null,
         shouldPersist: () -> Boolean = { true },
     ): Boolean {
-        val sessionId = currentBridgeAttachment()?.sessionId?.toString()
+        val sessionId = persistenceSessionId() ?: currentBridgeAttachment()?.sessionId?.toString()
         return updateConversationWithResult { conversation ->
             val latestRecord = conversation.hermesQueueRecords().lastOrNull { record ->
                 record.callId == callId && when {
@@ -892,6 +999,28 @@ class HermesJobManager(
         return (pollRetryDelayMs * multiplier)
             .coerceAtMost(pollIntervalMs)
             .coerceAtLeast(1L)
+    }
+
+    private fun buildQueueEvent(
+        type: String,
+        callId: String,
+        jobId: String,
+        status: String? = null,
+        elapsedMs: Long? = null,
+        serverElapsedMs: Long? = null,
+        answerChars: Int? = null,
+        sent: Boolean? = null,
+    ): String {
+        return buildJsonObject {
+            put("type", type)
+            put("callId", callId)
+            put("jobId", jobId)
+            status?.let { put("status", it) }
+            elapsedMs?.let { put("elapsedMs", it) }
+            serverElapsedMs?.let { put("serverElapsedMs", it) }
+            answerChars?.let { put("answerChars", it) }
+            sent?.let { put("sent", it) }
+        }.toString()
     }
 
     private fun Throwable.isTerminalHermesPollFailure(): Boolean {
