@@ -638,6 +638,7 @@ class VoiceConversationPersisterTest {
                 )
             }
             .let { persister.markHermesToolResultAnnounced(it, callId = "call-1") }
+            .let { persister.markHermesToolResultAnnounced(it, callId = "call-3") }
 
         val tools = conversation.currentMessages
             .flatMap { it.parts }

@@ -47,6 +47,7 @@ class HermesQueueRecordTest {
         val records = conversation.hermesQueueRecords()
 
         assertEquals(listOf("call-queued", "call-running", "call-complete"), records.map { it.callId })
+        assertEquals(listOf("job-queued", "job-running", "job-complete"), records.map { it.jobId })
         assertEquals(HermesQueueStatus.Queued, records[0].status)
         assertEquals(HermesQueueStatus.Running, records[1].status)
         assertEquals(HermesQueueStatus.Complete, records[2].status)
@@ -91,6 +92,7 @@ class HermesQueueRecordTest {
         val snapshot = HermesQueueSnapshot.from(conversation)
 
         assertEquals(listOf("active"), snapshot.active.map { it.callId })
+        assertEquals(listOf("job-active"), snapshot.active.map { it.jobId })
         assertEquals(listOf("new-result"), snapshot.unannouncedTerminal.map { it.callId })
         assertEquals(listOf("old-result"), snapshot.announcedTerminal.map { it.callId })
         assertTrue(snapshot.toPromptSummary().contains("active request"))
