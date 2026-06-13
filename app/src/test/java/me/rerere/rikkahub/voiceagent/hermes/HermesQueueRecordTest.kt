@@ -225,6 +225,57 @@ class HermesQueueRecordTest {
         assertFalse(snapshot.toPromptSummary().contains("old answer"))
     }
 
+    @Test
+    fun `new terminal Hermes records default to unannounced queue results`() {
+        val conversation = Conversation.ofId(Uuid.random())
+            .let {
+                persister.upsertHermesTool(
+                    conversation = it,
+                    callId = "complete",
+                    prompt = "complete request",
+                    status = VoiceToolRecordStatus.Complete("complete answer"),
+                    jobId = "job-complete",
+                )
+            }
+            .let {
+                persister.upsertHermesTool(
+                    conversation = it,
+                    callId = "failed",
+                    prompt = "failed request",
+                    status = VoiceToolRecordStatus.Failed("failed reason"),
+                    jobId = "job-failed",
+                )
+            }
+            .let {
+                persister.upsertHermesTool(
+                    conversation = it,
+                    callId = "expired",
+                    prompt = "expired request",
+                    status = VoiceToolRecordStatus.Expired("expired reason"),
+                    jobId = "job-expired",
+                )
+            }
+            .let {
+                persister.upsertHermesTool(
+                    conversation = it,
+                    callId = "canceled",
+                    prompt = "canceled request",
+                    status = VoiceToolRecordStatus.Canceled("canceled reason"),
+                    jobId = "job-canceled",
+                )
+            }
+
+        val snapshot = HermesQueueSnapshot.from(conversation)
+
+        assertTrue(snapshot.active.isEmpty())
+        assertTrue(snapshot.announcedTerminal.isEmpty())
+        assertEquals(
+            listOf("complete", "failed", "expired", "canceled"),
+            snapshot.unannouncedTerminal.map { it.callId },
+        )
+        assertTrue(snapshot.unannouncedTerminal.all { !it.resultAnnounced })
+    }
+
     private fun conversationOf(vararg tools: UIMessagePart.Tool): Conversation {
         return Conversation.ofId(Uuid.random())
             .updateCurrentMessages(

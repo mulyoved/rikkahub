@@ -608,6 +608,40 @@ class VoiceConversationPersisterTest {
     }
 
     @Test
+    fun `job-keyed active upsert replaces legacy active record without job id`() {
+        val persister = VoiceConversationPersister()
+        val pendingConversation = persister.upsertHermesTool(
+            conversation = emptyConversation(),
+            callId = "call-1",
+            prompt = "active prompt",
+            status = VoiceToolRecordStatus.Pending,
+            sessionId = "session-1",
+            jobId = null,
+        )
+        val pendingTool = pendingConversation.currentMessages.single().parts.single() as UIMessagePart.Tool
+        val pendingCreatedAt = pendingTool.metadata!!["voice_tool_created_at"]!!.jsonPrimitive.content
+
+        val runningConversation = persister.upsertHermesTool(
+            conversation = pendingConversation,
+            callId = "call-1",
+            prompt = "active prompt",
+            status = VoiceToolRecordStatus.Running,
+            sessionId = "session-1",
+            jobId = "job-1",
+        )
+
+        val tools = runningConversation.currentMessages
+            .flatMap { it.parts }
+            .filterIsInstance<UIMessagePart.Tool>()
+
+        assertEquals(1, tools.size)
+        val runningMetadata = tools.single().metadata!!
+        assertEquals("running", runningMetadata["voice_tool_status"]!!.jsonPrimitive.content)
+        assertEquals("job-1", runningMetadata["voice_tool_job_id"]!!.jsonPrimitive.content)
+        assertEquals(pendingCreatedAt, runningMetadata["voice_tool_created_at"]!!.jsonPrimitive.content)
+    }
+
+    @Test
     fun `Hermes persisted status names are parseable queue statuses`() {
         val persister = VoiceConversationPersister()
         val statuses = listOf(
