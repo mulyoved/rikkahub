@@ -203,13 +203,28 @@ class BlockedSubmit {
     var timeoutMillis: Long = 500
 }
 
+class BlockedCancellableSubmit {
+    val started = CountDownLatch(1)
+    val release = CompletableDeferred<Unit>()
+}
+
+class BlockedCancel {
+    val started = CompletableDeferred<Unit>()
+    val release = CompletableDeferred<Unit>()
+    val cancelled = CompletableDeferred<Unit>()
+}
+
 class FakeVoiceToolApi : VoiceToolApi {
     val requests = mutableListOf<Pair<String, String>>()
     private val lock = Any()
     private val calls = mutableMapOf<String, PendingHermesJob>()
     private val scriptedPolls = mutableMapOf<String, ArrayDeque<Any>>()
+    private val pollRequests = mutableListOf<String>()
     private val submitFailures = mutableMapOf<String, Throwable>()
+    private val submitResponses = mutableMapOf<String, MobileHermesJobSubmitResponse>()
     private val blockedSubmissions = mutableMapOf<String, MutableList<BlockedSubmit>>()
+    private val blockedCancellableSubmissions = mutableMapOf<String, MutableList<BlockedCancellableSubmit>>()
+    private val blockedCancellations = mutableMapOf<String, MutableList<BlockedCancel>>()
     private var jobCounter = 0
 
     override suspend fun submitHermesJob(callId: String, prompt: String): MobileHermesJobSubmitResponse {
@@ -231,6 +246,23 @@ class FakeVoiceToolApi : VoiceToolApi {
             blocked.started.countDown()
             blocked.release.await(blocked.timeoutMillis, TimeUnit.MILLISECONDS)
         }
+        val cancellableBlocked = synchronized(blockedCancellableSubmissions) {
+            blockedCancellableSubmissions[callId]?.removeFirstOrNull()
+        }
+        if (cancellableBlocked != null) {
+            cancellableBlocked.started.countDown()
+            try {
+                cancellableBlocked.release.await()
+            } catch (error: kotlinx.coroutines.CancellationException) {
+                job.cancelled.complete(Unit)
+                throw error
+            }
+        }
+        synchronized(lock) {
+            submitResponses.remove(callId)?.let { response ->
+                return response.copy(jobId = job.jobId, callId = callId)
+            }
+        }
         return MobileHermesJobSubmitResponse(
             jobId = job.jobId,
             callId = callId,
@@ -244,6 +276,7 @@ class FakeVoiceToolApi : VoiceToolApi {
         try {
             while (true) {
                 val scripted = synchronized(lock) {
+                    pollRequests += jobId
                     scriptedPolls[jobId]?.removeFirstOrNull()
                 }
                 when (scripted) {
@@ -264,6 +297,18 @@ class FakeVoiceToolApi : VoiceToolApi {
 
     override suspend fun cancelHermesJob(jobId: String): MobileHermesJobPollResponse {
         val job = synchronized(lock) { calls.getValue(jobId) }
+        val blocked = synchronized(blockedCancellations) {
+            blockedCancellations[job.callId]?.removeFirstOrNull()
+        }
+        if (blocked != null) {
+            blocked.started.complete(Unit)
+            try {
+                blocked.release.await()
+            } catch (error: kotlinx.coroutines.CancellationException) {
+                blocked.cancelled.complete(Unit)
+                throw error
+            }
+        }
         job.remoteCancelled.complete(Unit)
         job.result.cancel()
         return MobileHermesJobPollResponse(
@@ -365,6 +410,14 @@ class FakeVoiceToolApi : VoiceToolApi {
         }
     }
 
+    fun seedJob(jobId: String, callId: String) {
+        synchronized(lock) {
+            calls.getOrPut(jobId) {
+                PendingHermesJob(callId = callId, prompt = "", jobId = jobId)
+            }
+        }
+    }
+
     fun scriptPollFailure(callId: String, error: Throwable) {
         val job = call(callId)
         synchronized(lock) {
@@ -378,10 +431,37 @@ class FakeVoiceToolApi : VoiceToolApi {
         }
     }
 
+    fun scriptSubmitStatus(callId: String, status: String) {
+        synchronized(lock) {
+            submitResponses[callId] = MobileHermesJobSubmitResponse(
+                jobId = "",
+                callId = callId,
+                status = status,
+                createdAt = "2026-06-11T00:00:00.000Z",
+            )
+        }
+    }
+
     fun blockSubmit(callId: String): BlockedSubmit {
         return BlockedSubmit().also { blocked ->
             synchronized(blockedSubmissions) {
                 blockedSubmissions.getOrPut(callId) { mutableListOf() } += blocked
+            }
+        }
+    }
+
+    fun blockSubmitCancellable(callId: String): BlockedCancellableSubmit {
+        return BlockedCancellableSubmit().also { blocked ->
+            synchronized(blockedCancellableSubmissions) {
+                blockedCancellableSubmissions.getOrPut(callId) { mutableListOf() } += blocked
+            }
+        }
+    }
+
+    fun blockCancel(callId: String): BlockedCancel {
+        return BlockedCancel().also { blocked ->
+            synchronized(blockedCancellations) {
+                blockedCancellations.getOrPut(callId) { mutableListOf() } += blocked
             }
         }
     }
@@ -413,7 +493,20 @@ class FakeVoiceToolApi : VoiceToolApi {
         }
     }
 
+    suspend fun awaitRemoteCancelledJob(jobId: String) {
+        withTimeout(500) {
+            synchronized(lock) { calls.getValue(jobId) }.remoteCancelled.await()
+        }
+    }
+
     fun wasCancelled(callId: String): Boolean = call(callId).cancelled.isCompleted
+
+    fun wasRemoteCancelled(callId: String): Boolean = call(callId).remoteCancelled.isCompleted
+
+    fun pollCount(callId: String): Int = synchronized(lock) {
+        val jobIds = calls.values.filter { it.callId == callId }.map { it.jobId }.toSet()
+        pollRequests.count { it in jobIds }
+    }
 
     private fun call(callId: String): PendingHermesJob = synchronized(lock) {
         calls.values.firstOrNull { it.callId == callId && !it.result.isCompleted && !it.cancelled.isCompleted }
@@ -560,18 +653,24 @@ class FakeVoiceConversationStore(
 ) : VoiceConversationStore {
     private val updates = mutableListOf<Conversation>()
     private val blockedUpdates = mutableListOf<BlockedUpdate>()
+    private val blockedAfterUpdates = mutableListOf<BlockedUpdate>()
     override val conversation: StateFlow<Conversation> = MutableStateFlow(initialConversation)
 
     override suspend fun update(transform: (Conversation) -> Conversation) {
-        val blocked = synchronized(blockedUpdates) { blockedUpdates.removeFirstOrNull() }
-        if (blocked != null) {
-            blocked.started.countDown()
-            blocked.release.await(500, TimeUnit.MILLISECONDS)
+        val blockedBeforeUpdate = synchronized(blockedUpdates) { blockedUpdates.removeFirstOrNull() }
+        if (blockedBeforeUpdate != null) {
+            blockedBeforeUpdate.started.countDown()
+            blockedBeforeUpdate.release.await(500, TimeUnit.MILLISECONDS)
         }
         val flow = conversation as MutableStateFlow<Conversation>
         flow.value = transform(flow.value)
         synchronized(updates) {
             updates += flow.value
+        }
+        val blockedAfterUpdate = synchronized(blockedAfterUpdates) { blockedAfterUpdates.removeFirstOrNull() }
+        if (blockedAfterUpdate != null) {
+            blockedAfterUpdate.started.countDown()
+            blockedAfterUpdate.release.await(500, TimeUnit.MILLISECONDS)
         }
     }
 
@@ -579,6 +678,14 @@ class FakeVoiceConversationStore(
         return BlockedUpdate().also { blocked ->
             synchronized(blockedUpdates) {
                 blockedUpdates += blocked
+            }
+        }
+    }
+
+    fun blockAfterNextUpdate(): BlockedUpdate {
+        return BlockedUpdate().also { blocked ->
+            synchronized(blockedAfterUpdates) {
+                blockedAfterUpdates += blocked
             }
         }
     }

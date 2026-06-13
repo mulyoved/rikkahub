@@ -211,38 +211,43 @@ class VoiceConversationPersister {
         jobId: String? = null,
         matchMissingJobId: Boolean = false,
     ): Conversation {
+        return if (jobId != null || matchMissingJobId) {
+            markAllMatchingHermesResultsAnnounced(
+                conversation = conversation,
+                callId = callId,
+                jobId = jobId,
+                matchMissingJobId = matchMissingJobId,
+            )
+        } else {
+            markLatestHermesResultAnnounced(conversation = conversation, callId = callId)
+        }
+    }
+
+    private fun markLatestHermesResultAnnounced(
+        conversation: Conversation,
+        callId: String,
+    ): Conversation {
         val currentMessages = conversation.currentMessages
-        val messageIndex = currentMessages.indexOfLast { message ->
+        val latestMessageIndex = currentMessages.indexOfLast { message ->
             message.parts.any { part ->
-                part is UIMessagePart.Tool &&
-                    part.isTerminalHermesTool(callId = callId, jobId = jobId, matchMissingJobId = matchMissingJobId)
+                part is UIMessagePart.Tool && part.isTerminalHermesTool(callId = callId)
             }
         }
-        if (messageIndex < 0) return conversation
+        if (latestMessageIndex < 0) return conversation
 
-        val partIndex = currentMessages[messageIndex].parts.indexOfLast { part ->
-            part is UIMessagePart.Tool &&
-                part.isTerminalHermesTool(callId = callId, jobId = jobId, matchMissingJobId = matchMissingJobId)
+        val latestPartIndex = currentMessages[latestMessageIndex].parts.indexOfLast { part ->
+            part is UIMessagePart.Tool && part.isTerminalHermesTool(callId = callId)
         }
-        if (partIndex < 0) return conversation
+        if (latestPartIndex < 0) return conversation
 
         val updatedMessages = currentMessages.mapIndexed { currentMessageIndex, message ->
-            if (currentMessageIndex != messageIndex) {
+            if (currentMessageIndex != latestMessageIndex) {
                 message
             } else {
                 message.copy(
                     parts = message.parts.mapIndexed { currentPartIndex, part ->
-                        if (currentPartIndex == partIndex && part is UIMessagePart.Tool) {
-                            part.copy(
-                                metadata = part.metadata.withResultAnnounced(),
-                                output = part.output.map { outputPart ->
-                                    if (outputPart is UIMessagePart.Text) {
-                                        outputPart.copy(metadata = outputPart.metadata.withResultAnnounced())
-                                    } else {
-                                        outputPart
-                                    }
-                                },
-                            )
+                        if (currentPartIndex == latestPartIndex && part is UIMessagePart.Tool) {
+                            part.withResultAnnounced()
                         } else {
                             part
                         }
@@ -251,6 +256,50 @@ class VoiceConversationPersister {
             }
         }
         return conversation.updateCurrentMessages(updatedMessages)
+    }
+
+    private fun markAllMatchingHermesResultsAnnounced(
+        conversation: Conversation,
+        callId: String,
+        jobId: String?,
+        matchMissingJobId: Boolean,
+    ): Conversation {
+        val currentMessages = conversation.currentMessages
+        var markedAny = false
+        val updatedMessages = currentMessages.map { message ->
+            message.copy(
+                parts = message.parts.map { part ->
+                    if (
+                        part is UIMessagePart.Tool &&
+                        part.isTerminalHermesTool(
+                            callId = callId,
+                            jobId = jobId,
+                            matchMissingJobId = matchMissingJobId,
+                        )
+                    ) {
+                        markedAny = true
+                        part.withResultAnnounced()
+                    } else {
+                        part
+                    }
+                }
+            )
+        }
+        if (!markedAny) return conversation
+        return conversation.updateCurrentMessages(updatedMessages)
+    }
+
+    private fun UIMessagePart.Tool.withResultAnnounced(): UIMessagePart.Tool {
+        return copy(
+            metadata = metadata.withResultAnnounced(),
+            output = output.map { outputPart ->
+                if (outputPart is UIMessagePart.Text) {
+                    outputPart.copy(metadata = outputPart.metadata.withResultAnnounced())
+                } else {
+                    outputPart
+                }
+            },
+        )
     }
 
     private fun upsertTranscriptTurn(
@@ -329,7 +378,8 @@ class VoiceConversationPersister {
                 existingJobId == null || existingJobId == newJobId
             }
         } else if (newJobId != null) {
-            existingJobId == newJobId || (existingJobId == null && isActiveHermesTool())
+            existingJobId == newJobId ||
+                (existingJobId == null && canReceiveReturnedJobId(newStatus))
         } else {
             existingJobId == null
         }
@@ -341,6 +391,11 @@ class VoiceConversationPersister {
 
     private fun UIMessagePart.Tool.isActiveHermesTool(): Boolean {
         return metadata.queueStatus()?.isTerminal == false
+    }
+
+    private fun UIMessagePart.Tool.canReceiveReturnedJobId(newStatus: VoiceToolRecordStatus): Boolean {
+        return isActiveHermesTool() ||
+            (metadata.queueStatus() == HermesQueueStatus.Canceled && newStatus.queueStatus == HermesQueueStatus.Canceled)
     }
 
     private fun UIMessagePart.Tool.isTerminalHermesTool(

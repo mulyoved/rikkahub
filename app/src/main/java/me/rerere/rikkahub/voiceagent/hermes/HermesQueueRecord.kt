@@ -92,7 +92,7 @@ data class HermesQueueSnapshot(
 
     companion object {
         fun from(conversation: Conversation): HermesQueueSnapshot {
-            val records = conversation.hermesQueueRecords()
+            val records = conversation.hermesQueueRecords().latestByHermesDurableIdentity()
             return HermesQueueSnapshot(
                 active = records.filter { !it.status.isTerminal },
                 unannouncedTerminal = records.filter { it.status.isTerminal && !it.resultAnnounced },
@@ -107,6 +107,22 @@ fun Conversation.hermesQueueRecords(): List<HermesQueueRecord> {
         .flatMap { it.parts }
         .filterIsInstance<UIMessagePart.Tool>()
         .mapNotNull { it.toHermesQueueRecord() }
+}
+
+internal fun List<HermesQueueRecord>.latestByHermesDurableIdentity(): List<HermesQueueRecord> {
+    val seen = mutableSetOf<HermesDurableIdentity>()
+    return asReversed()
+        .filter { record -> seen.add(record.durableIdentity()) }
+        .asReversed()
+}
+
+private data class HermesDurableIdentity(
+    val callId: String,
+    val jobId: String?,
+)
+
+private fun HermesQueueRecord.durableIdentity(): HermesDurableIdentity {
+    return HermesDurableIdentity(callId = callId, jobId = jobId)
 }
 
 private fun UIMessagePart.Tool.toHermesQueueRecord(): HermesQueueRecord? {

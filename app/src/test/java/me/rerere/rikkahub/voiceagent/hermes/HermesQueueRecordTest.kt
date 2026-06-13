@@ -254,6 +254,46 @@ class HermesQueueRecordTest {
     }
 
     @Test
+    fun `queue snapshot uses latest record for duplicate durable identity`() {
+        val conversation = conversationOf(
+            legacyHermesTool(
+                callId = "call-duplicate",
+                prompt = "old prompt",
+                status = "complete",
+                jobId = "job-duplicate",
+                outputText = "old answer",
+                metadata = hermesMetadata(
+                    status = "complete",
+                    jobId = "job-duplicate",
+                    resultAnnounced = false,
+                ),
+            ),
+            legacyHermesTool(
+                callId = "call-duplicate",
+                prompt = "latest prompt",
+                status = "failed",
+                jobId = "job-duplicate",
+                outputText = "latest failure",
+                metadata = hermesMetadata(
+                    status = "failed",
+                    jobId = "job-duplicate",
+                    resultAnnounced = false,
+                ),
+            ),
+        )
+
+        val records = conversation.hermesQueueRecords()
+        val snapshot = HermesQueueSnapshot.from(conversation)
+        val summary = snapshot.toPromptSummary()
+
+        assertEquals(2, records.size)
+        assertEquals(listOf(HermesQueueStatus.Failed), snapshot.unannouncedTerminal.map { it.status })
+        assertTrue(snapshot.announcedTerminal.isEmpty())
+        assertFalse(summary.contains("old answer"))
+        assertTrue(summary.contains("latest failure"))
+    }
+
+    @Test
     fun `new terminal Hermes records default to unannounced queue results`() {
         val conversation = Conversation.ofId(Uuid.random())
             .let {
@@ -337,5 +377,16 @@ class HermesQueueRecordTest {
                 jobId?.let { put(HERMES_TOOL_JOB_ID_KEY, it) }
             },
         )
+    }
+
+    private fun hermesMetadata(
+        status: String,
+        jobId: String?,
+        resultAnnounced: Boolean,
+    ) = buildJsonObject {
+        put(HERMES_TOOL_SOURCE_KEY, VoiceAgentToolNames.ASK_HERMES)
+        put(HERMES_TOOL_STATUS_KEY, status)
+        jobId?.let { put(HERMES_TOOL_JOB_ID_KEY, it) }
+        put(HERMES_TOOL_RESULT_ANNOUNCED_KEY, resultAnnounced)
     }
 }

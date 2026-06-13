@@ -1,5 +1,7 @@
 package me.rerere.rikkahub.voiceagent.persistence
 
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import me.rerere.ai.core.MessageRole
@@ -1132,6 +1134,85 @@ class VoiceConversationPersisterTest {
     }
 
     @Test
+    fun `mark Hermes result announced marks duplicate terminal records for same job id`() {
+        val persister = VoiceConversationPersister()
+        val conversation = emptyConversation()
+            .let {
+                persister.upsertHermesTool(
+                    conversation = it,
+                    callId = "call-1",
+                    prompt = "old prompt",
+                    status = VoiceToolRecordStatus.Complete("old answer"),
+                    jobId = "job-1",
+                    resultAnnounced = false,
+                )
+            }
+            .withDuplicateToolPart(
+                callId = "call-1",
+                prompt = "latest prompt",
+                answer = "latest answer",
+            )
+            .let { persister.markHermesToolResultAnnounced(it, callId = "call-1", jobId = "job-1") }
+
+        val tools = conversation.currentMessages
+            .flatMap { it.parts }
+            .filterIsInstance<UIMessagePart.Tool>()
+
+        assertEquals(2, tools.size)
+        assertEquals(listOf("true", "true"), tools.map { it.metadata!!["voice_tool_result_announced"]!!.jsonPrimitive.content })
+        tools.forEach { tool ->
+            val output = tool.output.single() as UIMessagePart.Text
+            assertEquals("true", output.metadata!!["voice_tool_result_announced"]!!.jsonPrimitive.content)
+        }
+    }
+
+    @Test
+    fun `mark Hermes result announced for duplicate job id does not mark other job ids`() {
+        val persister = VoiceConversationPersister()
+        val conversation = emptyConversation()
+            .let {
+                persister.upsertHermesTool(
+                    conversation = it,
+                    callId = "call-1",
+                    prompt = "first prompt",
+                    status = VoiceToolRecordStatus.Complete("first answer"),
+                    jobId = "job-1",
+                    resultAnnounced = false,
+                )
+            }
+            .withDuplicateToolPart(
+                callId = "call-1",
+                prompt = "duplicate first prompt",
+                answer = "duplicate first answer",
+            )
+            .let {
+                persister.upsertHermesTool(
+                    conversation = it,
+                    callId = "call-1",
+                    prompt = "second prompt",
+                    status = VoiceToolRecordStatus.Complete("second answer"),
+                    jobId = "job-2",
+                    resultAnnounced = false,
+                )
+            }
+            .let { persister.markHermesToolResultAnnounced(it, callId = "call-1", jobId = "job-1") }
+
+        val tools = conversation.currentMessages
+            .flatMap { it.parts }
+            .filterIsInstance<UIMessagePart.Tool>()
+
+        assertEquals(listOf("job-1", "job-1", "job-2"), tools.map { it.metadata!!["voice_tool_job_id"]!!.jsonPrimitive.content })
+        assertEquals(listOf("true", "true", "false"), tools.map { it.metadata!!["voice_tool_result_announced"]!!.jsonPrimitive.content })
+        tools.forEachIndexed { index, tool ->
+            val output = tool.output.single() as UIMessagePart.Text
+            assertEquals(
+                if (index == 2) "false" else "true",
+                output.metadata!!["voice_tool_result_announced"]!!.jsonPrimitive.content,
+            )
+        }
+    }
+
+    @Test
     fun `mark Hermes result announced can target reused call id without job id`() {
         val persister = VoiceConversationPersister()
         val conversation = emptyConversation()
@@ -1178,6 +1259,35 @@ class VoiceConversationPersisterTest {
         id = Uuid.random(),
         messages = emptyList(),
     )
+
+    private fun Conversation.withDuplicateToolPart(
+        callId: String,
+        prompt: String,
+        answer: String,
+    ): Conversation {
+        val sourceTool = currentMessages
+            .flatMap { it.parts }
+            .filterIsInstance<UIMessagePart.Tool>()
+            .last { it.toolCallId == callId }
+        val duplicateTool = sourceTool.copy(
+            input = buildJsonObject {
+                put("prompt", JsonPrimitive(prompt))
+            }.toString(),
+            output = sourceTool.output.map { part ->
+                if (part is UIMessagePart.Text) {
+                    part.copy(text = answer)
+                } else {
+                    part
+                }
+            },
+        )
+        return updateCurrentMessages(
+            currentMessages + UIMessage(
+                role = MessageRole.ASSISTANT,
+                parts = listOf(duplicateTool),
+            )
+        )
+    }
 
     private fun assertVoiceMetadata(
         metadata: kotlinx.serialization.json.JsonObject,
