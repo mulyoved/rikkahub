@@ -896,6 +896,45 @@ class VoiceConversationPersisterTest {
         assertEquals("true", newOutput.metadata!!["voice_tool_result_announced"]!!.jsonPrimitive.content)
     }
 
+    @Test
+    fun `mark Hermes result announced can target reused call id by job id`() {
+        val persister = VoiceConversationPersister()
+        val conversation = emptyConversation()
+            .let {
+                persister.upsertHermesTool(
+                    conversation = it,
+                    callId = "call-1",
+                    prompt = "old prompt",
+                    status = VoiceToolRecordStatus.Complete("old answer"),
+                    jobId = "job-old",
+                    resultAnnounced = false,
+                )
+            }
+            .let {
+                persister.upsertHermesTool(
+                    conversation = it,
+                    callId = "call-1",
+                    prompt = "new prompt",
+                    status = VoiceToolRecordStatus.Complete("new answer"),
+                    jobId = "job-new",
+                    resultAnnounced = false,
+                )
+            }
+            .let { persister.markHermesToolResultAnnounced(it, callId = "call-1", jobId = "job-old") }
+            .let { persister.markHermesToolResultAnnounced(it, callId = "call-1", jobId = "job-new") }
+
+        val tools = conversation.currentMessages
+            .flatMap { it.parts }
+            .filterIsInstance<UIMessagePart.Tool>()
+
+        assertEquals(listOf("job-old", "job-new"), tools.map { it.metadata!!["voice_tool_job_id"]!!.jsonPrimitive.content })
+        assertEquals(listOf("true", "true"), tools.map { it.metadata!!["voice_tool_result_announced"]!!.jsonPrimitive.content })
+        tools.forEach { tool ->
+            val output = tool.output.single() as UIMessagePart.Text
+            assertEquals("true", output.metadata!!["voice_tool_result_announced"]!!.jsonPrimitive.content)
+        }
+    }
+
     private fun emptyConversation(): Conversation = Conversation.ofId(
         id = Uuid.random(),
         messages = emptyList(),

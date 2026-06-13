@@ -208,15 +208,16 @@ class VoiceConversationPersister {
     fun markHermesToolResultAnnounced(
         conversation: Conversation,
         callId: String,
+        jobId: String? = null,
     ): Conversation {
         val currentMessages = conversation.currentMessages
         val messageIndex = currentMessages.indexOfLast { message ->
-            message.parts.any { part -> part is UIMessagePart.Tool && part.isTerminalHermesTool(callId) }
+            message.parts.any { part -> part is UIMessagePart.Tool && part.isTerminalHermesTool(callId, jobId) }
         }
         if (messageIndex < 0) return conversation
 
         val partIndex = currentMessages[messageIndex].parts.indexOfLast { part ->
-            part is UIMessagePart.Tool && part.isTerminalHermesTool(callId)
+            part is UIMessagePart.Tool && part.isTerminalHermesTool(callId, jobId)
         }
         if (partIndex < 0) return conversation
 
@@ -333,8 +334,9 @@ class VoiceConversationPersister {
         return metadata.queueStatus()?.isTerminal == false
     }
 
-    private fun UIMessagePart.Tool.isTerminalHermesTool(callId: String): Boolean {
+    private fun UIMessagePart.Tool.isTerminalHermesTool(callId: String, jobId: String? = null): Boolean {
         if (!isHermesTool(callId)) return false
+        if (jobId != null && metadata.stringOrNull(HERMES_TOOL_JOB_ID_KEY) != jobId) return false
         return metadata.queueStatus()?.isTerminal == true
     }
 
