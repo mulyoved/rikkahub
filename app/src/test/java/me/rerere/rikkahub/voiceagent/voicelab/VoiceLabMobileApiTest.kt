@@ -225,7 +225,7 @@ class VoiceLabMobileApiTest {
     }
 
     @Test
-    fun `cancelHermesJob sends DELETE request and parses failed response`() = runBlocking {
+    fun `cancelHermesJob sends DELETE request and parses canceled response`() = runBlocking {
         var seenRequest: Request? = null
         val transport = transportFor { request ->
             seenRequest = request
@@ -235,7 +235,7 @@ class VoiceLabMobileApiTest {
                 {
                   "jobId":"hj_123",
                   "callId":"call-1",
-                  "status":"failed",
+                  "status":"canceled",
                   "error":"Hermes job canceled",
                   "createdAt":"2026-06-11T00:00:00.000Z",
                   "completedAt":"2026-06-11T00:00:01.000Z"
@@ -254,7 +254,7 @@ class VoiceLabMobileApiTest {
         val request = requireNotNull(seenRequest)
         assertEquals("DELETE", request.method)
         assertEquals("/base/api/mobile/hermes/jobs/hj_123", request.url.encodedPath)
-        assertEquals("failed", response.status)
+        assertEquals("canceled", response.status)
         assertEquals("Hermes job canceled", response.error)
     }
 

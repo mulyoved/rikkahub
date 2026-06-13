@@ -17,10 +17,12 @@ import me.rerere.rikkahub.data.model.Conversation
 import me.rerere.rikkahub.voiceagent.FakeVoiceConversationStore
 import me.rerere.rikkahub.voiceagent.FakeVoiceToolApi
 import me.rerere.rikkahub.voiceagent.VoiceConversationStore
+import me.rerere.rikkahub.voiceagent.VoiceToolApi
 import me.rerere.rikkahub.voiceagent.VoiceToolStatus
 import me.rerere.rikkahub.voiceagent.persistence.VoiceConversationPersister
 import me.rerere.rikkahub.voiceagent.persistence.VoiceToolRecordStatus
 import me.rerere.rikkahub.voiceagent.voicelab.MobileHermesJobPollResponse
+import me.rerere.rikkahub.voiceagent.voicelab.MobileHermesJobSubmitResponse
 import me.rerere.rikkahub.voiceagent.voicelab.MobileHermesResponse
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -29,6 +31,7 @@ import org.junit.Test
 import java.time.Instant
 import java.util.Collections
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.uuid.Uuid
 
 class HermesJobManagerTest {
@@ -173,6 +176,44 @@ class HermesJobManagerTest {
             .filter { it.callId == "call-reused-no-job" }
         assertEquals(listOf(null, "job-1"), records.map { it.jobId })
         assertEquals(listOf(HermesQueueStatus.Failed, HermesQueueStatus.Complete), records.map { it.status })
+    }
+
+    @Test
+    fun `same call id from different sessions can submit while older job remains active`() = runTest {
+        val toolApi = FakeVoiceToolApi()
+        val conversationStore = FakeVoiceConversationStore()
+        val manager = manager(toolApi = toolApi, conversationStore = conversationStore, scope = this)
+
+        assertTrue(manager.submit(callId = "call-reused-active", prompt = "older prompt", activeKey = "session-1:call-reused-active"))
+        assertEquals("call-reused-active" to "older prompt", toolApi.awaitRequest("call-reused-active"))
+        conversationStore.awaitHermesRecord("call-reused-active") {
+            it.jobId == "job-1" && it.status == HermesQueueStatus.Queued
+        }
+
+        assertTrue(manager.submit(callId = "call-reused-active", prompt = "new prompt", activeKey = "session-2:call-reused-active"))
+        withTimeout(500) {
+            while (toolApi.requests.count { it.first == "call-reused-active" } < 2) {
+                delay(10)
+            }
+        }
+        assertEquals(2, toolApi.requests.count { it.first == "call-reused-active" })
+        assertEquals(
+            listOf("older prompt", "new prompt"),
+            toolApi.requests.filter { it.first == "call-reused-active" }.map { it.second },
+        )
+    }
+
+    @Test
+    fun `same call id from same session is still treated as duplicate while active`() = runTest {
+        val toolApi = FakeVoiceToolApi()
+        val conversationStore = FakeVoiceConversationStore()
+        val manager = manager(toolApi = toolApi, conversationStore = conversationStore, scope = this)
+
+        assertTrue(manager.submit(callId = "call-duplicate-active", prompt = "first prompt", activeKey = "session-1:call-duplicate-active"))
+        assertEquals("call-duplicate-active" to "first prompt", toolApi.awaitRequest("call-duplicate-active"))
+
+        assertFalse(manager.submit(callId = "call-duplicate-active", prompt = "duplicate prompt", activeKey = "session-1:call-duplicate-active"))
+        assertEquals(listOf("first prompt"), toolApi.requests.map { it.second })
     }
 
     @Test
@@ -375,6 +416,41 @@ class HermesJobManagerTest {
         val record = conversationStore.conversation.value.hermesQueueRecords().single { it.callId == "call-cancel" }
         assertEquals(HermesQueueStatus.Canceled, record.status)
         assertEquals("Hermes job canceled.", record.error)
+    }
+
+    @Test
+    fun `keyed cancel does not cancel another session with reused call id`() = runTest {
+        val toolApi = FakeVoiceToolApi()
+        val conversationStore = FakeVoiceConversationStore()
+        val manager = manager(toolApi = toolApi, conversationStore = conversationStore, scope = this)
+
+        assertTrue(manager.submit(callId = "call-reused-cancel", prompt = "older prompt", activeKey = "session-1:call-reused-cancel"))
+        assertEquals("call-reused-cancel" to "older prompt", toolApi.awaitRequest("call-reused-cancel"))
+        conversationStore.awaitHermesRecord("call-reused-cancel") {
+            it.jobId == "job-1" && it.status == HermesQueueStatus.Queued
+        }
+        assertTrue(manager.submit(callId = "call-reused-cancel", prompt = "new prompt", activeKey = "session-2:call-reused-cancel"))
+        withTimeout(500) {
+            while (toolApi.requests.count { it.first == "call-reused-cancel" } < 2) {
+                delay(10)
+            }
+        }
+        conversationStore.awaitHermesRecord("call-reused-cancel") {
+            it.jobId == "job-2" && it.status == HermesQueueStatus.Queued
+        }
+
+        manager.cancel(callId = "call-reused-cancel", activeKey = "session-1:call-reused-cancel")
+        toolApi.awaitRemoteCancelledJob("job-1")
+        conversationStore.awaitHermesRecord("call-reused-cancel") {
+            it.jobId == "job-1" && it.status == HermesQueueStatus.Canceled
+        }
+
+        toolApi.complete(response(callId = "call-reused-cancel", answer = "new answer"))
+        conversationStore.awaitHermesRecord("call-reused-cancel") {
+            it.jobId == "job-2" &&
+                it.status == HermesQueueStatus.Complete &&
+                it.answer == "new answer"
+        }
     }
 
     @Test
@@ -1083,6 +1159,62 @@ class HermesJobManagerTest {
     }
 
     @Test
+    fun `resume skips same manager active pending submit with custom active key`() = runTest {
+        val toolApi = FakeVoiceToolApi()
+        val conversationStore = FakeVoiceConversationStore()
+        val blockedPendingUpdate = conversationStore.blockAfterNextUpdate()
+        val manager = manager(toolApi = toolApi, conversationStore = conversationStore, scope = this)
+
+        manager.submit(
+            callId = "call-resume-custom-pending",
+            prompt = "custom pending",
+            activeKey = "session-1:call-resume-custom-pending",
+        )
+        assertTrue(blockedPendingUpdate.started.await(500, TimeUnit.MILLISECONDS))
+        conversationStore.awaitHermesRecord("call-resume-custom-pending") {
+            it.status == HermesQueueStatus.Pending && it.jobId == null
+        }
+
+        manager.resumeActiveJobs()
+        blockedPendingUpdate.release.countDown()
+        assertEquals("call-resume-custom-pending" to "custom pending", toolApi.awaitRequest("call-resume-custom-pending"))
+        toolApi.complete(response(callId = "call-resume-custom-pending", answer = "custom pending answer"))
+        conversationStore.awaitHermesRecord("call-resume-custom-pending") {
+            it.status == HermesQueueStatus.Complete && it.answer == "custom pending answer"
+        }
+
+        val records = conversationStore.conversation.value.hermesQueueRecords()
+            .filter { it.callId == "call-resume-custom-pending" }
+        assertEquals(1, records.size)
+        assertFalse(records.any { it.status == HermesQueueStatus.Expired })
+        assertEquals(1, toolApi.requests.count { it.first == "call-resume-custom-pending" })
+    }
+
+    @Test
+    fun `resume does not start duplicate poller for live submitted job`() = runTest {
+        val toolApi = BlockingPollVoiceToolApi()
+        val conversationStore = FakeVoiceConversationStore()
+        val manager = manager(toolApi = toolApi, conversationStore = conversationStore, scope = this)
+
+        assertTrue(manager.submit(callId = "call-live-resume", prompt = "live resume", activeKey = "session-1:call-live-resume"))
+        conversationStore.awaitHermesRecord("call-live-resume") {
+            it.jobId == "job-live-resume" && it.status == HermesQueueStatus.Queued
+        }
+        toolApi.firstPollStarted.await()
+
+        manager.resumeActiveJobs()
+        delay(50)
+
+        assertEquals(1, toolApi.pollStarts.get())
+        toolApi.releasePoll.complete(Unit)
+        conversationStore.awaitHermesRecord("call-live-resume") {
+            it.jobId == "job-live-resume" &&
+                it.status == HermesQueueStatus.Complete &&
+                it.answer == "live resume answer"
+        }
+    }
+
+    @Test
     fun `resume ignores stale active duplicate superseded by terminal record`() = runTest {
         val initialConversation = Conversation.ofId(Uuid.random()).let {
             persister.upsertHermesTool(
@@ -1118,7 +1250,7 @@ class HermesJobManagerTest {
     }
 
     @Test
-    fun `resume polls latest active record when call id has multiple active jobs`() = runTest {
+    fun `resume polls distinct active records when call id has multiple active jobs`() = runTest {
         val initialConversation = Conversation.ofId(Uuid.random())
             .let {
                 persister.upsertHermesTool(
@@ -1139,7 +1271,7 @@ class HermesJobManagerTest {
                 )
             }
         val toolApi = FakeVoiceToolApi().apply {
-            seedJob(jobId = "job-old-active", callId = "call-reused-active")
+            scriptPollSucceeded(jobId = "job-old-active", callId = "call-reused-active", answer = "old active answer")
             scriptPollSucceeded(jobId = "job-new-active", callId = "call-reused-active", answer = "new active answer")
         }
         val conversationStore = FakeVoiceConversationStore(initialConversation)
@@ -1147,18 +1279,17 @@ class HermesJobManagerTest {
 
         manager.resumeActiveJobs()
         conversationStore.awaitHermesRecord("call-reused-active") {
-            it.jobId == "job-new-active" && it.status == HermesQueueStatus.Complete
+            it.jobId == "job-old-active" && it.status == HermesQueueStatus.Complete
         }
         conversationStore.awaitHermesRecord("call-reused-active") {
-            it.jobId == "job-old-active" && it.status == HermesQueueStatus.Expired
+            it.jobId == "job-new-active" && it.status == HermesQueueStatus.Complete
         }
 
         val records = conversationStore.conversation.value.hermesQueueRecords()
             .filter { it.callId == "call-reused-active" }
         assertEquals(listOf("job-old-active", "job-new-active"), records.map { it.jobId })
-        assertEquals(listOf(HermesQueueStatus.Expired, HermesQueueStatus.Complete), records.map { it.status })
-        assertEquals(1, toolApi.pollCount("call-reused-active"))
-        toolApi.awaitRemoteCancelledJob("job-old-active")
+        assertEquals(listOf(HermesQueueStatus.Complete, HermesQueueStatus.Complete), records.map { it.status })
+        assertEquals(2, toolApi.pollCount("call-reused-active"))
     }
 
     @Test
@@ -1343,9 +1474,48 @@ class HermesJobManagerTest {
 
         assertTrue(bridge.completionFollowUps.isEmpty())
         val snapshot = HermesQueueSnapshot.from(conversationStore.conversation.value)
-        assertEquals(listOf(HermesQueueStatus.Failed), snapshot.unannouncedTerminal.map { it.status })
+        assertTrue(snapshot.unannouncedTerminal.isEmpty())
+        assertEquals(listOf(HermesQueueStatus.Failed), snapshot.announcedTerminal.map { it.status })
         assertFalse(snapshot.toPromptSummary().contains("old answer"))
-        assertTrue(snapshot.toPromptSummary().contains("latest failure"))
+        assertFalse(snapshot.toPromptSummary().contains("latest failure"))
+        assertEquals(1, bridge.terminalFollowUps.size)
+        assertEquals("latest failure", bridge.terminalFollowUps.single().reason)
+    }
+
+    @Test
+    fun `repeated bridge attach announces failed terminal result once`() = runTest {
+        val conversation = Conversation.ofId(Uuid.random()).let {
+            persister.upsertHermesTool(
+                conversation = it,
+                callId = "call-failed-once",
+                prompt = "announce failure once",
+                status = VoiceToolRecordStatus.Failed("single failure"),
+                jobId = "job-failed-once",
+                resultAnnounced = false,
+            )
+        }
+        val toolApi = FakeVoiceToolApi()
+        val conversationStore = FakeVoiceConversationStore(conversation)
+        val bridge = RecordingHermesBridge()
+        val manager = manager(toolApi = toolApi, conversationStore = conversationStore, scope = this)
+
+        manager.attachBridge(bridge = bridge, sessionId = 5L)
+        manager.attachBridge(bridge = bridge, sessionId = 5L)
+        conversationStore.awaitHermesRecord("call-failed-once") {
+            it.resultAnnounced
+        }
+
+        assertEquals(1, bridge.terminalFollowUps.size)
+        assertEquals(
+            TerminalFollowUp(
+                callId = "call-failed-once",
+                prompt = "announce failure once",
+                status = HermesQueueStatus.Failed,
+                reason = "single failure",
+                sessionId = 5L,
+            ),
+            bridge.terminalFollowUps.single(),
+        )
     }
 
     @Test
@@ -1384,7 +1554,7 @@ class HermesJobManagerTest {
     }
 
     private fun manager(
-        toolApi: FakeVoiceToolApi,
+        toolApi: VoiceToolApi,
         conversationStore: VoiceConversationStore,
         scope: CoroutineScope,
         updateToolStatus: (VoiceToolStatus) -> Unit = {},
@@ -1601,10 +1771,56 @@ private class BlockedSnapshotUpdate {
     val release = CompletableDeferred<Unit>()
 }
 
+private class BlockingPollVoiceToolApi : VoiceToolApi {
+    val firstPollStarted = CompletableDeferred<Unit>()
+    val releasePoll = CompletableDeferred<Unit>()
+    val pollStarts = AtomicInteger(0)
+
+    override suspend fun submitHermesJob(callId: String, prompt: String): MobileHermesJobSubmitResponse {
+        return MobileHermesJobSubmitResponse(
+            jobId = "job-live-resume",
+            callId = callId,
+            status = "queued",
+            createdAt = "2026-06-11T00:00:00.000Z",
+        )
+    }
+
+    override suspend fun getHermesJob(jobId: String): MobileHermesJobPollResponse {
+        pollStarts.incrementAndGet()
+        firstPollStarted.complete(Unit)
+        releasePoll.await()
+        return MobileHermesJobPollResponse(
+            jobId = jobId,
+            callId = "call-live-resume",
+            status = "succeeded",
+            answer = "live resume answer",
+            model = "hermes-agent",
+            profileId = "default",
+            profileLabel = "Default",
+            elapsedMs = 123,
+            createdAt = "2026-06-11T00:00:00.000Z",
+            completedAt = "2026-06-11T00:00:01.000Z",
+        )
+    }
+
+    override suspend fun cancelHermesJob(jobId: String): MobileHermesJobPollResponse {
+        return MobileHermesJobPollResponse(
+            jobId = jobId,
+            callId = "call-live-resume",
+            status = "canceled",
+            error = "Hermes job canceled",
+            createdAt = "2026-06-11T00:00:00.000Z",
+            completedAt = "2026-06-11T00:00:01.000Z",
+        )
+    }
+}
+
 private class RecordingHermesBridge : HermesSessionBridge {
     val queuedAcknowledgements = Collections.synchronizedList(mutableListOf<Pair<String, Long>>())
     val completionFollowUps = Collections.synchronizedList(mutableListOf<CompletionFollowUp>())
+    val terminalFollowUps = Collections.synchronizedList(mutableListOf<TerminalFollowUp>())
     var failCompletionFollowUp = false
+    var failTerminalFollowUp = false
     var failQueuedAcknowledgement = false
     var throwQueuedAcknowledgement = false
     private val blockedQueuedAcknowledgements = Collections.synchronizedList(mutableListOf<BlockedBridgeCall>())
@@ -1638,6 +1854,24 @@ private class RecordingHermesBridge : HermesSessionBridge {
             callId = callId,
             prompt = prompt,
             answer = answer,
+            sessionId = sessionId,
+        )
+        return true
+    }
+
+    override fun sendTerminalFollowUp(
+        callId: String,
+        prompt: String,
+        status: HermesQueueStatus,
+        reason: String,
+        sessionId: Long,
+    ): Boolean {
+        if (failTerminalFollowUp) return false
+        terminalFollowUps += TerminalFollowUp(
+            callId = callId,
+            prompt = prompt,
+            status = status,
+            reason = reason,
             sessionId = sessionId,
         )
         return true
@@ -1679,5 +1913,13 @@ private data class CompletionFollowUp(
     val callId: String,
     val prompt: String,
     val answer: String,
+    val sessionId: Long,
+)
+
+private data class TerminalFollowUp(
+    val callId: String,
+    val prompt: String,
+    val status: HermesQueueStatus,
+    val reason: String,
     val sessionId: Long,
 )

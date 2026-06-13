@@ -5,7 +5,15 @@ import me.rerere.ai.ui.UIMessage
 import me.rerere.ai.ui.UIMessagePart
 import me.rerere.rikkahub.data.model.Conversation
 import me.rerere.rikkahub.data.model.MessageNode
+import me.rerere.rikkahub.voiceagent.VoiceAgentToolNames
+import me.rerere.rikkahub.voiceagent.hermes.HERMES_TOOL_RESULT_ANNOUNCED_KEY
+import me.rerere.rikkahub.voiceagent.hermes.HERMES_TOOL_SOURCE_KEY
+import me.rerere.rikkahub.voiceagent.hermes.HERMES_TOOL_STATUS_KEY
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import java.time.LocalDateTime
 import java.util.Locale
 import java.util.TimeZone
@@ -252,6 +260,96 @@ class VoiceContextBuilderTest {
     }
 
     @Test
+    fun `build includes active durable Hermes queue in system instruction`() {
+        val conversation = conversationWith(
+            listOf(
+                UIMessage.user("queue this"),
+                UIMessage(
+                    role = MessageRole.ASSISTANT,
+                    parts = listOf(
+                        hermesTool(
+                            callId = "call-active",
+                            prompt = "check project status",
+                            status = "running",
+                        )
+                    ),
+                ),
+            )
+        )
+
+        val context = VoiceContextBuilder().build(
+            assistantName = "Hermes",
+            assistantPrompt = "Prompt",
+            conversation = conversation,
+        )
+
+        assertTrue(context.systemInstruction.contains("Durable Hermes queue status:"))
+        assertTrue(context.systemInstruction.contains("- Still running: check project status"))
+        assertTrue(context.systemInstruction.contains("active queue items above"))
+    }
+
+    @Test
+    fun `build excludes unannounced durable Hermes result from system instruction`() {
+        val conversation = conversationWith(
+            listOf(
+                UIMessage.user("start a long request"),
+                UIMessage(
+                    role = MessageRole.ASSISTANT,
+                    parts = listOf(
+                        hermesTool(
+                            callId = "call-complete",
+                            prompt = "summarize the latest deployment",
+                            status = "complete",
+                            outputText = "Deployment completed successfully.",
+                            resultAnnounced = false,
+                        )
+                    ),
+                ),
+            )
+        )
+
+        val context = VoiceContextBuilder().build(
+            assistantName = "Hermes",
+            assistantPrompt = "Prompt",
+            conversation = conversation,
+        )
+
+        assertFalse(context.systemInstruction.contains("- Completed: summarize the latest deployment"))
+        assertFalse(context.systemInstruction.contains("Hermes answer: Deployment completed successfully."))
+    }
+
+    @Test
+    fun `build excludes failed durable Hermes result from system instruction`() {
+        val conversation = conversationWith(
+            listOf(
+                UIMessage.user("start a risky request"),
+                UIMessage(
+                    role = MessageRole.ASSISTANT,
+                    parts = listOf(
+                        hermesTool(
+                            callId = "call-failed",
+                            prompt = "debug the latest run",
+                            status = "failed",
+                            outputText = "Hermes request failed.",
+                            resultAnnounced = false,
+                        )
+                    ),
+                ),
+            )
+        )
+
+        val context = VoiceContextBuilder().build(
+            assistantName = "Hermes",
+            assistantPrompt = "Prompt",
+            conversation = conversation,
+        )
+
+        assertFalse(context.systemInstruction.contains("- Failed: debug the latest run"))
+        assertFalse(context.systemInstruction.contains("Reason: Hermes request failed."))
+        assertFalse(context.systemInstruction.contains("completed, failed, expired, or canceled Hermes queue items"))
+    }
+
+    @Test
     fun `build renders voice system prompt placeholders before Gemini setup`() {
         val context = VoiceContextBuilder(
             placeholderValues = VoicePromptPlaceholderValues(
@@ -332,6 +430,24 @@ class VoiceContextBuilderTest {
     private fun conversationWith(messages: List<UIMessage>): Conversation = Conversation.ofId(
         id = Uuid.random(),
         messages = messages.map(MessageNode::of),
+    )
+
+    private fun hermesTool(
+        callId: String,
+        prompt: String,
+        status: String,
+        outputText: String? = null,
+        resultAnnounced: Boolean = false,
+    ): UIMessagePart.Tool = UIMessagePart.Tool(
+        toolCallId = callId,
+        toolName = VoiceAgentToolNames.ASK_HERMES,
+        input = """{"prompt":"$prompt"}""",
+        output = outputText?.let { listOf(UIMessagePart.Text(it)) }.orEmpty(),
+        metadata = buildJsonObject {
+            put(HERMES_TOOL_SOURCE_KEY, VoiceAgentToolNames.ASK_HERMES)
+            put(HERMES_TOOL_STATUS_KEY, status)
+            put(HERMES_TOOL_RESULT_ANNOUNCED_KEY, resultAnnounced)
+        },
     )
 
     private companion object {

@@ -56,6 +56,20 @@ data class HermesQueueSnapshot(
     val hasPromptSummary: Boolean
         get() = active.isNotEmpty() || unannouncedTerminal.isNotEmpty()
 
+    val hasActivePromptSummary: Boolean
+        get() = active.isNotEmpty()
+
+    fun toActivePromptSummary(): String {
+        if (!hasActivePromptSummary) return ""
+        return buildString {
+            appendLine("Durable Hermes queue status:")
+            active.forEach { record ->
+                appendLine("- Still ${record.status.wireName}: ${record.prompt}")
+            }
+            append("If there are active queue items above, briefly tell the user they are still in progress.")
+        }.trim()
+    }
+
     fun toPromptSummary(): String {
         if (!hasPromptSummary) return ""
         return buildString {
@@ -84,8 +98,8 @@ data class HermesQueueSnapshot(
                 }
             }
             append(
-                "If there are completed results above, briefly tell the user those Hermes answers are ready. " +
-                    "Do not repeat completed results after they have already been announced."
+                "Briefly tell the user about any completed, failed, expired, or canceled Hermes queue items above. " +
+                    "Do not repeat terminal results after they have already been announced."
             )
         }.trim()
     }

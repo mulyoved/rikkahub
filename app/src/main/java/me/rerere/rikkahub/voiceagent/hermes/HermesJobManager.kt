@@ -27,6 +27,13 @@ import java.time.Instant
 interface HermesSessionBridge {
     fun sendQueuedAcknowledgement(callId: String, sessionId: Long): Boolean
     fun sendCompletionFollowUp(callId: String, prompt: String, answer: String, sessionId: Long): Boolean
+    fun sendTerminalFollowUp(
+        callId: String,
+        prompt: String,
+        status: HermesQueueStatus,
+        reason: String,
+        sessionId: Long,
+    ): Boolean
 }
 
 data class HermesJobCompletion(
@@ -81,10 +88,18 @@ class HermesJobManager(
     private var bridgeAttachment: BridgeAttachment? = null
 
     fun submit(callId: String, prompt: String): Boolean {
+        return submit(callId = callId, prompt = prompt, activeKey = callActiveKey(callId))
+    }
+
+    fun submit(callId: String, prompt: String, activeKey: String): Boolean {
         val managedJob = synchronized(lock) {
-            if (activeJobs.containsKey(callId)) return false
-            ManagedHermesJob(callId = callId, prompt = prompt).also {
-                activeJobs[callId] = it
+            if (activeJobs.containsKey(activeKey)) return false
+            ManagedHermesJob(
+                activeKey = activeKey,
+                callId = callId,
+                prompt = prompt,
+            ).also {
+                activeJobs[activeKey] = it
             }
         }
         launchManagedJob(managedJob) {
@@ -97,12 +112,9 @@ class HermesJobManager(
         conversationStore.conversation.value.hermesQueueRecords()
             .latestByHermesDurableIdentity()
             .filter { !it.status.isTerminal }
-            .groupBy { it.callId }
-            .values
-            .forEach { records ->
-                val record = records.last()
-                if (synchronized(lock) { activeJobs.containsKey(record.callId) }) return@forEach
-                records.dropLast(1).forEach(::expireSupersededActiveRecord)
+            .forEach { record ->
+                val activeKey = record.activeKey()
+                if (synchronized(lock) { hasActiveJob(record = record, activeKey = activeKey) }) return@forEach
                 val jobId = record.jobId
                 if (jobId == null) {
                     scope.launch(dispatcher) {
@@ -129,22 +141,33 @@ class HermesJobManager(
                             )
                         }
                         return@forEach
-                    }
+                }
                 val managedJob = synchronized(lock) {
-                    if (activeJobs.containsKey(record.callId)) return@forEach
+                    if (hasActiveJob(record = record, activeKey = activeKey)) return@forEach
                     ManagedHermesJob(
+                        activeKey = activeKey,
                         callId = record.callId,
                         prompt = record.prompt,
                         jobId = jobId,
                         startedAtMs = startedAtMs,
                     ).also {
-                        activeJobs[record.callId] = it
+                        activeJobs[activeKey] = it
                     }
                 }
                 launchManagedJob(managedJob) {
                     pollHermesJobSafely(managedJob, jobId)
                 }
+        }
+    }
+
+    private fun hasActiveJob(record: HermesQueueRecord, activeKey: String): Boolean {
+        if (activeJobs.containsKey(activeKey)) return true
+        return activeJobs.values.any { managedJob ->
+            when {
+                record.jobId != null -> managedJob.jobId == record.jobId
+                else -> managedJob.callId == record.callId && managedJob.jobId == null
             }
+        }
     }
 
     suspend fun awaitJobs() {
@@ -178,7 +201,7 @@ class HermesJobManager(
             bridgeAttachment = BridgeAttachment(bridge = bridge, sessionId = sessionId)
         }
         scope.launch(dispatcher) {
-            announceUnannouncedCompletedResults(bridge = bridge, sessionId = sessionId)
+            announceUnannouncedTerminalResults(bridge = bridge, sessionId = sessionId)
         }
     }
 
@@ -197,11 +220,23 @@ class HermesJobManager(
     }
 
     fun cancel(callId: String) {
+        cancel(callId = callId, activeKey = null)
+    }
+
+    fun cancel(callId: String, activeKey: String?) {
         val managedJob = synchronized(lock) {
-            activeJobs[callId]?.also { it.explicitlyCanceled = true }
+            val job = activeKey?.let { activeJobs[it] }
+                ?: activeJobs.values.lastOrNull { it.callId == callId }
+            job?.also { it.explicitlyCanceled = true }
         }
         val persistedRecord = conversationStore.conversation.value.hermesQueueRecords()
-            .lastOrNull { it.callId == callId }
+            .lastOrNull { record ->
+                record.callId == callId && when {
+                    managedJob?.jobId != null -> record.jobId == managedJob.jobId
+                    activeKey != null -> record.jobId == null
+                    else -> true
+                }
+            }
         if (managedJob == null && persistedRecord?.status?.isTerminal != false) return
 
         val prompt = managedJob?.prompt ?: persistedRecord?.prompt.orEmpty()
@@ -213,7 +248,7 @@ class HermesJobManager(
             if (canceled) {
                 updateToolStatus(callId, VoiceToolStatus.HermesFailed(callId = callId, message = CANCELED_MESSAGE))
                 val latestManagedJobId = synchronized(lock) {
-                    managedJob?.jobId ?: activeJobs[callId]?.jobId
+                    managedJob?.jobId ?: activeJobs.values.lastOrNull { it.callId == callId }?.jobId
                 }
                 val latestJobId = latestManagedJobId
                     ?: if (managedJob == null) persistedRecord?.jobId ?: initialJobId else initialJobId
@@ -235,8 +270,8 @@ class HermesJobManager(
         managedJob.job = job
         job.invokeOnCompletion {
             synchronized(lock) {
-                if (activeJobs[managedJob.callId] === managedJob) {
-                    activeJobs.remove(managedJob.callId)
+                if (activeJobs[managedJob.activeKey] === managedJob) {
+                    activeJobs.remove(managedJob.activeKey)
                 }
             }
         }
@@ -685,18 +720,26 @@ class HermesJobManager(
         }
     }
 
-    private suspend fun announceUnannouncedCompletedResults(bridge: HermesSessionBridge, sessionId: Long) {
+    private suspend fun announceUnannouncedTerminalResults(bridge: HermesSessionBridge, sessionId: Long) {
         conversationStore.conversation.value.hermesQueueRecords()
             .latestByHermesDurableIdentity()
-            .filter { it.status == HermesQueueStatus.Complete && !it.resultAnnounced && it.answer != null }
+            .filter { it.status.isTerminal && !it.resultAnnounced }
             .forEach { record ->
                 val current = currentBridgeAttachment() ?: return@forEach
                 if (current.bridge !== bridge || current.sessionId != sessionId) return@forEach
-                announceCompletedResult(
-                    callId = record.callId,
-                    jobId = record.jobId,
-                    attachment = current,
-                )
+                if (record.status == HermesQueueStatus.Complete && record.answer != null) {
+                    announceCompletedResult(
+                        callId = record.callId,
+                        jobId = record.jobId,
+                        attachment = current,
+                    )
+                } else if (record.status != HermesQueueStatus.Complete) {
+                    announceTerminalResult(
+                        callId = record.callId,
+                        jobId = record.jobId,
+                        attachment = current,
+                    )
+                }
             }
     }
 
@@ -724,6 +767,56 @@ class HermesJobManager(
                             callId = callId,
                             prompt = record.prompt,
                             answer = requireNotNull(record.answer),
+                            sessionId = current.sessionId,
+                        )
+                    }
+                } ?: false
+            }.getOrDefault(false)
+            if (sent) {
+                updateConversation { conversation ->
+                    persister.markHermesToolResultAnnounced(
+                        conversation = conversation,
+                        callId = callId,
+                        jobId = jobId,
+                        matchMissingJobId = jobId == null,
+                    )
+                }
+            }
+        }
+    }
+
+    private suspend fun announceTerminalResult(
+        callId: String,
+        jobId: String?,
+        attachment: BridgeAttachment? = currentBridgeAttachment(),
+    ) {
+        val current = attachment ?: return
+        announcementMutex.withLock {
+            val record = conversationStore.conversation.value.hermesQueueRecords()
+                .lastOrNull { record ->
+                    record.callId == callId && when {
+                        jobId != null -> record.jobId == jobId
+                        else -> record.jobId == null
+                    }
+                }
+            if (
+                record == null ||
+                record.status == HermesQueueStatus.Complete ||
+                !record.status.isTerminal ||
+                record.resultAnnounced
+            ) {
+                return@withLock
+            }
+            if (!current.isCurrentBridgeAttachment()) return@withLock
+
+            val sent = runCatching {
+                withTimeoutOrNull(bridgeSendTimeoutMs) {
+                    runInterruptible {
+                        current.bridge.sendTerminalFollowUp(
+                            callId = callId,
+                            prompt = record.prompt,
+                            status = record.status,
+                            reason = record.error.orEmpty(),
                             sessionId = current.sessionId,
                         )
                     }
@@ -1038,7 +1131,14 @@ class HermesJobManager(
             ?.let { runCatching { Instant.parse(it).toEpochMilli() }.getOrNull() }
     }
 
+    private fun HermesQueueRecord.activeKey(): String {
+        return jobId?.let { "job:$it" } ?: callActiveKey(callId)
+    }
+
+    private fun callActiveKey(callId: String): String = "call:$callId"
+
     private class ManagedHermesJob(
+        val activeKey: String,
         val callId: String,
         val prompt: String,
         var jobId: String? = null,

@@ -27,6 +27,7 @@ import me.rerere.rikkahub.voiceagent.hermes.HermesJobCompletion
 import me.rerere.rikkahub.voiceagent.hermes.HermesJobFailure
 import me.rerere.rikkahub.voiceagent.hermes.HermesJobManager
 import me.rerere.rikkahub.voiceagent.hermes.HermesPollFailure
+import me.rerere.rikkahub.voiceagent.hermes.HermesQueueStatus
 import me.rerere.rikkahub.voiceagent.hermes.HermesSessionBridge
 import me.rerere.rikkahub.voiceagent.persistence.VoiceConversationPersister
 import me.rerere.rikkahub.voiceagent.persistence.VoiceTranscriptStatus
@@ -417,6 +418,36 @@ class VoiceAgentCoordinator(
             }
             return sent
         }
+
+        override fun sendTerminalFollowUp(
+            callId: String,
+            prompt: String,
+            status: HermesQueueStatus,
+            reason: String,
+            sessionId: Long,
+        ): Boolean {
+            clearOutputAudioSuppressionForNewTurn()
+            val text = hermesTerminalFollowUpText(prompt = prompt, status = status, reason = reason)
+            val sent = if (sessionId == UNBOUND_HERMES_BRIDGE_SESSION_ID) {
+                gemini.sendTextTurn(text = text)
+            } else {
+                gemini.sendTextTurn(text = text, sessionId = sessionId)
+            }
+            writeHermesQueueEvent(
+                type = "late_terminal_text_turn_sent",
+                callId = callId,
+                jobId = "none",
+                sent = sent,
+            )
+            val detail = "callId=$callId, jobId=none, status=${status.wireName}, reasonChars=${reason.length}"
+            if (sent) {
+                diagnostics.record("hermes_terminal_follow_up_sent", detail)
+            } else {
+                diagnostics.record("hermes_terminal_follow_up_failed", detail)
+                appendLocalAssistantTranscript("Hermes ${status.wireName}: $reason")
+            }
+            return sent
+        }
     }
 
     fun attachHermesBridge(bridge: HermesSessionBridge, sessionId: Long) {
@@ -565,7 +596,8 @@ class VoiceAgentCoordinator(
         runCatching {
             Log.d(E2E_TAG, "hermes_tool_call_received callId=${call.callId} promptChars=${call.prompt.length}")
         }
-        if (hermesJobManager.submit(callId = call.callId, prompt = call.prompt)) {
+        val activeKey = ToolCallKey(sessionId = sessionId, callId = call.callId).toString()
+        if (hermesJobManager.submit(callId = call.callId, prompt = call.prompt, activeKey = activeKey)) {
             writeArtifactSafely(artifact = VoiceE2EArtifact.HermesCall, content = call.prompt)
             recordHermesToolRequestHash(callId = call.callId, prompt = call.prompt)
             diagnostics.record("hermes_tool_started", "callId=${call.callId}")
@@ -604,6 +636,10 @@ class VoiceAgentCoordinator(
 
     private fun hermesCompletionFollowUpText(prompt: String, answer: String): String =
         "$HERMES_COMPLETION_FOLLOW_UP_PREFIX\n\nOriginal request:\n$prompt\n\nHermes answer:\n$answer"
+
+    private fun hermesTerminalFollowUpText(prompt: String, status: HermesQueueStatus, reason: String): String =
+        "A queued Hermes request reached a terminal state.\n\nOriginal request:\n$prompt\n\n" +
+            "Hermes status: ${status.wireName}\nReason: $reason"
 
     private fun appendLocalAssistantTranscript(text: String) {
         val artifactSnapshot = synchronized(toolJobsLock) {
@@ -666,7 +702,12 @@ class VoiceAgentCoordinator(
                 cancelledToolCallIds += ToolCallKey(sessionId = sessionId, callId = callId)
             }
         }
-        event.callIds.forEach(hermesJobManager::cancel)
+        event.callIds.forEach { callId ->
+            hermesJobManager.cancel(
+                callId = callId,
+                activeKey = ToolCallKey(sessionId = sessionId, callId = callId).toString(),
+            )
+        }
         removeToolStatuses(event.callIds)
     }
 
