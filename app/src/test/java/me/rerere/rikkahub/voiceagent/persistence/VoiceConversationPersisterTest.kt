@@ -566,36 +566,41 @@ class VoiceConversationPersisterTest {
     @Test
     fun `Hermes queued and running statuses persist job metadata`() {
         val persister = VoiceConversationPersister()
-        val conversation = emptyConversation()
-            .let {
-                persister.upsertHermesTool(
-                    conversation = it,
-                    callId = "call-1",
-                    prompt = "queued prompt",
-                    status = VoiceToolRecordStatus.Queued,
-                    sessionId = "session-1",
-                    jobId = "job-1",
-                )
-            }
-            .let {
-                persister.upsertHermesTool(
-                    conversation = it,
-                    callId = "call-1",
-                    prompt = "queued prompt",
-                    status = VoiceToolRecordStatus.Running,
-                    sessionId = "session-1",
-                    jobId = "job-1",
-                )
-            }
+        val queuedConversation = persister.upsertHermesTool(
+            conversation = emptyConversation(),
+            callId = "call-1",
+            prompt = "queued prompt",
+            status = VoiceToolRecordStatus.Queued,
+            sessionId = "session-1",
+            jobId = "job-1",
+        )
 
-        val tool = conversation.currentMessages.single().parts.single() as UIMessagePart.Tool
-        val metadata = tool.metadata!!
+        val queuedTool = queuedConversation.currentMessages.single().parts.single() as UIMessagePart.Tool
+        val queuedMetadata = queuedTool.metadata!!
 
-        assertEquals("running", metadata["voice_tool_status"]!!.jsonPrimitive.content)
-        assertEquals("job-1", metadata["voice_tool_job_id"]!!.jsonPrimitive.content)
-        assertEquals("false", metadata["voice_tool_result_announced"]!!.jsonPrimitive.content)
-        assertTrue(metadata.containsKey("voice_tool_created_at"))
-        assertTrue(metadata.containsKey("voice_tool_updated_at"))
+        assertEquals("queued", queuedMetadata["voice_tool_status"]!!.jsonPrimitive.content)
+        assertEquals("job-1", queuedMetadata["voice_tool_job_id"]!!.jsonPrimitive.content)
+        assertEquals("false", queuedMetadata["voice_tool_result_announced"]!!.jsonPrimitive.content)
+        assertTrue(queuedMetadata.containsKey("voice_tool_created_at"))
+        assertTrue(queuedMetadata.containsKey("voice_tool_updated_at"))
+
+        val runningConversation = persister.upsertHermesTool(
+            conversation = queuedConversation,
+            callId = "call-1",
+            prompt = "queued prompt",
+            status = VoiceToolRecordStatus.Running,
+            sessionId = "session-1",
+            jobId = "job-1",
+        )
+
+        val runningTool = runningConversation.currentMessages.single().parts.single() as UIMessagePart.Tool
+        val runningMetadata = runningTool.metadata!!
+
+        assertEquals("running", runningMetadata["voice_tool_status"]!!.jsonPrimitive.content)
+        assertEquals("job-1", runningMetadata["voice_tool_job_id"]!!.jsonPrimitive.content)
+        assertEquals("false", runningMetadata["voice_tool_result_announced"]!!.jsonPrimitive.content)
+        assertTrue(runningMetadata.containsKey("voice_tool_created_at"))
+        assertTrue(runningMetadata.containsKey("voice_tool_updated_at"))
     }
 
     @Test
@@ -612,13 +617,43 @@ class VoiceConversationPersisterTest {
                     resultAnnounced = false,
                 )
             }
+            .let {
+                persister.upsertHermesTool(
+                    conversation = it,
+                    callId = "call-2",
+                    prompt = "other prompt",
+                    status = VoiceToolRecordStatus.Complete("other answer"),
+                    jobId = "job-2",
+                    resultAnnounced = false,
+                )
+            }
+            .let {
+                persister.upsertHermesTool(
+                    conversation = it,
+                    callId = "call-3",
+                    prompt = "active prompt",
+                    status = VoiceToolRecordStatus.Running,
+                    jobId = "job-3",
+                    resultAnnounced = false,
+                )
+            }
             .let { persister.markHermesToolResultAnnounced(it, callId = "call-1") }
 
-        val tool = conversation.currentMessages.single().parts.single() as UIMessagePart.Tool
+        val tools = conversation.currentMessages
+            .flatMap { it.parts }
+            .filterIsInstance<UIMessagePart.Tool>()
+            .associateBy { it.toolCallId }
 
-        assertEquals("true", tool.metadata!!["voice_tool_result_announced"]!!.jsonPrimitive.content)
-        val output = tool.output.single() as UIMessagePart.Text
-        assertEquals("true", output.metadata!!["voice_tool_result_announced"]!!.jsonPrimitive.content)
+        assertEquals("true", tools.getValue("call-1").metadata!!["voice_tool_result_announced"]!!.jsonPrimitive.content)
+        val call1Output = tools.getValue("call-1").output.single() as UIMessagePart.Text
+        assertEquals("true", call1Output.metadata!!["voice_tool_result_announced"]!!.jsonPrimitive.content)
+
+        assertEquals("false", tools.getValue("call-2").metadata!!["voice_tool_result_announced"]!!.jsonPrimitive.content)
+        val call2Output = tools.getValue("call-2").output.single() as UIMessagePart.Text
+        assertEquals("false", call2Output.metadata!!["voice_tool_result_announced"]!!.jsonPrimitive.content)
+
+        assertEquals("false", tools.getValue("call-3").metadata!!["voice_tool_result_announced"]!!.jsonPrimitive.content)
+        assertTrue(tools.getValue("call-3").output.isEmpty())
     }
 
     private fun emptyConversation(): Conversation = Conversation.ofId(
