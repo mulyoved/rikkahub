@@ -643,18 +643,21 @@ class VoiceConversationPersisterTest {
         val tools = conversation.currentMessages
             .flatMap { it.parts }
             .filterIsInstance<UIMessagePart.Tool>()
-            .associateBy { it.toolCallId }
 
-        assertEquals("true", tools.getValue("call-1").metadata!!["voice_tool_result_announced"]!!.jsonPrimitive.content)
-        val call1Output = tools.getValue("call-1").output.single() as UIMessagePart.Text
+        assertEquals(listOf("call-1", "call-2", "call-3"), tools.map { it.toolCallId })
+
+        val toolsByCallId = tools.associateBy { it.toolCallId }
+
+        assertEquals("true", toolsByCallId.getValue("call-1").metadata!!["voice_tool_result_announced"]!!.jsonPrimitive.content)
+        val call1Output = toolsByCallId.getValue("call-1").output.single() as UIMessagePart.Text
         assertEquals("true", call1Output.metadata!!["voice_tool_result_announced"]!!.jsonPrimitive.content)
 
-        assertEquals("false", tools.getValue("call-2").metadata!!["voice_tool_result_announced"]!!.jsonPrimitive.content)
-        val call2Output = tools.getValue("call-2").output.single() as UIMessagePart.Text
+        assertEquals("false", toolsByCallId.getValue("call-2").metadata!!["voice_tool_result_announced"]!!.jsonPrimitive.content)
+        val call2Output = toolsByCallId.getValue("call-2").output.single() as UIMessagePart.Text
         assertEquals("false", call2Output.metadata!!["voice_tool_result_announced"]!!.jsonPrimitive.content)
 
-        assertEquals("false", tools.getValue("call-3").metadata!!["voice_tool_result_announced"]!!.jsonPrimitive.content)
-        assertTrue(tools.getValue("call-3").output.isEmpty())
+        assertEquals("false", toolsByCallId.getValue("call-3").metadata!!["voice_tool_result_announced"]!!.jsonPrimitive.content)
+        assertTrue(toolsByCallId.getValue("call-3").output.isEmpty())
     }
 
     private fun emptyConversation(): Conversation = Conversation.ofId(
