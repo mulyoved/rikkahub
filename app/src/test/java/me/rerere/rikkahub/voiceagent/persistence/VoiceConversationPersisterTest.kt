@@ -781,6 +781,38 @@ class VoiceConversationPersisterTest {
     }
 
     @Test
+    fun `terminal upsert with job id replaces legacy active record without job id`() {
+        val persister = VoiceConversationPersister()
+        val active = persister.upsertHermesTool(
+            conversation = emptyConversation(),
+            callId = "call-1",
+            prompt = "legacy active prompt",
+            status = VoiceToolRecordStatus.Pending,
+        )
+        val activeTool = active.currentMessages.single().parts.single() as UIMessagePart.Tool
+        val activeCreatedAt = activeTool.metadata!!["voice_tool_created_at"]!!.jsonPrimitive.content
+
+        val completed = persister.upsertHermesTool(
+            conversation = active,
+            callId = "call-1",
+            prompt = "completed prompt",
+            status = VoiceToolRecordStatus.Complete("completed answer"),
+            jobId = "job-1",
+        )
+
+        val tools = completed.currentMessages
+            .flatMap { it.parts }
+            .filterIsInstance<UIMessagePart.Tool>()
+
+        assertEquals(1, tools.size)
+        val tool = tools.single()
+        assertEquals("complete", tool.metadata!!["voice_tool_status"]!!.jsonPrimitive.content)
+        assertEquals("job-1", tool.metadata!!["voice_tool_job_id"]!!.jsonPrimitive.content)
+        assertEquals(activeCreatedAt, tool.metadata!!["voice_tool_created_at"]!!.jsonPrimitive.content)
+        assertEquals("completed answer", tool.output.text())
+    }
+
+    @Test
     fun `mark Hermes result announced updates only matching terminal tool`() {
         val persister = VoiceConversationPersister()
         val conversation = emptyConversation()

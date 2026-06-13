@@ -320,7 +320,7 @@ class VoiceConversationPersister {
         return if (!newStatus.queueStatus.isTerminal) {
             isActiveHermesTool() && (newJobId == null || existingJobId == null || existingJobId == newJobId)
         } else if (newJobId != null) {
-            existingJobId == newJobId
+            existingJobId == newJobId || (existingJobId == null && isActiveHermesTool())
         } else {
             true
         }
