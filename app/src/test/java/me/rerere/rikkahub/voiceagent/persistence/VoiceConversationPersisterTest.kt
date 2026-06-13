@@ -563,6 +563,64 @@ class VoiceConversationPersisterTest {
         )
     }
 
+    @Test
+    fun `Hermes queued and running statuses persist job metadata`() {
+        val persister = VoiceConversationPersister()
+        val conversation = emptyConversation()
+            .let {
+                persister.upsertHermesTool(
+                    conversation = it,
+                    callId = "call-1",
+                    prompt = "queued prompt",
+                    status = VoiceToolRecordStatus.Queued,
+                    sessionId = "session-1",
+                    jobId = "job-1",
+                )
+            }
+            .let {
+                persister.upsertHermesTool(
+                    conversation = it,
+                    callId = "call-1",
+                    prompt = "queued prompt",
+                    status = VoiceToolRecordStatus.Running,
+                    sessionId = "session-1",
+                    jobId = "job-1",
+                )
+            }
+
+        val tool = conversation.currentMessages.single().parts.single() as UIMessagePart.Tool
+        val metadata = tool.metadata!!
+
+        assertEquals("running", metadata["voice_tool_status"]!!.jsonPrimitive.content)
+        assertEquals("job-1", metadata["voice_tool_job_id"]!!.jsonPrimitive.content)
+        assertEquals("false", metadata["voice_tool_result_announced"]!!.jsonPrimitive.content)
+        assertTrue(metadata.containsKey("voice_tool_created_at"))
+        assertTrue(metadata.containsKey("voice_tool_updated_at"))
+    }
+
+    @Test
+    fun `mark Hermes result announced updates only matching terminal tool`() {
+        val persister = VoiceConversationPersister()
+        val conversation = emptyConversation()
+            .let {
+                persister.upsertHermesTool(
+                    conversation = it,
+                    callId = "call-1",
+                    prompt = "prompt",
+                    status = VoiceToolRecordStatus.Complete("answer"),
+                    jobId = "job-1",
+                    resultAnnounced = false,
+                )
+            }
+            .let { persister.markHermesToolResultAnnounced(it, callId = "call-1") }
+
+        val tool = conversation.currentMessages.single().parts.single() as UIMessagePart.Tool
+
+        assertEquals("true", tool.metadata!!["voice_tool_result_announced"]!!.jsonPrimitive.content)
+        val output = tool.output.single() as UIMessagePart.Text
+        assertEquals("true", output.metadata!!["voice_tool_result_announced"]!!.jsonPrimitive.content)
+    }
+
     private fun emptyConversation(): Conversation = Conversation.ofId(
         id = Uuid.random(),
         messages = emptyList(),
