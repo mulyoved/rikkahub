@@ -68,6 +68,14 @@ class OkHttpGeminiLiveVoiceClient(
         return delegate.sendToolResponse(callId = callId, answer = answer, sessionId = sessionId)
     }
 
+    override fun sendTextTurn(text: String): Boolean {
+        return delegate.sendTextTurn(text = text)
+    }
+
+    override fun sendTextTurn(text: String, sessionId: Long?): Boolean {
+        return delegate.sendTextTurn(text = text, sessionId = sessionId)
+    }
+
     override fun close() {
         delegate.close()
     }

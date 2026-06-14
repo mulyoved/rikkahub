@@ -6,6 +6,7 @@ import me.rerere.ai.ui.UIMessage
 import me.rerere.ai.ui.UIMessagePart
 import me.rerere.rikkahub.data.model.Conversation
 import me.rerere.rikkahub.voiceagent.gemini.GeminiContentTurn
+import me.rerere.rikkahub.voiceagent.hermes.HermesQueueSnapshot
 import java.time.LocalDate
 import java.time.LocalDateTime
 import java.time.LocalTime
@@ -57,6 +58,7 @@ class VoiceContextBuilder(
                 assistantPrompt = assistantPrompt,
                 voiceModelName = voiceModelName,
                 userNickname = userNickname,
+                hermesQueueSummary = HermesQueueSnapshot.from(conversation).toActivePromptSummary(),
             ),
             turns = (leadingSummaryTurns + recentTurns).takeLast(maxTurns),
         )
@@ -67,6 +69,7 @@ class VoiceContextBuilder(
         assistantPrompt: String,
         voiceModelName: String,
         userNickname: String,
+        hermesQueueSummary: String,
     ): String {
         val renderedAssistantPrompt = assistantPrompt.renderVoicePlaceholders(
             assistantName = assistantName,
@@ -76,6 +79,11 @@ class VoiceContextBuilder(
         return buildString {
             appendLine("You are $assistantName in RikkaHub voice mode.")
             append(VOICE_HERMES_TOOL_POLICY)
+            if (hermesQueueSummary.isNotBlank()) {
+                appendLine()
+                appendLine()
+                append(hermesQueueSummary)
+            }
             if (renderedAssistantPrompt.isNotBlank()) {
                 appendLine()
                 appendLine()

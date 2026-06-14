@@ -151,6 +151,36 @@ class GeminiLiveVoiceClientTest {
     }
 
     @Test
+    fun `send text turn sends client content after setup`() = runBlocking {
+        val socket = FakeGeminiSocket()
+        val client = TestableGeminiLiveVoiceClient(socket = socket, codec = GeminiLiveCodec())
+
+        client.connect(
+            token = "token-1",
+            websocketUrl = "wss://example.test/live",
+            providerModel = "gemini-2.0-flash-live-001",
+            liveConnectConfig = liveConnectConfig,
+            systemInstruction = "You are Hermes.",
+            contextTurns = emptyList(),
+            onEvent = {},
+        )
+        socket.receive(setupCompleteMessage)
+
+        assertTrue(client.sendTextTurn("Hermes answer is ready"))
+
+        val clientContent = socket.sentMessages.last()
+            .jsonObject()["clientContent"]!!
+            .jsonObject
+        assertTrue(clientContent["turnComplete"]!!.jsonPrimitive.boolean)
+        val turn = clientContent["turns"]!!.jsonArray.single().jsonObject
+        assertEquals("user", turn["role"]!!.jsonPrimitive.content)
+        assertEquals(
+            "Hermes answer is ready",
+            turn["parts"]!!.jsonArray.single().jsonObject["text"]!!.jsonPrimitive.content,
+        )
+    }
+
+    @Test
     fun `connect omits client content when context is empty`() = runBlocking {
         val socket = FakeGeminiSocket()
         val client = TestableGeminiLiveVoiceClient(socket = socket, codec = GeminiLiveCodec())
