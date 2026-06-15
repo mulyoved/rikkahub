@@ -1,6 +1,7 @@
 package me.rerere.rikkahub.voiceagent.voicelab
 
 import kotlinx.coroutines.runBlocking
+import me.rerere.rikkahub.voiceagent.telemetry.VoiceTraceContext
 import okhttp3.Protocol
 import okhttp3.Request
 import okhttp3.Response
@@ -132,6 +133,44 @@ class VoiceLabMobileApiTest {
         api.askHermes(callId = "call-1", prompt = "status", profileId = "research")
 
         assertTrue(seenBody.contains("\"profileId\":\"research\""))
+    }
+
+    @Test
+    fun `requests include voice trace headers when configured`() = runBlocking {
+        var seenRequest: Request? = null
+        val transport = transportFor { request ->
+            seenRequest = request
+            responseFor(
+                request = request,
+                body = """
+                {
+                  "callId":"call-1",
+                  "answer":"done",
+                  "model":"ms-agent",
+                  "profileId":"default",
+                  "profileLabel":"Default"
+                }
+                """.trimIndent(),
+            )
+        }
+
+        val api = VoiceLabMobileApi(
+            baseUrl = "https://voice-lab.example.test",
+            credentials = VoiceLabMobileCredentials(hermesProfileApiKey = "profile-api-key"),
+            transport = transport,
+            traceHeaders = VoiceLabTraceHeaders.from(
+                VoiceTraceContext(
+                    traceId = "trace-123",
+                    voiceSessionId = "session-456",
+                )
+            ),
+        )
+
+        api.askHermes(callId = "call-1", prompt = "status")
+
+        val request = requireNotNull(seenRequest)
+        assertEquals("trace-123", request.header("X-Voice-Trace-Id"))
+        assertEquals("session-456", request.header("X-Voice-Session-Id"))
     }
 
     @Test
