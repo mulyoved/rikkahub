@@ -7,7 +7,11 @@ import me.rerere.rikkahub.data.datastore.SettingsStore
 import me.rerere.rikkahub.service.ChatService
 import me.rerere.rikkahub.voiceagent.audio.AndroidVoiceAudioEngine
 import me.rerere.rikkahub.voiceagent.gemini.OkHttpGeminiLiveVoiceClient
+import me.rerere.rikkahub.voiceagent.telemetry.NoOpVoiceObservability
+import me.rerere.rikkahub.voiceagent.telemetry.VoiceObservability
+import me.rerere.rikkahub.voiceagent.telemetry.newVoiceTraceContext
 import me.rerere.rikkahub.voiceagent.voicelab.VoiceLabMobileApi
+import me.rerere.rikkahub.voiceagent.voicelab.VoiceLabTraceHeaders
 import okhttp3.OkHttpClient
 import java.io.File
 import kotlin.uuid.Uuid
@@ -37,15 +41,18 @@ class DefaultVoiceAgentCallFactory(
     private val chatService: ChatService,
     private val settingsStore: SettingsStore,
     private val okHttpClient: OkHttpClient,
+    private val observability: VoiceObservability = NoOpVoiceObservability,
 ) : VoiceAgentCallFactory {
     override fun create(
         conversationId: Uuid,
         config: VoiceAgentLaunchConfig,
         scope: CoroutineScope,
     ): ManagedVoiceCallSession {
+        val traceContext = newVoiceTraceContext()
         val voiceLabApi = VoiceLabMobileApi(
             baseUrl = config.voiceLabBaseUrl,
             credentials = config.credentials,
+            traceHeaders = VoiceLabTraceHeaders.from(traceContext),
         )
         return VoiceAgentCallSession(
             modelId = config.voiceModelId,
@@ -61,6 +68,8 @@ class DefaultVoiceAgentCallFactory(
                 settingsStore = settingsStore,
                 voiceModelName = config.voiceModelId,
             ),
+            observability = observability,
+            traceContext = traceContext,
             voiceE2EArtifacts = createDefaultVoiceE2EArtifactWriter(
                 config = config,
                 noBackupFilesDir = context.noBackupFilesDir,

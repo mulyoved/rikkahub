@@ -1,20 +1,21 @@
 package me.rerere.rikkahub.voiceagent.telemetry
 
 import java.security.MessageDigest
+import kotlin.uuid.Uuid
 
-internal data class VoiceTraceContext(
+data class VoiceTraceContext(
     val traceId: String,
     val voiceSessionId: String,
 )
 
-internal typealias VoiceAttributes = Map<String, Any?>
+typealias VoiceAttributes = Map<String, Any?>
 
-internal interface VoiceSpan {
+interface VoiceSpan {
     fun setAttribute(key: String, value: Any?)
     fun setAttributes(attributes: VoiceAttributes)
 }
 
-internal interface VoiceObservability {
+interface VoiceObservability {
     fun recordEvent(
         name: String,
         trace: VoiceTraceContext,
@@ -63,7 +64,7 @@ private object NoOpVoiceSpan : VoiceSpan {
     override fun setAttributes(attributes: VoiceAttributes) = Unit
 }
 
-internal object NoOpVoiceObservability : VoiceObservability {
+object NoOpVoiceObservability : VoiceObservability {
     override fun recordEvent(
         name: String,
         trace: VoiceTraceContext,
@@ -175,6 +176,12 @@ internal fun sha256Hex(value: String): String =
     MessageDigest.getInstance("SHA-256")
         .digest(value.toByteArray(Charsets.UTF_8))
         .joinToString(separator = "") { byte -> "%02x".format(byte) }
+
+internal fun newVoiceTraceContext(): VoiceTraceContext =
+    VoiceTraceContext(
+        traceId = Uuid.random().toString(),
+        voiceSessionId = Uuid.random().toString(),
+    )
 
 private fun VoiceAttributes.withoutNullValues(): Map<String, Any> =
     mapNotNull { (key, value) -> value?.let { key to it } }.toMap()
