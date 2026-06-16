@@ -162,6 +162,8 @@ class VoiceLabMobileApiTest {
                 VoiceTraceContext(
                     traceId = "trace-123",
                     voiceSessionId = "session-456",
+                    sentryTrace = "0123456789abcdef0123456789abcdef-0123456789abcdef-1",
+                    sentryBaggage = "sentry-trace_id=0123456789abcdef0123456789abcdef,sentry-sampled=true",
                 )
             ),
         )
@@ -171,6 +173,79 @@ class VoiceLabMobileApiTest {
         val request = requireNotNull(seenRequest)
         assertEquals("trace-123", request.header("X-Voice-Trace-Id"))
         assertEquals("session-456", request.header("X-Voice-Session-Id"))
+        assertEquals(
+            "0123456789abcdef0123456789abcdef-0123456789abcdef-1",
+            request.header("sentry-trace"),
+        )
+        assertEquals(
+            "sentry-trace_id=0123456789abcdef0123456789abcdef,sentry-sampled=true",
+            request.header("baggage"),
+        )
+    }
+
+    @Test
+    fun `trace headers reject invalid Sentry propagation values`() {
+        assertThrows(IllegalArgumentException::class.java) {
+            VoiceLabTraceHeaders(
+                traceId = "trace-123",
+                voiceSessionId = "session-456",
+                sentryTrace = "0123456789abcdef0123456789abcdef\n0123456789abcdef-1",
+            )
+        }
+
+        assertThrows(IllegalArgumentException::class.java) {
+            VoiceLabTraceHeaders(
+                traceId = "trace-123",
+                voiceSessionId = "session-456",
+                sentryBaggage = "x".repeat(8193),
+            )
+        }
+
+        listOf(
+            "baggage\u0000bad",
+            "baggage\u007fbad",
+            "baggage\u00e9bad",
+        ).forEach { invalidBaggage ->
+            assertThrows(IllegalArgumentException::class.java) {
+                VoiceLabTraceHeaders(
+                    traceId = "trace-123",
+                    voiceSessionId = "session-456",
+                    sentryBaggage = invalidBaggage,
+                )
+            }
+        }
+    }
+
+    @Test
+    fun `trace headers reject invalid custom voice values before request building`() {
+        listOf(
+            "\t",
+            "trace\u0000bad",
+            "trace\u007fbad",
+            "trace\u00e9bad",
+            "x".repeat(129),
+        ).forEach { invalidTraceId ->
+            assertThrows(IllegalArgumentException::class.java) {
+                VoiceLabTraceHeaders(
+                    traceId = invalidTraceId,
+                    voiceSessionId = "session-456",
+                )
+            }
+        }
+
+        listOf(
+            "session\u0000bad",
+            "session\u007fbad",
+            "session\u00e9bad",
+            "x".repeat(129),
+        ).forEach { invalidVoiceSessionId ->
+            assertThrows(IllegalArgumentException::class.java) {
+                VoiceLabTraceHeaders(
+                    traceId = "trace-123",
+                    voiceSessionId = invalidVoiceSessionId,
+                )
+            }
+        }
     }
 
     @Test

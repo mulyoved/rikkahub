@@ -80,13 +80,21 @@ private val ERROR_SECRET_PATTERNS = listOf(
 data class VoiceLabTraceHeaders(
     val traceId: String,
     val voiceSessionId: String,
+    val sentryTrace: String? = null,
+    val sentryBaggage: String? = null,
 ) {
     init {
         require(traceId.isValidVoiceTraceHeader()) {
-            "Voice trace id must be non-blank and must not contain CR or LF"
+            "Voice trace id must be non-blank, at most 128 characters, and must be safe for HTTP headers"
         }
         require(voiceSessionId.isValidVoiceTraceHeader()) {
-            "Voice session id must be non-blank and must not contain CR or LF"
+            "Voice session id must be non-blank, at most 128 characters, and must be safe for HTTP headers"
+        }
+        require(sentryTrace == null || sentryTrace.isValidSentryPropagationHeader()) {
+            "Sentry trace header must be non-blank, at most 8192 characters, and must be safe for HTTP headers"
+        }
+        require(sentryBaggage == null || sentryBaggage.isValidSentryPropagationHeader()) {
+            "Sentry baggage header must be non-blank, at most 8192 characters, and must be safe for HTTP headers"
         }
     }
 
@@ -95,6 +103,8 @@ data class VoiceLabTraceHeaders(
             VoiceLabTraceHeaders(
                 traceId = trace.traceId,
                 voiceSessionId = trace.voiceSessionId,
+                sentryTrace = trace.sentryTrace,
+                sentryBaggage = trace.sentryBaggage,
             )
     }
 }
@@ -238,6 +248,8 @@ class VoiceLabMobileApi internal constructor(
                 traceHeaders?.let {
                     addHeader("X-Voice-Trace-Id", it.traceId)
                     addHeader("X-Voice-Session-Id", it.voiceSessionId)
+                    it.sentryTrace?.let { sentryTrace -> addHeader("sentry-trace", sentryTrace) }
+                    it.sentryBaggage?.let { sentryBaggage -> addHeader("baggage", sentryBaggage) }
                 }
             }
 
@@ -263,7 +275,15 @@ class VoiceLabMobileApi internal constructor(
 }
 
 private fun String.isValidVoiceTraceHeader(): Boolean =
-    isNotBlank() && none { it == '\r' || it == '\n' }
+    isValidHttpHeaderValue(maxLength = 128)
+
+private fun String.isValidSentryPropagationHeader(): Boolean =
+    isValidHttpHeaderValue(maxLength = 8192)
+
+private fun String.isValidHttpHeaderValue(maxLength: Int): Boolean =
+    isNotBlank() &&
+        length <= maxLength &&
+        all { it == '\t' || it in ' '..'~' }
 
 private fun String.isDevHttpHost(): Boolean =
     this in DEV_HTTP_HOSTS || isTailscaleIpv4()

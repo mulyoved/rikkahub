@@ -6,6 +6,8 @@ import kotlin.uuid.Uuid
 data class VoiceTraceContext(
     val traceId: String,
     val voiceSessionId: String,
+    val sentryTrace: String? = null,
+    val sentryBaggage: String? = null,
 )
 
 typealias VoiceAttributes = Map<String, Any?>
