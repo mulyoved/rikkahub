@@ -48,35 +48,61 @@ class DefaultVoiceAgentCallFactory(
         config: VoiceAgentLaunchConfig,
         scope: CoroutineScope,
     ): ManagedVoiceCallSession {
-        val traceContext = newVoiceTraceContext()
-        val voiceLabApi = VoiceLabMobileApi(
-            baseUrl = config.voiceLabBaseUrl,
-            credentials = config.credentials,
-            traceHeaders = VoiceLabTraceHeaders.from(traceContext),
-        )
-        return VoiceAgentCallSession(
-            modelId = config.voiceModelId,
-            sessionApi = VoiceLabVoiceSessionApi(api = voiceLabApi),
-            toolApi = VoiceLabHermesToolApi(api = voiceLabApi),
-            gemini = OkHttpGeminiLiveVoiceClient(httpClient = okHttpClient),
-            audio = AndroidVoiceAudioEngine(context = context),
-            conversationStore = ChatServiceVoiceConversationStore(
-                conversationId = conversationId,
-                chatService = chatService,
-            ),
-            contextProvider = SettingsVoiceAgentContextProvider(
-                settingsStore = settingsStore,
-                voiceModelName = config.voiceModelId,
-            ),
-            observability = observability,
-            traceContext = traceContext,
-            voiceE2EArtifacts = createDefaultVoiceE2EArtifactWriter(
-                config = config,
-                noBackupFilesDir = context.noBackupFilesDir,
+        val baseTraceContext = newVoiceTraceContext()
+        val propagatedTraceContext = runCatching {
+            observability.withSentryPropagation(baseTraceContext)
+        }.getOrDefault(baseTraceContext)
+        val (traceContext, traceHeaders) = runCatching {
+            propagatedTraceContext to VoiceLabTraceHeaders.from(propagatedTraceContext)
+        }.getOrElse {
+            runCatching {
+                observability.recordEvent(
+                    name = "voicelab.mobile.session.ended",
+                    trace = propagatedTraceContext,
+                    attributes = mapOf("modelId" to config.voiceModelId),
+                )
+            }
+            baseTraceContext to VoiceLabTraceHeaders.from(baseTraceContext)
+        }
+        return runCatching {
+            val voiceLabApi = VoiceLabMobileApi(
+                baseUrl = config.voiceLabBaseUrl,
+                credentials = config.credentials,
+                traceHeaders = traceHeaders,
+            )
+            VoiceAgentCallSession(
+                modelId = config.voiceModelId,
+                sessionApi = VoiceLabVoiceSessionApi(api = voiceLabApi),
+                toolApi = VoiceLabHermesToolApi(api = voiceLabApi),
+                gemini = OkHttpGeminiLiveVoiceClient(httpClient = okHttpClient),
+                audio = AndroidVoiceAudioEngine(context = context),
+                conversationStore = ChatServiceVoiceConversationStore(
+                    conversationId = conversationId,
+                    chatService = chatService,
+                ),
+                contextProvider = SettingsVoiceAgentContextProvider(
+                    settingsStore = settingsStore,
+                    voiceModelName = config.voiceModelId,
+                ),
+                observability = observability,
+                traceContext = traceContext,
+                voiceE2EArtifacts = createDefaultVoiceE2EArtifactWriter(
+                    config = config,
+                    noBackupFilesDir = context.noBackupFilesDir,
+                    scope = scope,
+                ),
                 scope = scope,
-            ),
-            scope = scope,
-        )
+            )
+        }.getOrElse { throwable ->
+            runCatching {
+                observability.recordEvent(
+                    name = "voicelab.mobile.session.ended",
+                    trace = traceContext,
+                    attributes = mapOf("modelId" to config.voiceModelId),
+                )
+            }
+            throw throwable
+        }
     }
 }
 

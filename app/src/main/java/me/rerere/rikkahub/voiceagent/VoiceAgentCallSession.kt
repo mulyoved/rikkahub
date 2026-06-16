@@ -35,6 +35,32 @@ class VoiceAgentCallSession(
     private val voiceE2EArtifacts: VoiceE2EArtifactWriter = VoiceE2EArtifactWriter.disabled(),
     private val scope: CoroutineScope,
 ) : ManagedVoiceCallSession {
+    constructor(
+        modelId: String,
+        sessionApi: VoiceSessionApi,
+        toolApi: VoiceToolApi,
+        gemini: GeminiLiveVoiceClient,
+        audio: VoiceAudioEngine,
+        conversationStore: VoiceConversationStore,
+        contextProvider: VoiceAgentContextProvider,
+        diagnostics: VoiceDiagnostics = VoiceDiagnostics(),
+        voiceE2EArtifacts: VoiceE2EArtifactWriter = VoiceE2EArtifactWriter.disabled(),
+        scope: CoroutineScope,
+    ) : this(
+        modelId = modelId,
+        sessionApi = sessionApi,
+        toolApi = toolApi,
+        gemini = gemini,
+        audio = audio,
+        conversationStore = conversationStore,
+        contextProvider = contextProvider,
+        diagnostics = diagnostics,
+        observability = NoOpVoiceObservability,
+        traceContext = newVoiceTraceContext(),
+        voiceE2EArtifacts = voiceE2EArtifacts,
+        scope = scope,
+    )
+
     private val coordinator = VoiceAgentCoordinator(
         gemini = gemini,
         toolApi = toolApi,
@@ -50,6 +76,7 @@ class VoiceAgentCallSession(
     private var muted = false
     private var sessionId = 0L
     private var ended = false
+    private var sessionEndedRecorded = false
     private var hermesBridge: HermesSessionBridge? = null
 
     override val state: StateFlow<VoiceAgentUiState> = coordinator.state
@@ -274,16 +301,13 @@ class VoiceAgentCallSession(
     }
 
     private suspend fun finishEnd(previousJob: Job?, visibleReason: String?) {
-        previousJob?.cancelAndJoin()
-        coordinator.updateSessionStatus(VoiceSessionStatus.Ending)
-        coordinator.close()
-        recordEventSafely(
-            name = "voicelab.mobile.session.ended",
-            attributes = mapOf(
-                "sessionId" to sessionId,
-                "modelId" to modelId,
-            ),
-        )
+        try {
+            previousJob?.cancelAndJoin()
+            coordinator.updateSessionStatus(VoiceSessionStatus.Ending)
+            coordinator.close()
+        } finally {
+            recordSessionEndedSafely()
+        }
         visibleReason?.let(coordinator::setVisibleError)
         coordinator.awaitPersistenceJobs()
         voiceE2EArtifacts.drain()
@@ -291,7 +315,8 @@ class VoiceAgentCallSession(
     }
 
     override fun closeNow() {
-        if (!ended) {
+        val shouldRecordEnd = !ended
+        if (shouldRecordEnd) {
             ended = true
         }
         startJob?.cancel()
@@ -302,6 +327,7 @@ class VoiceAgentCallSession(
         audio.suppressPlayback()
         coordinator.updateSessionStatus(VoiceSessionStatus.Ending)
         coordinator.close(waitForStartedSends = false)
+        recordSessionEndedSafely()
         coordinator.launchPersistenceDrain()
     }
 
@@ -354,6 +380,18 @@ class VoiceAgentCallSession(
         runCatching {
             observability.recordEvent(name = name, trace = traceContext, attributes = attributes)
         }
+    }
+
+    private fun recordSessionEndedSafely() {
+        if (sessionEndedRecorded) return
+        sessionEndedRecorded = true
+        recordEventSafely(
+            name = "voicelab.mobile.session.ended",
+            attributes = mapOf(
+                "sessionId" to sessionId,
+                "modelId" to modelId,
+            ),
+        )
     }
 
     private companion object {

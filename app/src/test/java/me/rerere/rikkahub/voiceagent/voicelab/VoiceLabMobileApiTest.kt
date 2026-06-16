@@ -220,6 +220,9 @@ class VoiceLabMobileApiTest {
     fun `trace headers reject invalid custom voice values before request building`() {
         listOf(
             "\t",
+            "trace id",
+            "trace/id",
+            "trace\tid",
             "trace\u0000bad",
             "trace\u007fbad",
             "trace\u00e9bad",
@@ -234,6 +237,9 @@ class VoiceLabMobileApiTest {
         }
 
         listOf(
+            "session id",
+            "session/id",
+            "session\tid",
             "session\u0000bad",
             "session\u007fbad",
             "session\u00e9bad",

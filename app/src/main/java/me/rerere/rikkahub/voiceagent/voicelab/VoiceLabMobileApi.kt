@@ -149,8 +149,40 @@ class VoiceLabMobileApi internal constructor(
     constructor(
         baseUrl: String,
         credentials: VoiceLabMobileCredentials,
-        traceHeaders: VoiceLabTraceHeaders? = null,
-        json: Json = JsonInstant,
+    ) : this(
+        baseUrl = baseUrl,
+        credentials = credentials,
+        json = JsonInstant,
+        traceHeaders = null,
+    )
+
+    constructor(
+        baseUrl: String,
+        credentials: VoiceLabMobileCredentials,
+        json: Json,
+    ) : this(
+        baseUrl = baseUrl,
+        credentials = credentials,
+        json = json,
+        traceHeaders = null,
+    )
+
+    constructor(
+        baseUrl: String,
+        credentials: VoiceLabMobileCredentials,
+        traceHeaders: VoiceLabTraceHeaders?,
+    ) : this(
+        baseUrl = baseUrl,
+        credentials = credentials,
+        json = JsonInstant,
+        traceHeaders = traceHeaders,
+    )
+
+    constructor(
+        baseUrl: String,
+        credentials: VoiceLabMobileCredentials,
+        json: Json,
+        traceHeaders: VoiceLabTraceHeaders?,
     ) : this(
         baseUrl = baseUrl,
         credentials = credentials,
@@ -275,7 +307,9 @@ class VoiceLabMobileApi internal constructor(
 }
 
 private fun String.isValidVoiceTraceHeader(): Boolean =
-    isValidHttpHeaderValue(maxLength = 128)
+    isNotBlank() &&
+        length <= 128 &&
+        all { it in 'A'..'Z' || it in 'a'..'z' || it in '0'..'9' || it == '.' || it == '_' || it == ':' || it == '-' }
 
 private fun String.isValidSentryPropagationHeader(): Boolean =
     isValidHttpHeaderValue(maxLength = 8192)

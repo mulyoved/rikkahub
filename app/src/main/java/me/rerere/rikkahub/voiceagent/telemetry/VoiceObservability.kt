@@ -18,6 +18,8 @@ interface VoiceSpan {
 }
 
 interface VoiceObservability {
+    fun withSentryPropagation(trace: VoiceTraceContext): VoiceTraceContext = trace
+
     fun recordEvent(
         name: String,
         trace: VoiceTraceContext,

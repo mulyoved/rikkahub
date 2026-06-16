@@ -184,5 +184,41 @@ class VoiceAgentCallSessionTest {
         assertEquals(listOf(1L), gemini.audioStreamEndSessionIds)
     }
 
+    @Test
+    fun `close now records session ended observability event`() = runTest {
+        val observability = RecordingVoiceObservability()
+        val trace = VoiceTraceContext(traceId = "trace-123", voiceSessionId = "session-456")
+        val session = VoiceAgentCallSession(
+            modelId = "gemini-flash",
+            sessionApi = FakeVoiceSessionApi(),
+            toolApi = FakeVoiceToolApi(),
+            gemini = FakeGeminiLiveVoiceClient(),
+            audio = FakeVoiceAudioEngine(),
+            conversationStore = FakeVoiceConversationStore(),
+            contextProvider = FakeVoiceAgentContextProvider(
+                VoiceContext(systemInstruction = "system", turns = emptyList())
+            ),
+            observability = observability,
+            traceContext = trace,
+            scope = this,
+        )
+
+        session.start()
+        session.closeNow()
+        session.closeNow()
+
+        assertEquals(
+            listOf(
+                mapOf(
+                    "sessionId" to 1L,
+                    "modelId" to "gemini-flash",
+                )
+            ),
+            observability.events
+                .filter { it.name == "voicelab.mobile.session.ended" }
+                .map { it.attributes },
+        )
+    }
+
     private fun runTest(block: suspend CoroutineScope.() -> Unit) = runBlocking(block = block)
 }
