@@ -140,7 +140,7 @@ class VoiceAgentCoordinator(
     private val voiceArtifactSessionId = Uuid.random().toString()
     private val removeDiagnosticsListener: () -> Unit
 
-    private val _state = MutableStateFlow(VoiceAgentUiState())
+    private val _state = MutableStateFlow(VoiceAgentUiState(traceId = traceContext.traceId))
     val state: StateFlow<VoiceAgentUiState> = _state.asStateFlow()
 
     init {
