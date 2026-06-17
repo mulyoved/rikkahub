@@ -8,10 +8,12 @@ INJECT_ACTION="me.rerere.rikkahub.debug.voiceagent.INJECT_PCM"
 CALL_START_ACTION="me.rerere.rikkahub.voiceagent.action.START"
 CALL_END_ACTION="me.rerere.rikkahub.voiceagent.action.END"
 APP_PCM_PATH="voice-e2e/prompt.pcm"
-APP_MANUAL_ANSWER_PATH="no_backup/voice-e2e/hermes-answer.txt"
-APP_INPUT_TRANSCRIPT_PATH="no_backup/voice-e2e/input-transcript.txt"
-APP_OUTPUT_TRANSCRIPT_PATH="no_backup/voice-e2e/output-transcript.txt"
-APP_HERMES_CALL_PATH="no_backup/voice-e2e/hermes-call.txt"
+APP_ARTIFACT_BASE_DIR="no_backup/voice-e2e"
+APP_LATEST_TRACE_ID_PATH="$APP_ARTIFACT_BASE_DIR/latest-trace-id.txt"
+APP_MANUAL_ANSWER_ARTIFACT="hermes-answer.txt"
+APP_INPUT_TRANSCRIPT_ARTIFACT="input-transcript.txt"
+APP_OUTPUT_TRANSCRIPT_ARTIFACT="output-transcript.txt"
+APP_HERMES_CALL_ARTIFACT="hermes-call.txt"
 DEVICE_TMP_PCM="/data/local/tmp/rikkahub-voice-agent-e2e-prompt.pcm"
 LOG_DIR="${VOICE_AGENT_E2E_LOG_DIR:-build/voice-agent-e2e}"
 LOG_FILE="$LOG_DIR/logcat.txt"
@@ -265,13 +267,47 @@ fail_if_log() {
   fi
 }
 
+safe_voice_trace_id() {
+  local trace_id="$1"
+  [[ "$trace_id" =~ ^[A-Za-z0-9._-]+$ ]] &&
+    [[ "$trace_id" != "." ]] &&
+    [[ "$trace_id" != ".." ]] &&
+    [[ "$trace_id" != "latest-trace-id.txt" ]]
+}
+
+resolve_app_artifact_dir() {
+  local temp_path
+  local trace_id
+  temp_path="$(mktemp "$LOG_DIR/latest-trace-id.XXXXXX")"
+  register_report_temp_file "$temp_path"
+  chmod 600 "$temp_path"
+  if adb_exec_out_to_file "$temp_path" run-as "$PACKAGE" cat "$APP_LATEST_TRACE_ID_PATH"; then
+    trace_id="$(tr -d '\r\n' < "$temp_path")"
+    rm -f "$temp_path"
+    if [[ -n "$trace_id" ]] && safe_voice_trace_id "$trace_id"; then
+      printf '%s/%s' "$APP_ARTIFACT_BASE_DIR" "$trace_id"
+      return 0
+    fi
+  else
+    rm -f "$temp_path"
+  fi
+  printf '%s' "$APP_ARTIFACT_BASE_DIR"
+}
+
+app_artifact_path() {
+  local artifact_name="$1"
+  printf '%s/%s' "$(resolve_app_artifact_dir)" "$artifact_name"
+}
+
 extract_manual_review_answer() {
   umask 077
   mkdir -p "$(dirname "$MANUAL_REVIEW_ANSWER_FILE")"
   local deadline=$((SECONDS + ${VOICE_AGENT_E2E_MANUAL_ANSWER_TIMEOUT_SECONDS:-10}))
+  local app_answer_path
   while (( SECONDS < deadline )); do
+    app_answer_path="$(app_artifact_path "$APP_MANUAL_ANSWER_ARTIFACT")"
     if adb_exec_out_to_file "$MANUAL_REVIEW_ANSWER_FILE" \
-      run-as "$PACKAGE" cat "$APP_MANUAL_ANSWER_PATH" &&
+      run-as "$PACKAGE" cat "$app_answer_path" &&
       [[ -s "$MANUAL_REVIEW_ANSWER_FILE" ]]; then
       chmod 600 "$MANUAL_REVIEW_ANSWER_FILE"
       printf 'Manual review answer artifact: %s\n' "$MANUAL_REVIEW_ANSWER_FILE"
@@ -281,7 +317,7 @@ extract_manual_review_answer() {
     sleep 1
   done
 
-  printf 'Failed to pull app-private Hermes answer artifact: %s\n' "$APP_MANUAL_ANSWER_PATH" >&2
+  printf 'Failed to pull app-private Hermes answer artifact: %s\n' "$(app_artifact_path "$APP_MANUAL_ANSWER_ARTIFACT")" >&2
   return 1
 }
 
@@ -290,8 +326,10 @@ register_report_temp_file() {
 }
 
 pull_optional_app_artifact() {
-  local app_path="$1"
+  local artifact_name="$1"
   local local_path="$2"
+  local app_path
+  app_path="$(app_artifact_path "$artifact_name")"
   umask 077
   mkdir -p "$(dirname "$local_path")"
   local temp_path
@@ -315,9 +353,11 @@ pull_optional_app_artifact() {
 
 append_artifact_preview_to_file() {
   local label="$1"
-  local app_path="$2"
+  local artifact_name="$2"
   local output_file="$3"
+  local app_path
   local temp_path
+  app_path="$(app_artifact_path "$artifact_name")"
   temp_path="$(mktemp "$LOG_DIR/report-artifact.XXXXXX")"
   register_report_temp_file "$temp_path"
   chmod 600 "$temp_path"
@@ -340,9 +380,9 @@ write_missing_tool_call_diagnostics() {
   register_report_temp_file "$temp_path"
   chmod 600 "$temp_path"
   printf 'Voice Agent E2E diagnostic artifacts after missing tool call:\n' > "$temp_path"
-  append_artifact_preview_to_file "Gemini understood from voice" "$APP_INPUT_TRANSCRIPT_PATH" "$temp_path"
-  append_artifact_preview_to_file "Gemini response to user" "$APP_OUTPUT_TRANSCRIPT_PATH" "$temp_path"
-  append_artifact_preview_to_file "Hermes call" "$APP_HERMES_CALL_PATH" "$temp_path"
+  append_artifact_preview_to_file "Gemini understood from voice" "$APP_INPUT_TRANSCRIPT_ARTIFACT" "$temp_path"
+  append_artifact_preview_to_file "Gemini response to user" "$APP_OUTPUT_TRANSCRIPT_ARTIFACT" "$temp_path"
+  append_artifact_preview_to_file "Hermes call" "$APP_HERMES_CALL_ARTIFACT" "$temp_path"
   mv -f "$temp_path" "$MISSING_TOOL_CALL_DIAGNOSTICS_FILE"
   chmod 600 "$MISSING_TOOL_CALL_DIAGNOSTICS_FILE"
   printf 'Voice Agent E2E diagnostic artifact: %s\n' "$MISSING_TOOL_CALL_DIAGNOSTICS_FILE" >&2
@@ -381,9 +421,9 @@ write_e2e_report() {
     mv -f "$source_temp_file" "$source_text_file"
     chmod 600 "$source_text_file"
   fi
-  pull_optional_app_artifact "$APP_INPUT_TRANSCRIPT_PATH" "$input_transcript_file"
-  pull_optional_app_artifact "$APP_HERMES_CALL_PATH" "$hermes_call_file"
-  pull_optional_app_artifact "$APP_OUTPUT_TRANSCRIPT_PATH" "$output_transcript_file"
+  pull_optional_app_artifact "$APP_INPUT_TRANSCRIPT_ARTIFACT" "$input_transcript_file"
+  pull_optional_app_artifact "$APP_HERMES_CALL_ARTIFACT" "$hermes_call_file"
+  pull_optional_app_artifact "$APP_OUTPUT_TRANSCRIPT_ARTIFACT" "$output_transcript_file"
 
   {
     printf 'Text used to generate voice:\n'
@@ -444,13 +484,24 @@ generate_pcm_prompt() {
 }
 
 clear_app_text_artifacts() {
-  for app_path in \
-    "$APP_MANUAL_ANSWER_PATH" \
-    "$APP_INPUT_TRANSCRIPT_PATH" \
-    "$APP_OUTPUT_TRANSCRIPT_PATH" \
-    "$APP_HERMES_CALL_PATH"; do
-    adb_cmd shell "run-as $PACKAGE rm -f $app_path" >/dev/null 2>&1 || true
+  local artifact_names=(
+    "$APP_MANUAL_ANSWER_ARTIFACT"
+    "$APP_INPUT_TRANSCRIPT_ARTIFACT"
+    "$APP_OUTPUT_TRANSCRIPT_ARTIFACT"
+    "$APP_HERMES_CALL_ARTIFACT"
+  )
+  local artifact_name
+  local trace_dir
+  trace_dir="$(resolve_app_artifact_dir)"
+  if [[ "$trace_dir" != "$APP_ARTIFACT_BASE_DIR" ]]; then
+    for artifact_name in "${artifact_names[@]}"; do
+      adb_cmd shell "run-as $PACKAGE rm -f $trace_dir/$artifact_name" >/dev/null 2>&1 || true
+    done
+  fi
+  for artifact_name in "${artifact_names[@]}"; do
+    adb_cmd shell "run-as $PACKAGE rm -f $APP_ARTIFACT_BASE_DIR/$artifact_name" >/dev/null 2>&1 || true
   done
+  adb_cmd shell "run-as $PACKAGE rm -f $APP_LATEST_TRACE_ID_PATH" >/dev/null 2>&1 || true
 }
 
 cleanup() {

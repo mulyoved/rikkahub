@@ -12,6 +12,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.File
 import java.nio.file.Files
+import me.rerere.rikkahub.voiceagent.telemetry.VoiceTraceContext
 import me.rerere.rikkahub.voiceagent.voicelab.VoiceLabMobileCredentials
 
 class VoiceE2EArtifactWriterTest {
@@ -335,12 +336,14 @@ class VoiceE2EArtifactWriterTest {
             val writer = createDefaultVoiceE2EArtifactWriter(
                 config = launchConfig(enableVoiceE2EArtifacts = false),
                 noBackupFilesDir = root,
+                traceContext = VoiceTraceContext(traceId = "trace-test", voiceSessionId = "session-test"),
                 scope = scope,
             )
 
             writer(VoiceE2EArtifact.HermesAnswer, "private answer")
             delay(100)
 
+            assertFalse(File(root, "voice-e2e/trace-test/hermes-answer.txt").exists())
             assertFalse(File(root, "voice-e2e/hermes-answer.txt").exists())
         } finally {
             scope.cancel()
@@ -356,14 +359,37 @@ class VoiceE2EArtifactWriterTest {
             val writer = createDefaultVoiceE2EArtifactWriter(
                 config = launchConfig(enableVoiceE2EArtifacts = true),
                 noBackupFilesDir = root,
+                traceContext = VoiceTraceContext(traceId = "trace-test", voiceSessionId = "session-test"),
                 scope = scope,
             )
 
             writer(VoiceE2EArtifact.HermesAnswer, "private answer")
             writer.drain()
 
-            val answerFile = File(root, "voice-e2e/hermes-answer.txt")
+            val answerFile = File(root, "voice-e2e/trace-test/hermes-answer.txt")
             assertEquals("private answer", answerFile.readText())
+        } finally {
+            scope.cancel()
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `default factory writer boundary keys artifacts by active trace context`() = runBlocking {
+        val root = Files.createTempDirectory("voice-e2e-factory-trace-keyed").toFile()
+        val scope = CoroutineScope(coroutineContext + SupervisorJob())
+        try {
+            val writer = createDefaultVoiceE2EArtifactWriter(
+                config = launchConfig(enableVoiceE2EArtifacts = true),
+                noBackupFilesDir = root,
+                traceContext = VoiceTraceContext(traceId = "trace-456", voiceSessionId = "session-456"),
+                scope = scope,
+            )
+
+            writer(VoiceE2EArtifact.HermesCall, "prompt")
+            writer.drain()
+
+            assertEquals("prompt", File(root, "voice-e2e/trace-456/hermes-call.txt").readText())
         } finally {
             scope.cancel()
             root.deleteRecursively()

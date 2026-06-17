@@ -9,6 +9,7 @@ import me.rerere.rikkahub.voiceagent.audio.AndroidVoiceAudioEngine
 import me.rerere.rikkahub.voiceagent.gemini.OkHttpGeminiLiveVoiceClient
 import me.rerere.rikkahub.voiceagent.telemetry.NoOpVoiceObservability
 import me.rerere.rikkahub.voiceagent.telemetry.VoiceObservability
+import me.rerere.rikkahub.voiceagent.telemetry.VoiceTraceContext
 import me.rerere.rikkahub.voiceagent.telemetry.newVoiceTraceContext
 import me.rerere.rikkahub.voiceagent.voicelab.VoiceLabMobileApi
 import me.rerere.rikkahub.voiceagent.voicelab.VoiceLabTraceHeaders
@@ -89,6 +90,7 @@ class DefaultVoiceAgentCallFactory(
                 voiceE2EArtifacts = createDefaultVoiceE2EArtifactWriter(
                     config = config,
                     noBackupFilesDir = context.noBackupFilesDir,
+                    traceContext = traceContext,
                     scope = scope,
                 ),
                 scope = scope,
@@ -109,9 +111,11 @@ class DefaultVoiceAgentCallFactory(
 internal fun createDefaultVoiceE2EArtifactWriter(
     config: VoiceAgentLaunchConfig,
     noBackupFilesDir: File,
+    traceContext: VoiceTraceContext,
     scope: CoroutineScope,
 ): VoiceE2EArtifactWriter = VoiceE2EArtifactWriter.create(
     enabled = config.enableVoiceE2EArtifacts,
     rootDirectory = noBackupFilesDir,
+    traceId = traceContext.traceId,
     scope = scope,
 )
