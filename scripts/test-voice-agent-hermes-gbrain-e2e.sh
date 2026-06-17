@@ -319,6 +319,19 @@ LOGS
       missing)
         exit 1
         ;;
+      late)
+        counter_file="${FAKE_ADB_LATE_TRACE_COUNTER:?}"
+        counter=0
+        if [[ -f "$counter_file" ]]; then
+          counter="$(cat "$counter_file")"
+        fi
+        counter=$((counter + 1))
+        printf '%s' "$counter" > "$counter_file"
+        if (( counter <= ${FAKE_ADB_LATE_TRACE_MISSING_COUNT:-1} )); then
+          exit 1
+        fi
+        printf 'trace-gbrain'
+        ;;
       *)
         printf '%s' "${FAKE_ADB_LATEST_TRACE_ID:-trace-gbrain}"
         ;;
@@ -401,6 +414,9 @@ LOGS
     ;;
   "-s RZ exec-out run-as me.rerere.rikkahub.debug cat no_backup/voice-e2e/hermes-answer.txt")
     if [[ "${FAKE_ADB_MISSING_ANSWER:-0}" == "1" ]]; then
+      exit 1
+    fi
+    if [[ "${FAKE_ADB_MISSING_BASE_ANSWER:-0}" == "1" ]]; then
       exit 1
     fi
     printf 'manual answer from Hermes'
@@ -1249,6 +1265,41 @@ if grep -F -- "databases/rikka_hub" "$FAKE_ADB_ARGS_LOG" >/dev/null; then
   printf 'Actual ADB log:\n%s\n' "$(cat "$FAKE_ADB_ARGS_LOG")" >&2
   exit 1
 fi
+
+late_trace_answer_log_dir="$TMP_DIR/late-trace-answer-log"
+late_trace_adb_log="$TMP_DIR/late-trace-adb-args.log"
+late_trace_counter="$TMP_DIR/late-trace-counter"
+set +e
+late_trace_answer_output="$(
+  PATH="$TMP_DIR:$PATH" \
+  FAKE_ADB_ARGS_LOG="$late_trace_adb_log" \
+  FAKE_ADB_LATEST_TRACE_ID=late \
+  FAKE_ADB_LATE_TRACE_COUNTER="$late_trace_counter" \
+  FAKE_ADB_LATE_TRACE_MISSING_COUNT=2 \
+  FAKE_ADB_MISSING_BASE_ANSWER=1 \
+  VOICE_AGENT_E2E_SERIAL=RZ \
+  VOICE_AGENT_E2E_ADB_READY_SCRIPT="$TMP_DIR/adb-ready.sh" \
+  VOICE_AGENT_E2E_PCM_PATH="$TMP_DIR/prompt.pcm" \
+  VOICE_AGENT_E2E_CONVERSATION_ID=conversation-1 \
+  VOICE_AGENT_E2E_LOG_DIR="$late_trace_answer_log_dir" \
+  VOICE_AGENT_E2E_MANUAL_REVIEW=1 \
+  VOICE_AGENT_E2E_MANUAL_ANSWER_TIMEOUT_SECONDS=3 \
+  VOICE_AGENT_E2E_GEMINI_TOOL_CALL_TIMEOUT_SECONDS=5 \
+  VOICE_AGENT_E2E_HERMES_RESPONSE_TIMEOUT_SECONDS=5 \
+  "$SCRIPT" 2>&1
+)"
+late_trace_answer_status=$?
+set -e
+
+if [[ "$late_trace_answer_status" -ne 0 ]]; then
+  printf 'Expected manual mode to re-resolve a late trace id and pull the answer.\n' >&2
+  printf 'Actual output:\n%s\n' "$late_trace_answer_output" >&2
+  exit 1
+fi
+assert_contains "$late_trace_answer_output" "Manual review answer artifact:"
+assert_file_contains_exactly "$late_trace_answer_log_dir/manual-hermes-answer.txt" "manual answer from Hermes"
+assert_file_contains "$late_trace_adb_log" "cat no_backup/voice-e2e/hermes-answer.txt"
+assert_file_contains "$late_trace_adb_log" "cat no_backup/voice-e2e/trace-gbrain/hermes-answer.txt"
 
 missing_tool_call_log_dir="$TMP_DIR/missing-tool-call-log"
 set +e

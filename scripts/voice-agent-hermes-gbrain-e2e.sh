@@ -276,9 +276,10 @@ extract_manual_review_answer() {
   local deadline=$((SECONDS + ${VOICE_AGENT_E2E_MANUAL_ANSWER_TIMEOUT_SECONDS:-10}))
   local artifact_dir
   local app_answer_path
-  artifact_dir="$(resolve_app_artifact_dir)"
-  app_answer_path="$(app_artifact_path "$artifact_dir" "$APP_MANUAL_ANSWER_ARTIFACT")"
+  app_answer_path="$(app_artifact_path "$APP_ARTIFACT_BASE_DIR" "$APP_MANUAL_ANSWER_ARTIFACT")"
   while (( SECONDS < deadline )); do
+    artifact_dir="$(resolve_app_artifact_dir)"
+    app_answer_path="$(app_artifact_path "$artifact_dir" "$APP_MANUAL_ANSWER_ARTIFACT")"
     if adb_exec_out_to_file "$MANUAL_REVIEW_ANSWER_FILE" \
       run-as "$PACKAGE" cat "$app_answer_path" &&
       [[ -s "$MANUAL_REVIEW_ANSWER_FILE" ]]; then
