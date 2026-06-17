@@ -63,6 +63,74 @@ class VoiceE2EArtifactWriterTest {
     }
 
     @Test
+    fun `enabled writer persists artifacts under the voice trace id when provided`() = runBlocking {
+        val root = Files.createTempDirectory("voice-e2e-trace-keyed").toFile()
+        val scope = CoroutineScope(coroutineContext + SupervisorJob())
+        try {
+            val writer = VoiceE2EArtifactWriter.create(
+                enabled = true,
+                rootDirectory = root,
+                traceId = "trace-123",
+                scope = scope,
+            )
+
+            writer(VoiceE2EArtifact.InputTranscript, "user transcript")
+            writer(VoiceE2EArtifact.OutputTranscript, "assistant transcript")
+            writer.drain()
+
+            assertEquals("user transcript", File(root, "voice-e2e/trace-123/input-transcript.txt").readText())
+            assertEquals("assistant transcript", File(root, "voice-e2e/trace-123/output-transcript.txt").readText())
+            assertEquals("trace-123", File(root, "voice-e2e/latest-trace-id.txt").readText())
+        } finally {
+            scope.cancel()
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `enabled writer falls back to base directory for unsafe voice trace ids`() = runBlocking {
+        listOf(".", "..", "a/b", "latest-trace-id.txt").forEachIndexed { index, traceId ->
+            val root = Files.createTempDirectory("voice-e2e-unsafe-trace-$index").toFile()
+            val scope = CoroutineScope(coroutineContext + SupervisorJob())
+            try {
+                val writer = VoiceE2EArtifactWriter.create(
+                    enabled = true,
+                    rootDirectory = root,
+                    traceId = traceId,
+                    scope = scope,
+                )
+
+                writer(VoiceE2EArtifact.InputTranscript, "safe fallback $index")
+                writer.drain()
+
+                assertEquals(
+                    "safe fallback $index",
+                    File(root, "voice-e2e/input-transcript.txt").readText(),
+                )
+                assertFalse(
+                    "unsafe trace id must not write latest marker for $traceId",
+                    File(root, "voice-e2e/latest-trace-id.txt").exists(),
+                )
+                assertFalse(
+                    "unsafe trace id must not escape voice-e2e for $traceId",
+                    File(root, "input-transcript.txt").exists(),
+                )
+                assertFalse(
+                    "unsafe trace id must not create nested trace artifacts for $traceId",
+                    File(root, "voice-e2e/a/b/input-transcript.txt").exists(),
+                )
+                assertFalse(
+                    "unsafe trace id must not collide with latest marker path for $traceId",
+                    File(root, "voice-e2e/latest-trace-id.txt/input-transcript.txt").exists(),
+                )
+            } finally {
+                scope.cancel()
+                root.deleteRecursively()
+            }
+        }
+    }
+
+    @Test
     fun `enabled writer keeps later transcript snapshots when writes are queued quickly`() = runBlocking {
         val root = Files.createTempDirectory("voice-e2e-ordered").toFile()
         val scope = CoroutineScope(coroutineContext + SupervisorJob())
@@ -166,6 +234,36 @@ class VoiceE2EArtifactWriterTest {
                 listOf("""{"event":"new-row"}"""),
                 eventsFile.readLines(),
             )
+        } finally {
+            scope.cancel()
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `enabled writer clears stale append-only hermes events under the voice trace id`() = runBlocking {
+        val root = Files.createTempDirectory("voice-e2e-hermes-events-trace-stale").toFile()
+        val scope = CoroutineScope(coroutineContext + SupervisorJob())
+        try {
+            val eventsFile = File(root, "voice-e2e/trace-123/hermes-events.ndjson")
+            requireNotNull(eventsFile.parentFile).mkdirs()
+            eventsFile.writeText("""{"event":"old-private-row"}""" + "\n")
+
+            val writer = VoiceE2EArtifactWriter.create(
+                enabled = true,
+                rootDirectory = root,
+                traceId = "trace-123",
+                scope = scope,
+            )
+
+            writer(VoiceE2EArtifact.HermesEvents, """{"event":"new-row"}""")
+            writer.drain()
+
+            assertEquals(
+                listOf("""{"event":"new-row"}"""),
+                eventsFile.readLines(),
+            )
+            assertFalse(File(root, "voice-e2e/hermes-events.ndjson").exists())
         } finally {
             scope.cancel()
             root.deleteRecursively()

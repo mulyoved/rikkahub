@@ -22,6 +22,7 @@ enum class VoiceE2EArtifact(
 class VoiceE2EArtifactWriter private constructor(
     enabled: Boolean,
     rootDirectory: File,
+    traceId: String?,
     scope: CoroutineScope?,
 ) {
     private val commands = if (enabled) {
@@ -29,7 +30,12 @@ class VoiceE2EArtifactWriter private constructor(
     } else {
         null
     }
-    private val directory = File(rootDirectory, "voice-e2e")
+    private val activeTraceId = traceId?.takeIf { it.isSafeTraceDirectoryName() }
+    private val baseDirectory = File(rootDirectory, "voice-e2e")
+    private val directory = activeTraceId
+        ?.let { File(baseDirectory, it) }
+        ?: baseDirectory
+    private val latestTraceFile = activeTraceId?.let { File(baseDirectory, "latest-trace-id.txt") }
     private val pendingLock = Any()
     private val pendingWrites = LinkedHashMap<VoiceE2EArtifact, String>()
     private val pendingAppends = mutableListOf<PendingAppend>()
@@ -102,6 +108,10 @@ class VoiceE2EArtifactWriter private constructor(
     private fun writeArtifact(artifact: VoiceE2EArtifact, content: String, append: Boolean) {
         runCatching {
             directory.mkdirs()
+            latestTraceFile?.let { file ->
+                requireNotNull(file.parentFile).mkdirs()
+                file.writeText(requireNotNull(activeTraceId))
+            }
             val file = File(directory, artifact.fileName)
             if (append) {
                 file.appendText("$content\n")
@@ -151,16 +161,19 @@ class VoiceE2EArtifactWriter private constructor(
         fun disabled(): VoiceE2EArtifactWriter = VoiceE2EArtifactWriter(
             enabled = false,
             rootDirectory = File(""),
+            traceId = null,
             scope = null,
         )
 
         fun create(
             enabled: Boolean,
             rootDirectory: File,
+            traceId: String? = null,
             scope: CoroutineScope,
         ): VoiceE2EArtifactWriter = VoiceE2EArtifactWriter(
             enabled = enabled,
             rootDirectory = rootDirectory,
+            traceId = traceId,
             scope = scope,
         )
     }
@@ -168,4 +181,13 @@ class VoiceE2EArtifactWriter private constructor(
 
 private fun String.containsLineBreak(): Boolean = contains('\n') || contains('\r')
 
+private fun String.isSafeTraceDirectoryName(): Boolean =
+    isNotBlank() &&
+        this != "." &&
+        this != ".." &&
+        this != LATEST_TRACE_ID_FILE_NAME &&
+        SAFE_TRACE_DIRECTORY_NAME.matches(this)
+
+private val SAFE_TRACE_DIRECTORY_NAME = Regex("[A-Za-z0-9._-]+")
+private const val LATEST_TRACE_ID_FILE_NAME = "latest-trace-id.txt"
 private const val TAG = "VoiceE2EArtifactWriter"
