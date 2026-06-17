@@ -339,15 +339,17 @@ resolve_app_artifact_dir() {
 }
 
 app_artifact_path() {
-  local artifact_name="$1"
-  printf '%s/%s' "$(resolve_app_artifact_dir)" "$artifact_name"
+  local artifact_dir="$1"
+  local artifact_name="$2"
+  printf '%s/%s' "$artifact_dir" "$artifact_name"
 }
 
 pull_optional_app_artifact() {
-  local artifact_name="$1"
-  local local_path="$2"
+  local artifact_dir="$1"
+  local artifact_name="$2"
+  local local_path="$3"
   local app_path
-  app_path="$(app_artifact_path "$artifact_name")"
+  app_path="$(app_artifact_path "$artifact_dir" "$artifact_name")"
   umask 077
   mkdir -p "$(dirname "$local_path")"
   local temp_path
@@ -369,15 +371,17 @@ write_e2e_report() {
   umask 077
   mkdir -p "$LOG_DIR" "$(dirname "$REPORT_FILE")"
   local report_temp_file
+  local artifact_dir
   report_temp_file="$(mktemp "$LOG_DIR/report.XXXXXX")"
   register_report_temp_file "$report_temp_file"
   chmod 600 "$report_temp_file"
+  artifact_dir="$(resolve_app_artifact_dir)"
 
-  pull_optional_app_artifact "$APP_HERMES_EVENTS_ARTIFACT" "$HERMES_EVENTS_FILE"
-  pull_optional_app_artifact "$APP_INPUT_TRANSCRIPT_ARTIFACT" "$INPUT_TRANSCRIPT_FILE"
-  pull_optional_app_artifact "$APP_OUTPUT_TRANSCRIPT_ARTIFACT" "$OUTPUT_TRANSCRIPT_FILE"
-  pull_optional_app_artifact "$APP_HERMES_CALL_ARTIFACT" "$HERMES_CALL_FILE"
-  pull_optional_app_artifact "$APP_HERMES_ANSWER_ARTIFACT" "$HERMES_ANSWER_FILE"
+  pull_optional_app_artifact "$artifact_dir" "$APP_HERMES_EVENTS_ARTIFACT" "$HERMES_EVENTS_FILE"
+  pull_optional_app_artifact "$artifact_dir" "$APP_INPUT_TRANSCRIPT_ARTIFACT" "$INPUT_TRANSCRIPT_FILE"
+  pull_optional_app_artifact "$artifact_dir" "$APP_OUTPUT_TRANSCRIPT_ARTIFACT" "$OUTPUT_TRANSCRIPT_FILE"
+  pull_optional_app_artifact "$artifact_dir" "$APP_HERMES_CALL_ARTIFACT" "$HERMES_CALL_FILE"
+  pull_optional_app_artifact "$artifact_dir" "$APP_HERMES_ANSWER_ARTIFACT" "$HERMES_ANSWER_FILE"
 
   if [[ ! -s "$PROMPT_SOURCE_TEXT_FILE" ]]; then
     printf 'missing' > "$PROMPT_SOURCE_TEXT_FILE"

@@ -295,17 +295,20 @@ resolve_app_artifact_dir() {
 }
 
 app_artifact_path() {
-  local artifact_name="$1"
-  printf '%s/%s' "$(resolve_app_artifact_dir)" "$artifact_name"
+  local artifact_dir="$1"
+  local artifact_name="$2"
+  printf '%s/%s' "$artifact_dir" "$artifact_name"
 }
 
 extract_manual_review_answer() {
   umask 077
   mkdir -p "$(dirname "$MANUAL_REVIEW_ANSWER_FILE")"
   local deadline=$((SECONDS + ${VOICE_AGENT_E2E_MANUAL_ANSWER_TIMEOUT_SECONDS:-10}))
+  local artifact_dir
   local app_answer_path
+  artifact_dir="$(resolve_app_artifact_dir)"
+  app_answer_path="$(app_artifact_path "$artifact_dir" "$APP_MANUAL_ANSWER_ARTIFACT")"
   while (( SECONDS < deadline )); do
-    app_answer_path="$(app_artifact_path "$APP_MANUAL_ANSWER_ARTIFACT")"
     if adb_exec_out_to_file "$MANUAL_REVIEW_ANSWER_FILE" \
       run-as "$PACKAGE" cat "$app_answer_path" &&
       [[ -s "$MANUAL_REVIEW_ANSWER_FILE" ]]; then
@@ -317,7 +320,7 @@ extract_manual_review_answer() {
     sleep 1
   done
 
-  printf 'Failed to pull app-private Hermes answer artifact: %s\n' "$(app_artifact_path "$APP_MANUAL_ANSWER_ARTIFACT")" >&2
+  printf 'Failed to pull app-private Hermes answer artifact: %s\n' "$app_answer_path" >&2
   return 1
 }
 
@@ -326,10 +329,11 @@ register_report_temp_file() {
 }
 
 pull_optional_app_artifact() {
-  local artifact_name="$1"
-  local local_path="$2"
+  local artifact_dir="$1"
+  local artifact_name="$2"
+  local local_path="$3"
   local app_path
-  app_path="$(app_artifact_path "$artifact_name")"
+  app_path="$(app_artifact_path "$artifact_dir" "$artifact_name")"
   umask 077
   mkdir -p "$(dirname "$local_path")"
   local temp_path
@@ -353,11 +357,12 @@ pull_optional_app_artifact() {
 
 append_artifact_preview_to_file() {
   local label="$1"
-  local artifact_name="$2"
-  local output_file="$3"
+  local artifact_dir="$2"
+  local artifact_name="$3"
+  local output_file="$4"
   local app_path
   local temp_path
-  app_path="$(app_artifact_path "$artifact_name")"
+  app_path="$(app_artifact_path "$artifact_dir" "$artifact_name")"
   temp_path="$(mktemp "$LOG_DIR/report-artifact.XXXXXX")"
   register_report_temp_file "$temp_path"
   chmod 600 "$temp_path"
@@ -375,14 +380,16 @@ append_artifact_preview_to_file() {
 write_missing_tool_call_diagnostics() {
   umask 077
   mkdir -p "$LOG_DIR" "$(dirname "$MISSING_TOOL_CALL_DIAGNOSTICS_FILE")"
+  local artifact_dir
   local temp_path
+  artifact_dir="$(resolve_app_artifact_dir)"
   temp_path="$(mktemp "$LOG_DIR/missing-tool-call-diagnostics.XXXXXX")"
   register_report_temp_file "$temp_path"
   chmod 600 "$temp_path"
   printf 'Voice Agent E2E diagnostic artifacts after missing tool call:\n' > "$temp_path"
-  append_artifact_preview_to_file "Gemini understood from voice" "$APP_INPUT_TRANSCRIPT_ARTIFACT" "$temp_path"
-  append_artifact_preview_to_file "Gemini response to user" "$APP_OUTPUT_TRANSCRIPT_ARTIFACT" "$temp_path"
-  append_artifact_preview_to_file "Hermes call" "$APP_HERMES_CALL_ARTIFACT" "$temp_path"
+  append_artifact_preview_to_file "Gemini understood from voice" "$artifact_dir" "$APP_INPUT_TRANSCRIPT_ARTIFACT" "$temp_path"
+  append_artifact_preview_to_file "Gemini response to user" "$artifact_dir" "$APP_OUTPUT_TRANSCRIPT_ARTIFACT" "$temp_path"
+  append_artifact_preview_to_file "Hermes call" "$artifact_dir" "$APP_HERMES_CALL_ARTIFACT" "$temp_path"
   mv -f "$temp_path" "$MISSING_TOOL_CALL_DIAGNOSTICS_FILE"
   chmod 600 "$MISSING_TOOL_CALL_DIAGNOSTICS_FILE"
   printf 'Voice Agent E2E diagnostic artifact: %s\n' "$MISSING_TOOL_CALL_DIAGNOSTICS_FILE" >&2
@@ -402,6 +409,7 @@ write_e2e_report() {
   local hermes_call_file
   local output_transcript_file
   local report_temp_file
+  local artifact_dir
   input_transcript_file="$(mktemp "$LOG_DIR/report-input-transcript.XXXXXX")"
   hermes_call_file="$(mktemp "$LOG_DIR/report-hermes-call.XXXXXX")"
   output_transcript_file="$(mktemp "$LOG_DIR/report-output-transcript.XXXXXX")"
@@ -411,6 +419,7 @@ write_e2e_report() {
   register_report_temp_file "$output_transcript_file"
   register_report_temp_file "$report_temp_file"
   chmod 600 "$input_transcript_file" "$hermes_call_file" "$output_transcript_file" "$report_temp_file"
+  artifact_dir="$(resolve_app_artifact_dir)"
 
   if [[ ! -s "$source_text_file" ]]; then
     local source_temp_file
@@ -421,9 +430,9 @@ write_e2e_report() {
     mv -f "$source_temp_file" "$source_text_file"
     chmod 600 "$source_text_file"
   fi
-  pull_optional_app_artifact "$APP_INPUT_TRANSCRIPT_ARTIFACT" "$input_transcript_file"
-  pull_optional_app_artifact "$APP_HERMES_CALL_ARTIFACT" "$hermes_call_file"
-  pull_optional_app_artifact "$APP_OUTPUT_TRANSCRIPT_ARTIFACT" "$output_transcript_file"
+  pull_optional_app_artifact "$artifact_dir" "$APP_INPUT_TRANSCRIPT_ARTIFACT" "$input_transcript_file"
+  pull_optional_app_artifact "$artifact_dir" "$APP_HERMES_CALL_ARTIFACT" "$hermes_call_file"
+  pull_optional_app_artifact "$artifact_dir" "$APP_OUTPUT_TRANSCRIPT_ARTIFACT" "$output_transcript_file"
 
   {
     printf 'Text used to generate voice:\n'

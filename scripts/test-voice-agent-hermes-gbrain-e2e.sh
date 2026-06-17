@@ -623,6 +623,43 @@ if grep -F -- "exec-out run-as me.rerere.rikkahub.debug cat no_backup/voice-e2e/
   exit 1
 fi
 
+unsafe_fallback_manual_log_dir="$TMP_DIR/manual-unsafe-fallback-log"
+: > "$FAKE_ADB_ARGS_LOG"
+set +e
+unsafe_fallback_manual_output="$(
+  PATH="$TMP_DIR:$PATH" \
+  FAKE_ADB_LATEST_TRACE_ID='../trace-gbrain' \
+  VOICE_AGENT_E2E_SERIAL=RZ \
+  VOICE_AGENT_E2E_ADB_READY_SCRIPT="$TMP_DIR/adb-ready.sh" \
+  VOICE_AGENT_E2E_EXPECTED_HASH="$expected_hash" \
+  VOICE_AGENT_E2E_PCM_PATH="$TMP_DIR/prompt.pcm" \
+  VOICE_AGENT_E2E_CONVERSATION_ID=conversation-1 \
+  VOICE_AGENT_E2E_LOG_DIR="$unsafe_fallback_manual_log_dir" \
+  VOICE_AGENT_E2E_MANUAL_REVIEW=1 \
+  VOICE_AGENT_E2E_GEMINI_TOOL_CALL_TIMEOUT_SECONDS=5 \
+  VOICE_AGENT_E2E_HERMES_RESPONSE_TIMEOUT_SECONDS=5 \
+  "$SCRIPT" 2>&1
+)"
+unsafe_fallback_manual_status=$?
+set -e
+
+if [[ "$unsafe_fallback_manual_status" -ne 0 ]]; then
+  printf 'Expected unsafe latest trace manual fallback to pass, got status %s.\n' "$unsafe_fallback_manual_status" >&2
+  printf 'Actual output:\n%s\n' "$unsafe_fallback_manual_output" >&2
+  exit 1
+fi
+assert_contains "$unsafe_fallback_manual_output" "Manual review answer artifact: $unsafe_fallback_manual_log_dir/manual-hermes-answer.txt"
+assert_file_contains "$FAKE_ADB_ARGS_LOG" "cat no_backup/voice-e2e/latest-trace-id.txt"
+assert_file_contains "$FAKE_ADB_ARGS_LOG" "cat no_backup/voice-e2e/hermes-answer.txt"
+assert_file_contains "$FAKE_ADB_ARGS_LOG" "cat no_backup/voice-e2e/input-transcript.txt"
+assert_file_contains "$FAKE_ADB_ARGS_LOG" "cat no_backup/voice-e2e/hermes-call.txt"
+assert_file_contains "$FAKE_ADB_ARGS_LOG" "cat no_backup/voice-e2e/output-transcript.txt"
+if grep -F -- "exec-out run-as me.rerere.rikkahub.debug cat no_backup/voice-e2e/trace-gbrain/" "$FAKE_ADB_ARGS_LOG" >/dev/null; then
+  printf 'Expected unsafe latest trace fallback not to pull trace-keyed GBrain artifacts.\n' >&2
+  printf 'ADB args:\n%s\n' "$(cat "$FAKE_ADB_ARGS_LOG")" >&2
+  exit 1
+fi
+
 manual_no_hash_log_dir="$TMP_DIR/manual-no-hash-log"
 set +e
 manual_no_hash_output="$(

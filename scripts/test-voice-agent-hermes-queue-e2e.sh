@@ -435,6 +435,38 @@ assert_file_contains "$FAKE_ADB_ARGS_LOG" "cat no_backup/voice-e2e/hermes-call.t
 assert_file_contains "$FAKE_ADB_ARGS_LOG" "cat no_backup/voice-e2e/hermes-answer.txt"
 assert_not_contains "$(cat "$FAKE_ADB_ARGS_LOG")" "cat no_backup/voice-e2e/trace-queue"
 
+unsafe_markers_log_dir="$TMP_DIR/unsafe-markers-log"
+: > "$FAKE_ADB_ARGS_LOG"
+set +e
+unsafe_markers_output="$(
+  PATH="$TMP_DIR:$PATH" \
+  FAKE_ADB_LATEST_TRACE_ID='../trace-queue' \
+  VOICE_AGENT_E2E_SERIAL=RZ \
+  VOICE_AGENT_E2E_ADB_READY_SCRIPT="$TMP_DIR/adb-ready.sh" \
+  VOICE_AGENT_QUEUE_E2E_PCM_PATH="$TMP_DIR/queue-prompt.pcm" \
+  VOICE_AGENT_E2E_CONVERSATION_ID=conversation-1 \
+  VOICE_AGENT_QUEUE_E2E_LOG_DIR="$unsafe_markers_log_dir" \
+  VOICE_AGENT_QUEUE_E2E_TOOL_CALL_TIMEOUT_SECONDS=5 \
+  VOICE_AGENT_QUEUE_E2E_COMPLETION_TIMEOUT_SECONDS=5 \
+  "$SCRIPT" 2>&1
+)"
+unsafe_markers_status=$?
+set -e
+if [[ "$unsafe_markers_status" -ne 0 ]]; then
+  printf 'Expected unsafe-markers scenario to pass, got %s.\n' "$unsafe_markers_status" >&2
+  printf 'Actual output:\n%s\n' "$unsafe_markers_output" >&2
+  exit 1
+fi
+assert_contains "$unsafe_markers_output" "Voice Agent Hermes queue E2E reached manual review gate."
+assert_file_contains "$unsafe_markers_log_dir/report.txt" "Gemini understood from voice:"
+assert_file_contains "$FAKE_ADB_ARGS_LOG" "cat no_backup/voice-e2e/latest-trace-id.txt"
+assert_file_contains "$FAKE_ADB_ARGS_LOG" "cat no_backup/voice-e2e/hermes-events.ndjson"
+assert_file_contains "$FAKE_ADB_ARGS_LOG" "cat no_backup/voice-e2e/input-transcript.txt"
+assert_file_contains "$FAKE_ADB_ARGS_LOG" "cat no_backup/voice-e2e/output-transcript.txt"
+assert_file_contains "$FAKE_ADB_ARGS_LOG" "cat no_backup/voice-e2e/hermes-call.txt"
+assert_file_contains "$FAKE_ADB_ARGS_LOG" "cat no_backup/voice-e2e/hermes-answer.txt"
+assert_not_contains "$(cat "$FAKE_ADB_ARGS_LOG")" "cat no_backup/voice-e2e/trace-queue"
+
 one_complete_log_dir="$TMP_DIR/one-complete-log"
 set +e
 one_complete_output="$(
