@@ -47,6 +47,7 @@ class VoiceE2EArtifactWriter private constructor(
             scope.launch(Dispatchers.IO) {
                 for (command in queue) {
                     when (command) {
+                        WriteCommand.CleanOldTraceDirectories -> cleanOldTraceDirectories()
                         WriteCommand.ClearAppendOnlyArtifacts -> clearAppendOnlyArtifacts()
                         WriteCommand.Flush -> flushPendingWrites()
                         is WriteCommand.Drain -> {
@@ -55,6 +56,9 @@ class VoiceE2EArtifactWriter private constructor(
                         }
                     }
                 }
+            }
+            if (activeTraceId != null && queue.trySend(WriteCommand.CleanOldTraceDirectories).isFailure) {
+                VoiceAgentLog.w(TAG, "artifact trace retention cleanup queue rejected")
             }
             if (queue.trySend(WriteCommand.ClearAppendOnlyArtifacts).isFailure) {
                 VoiceAgentLog.w(TAG, "artifact append cleanup queue rejected")
@@ -105,6 +109,32 @@ class VoiceE2EArtifactWriter private constructor(
         }
     }
 
+    private fun cleanOldTraceDirectories() {
+        val traceId = activeTraceId ?: return
+        runCatching {
+            directory.mkdirs()
+            val traceDirectories = baseDirectory.listFiles()
+                .orEmpty()
+                .filter { child ->
+                    child.isDirectory &&
+                        !Files.isSymbolicLink(child.toPath()) &&
+                        child.name.isSafeTraceDirectoryName()
+                }
+                .sortedWith(
+                    compareByDescending<File> { if (it.name == traceId) 1 else 0 }
+                        .thenByDescending { it.lastModified() }
+                        .thenByDescending { it.name },
+                )
+
+            traceDirectories
+                .drop(MAX_TRACE_ARTIFACT_DIRECTORIES)
+                .forEach { it.deleteRecursively() }
+        }.onFailure { error ->
+            val message = (error.message ?: error.javaClass.simpleName).redactForVoiceAgentLog()
+            VoiceAgentLog.w(TAG, "artifact trace retention cleanup failed message=$message")
+        }
+    }
+
     private fun writeArtifact(artifact: VoiceE2EArtifact, content: String, append: Boolean) {
         runCatching {
             directory.mkdirs()
@@ -152,6 +182,7 @@ class VoiceE2EArtifactWriter private constructor(
     )
 
     private sealed interface WriteCommand {
+        object CleanOldTraceDirectories : WriteCommand
         object ClearAppendOnlyArtifacts : WriteCommand
         object Flush : WriteCommand
         data class Drain(val completed: CompletableDeferred<Unit>) : WriteCommand
@@ -190,4 +221,5 @@ private fun String.isSafeTraceDirectoryName(): Boolean =
 
 private val SAFE_TRACE_DIRECTORY_NAME = Regex("[A-Za-z0-9._-]+")
 private const val LATEST_TRACE_ID_FILE_NAME = "latest-trace-id.txt"
+private const val MAX_TRACE_ARTIFACT_DIRECTORIES = 3
 private const val TAG = "VoiceE2EArtifactWriter"

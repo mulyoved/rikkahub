@@ -200,17 +200,10 @@ private fun VoiceAgentScreen(
             null
         },
         content = {
-            StateCard(label = "Call", value = state.callStatusText())
-            StateCard(label = "Session", value = state.session.statusLabel())
-            state.traceIdCardState { traceId -> context.writeClipboardText(traceId) }?.let { traceIdCard ->
-                TraceIdCard(
-                    traceId = traceIdCard.traceId,
-                    onCopyTraceId = traceIdCard.onCopyTraceId,
-                )
-            }
-            StateCard(label = "Audio", value = state.audio.statusLabel())
-            StateCard(label = "Hermes/MS-agent", value = state.tool.visibleStatusLabel())
-            StateCard(label = "History", value = state.persistence.statusLabel())
+            VoiceAgentStatusCards(
+                state = state,
+                onCopyTraceId = { traceId -> context.writeClipboardText(traceId) },
+            )
             if (startGate == VoiceAgentStartGate.NeedsMicrophonePermission) {
                 MicrophonePermissionCard(
                     onRequestPermission = {
@@ -248,6 +241,24 @@ private fun VoiceAgentScreen(
             DiagnosticsCard(diagnostics = state.diagnostics)
         },
     )
+}
+
+@Composable
+internal fun VoiceAgentStatusCards(
+    state: VoiceAgentUiState,
+    onCopyTraceId: (String) -> Unit,
+) {
+    StateCard(label = "Call", value = state.callStatusText())
+    StateCard(label = "Session", value = state.session.statusLabel())
+    state.traceIdCardState(onCopyTraceId)?.let { traceIdCard ->
+        TraceIdCard(
+            traceId = traceIdCard.traceId,
+            onCopyTraceId = traceIdCard.onCopyTraceId,
+        )
+    }
+    StateCard(label = "Audio", value = state.audio.statusLabel())
+    StateCard(label = "Hermes/MS-agent", value = state.tool.visibleStatusLabel())
+    StateCard(label = "History", value = state.persistence.statusLabel())
 }
 
 @Composable

@@ -89,6 +89,73 @@ class VoiceE2EArtifactWriterTest {
     }
 
     @Test
+    fun `enabled writer prunes older trace artifact directories`() = runBlocking {
+        val root = Files.createTempDirectory("voice-e2e-trace-retention").toFile()
+        val scope = CoroutineScope(coroutineContext + SupervisorJob())
+        try {
+            createTraceArtifactDirectory(root, "trace-oldest", lastModified = 1_000)
+            createTraceArtifactDirectory(root, "trace-middle", lastModified = 2_000)
+            createTraceArtifactDirectory(root, "trace-newest", lastModified = 3_000)
+
+            val writer = VoiceE2EArtifactWriter.create(
+                enabled = true,
+                rootDirectory = root,
+                traceId = "trace-active",
+                scope = scope,
+            )
+
+            writer(VoiceE2EArtifact.InputTranscript, "active transcript")
+            writer.drain()
+
+            assertEquals(
+                "active transcript",
+                File(root, "voice-e2e/trace-active/input-transcript.txt").readText(),
+            )
+            assertTrue(File(root, "voice-e2e/trace-newest").isDirectory)
+            assertTrue(File(root, "voice-e2e/trace-middle").isDirectory)
+            assertFalse(File(root, "voice-e2e/trace-oldest").exists())
+        } finally {
+            scope.cancel()
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `trace retention ignores unsafe child directories and marker files`() = runBlocking {
+        val root = Files.createTempDirectory("voice-e2e-trace-retention-safe").toFile()
+        val scope = CoroutineScope(coroutineContext + SupervisorJob())
+        try {
+            val baseDirectory = File(root, "voice-e2e")
+            createTraceArtifactDirectory(root, "trace-oldest", lastModified = 1_000)
+            createTraceArtifactDirectory(root, "trace-middle", lastModified = 2_000)
+            createTraceArtifactDirectory(root, "trace-newest", lastModified = 3_000)
+            File(baseDirectory, "unsafe trace").apply {
+                mkdirs()
+                File(this, "input-transcript.txt").writeText("unsafe child")
+                setLastModified(500)
+            }
+            File(baseDirectory, "latest-trace-id.txt").writeText("trace-oldest")
+
+            val writer = VoiceE2EArtifactWriter.create(
+                enabled = true,
+                rootDirectory = root,
+                traceId = "trace-active",
+                scope = scope,
+            )
+
+            writer(VoiceE2EArtifact.OutputTranscript, "active output")
+            writer.drain()
+
+            assertTrue(File(baseDirectory, "unsafe trace").isDirectory)
+            assertEquals("trace-active", File(baseDirectory, "latest-trace-id.txt").readText())
+            assertFalse(File(baseDirectory, "trace-oldest").exists())
+        } finally {
+            scope.cancel()
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
     fun `enabled writer falls back to base directory for unsafe voice trace ids`() = runBlocking {
         listOf(".", "..", "a/b", "latest-trace-id.txt").forEachIndexed { index, traceId ->
             val root = Files.createTempDirectory("voice-e2e-unsafe-trace-$index").toFile()
@@ -432,4 +499,15 @@ class VoiceE2EArtifactWriterTest {
         assistantPrompt = "system",
         enableVoiceE2EArtifacts = enableVoiceE2EArtifacts,
     )
+
+    private fun createTraceArtifactDirectory(
+        root: File,
+        traceId: String,
+        lastModified: Long,
+    ) {
+        val directory = File(root, "voice-e2e/$traceId")
+        directory.mkdirs()
+        File(directory, "input-transcript.txt").writeText("private artifact for $traceId")
+        assertTrue("failed to set modified time for $traceId", directory.setLastModified(lastModified))
+    }
 }
