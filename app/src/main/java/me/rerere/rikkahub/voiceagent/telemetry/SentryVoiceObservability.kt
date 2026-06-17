@@ -42,6 +42,7 @@ class SentryVoiceObservability : VoiceObservability {
                 isWaitForChildren = true
             },
         ).apply {
+            setTag("service", ANDROID_SERVICE)
             setTag("voice_trace_id", trace.traceId)
             setTag("voice_session_id", trace.voiceSessionId)
         }
@@ -172,8 +173,10 @@ private fun applyVoiceTrace(
     attributes: VoiceAttributes,
 ) {
     activeTransaction?.let(scope::setActiveSpan)
+    scope.setTag("service", ANDROID_SERVICE)
     scope.setTag("voice_trace_id", trace.traceId)
     scope.setTag("voice_session_id", trace.voiceSessionId)
+    scope.setExtra("service", ANDROID_SERVICE)
     scope.setExtra("traceId", trace.traceId)
     scope.setExtra("voiceSessionId", trace.voiceSessionId)
     attributes.withoutNullValues().forEach { (key, value) ->
@@ -196,9 +199,12 @@ private fun VoiceTraceContext.withPropagationHeadersFrom(span: ISpan): VoiceTrac
         ?: this
 
 private fun isUsableSentryTrace(value: String): Boolean =
-    value.isNotBlank() && !value.startsWith("00000000000000000000000000000000-")
+    value.isNotBlank() &&
+        !value.startsWith("00000000000000000000000000000000-") &&
+        !value.endsWith("-0")
 
 private const val TAG = "SentryVoiceObservability"
+private const val ANDROID_SERVICE = "android"
 
 private data class ActiveVoiceTransaction(
     val traceId: String,

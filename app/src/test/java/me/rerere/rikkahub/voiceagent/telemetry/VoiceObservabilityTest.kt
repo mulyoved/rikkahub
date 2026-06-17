@@ -49,12 +49,14 @@ class VoiceObservabilityTest {
         val event = capturedEvents.single()
         assertEquals("voicelab.mobile.session.started", event.message?.formatted)
         assertEquals(SentryLevel.INFO, event.level)
+        assertEquals("android", event.getTag("service"))
         assertEquals("trace-123", event.getTag("voice_trace_id"))
         assertEquals("session-456", event.getTag("voice_session_id"))
+        assertEquals("android", event.getExtra("service"))
         assertEquals("trace-123", event.getExtra("traceId"))
         assertEquals("session-456", event.getExtra("voiceSessionId"))
         assertEquals("status", event.getExtra("prompt"))
-        assertFalse(event.extras.containsKey("ignored"))
+        assertFalse(event.extras.orEmpty().containsKey("ignored"))
     }
 
     @Test
@@ -191,16 +193,20 @@ class VoiceObservabilityTest {
                 capturedEvents.mapNotNull { event -> event.message?.formatted },
             )
             val failedEvent = capturedEvents.single { event -> event.message?.formatted == "voice.span.failed" }
+            assertEquals("android", failedEvent.getTag("service"))
             assertEquals("trace-123", failedEvent.getTag("voice_trace_id"))
             assertEquals("session-456", failedEvent.getTag("voice_session_id"))
+            assertEquals("android", failedEvent.getExtra("service"))
             assertEquals("trace-123", failedEvent.getExtra("traceId"))
             assertEquals("session-456", failedEvent.getExtra("voiceSessionId"))
             assertEquals("tool", failedEvent.getExtra("step"))
             val exceptionEvent = capturedEvents.single { event ->
                 event.exceptions.orEmpty().any { exception -> exception.value == "boom" }
             }
+            assertEquals("android", exceptionEvent.getTag("service"))
             assertEquals("trace-123", exceptionEvent.getTag("voice_trace_id"))
             assertEquals("session-456", exceptionEvent.getTag("voice_session_id"))
+            assertEquals("android", exceptionEvent.getExtra("service"))
             assertEquals("trace-123", exceptionEvent.getExtra("traceId"))
             assertEquals("session-456", exceptionEvent.getExtra("voiceSessionId"))
             assertEquals("tool", exceptionEvent.getExtra("step"))
