@@ -178,6 +178,58 @@ class VoiceAgentCallManagerTest {
     }
 
     @Test
+    fun `matching route failure chain ending idle remains retryable`() = runTest {
+        repeat(50) { attempt ->
+            val releaseFirstFactory = CountDownLatch(1)
+            val creationFailure = IllegalStateException("factory failure $attempt")
+            val factory = BlockingFirstThenFailingVoiceAgentCallFactory(
+                releaseFirstFactory = releaseFirstFactory,
+                failure = creationFailure,
+            )
+            val manager = VoiceAgentCallManager(factory)
+            val conversationId = Uuid.random()
+            val config = fakeLaunchConfig()
+            val ownerLease = CountingTelecomLease()
+            val retryLeases = List(8) { CountingTelecomLease() }
+
+            val owner = async(Dispatchers.Default) {
+                runCatching { manager.start(conversationId, config, ownerLease.lease, this@runTest) }
+            }
+            assertTrue(factory.firstFactoryEntered.await(1, TimeUnit.SECONDS))
+            val retryOwners = retryLeases.take(4).map { retryLease ->
+                async(Dispatchers.Default, start = CoroutineStart.UNDISPATCHED) {
+                    runCatching { manager.start(conversationId, config, retryLease.lease, this@runTest) }
+                }
+            }.toMutableList()
+            val matching = async(Dispatchers.Default, start = CoroutineStart.UNDISPATCHED) {
+                manager.matchingRoute(conversationId, config)
+            }
+            retryOwners += retryLeases.drop(4).map { retryLease ->
+                async(Dispatchers.Default, start = CoroutineStart.UNDISPATCHED) {
+                    runCatching { manager.start(conversationId, config, retryLease.lease, this@runTest) }
+                }
+            }
+
+            releaseFirstFactory.countDown()
+
+            assertEquals(
+                "failure-chain attempt $attempt",
+                VoiceAgentRouteMatchResult.NoMatch,
+                matching.await(),
+            )
+            assertSame(creationFailure, owner.await().exceptionOrNull())
+            retryOwners.forEach { retryOwner ->
+                assertSame(creationFailure, retryOwner.await().exceptionOrNull())
+            }
+            assertEquals(1, ownerLease.retireCalls)
+            retryLeases.forEach { retryLease -> assertEquals(1, retryLease.retireCalls) }
+            assertEquals(1 + retryLeases.size, factory.createdCalls.get())
+            assertEquals(null, manager.activeConversationId.value)
+            assertEquals(VoiceAgentUiState(), manager.state.value)
+        }
+    }
+
+    @Test
     fun `cancelled matching waiter retires exact lease and preserves cancellation`() = runTest {
         val releaseFactory = CountDownLatch(1)
         val factory = BlockingFirstVoiceAgentCallFactory(releaseFactory)
@@ -567,6 +619,30 @@ private class BlockingFirstVoiceAgentCallFactory(
         factoryEntered.countDown()
         check(releaseFactory.await(1, TimeUnit.SECONDS)) { "timed out waiting to release call factory" }
         return RouteOwnedVoiceCallSession(session, routeLease)
+    }
+}
+
+private class BlockingFirstThenFailingVoiceAgentCallFactory(
+    private val releaseFirstFactory: CountDownLatch,
+    private val failure: Throwable,
+) : VoiceAgentCallFactory {
+    val firstFactoryEntered = CountDownLatch(1)
+    val createdCalls = AtomicInteger()
+
+    override fun create(
+        conversationId: Uuid,
+        config: VoiceAgentLaunchConfig,
+        routeLease: VoiceAgentRouteLease,
+        scope: CoroutineScope,
+    ): RouteOwnedManagedVoiceCallSession {
+        if (createdCalls.incrementAndGet() == 1) {
+            firstFactoryEntered.countDown()
+            check(releaseFirstFactory.await(1, TimeUnit.SECONDS)) {
+                "timed out waiting to release first failing factory invocation"
+            }
+        }
+        routeLease.retire()
+        throw failure
     }
 }
 

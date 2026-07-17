@@ -147,51 +147,32 @@ class VoiceAgentCallManager(
     ): VoiceAgentRouteMatchResult {
         var awaitedRoute: VoiceAgentRouteMetadata? = null
         while (true) {
-            val matching = synchronized(lock) {
-                when (val current = slot) {
-                    CallSlot.Idle -> null
-                    is CallSlot.Active -> current.takeIf {
-                        it.conversationId == conversationId && it.launchConfig == config
-                    }
-                    is CallSlot.Starting -> current.takeIf {
-                        it.conversationId == conversationId && it.launchConfig == config
-                    }
-                }
-            }
-            when (matching) {
+            when (val current = synchronized(lock) { slot }) {
                 CallSlot.Idle -> return VoiceAgentRouteMatchResult.NoMatch
-                null -> return awaitedRoute?.let(VoiceAgentRouteMatchResult::Superseded)
-                    ?: VoiceAgentRouteMatchResult.NoMatch
-                is CallSlot.Active -> return VoiceAgentRouteMatchResult.Existing(matching.route)
+                is CallSlot.Active -> if (
+                    current.conversationId == conversationId && current.launchConfig == config
+                ) {
+                    return VoiceAgentRouteMatchResult.Existing(current.route)
+                } else {
+                    return awaitedRoute?.let(VoiceAgentRouteMatchResult::Superseded)
+                        ?: VoiceAgentRouteMatchResult.NoMatch
+                }
                 is CallSlot.Starting -> {
-                    awaitedRoute = matching.route
-                    when (matching.resolution.await()) {
+                    if (current.conversationId != conversationId || current.launchConfig != config) {
+                        return awaitedRoute?.let(VoiceAgentRouteMatchResult::Superseded)
+                            ?: VoiceAgentRouteMatchResult.NoMatch
+                    }
+                    awaitedRoute = current.route
+                    when (current.resolution.await()) {
                         VoiceAgentStartupResolution.Published -> {
-                            return VoiceAgentRouteMatchResult.Existing(matching.route)
+                            return VoiceAgentRouteMatchResult.Existing(current.route)
                         }
 
                         VoiceAgentStartupResolution.Superseded -> {
-                            return VoiceAgentRouteMatchResult.Superseded(matching.route)
+                            return VoiceAgentRouteMatchResult.Superseded(current.route)
                         }
 
-                        VoiceAgentStartupResolution.Failed -> {
-                            val afterFailure = synchronized(lock) { slot }
-                            when (afterFailure) {
-                                CallSlot.Idle -> return VoiceAgentRouteMatchResult.NoMatch
-                                is CallSlot.Active -> if (
-                                    afterFailure.conversationId != conversationId ||
-                                    afterFailure.launchConfig != config
-                                ) {
-                                    return VoiceAgentRouteMatchResult.Superseded(matching.route)
-                                }
-                                is CallSlot.Starting -> if (
-                                    afterFailure.conversationId != conversationId ||
-                                    afterFailure.launchConfig != config
-                                ) {
-                                    return VoiceAgentRouteMatchResult.Superseded(matching.route)
-                                }
-                            }
-                        }
+                        VoiceAgentStartupResolution.Failed -> Unit
                     }
                 }
             }
