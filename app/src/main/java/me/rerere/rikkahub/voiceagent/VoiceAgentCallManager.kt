@@ -411,6 +411,18 @@ class VoiceAgentCallManager(
             reservation.resolution.complete(VoiceAgentStartupResolution.Published)
             return VoiceAgentManagerStartResult.Started(session.routeMetadata)
         } catch (failure: Throwable) {
+            val cleanupFailure = when {
+                factoryOwnsLease && createdSession != null && !createdSessionCleanupAttempted -> {
+                    createdSessionCleanupAttempted = true
+                    runCatching(createdSession::closeNow).exceptionOrNull()
+                }
+                !factoryOwnsLease && !routeLeaseCleanupAttempted -> {
+                    routeLeaseCleanupAttempted = true
+                    runCatching(routeLease::retire).exceptionOrNull()
+                }
+                else -> null
+            }
+            cleanupFailure?.takeIf { it !== failure }?.let(failure::addSuppressed)
             val wasOwner = synchronized(lock) {
                 val current = slot
                 if (current === reservation ||
@@ -425,18 +437,6 @@ class VoiceAgentCallManager(
                 }
             }
             if (wasOwner) reservation.resolution.complete(VoiceAgentStartupResolution.Failed)
-            val cleanupFailure = when {
-                factoryOwnsLease && createdSession != null && !createdSessionCleanupAttempted -> {
-                    createdSessionCleanupAttempted = true
-                    runCatching(createdSession::closeNow).exceptionOrNull()
-                }
-                !factoryOwnsLease && !routeLeaseCleanupAttempted -> {
-                    routeLeaseCleanupAttempted = true
-                    runCatching(routeLease::retire).exceptionOrNull()
-                }
-                else -> null
-            }
-            cleanupFailure?.takeIf { it !== failure }?.let(failure::addSuppressed)
             throw failure
         }
     }

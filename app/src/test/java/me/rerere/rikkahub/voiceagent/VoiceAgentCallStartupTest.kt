@@ -218,9 +218,15 @@ class VoiceAgentCallStartupTest {
 
 internal class CountingTelecomLease(
     disconnectFailure: Throwable? = null,
+    disconnectEntered: CountDownLatch? = null,
+    releaseRetirement: CountDownLatch? = null,
 ) {
     private val registry = VoiceAgentTelecomCallRegistry()
-    private val call = CountingTelecomCall(disconnectFailure)
+    private val call = CountingTelecomCall(
+        disconnectFailure = disconnectFailure,
+        disconnectEntered = disconnectEntered,
+        releaseRetirement = releaseRetirement,
+    )
     private val attempt = registry.beginAttempt()
     val lease: VoiceAgentRouteLease
     val retireCalls: Int get() = call.disconnectCalls
@@ -234,10 +240,18 @@ internal class CountingTelecomLease(
 
 private class CountingTelecomCall(
     private val disconnectFailure: Throwable?,
+    private val disconnectEntered: CountDownLatch?,
+    private val releaseRetirement: CountDownLatch?,
 ) : VoiceAgentTelecomCall {
     var disconnectCalls = 0
     override fun disconnectFromApp() {
         disconnectCalls += 1
+        disconnectEntered?.countDown()
+        releaseRetirement?.let { release ->
+            check(release.await(1, TimeUnit.SECONDS)) {
+                "timed out waiting to release telecom retirement"
+            }
+        }
         disconnectFailure?.let { throw it }
     }
 }
