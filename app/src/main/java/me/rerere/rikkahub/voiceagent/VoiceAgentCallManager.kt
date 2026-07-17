@@ -36,6 +36,10 @@ class VoiceAgentCallManager(
     private sealed interface CallSlot {
         data object Idle : CallSlot
 
+        data class CleanupFence(
+            val predecessorCleanup: CompletableDeferred<Result<Unit>>,
+        ) : CallSlot
+
         data class Starting(
             val token: Any,
             val conversationId: Uuid,
@@ -149,6 +153,7 @@ class VoiceAgentCallManager(
         while (true) {
             when (val current = synchronized(lock) { slot }) {
                 CallSlot.Idle -> return VoiceAgentRouteMatchResult.NoMatch
+                is CallSlot.CleanupFence -> return VoiceAgentRouteMatchResult.NoMatch
                 is CallSlot.Active -> if (
                     current.conversationId == conversationId && current.launchConfig == config
                 ) {
@@ -207,7 +212,7 @@ class VoiceAgentCallManager(
             detachTerminalLocked()
         }
         when (detached) {
-            null, CallSlot.Idle -> Unit
+            null, CallSlot.Idle, is CallSlot.CleanupFence -> Unit
             is CallSlot.Starting -> {
                 detached.resolution.complete(VoiceAgentStartupResolution.Superseded)
             }
@@ -225,7 +230,7 @@ class VoiceAgentCallManager(
             detachTerminalLocked()
         }
         return when (detached) {
-            null, CallSlot.Idle -> null
+            null, CallSlot.Idle, is CallSlot.CleanupFence -> null
             is CallSlot.Starting -> {
                 detached.resolution.complete(VoiceAgentStartupResolution.Superseded)
                 null
@@ -244,7 +249,7 @@ class VoiceAgentCallManager(
             detachTerminalLocked()
         }
         when (detached) {
-            null, CallSlot.Idle -> Unit
+            null, CallSlot.Idle, is CallSlot.CleanupFence -> Unit
             is CallSlot.Starting -> {
                 detached.resolution.complete(VoiceAgentStartupResolution.Superseded)
             }
@@ -263,6 +268,17 @@ class VoiceAgentCallManager(
     ): StartDecision = when (val current = slot) {
         CallSlot.Idle -> StartDecision.Own(
             reservation = installReservationLocked(conversationId, config, route, predecessorCleanup = null),
+            predecessor = null,
+            displaced = null,
+        )
+
+        is CallSlot.CleanupFence -> StartDecision.Own(
+            reservation = installReservationLocked(
+                conversationId,
+                config,
+                route,
+                current.predecessorCleanup,
+            ),
             predecessor = null,
             displaced = null,
         )
@@ -428,7 +444,12 @@ class VoiceAgentCallManager(
                 if (current === reservation ||
                     current is CallSlot.Active && current.token === reservation.token
                 ) {
-                    slot = CallSlot.Idle
+                    val predecessorCleanup = reservation.predecessorCleanup
+                    slot = if (predecessorCleanup != null && !predecessorCleanup.isCompleted) {
+                        CallSlot.CleanupFence(predecessorCleanup)
+                    } else {
+                        CallSlot.Idle
+                    }
                     _activeConversationId.value = null
                     _state.value = VoiceAgentUiState()
                     true
@@ -451,10 +472,15 @@ class VoiceAgentCallManager(
 
     private fun detachTerminalLocked(): CallSlot? = when (val current = slot) {
         CallSlot.Idle -> null
+        is CallSlot.CleanupFence -> null
         is CallSlot.Starting,
         is CallSlot.Active,
         -> current.also {
-            slot = CallSlot.Idle
+            slot = if (current is CallSlot.Starting) {
+                current.predecessorCleanup?.let { CallSlot.CleanupFence(it) } ?: CallSlot.Idle
+            } else {
+                CallSlot.Idle
+            }
             _activeConversationId.value = null
         }
     }

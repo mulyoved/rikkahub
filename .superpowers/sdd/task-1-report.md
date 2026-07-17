@@ -1,0 +1,101 @@
+## Current Result
+- Status: DONE
+- Commits:
+  - 55ebb7c4 refactor(voice): reserve call startup outside monitor
+  - 44286c0c fix(voice): make stale cleanup exact once
+  - c2ffe06c fix(voice): preserve waiter cancellation identity
+  - 5d818a16 fix(voice): keep failed route matching retryable
+- Summary: Added suspending call-start reservations and pre-route matching so duplicate callers reuse one published session without blocking the manager monitor. Stable-review cleanup records each stale lease/session cleanup attempt before invoking it, preventing catch-side retries and preserving the original cleanup failure. Matching-waiter cancellation ignores an identical retirement throwable so self-suppression cannot replace the canonical cancellation. `matchingRoute` now preserves the complete slot snapshot so a failed matching chain ending in `Idle` remains retryable `NoMatch`, while genuinely newer nonmatching ownership remains `Superseded`.
+## Tests
+- RED: `./gradlew :app:testDebugUnitTest --tests '*VoiceAgentCallManagerTest' --tests '*VoiceAgentCallStartupTest'` failed during test compilation as expected because `VoiceAgentManagerStartResult`, `VoiceAgentRouteMatchResult`, and `matchingRoute` did not exist.
+- GREEN: `./gradlew :app:testDebugUnitTest --tests '*VoiceAgentCallManagerTest' --tests '*VoiceAgentCallStartupTest'` passed with 20 selected tests and `BUILD SUCCESSFUL`.
+- Stable-review RED: With the cleanup-attempt fix reverted and the failure-injecting regressions present, the focused command ran 23 tests and failed only the stale unconsumed-lease, created-session, and started-session exact-once tests.
+- Stable-review GREEN: `./gradlew :app:testDebugUnitTest --tests '*VoiceAgentCallManagerTest' --tests '*VoiceAgentCallStartupTest'` passed with 23 selected tests (16 manager, 7 startup), zero failures/errors, and `BUILD SUCCESSFUL`.
+- Stable re-review RED: The focused command ran 24 tests and failed only `cancelled matching waiter ignores self suppression from exact retirement failure`; the canonical cancellation was replaced by `IllegalArgumentException: Self-suppression not permitted`.
+- Stable re-review GREEN: `./gradlew :app:testDebugUnitTest --tests '*VoiceAgentCallManagerTest' --tests '*VoiceAgentCallStartupTest'` passed with 24 selected tests (17 manager, 7 startup), zero failures/errors, and `BUILD SUCCESSFUL`.
+- Third stable-review RED: The focused command ran 25 tests and failed only `matching route failure chain ending idle remains retryable`; on failure-chain attempt 9, `matchingRoute` returned `Superseded` instead of retryable `NoMatch` after all matching reservations retired to `Idle`.
+- Third stable-review GREEN: `./gradlew :app:testDebugUnitTest --tests '*VoiceAgentCallManagerTest' --tests '*VoiceAgentCallStartupTest'` passed with 25 selected tests (18 manager, 7 startup), zero failures/errors, and `BUILD SUCCESSFUL`.
+## Files Changed
+- `app/src/main/java/me/rerere/rikkahub/voiceagent/VoiceAgentCallManager.kt`: owns sealed call-slot reservations, deferred publication results, suspending start/match APIs, full-slot matching snapshots, exact lease cleanup, monitor-safe session snapshots, exact-once stale cleanup-attempt bookkeeping, and cancellation-safe suppression identity guards.
+- `app/src/main/java/me/rerere/rikkahub/voiceagent/VoiceAgentCallStartup.kt`: maps route-match and manager-start results directly to service-level Started or Stale results.
+- `app/src/test/java/me/rerere/rikkahub/voiceagent/VoiceAgentCallManagerTest.kt`: verifies suspended matching starts, non-blocking status updates, exact published-route reuse, failure-chain retryability with exact lease retirement, waiter cancellation identity including identical retirement failures, and single-invocation cleanup failure semantics for stale unconsumed, created, and started resources.
+- `app/src/test/java/me/rerere/rikkahub/voiceagent/VoiceAgentCallStartupTest.kt`: verifies startup mapping through the new suspending route-match contract.
+## Concerns
+- none
+
+## CE1 Wave 2 Repair
+
+### Result
+
+- Status: DONE.
+- Review baseline: `746a458d34a3c62ff83046312ebe7755a615a8d9`.
+- Commit: this report is included in the single wave-2 fix commit; its full SHA is supplied in the completion handoff because a Git commit cannot contain its own final hash.
+
+### Summary
+
+- Added a non-publishable `CleanupFence` slot that preserves the exact inherited predecessor-cleanup deferred across terminal invalidation and cancellation while it is incomplete.
+- Fresh reservations replace the fence by identity and await the same result before factory transfer; failed cleanup is rethrown as the exact same throwable.
+- Added direct `matchingRoute` coverage for Failed -> matching Published and directly awaited Superseded, including immutable route reuse, zero redundant resolver calls, and zero redundant session starts.
+- Split barrier behavior and reusable deterministic fixtures out of the former 1,228-line manager test file. All touched voice-call test files are now below 1,000 lines.
+
+### TDD and Verification
+
+- RED: the fresh focused `--rerun-tasks` command executed 43 tests and failed exactly four new regressions: terminal invalidation and inheriting-owner cancellation, each with successful and failed predecessor cleanup. Both failures admitted the fresh reservation before the blocked predecessor end was released.
+- Coverage additions for the two `matchingRoute` branches passed before the production change, confirming missing proof rather than a second production defect.
+- GREEN: `./gradlew :app:testDebugUnitTest --tests '*VoiceAgentCallManager*Test' --tests '*VoiceAgentCallStartupTest' --rerun-tasks` executed all 179 Gradle tasks and passed 43 tests (30 manager, 5 barrier, 8 startup), zero failures/errors, `BUILD SUCCESSFUL in 1m 21s`.
+- `git diff --check`: clean.
+
+### Files
+
+- `VoiceAgentCallManager.kt`: cleanup-fence state and exact barrier inheritance.
+- `VoiceAgentCallManagerTest.kt`: matching-route regressions and retained manager behavior tests (981 lines).
+- `VoiceAgentCallManagerBarrierTest.kt`: focused predecessor-barrier tests (220 lines).
+- `VoiceAgentCallManagerTestFixtures.kt`: package-internal deterministic fixtures (353 lines).
+- `VoiceAgentCallStartupTest.kt`: shared Telecom lease fixture removed; behavior unchanged (328 lines).
+
+### Concerns
+
+- None known.
+
+## Attempt Appendix
+
+### Stable review fix: exact-once stale cleanup
+- Reviewer issue: Explicit stale-path `retire()`/`closeNow()` calls could throw into the shared catch, which then invoked the same cleanup a second time. When both attempts threw the same object, `addSuppressed` attempted self-suppression and replaced/corrupted the primary failure.
+- Fix: Mark the unconsumed lease or created session cleanup as attempted immediately before every explicit stale cleanup call. The shared catch cleans only resources whose cleanup has not already been attempted and never suppresses a throwable onto itself.
+- Tests: Added failure-injecting concurrency regressions for stale unconsumed leases, stale created sessions, and stale started sessions. Each asserts the exact thrown instance stays primary, has no suppressed self-reference, and cleanup is invoked once.
+- Commit: `44286c0c fix(voice): make stale cleanup exact once`.
+
+### Stable re-review fix: matching-waiter cancellation identity
+- Reviewer issue: Matching-waiter cancellation unconditionally suppressed a duplicate-lease retirement failure. If retirement threw the exact canonical `CancellationException`, `addSuppressed` threw `IllegalArgumentException` and replaced the cancellation identity.
+- Fix: Filter out a retirement throwable identical to the caught cancellation before calling `addSuppressed`, matching the stale-cleanup identity guard.
+- Tests: Added a blocked-owner matching-waiter regression whose duplicate lease retirement throws the exact cancellation instance. It asserts one retirement call, the same cancellation instance with no suppressed self-reference, and an unchanged pending owner/reservation that publishes normally after release.
+- Commit: `c2ffe06c fix(voice): preserve waiter cancellation identity`.
+
+### Third stable-review fix: failed matching chain remains retryable
+- Reviewer issue: The top of `matchingRoute` projected both `Idle` and nonmatching `Active`/`Starting` slots to `null`. Once `awaitedRoute` was populated, a matching failure chain that reached `Idle` could therefore return terminal `Superseded` instead of retryable `NoMatch`.
+- Fix: Snapshot the complete `CallSlot` on every loop. Branch `Idle` directly to `NoMatch`, follow matching `Starting`/`Active` ownership, and return `Superseded` only when a prior matching reservation was awaited and the current complete slot is genuinely newer and nonmatching.
+- Tests: Added 50 concurrent failure-chain attempts with one blocked owner and eight matching retry owners. The regression asserts `NoMatch`, exact primary factory failures, one retirement per route lease, the expected factory-consumption count, and no surviving active conversation or UI state.
+- Commit: `5d818a16 fix(voice): keep failed route matching retryable`.
+
+### CE1 wave 1 fix: terminal invalidation and concurrency contract coverage
+- Synthesized root causes: terminal APIs ignored `Starting`; reservation-owner cancellation checkpoints were unproved; terminal supersession against newer `Starting`/`Active` was unproved; inherited predecessor-cleanup serialization and failure replay were insufficiently asserted.
+- Production fix: `end()`, `detachForEndAndDrain()`, and `closeNow()` now use one exhaustive locked terminal transition over `Idle`, `Starting`, and `Active`. A detached `Starting` moves to `Idle` atomically and completes `Superseded` outside the monitor. Each detached `Active` retains its prior collector/session behavior.
+- Terminal tests: Every terminal API is exercised while factory creation is blocked and while `session.start()` is blocked. Owners and matching waiters return terminal `Superseded`; exact owner/waiter leases retire once; created sessions close once; no call publishes afterward.
+- Cancellation tests: Deterministic cancellation before factory transfer, after factory creation, and after supersession proves canonical cancellation identity, `Failed` wake-up/retry for a matching waiter, exact lease/session cleanup, idle state, and preservation of a newer active slot.
+- Supersession/startup tests: Delayed retry continuations prove terminal manager and pre-route supersession for newer `Starting` and `Active` slots. Startup maps the immutable awaited route to `Stale` without invoking route resolution again.
+- Barrier tests: The successful inherited-barrier test now proves no successor factory admission before predecessor cleanup release. A failure variant passes one shared cleanup failure through three inheritors, with the exact failure replayed, one retirement per lease, and no successor factory admission.
+- RED: `./gradlew :app:testDebugUnitTest --tests '*VoiceAgentCallManagerTest' --tests '*VoiceAgentCallStartupTest'` ran 35 tests and failed exactly the three new terminal regressions because owners returned `Started` instead of `Superseded` after `end`, detach, or close.
+- GREEN: The same focused command passed 35 tests (27 manager, 8 startup), zero failures/errors, with `BUILD SUCCESSFUL`.
+- Fix commit: `470f087fc1447e1a7f934cceb88fe6c2da1f38d2 fix(voice): terminate in-flight call reservations`.
+- Detailed report: `.superpowers/ce1/voice-concurrency-ce1-20260717/task-1-wave-1-fix-report.md`.
+- Residual concerns: none known.
+
+### Post-fix stable review repair: cleanup before retry publication
+- Stable finding: The shared reservation-owner catch path moved the current slot to `Idle` and completed its deferred `Failed` before attempting cleanup of the exact owned lease or session. Existing and fresh matching callers could therefore retry and consume the factory while failed-owner cleanup was still blocked.
+- Production repair: The catch path now attempts exact current-resource cleanup and applies any distinct cleanup failure as suppressed first, outside the monitor. Only afterward does it atomically clear the slot if the reservation/token is still current, followed by `Failed` completion outside the monitor.
+- Regression coverage: Added a failed pre-factory owner with blocked Telecom lease retirement and a canceled post-factory owner with blocked session close. In each case, one existing matching waiter and one fresh matching caller remain suspended, and the factory remains at its original admission, until cleanup release. After release, exactly one retry starts and the other reuses it.
+- Preserved contracts: canonical cancellation identity, exact-once lease/session cleanup, primary/suppressed identity and order, newer-slot protection, and the prohibition on external work or deferred completion under the manager monitor.
+- RED: `./gradlew :app:testDebugUnitTest --tests '*VoiceAgentCallManagerTest' --tests '*VoiceAgentCallStartupTest'` ran 37 tests and failed exactly the two new blocked-cleanup regressions because a second factory admission occurred before cleanup release.
+- GREEN: `./gradlew :app:testDebugUnitTest --tests '*VoiceAgentCallManagerTest' --tests '*VoiceAgentCallStartupTest' --rerun-tasks` executed all 179 Gradle tasks and passed 37 tests (29 manager, 8 startup), zero failures/errors, with `BUILD SUCCESSFUL`.
+- Commit: `746a458d34a3c62ff83046312ebe7755a615a8d9 fix(voice): finish owner cleanup before retry`.
+- Residual concerns: none known.
