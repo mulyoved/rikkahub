@@ -212,6 +212,39 @@ class VoiceAgentCallManagerTest {
     }
 
     @Test
+    fun `cancelled matching waiter ignores self suppression from exact retirement failure`() = runTest {
+        val releaseFactory = CountDownLatch(1)
+        val factory = BlockingFirstVoiceAgentCallFactory(releaseFactory)
+        val manager = VoiceAgentCallManager(factory)
+        val conversationId = Uuid.random()
+        val config = fakeLaunchConfig()
+        val installed = CountingTelecomLease()
+        val cancellation = CanonicalCancellationException(Any())
+        val duplicate = CountingTelecomLease(disconnectFailure = cancellation)
+
+        val owner = async(Dispatchers.Default) {
+            manager.start(conversationId, config, installed.lease, this@runTest)
+        }
+        assertTrue(factory.factoryEntered.await(1, TimeUnit.SECONDS))
+        val waiter = async(Dispatchers.Default, start = CoroutineStart.UNDISPATCHED) {
+            manager.start(conversationId, config, duplicate.lease, this@runTest)
+        }
+
+        waiter.cancel(cancellation)
+        val thrown = runCatching { waiter.await() }.exceptionOrNull()
+
+        assertSame(cancellation, thrown)
+        assertEquals(emptyList<Throwable>(), thrown?.suppressed?.toList())
+        assertEquals(1, duplicate.retireCalls)
+        assertFalse(owner.isCompleted)
+        assertEquals(1, factory.createdCalls.get())
+        assertEquals(0, installed.retireCalls)
+
+        releaseFactory.countDown()
+        assertTrue(owner.await() is VoiceAgentManagerStartResult.Started)
+    }
+
+    @Test
     fun `superseded unconsumed lease retirement failure stays primary and is attempted once`() = runTest {
         val releaseEnd = CountDownLatch(1)
         val firstSession = BlockingEndManagedVoiceCallSession(releaseEnd)

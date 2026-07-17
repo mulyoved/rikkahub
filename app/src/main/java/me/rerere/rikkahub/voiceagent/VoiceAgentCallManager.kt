@@ -109,6 +109,7 @@ class VoiceAgentCallManager(
                     } catch (cancellation: CancellationException) {
                         runCatching(routeLease::retire)
                             .exceptionOrNull()
+                            ?.takeIf { it !== cancellation }
                             ?.let(cancellation::addSuppressed)
                         throw cancellation
                     }
