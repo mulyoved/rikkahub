@@ -2,10 +2,12 @@ package me.rerere.rikkahub.voiceagent
 
 import java.util.concurrent.CancellationException
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.async
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.SupervisorJob
@@ -297,11 +299,223 @@ class VoiceAgentCallManagerTest {
     }
 
     @Test
+    fun `end invalidates starting before and after factory transfer`() = runTest {
+        assertTerminalInvalidatesBlockedFactory(StartingTerminalAction.End, this)
+        assertTerminalInvalidatesBlockedSessionStart(StartingTerminalAction.End, this)
+    }
+
+    @Test
+    fun `detach for drain invalidates starting before and after factory transfer`() = runTest {
+        assertTerminalInvalidatesBlockedFactory(StartingTerminalAction.DetachForEndAndDrain, this)
+        assertTerminalInvalidatesBlockedSessionStart(StartingTerminalAction.DetachForEndAndDrain, this)
+    }
+
+    @Test
+    fun `close now invalidates starting before and after factory transfer`() = runTest {
+        assertTerminalInvalidatesBlockedFactory(StartingTerminalAction.CloseNow, this)
+        assertTerminalInvalidatesBlockedSessionStart(StartingTerminalAction.CloseNow, this)
+    }
+
+    @Test
+    fun `cancelled reservation owner before factory transfer preserves cancellation and idle`() = runTest {
+        val releaseEnd = CountDownLatch(1)
+        val predecessor = BlockingEndManagedVoiceCallSession(releaseEnd)
+        val factory = FakeVoiceAgentCallFactory(predecessor, FakeManagedVoiceCallSession())
+        val manager = VoiceAgentCallManager(factory)
+        val predecessorLease = CountingTelecomLease()
+        manager.start(Uuid.random(), fakeLaunchConfig(), predecessorLease.lease, this)
+        val ownerLease = CountingTelecomLease()
+        val conversationId = Uuid.random()
+        val config = fakeLaunchConfig()
+        val owner = async(Dispatchers.Default) {
+            manager.start(conversationId, config, ownerLease.lease, this@runTest)
+        }
+        assertTrue(predecessor.endEntered.await(1, TimeUnit.SECONDS))
+        val cancellation = CanonicalCancellationException(Any())
+
+        owner.cancel(cancellation)
+        releaseEnd.countDown()
+        val thrown = runCatching { owner.await() }.exceptionOrNull()
+
+        assertSame(cancellation, thrown)
+        assertEquals(1, predecessorLease.retireCalls)
+        assertEquals(1, ownerLease.retireCalls)
+        assertEquals(1, factory.created.size)
+        assertEquals(null, manager.activeConversationId.value)
+        assertEquals(VoiceAgentRouteMatchResult.NoMatch, manager.matchingRoute(conversationId, config))
+    }
+
+    @Test
+    fun `cancelled reservation owner after factory creation completes failed for waiter and closes exact session`() = runTest {
+        val releaseStart = CountDownLatch(1)
+        val cancelledSession = BlockingStartManagedVoiceCallSession(releaseStart)
+        val installedSession = FakeManagedVoiceCallSession()
+        val manager = VoiceAgentCallManager(FakeVoiceAgentCallFactory(cancelledSession, installedSession))
+        val conversationId = Uuid.random()
+        val config = fakeLaunchConfig()
+        val ownerLease = CountingTelecomLease()
+        val waiterLease = CountingTelecomLease()
+        val owner = async(Dispatchers.Default) {
+            manager.start(conversationId, config, ownerLease.lease, this@runTest)
+        }
+        assertTrue(cancelledSession.startEntered.await(1, TimeUnit.SECONDS))
+        val waiter = async(Dispatchers.Default, start = CoroutineStart.UNDISPATCHED) {
+            manager.start(conversationId, config, waiterLease.lease, this@runTest)
+        }
+        val cancellation = CanonicalCancellationException(Any())
+
+        owner.cancel(cancellation)
+        releaseStart.countDown()
+        val thrown = runCatching { owner.await() }.exceptionOrNull()
+
+        assertSame(cancellation, thrown)
+        assertEquals(1, cancelledSession.closeNowCalls)
+        assertEquals(1, ownerLease.retireCalls)
+        assertEquals(VoiceAgentManagerStartResult.Started(waiterLease.lease.metadata), waiter.await())
+        assertEquals(0, waiterLease.retireCalls)
+        assertEquals(1, installedSession.startCalls)
+        assertEquals(conversationId, manager.activeConversationId.value)
+    }
+
+    @Test
+    fun `cancelled superseded owner closes exact session without clearing newer active slot`() = runTest {
+        val releaseStart = CountDownLatch(1)
+        val staleSession = BlockingStartManagedVoiceCallSession(releaseStart)
+        val installedSession = FakeManagedVoiceCallSession()
+        val manager = VoiceAgentCallManager(FakeVoiceAgentCallFactory(staleSession, installedSession))
+        val staleLease = CountingTelecomLease()
+        val installedLease = CountingTelecomLease()
+        val staleOwner = async(Dispatchers.Default) {
+            manager.start(Uuid.random(), fakeLaunchConfig(), staleLease.lease, this@runTest)
+        }
+        assertTrue(staleSession.startEntered.await(1, TimeUnit.SECONDS))
+        val installedConversation = Uuid.random()
+
+        assertEquals(
+            VoiceAgentManagerStartResult.Started(installedLease.lease.metadata),
+            manager.start(installedConversation, fakeLaunchConfig(), installedLease.lease, this),
+        )
+        val cancellation = CanonicalCancellationException(Any())
+        staleOwner.cancel(cancellation)
+        releaseStart.countDown()
+        val thrown = runCatching { staleOwner.await() }.exceptionOrNull()
+
+        assertSame(cancellation, thrown)
+        assertEquals(1, staleSession.closeNowCalls)
+        assertEquals(1, staleLease.retireCalls)
+        assertEquals(0, installedLease.retireCalls)
+        assertEquals(installedConversation, manager.activeConversationId.value)
+        assertEquals(1, installedSession.startCalls)
+    }
+
+    @Test
+    fun `failed matching retry is terminally superseded by newer active slot`() = runTest {
+        val releaseFailure = CountDownLatch(1)
+        val creationFailure = NonCopyableCleanupException(Any(), "first factory failed")
+        val installedSession = FakeManagedVoiceCallSession()
+        val factory = BlockingFirstFailingVoiceAgentCallFactory(
+            releaseFirstFailure = releaseFailure,
+            firstFailure = creationFailure,
+            subsequentSessions = arrayOf(installedSession),
+        )
+        val manager = VoiceAgentCallManager(factory)
+        val failedConversation = Uuid.random()
+        val failedConfig = fakeLaunchConfig()
+        val failedOwnerLease = CountingTelecomLease()
+        val retryLease = CountingTelecomLease()
+        val failedOwner = async(Dispatchers.Default) {
+            manager.start(failedConversation, failedConfig, failedOwnerLease.lease, this@runTest)
+        }
+        assertTrue(factory.firstCreateEntered.await(1, TimeUnit.SECONDS))
+        val retryGate = BlockedRetryDispatcher()
+        try {
+            val retry = async(retryGate.dispatcher, start = CoroutineStart.UNDISPATCHED) {
+                manager.start(failedConversation, failedConfig, retryLease.lease, this@runTest)
+            }
+
+            releaseFailure.countDown()
+            assertSame(creationFailure, runCatching { failedOwner.await() }.exceptionOrNull())
+            val installedConversation = Uuid.random()
+            val installedLease = CountingTelecomLease()
+            assertEquals(
+                VoiceAgentManagerStartResult.Started(installedLease.lease.metadata),
+                manager.start(installedConversation, fakeLaunchConfig(), installedLease.lease, this),
+            )
+
+            retryGate.release()
+            assertEquals(VoiceAgentManagerStartResult.Superseded, retry.await())
+            assertEquals(1, failedOwnerLease.retireCalls)
+            assertEquals(1, retryLease.retireCalls)
+            assertEquals(0, installedLease.retireCalls)
+            assertEquals(installedConversation, manager.activeConversationId.value)
+        } finally {
+            retryGate.close()
+        }
+    }
+
+    @Test
+    fun `failed matching start and route match are terminally superseded by newer starting slot`() = runTest {
+        val releaseFailure = CountDownLatch(1)
+        val releaseNewerCreate = CountDownLatch(1)
+        val creationFailure = NonCopyableCleanupException(Any(), "first factory failed")
+        val newerSession = FakeManagedVoiceCallSession()
+        val factory = BlockingFirstFailingVoiceAgentCallFactory(
+            releaseFirstFailure = releaseFailure,
+            firstFailure = creationFailure,
+            releaseSecondCreate = releaseNewerCreate,
+            subsequentSessions = arrayOf(newerSession),
+        )
+        val manager = VoiceAgentCallManager(factory)
+        val failedConversation = Uuid.random()
+        val failedConfig = fakeLaunchConfig()
+        val failedOwnerLease = CountingTelecomLease()
+        val retryLease = CountingTelecomLease()
+        val failedOwner = async(Dispatchers.Default) {
+            manager.start(failedConversation, failedConfig, failedOwnerLease.lease, this@runTest)
+        }
+        assertTrue(factory.firstCreateEntered.await(1, TimeUnit.SECONDS))
+        val retryGate = BlockedRetryDispatcher()
+        try {
+            val retry = async(retryGate.dispatcher, start = CoroutineStart.UNDISPATCHED) {
+                manager.start(failedConversation, failedConfig, retryLease.lease, this@runTest)
+            }
+            val matchingRoute = async(retryGate.dispatcher, start = CoroutineStart.UNDISPATCHED) {
+                manager.matchingRoute(failedConversation, failedConfig)
+            }
+
+            releaseFailure.countDown()
+            assertSame(creationFailure, runCatching { failedOwner.await() }.exceptionOrNull())
+            val newerLease = CountingTelecomLease()
+            val newerOwner = async(Dispatchers.Default) {
+                manager.start(Uuid.random(), fakeLaunchConfig(), newerLease.lease, this@runTest)
+            }
+            assertTrue(factory.secondCreateEntered.await(1, TimeUnit.SECONDS))
+
+            retryGate.release()
+            assertEquals(VoiceAgentManagerStartResult.Superseded, retry.await())
+            assertEquals(
+                VoiceAgentRouteMatchResult.Superseded(failedOwnerLease.lease.metadata),
+                matchingRoute.await(),
+            )
+            assertEquals(1, retryLease.retireCalls)
+            assertFalse(newerOwner.isCompleted)
+
+            releaseNewerCreate.countDown()
+            assertTrue(newerOwner.await() is VoiceAgentManagerStartResult.Started)
+            assertEquals(0, newerLease.retireCalls)
+        } finally {
+            releaseNewerCreate.countDown()
+            retryGate.close()
+        }
+    }
+
+    @Test
     fun `superseded unconsumed lease retirement failure stays primary and is attempted once`() = runTest {
         val releaseEnd = CountDownLatch(1)
         val firstSession = BlockingEndManagedVoiceCallSession(releaseEnd)
         val installedSession = FakeManagedVoiceCallSession()
-        val manager = VoiceAgentCallManager(FakeVoiceAgentCallFactory(firstSession, installedSession))
+        val factory = FakeVoiceAgentCallFactory(firstSession, installedSession)
+        val manager = VoiceAgentCallManager(factory)
         val activeLease = CountingTelecomLease()
         manager.start(Uuid.random(), fakeLaunchConfig(), activeLease.lease, this)
         val retirementFailure = NonCopyableCleanupException(Any(), "stale lease retirement failed")
@@ -316,6 +530,9 @@ class VoiceAgentCallManagerTest {
             manager.start(Uuid.random(), fakeLaunchConfig(), installedLease.lease, this@runTest)
         }
 
+        assertFalse(replacement.isCompleted)
+        assertEquals(1, factory.created.size)
+
         releaseEnd.countDown()
         val thrown = runCatching { staleOwner.await() }.exceptionOrNull()
 
@@ -325,6 +542,47 @@ class VoiceAgentCallManagerTest {
         assertTrue(replacement.await() is VoiceAgentManagerStartResult.Started)
         assertEquals(0, installedLease.retireCalls)
         assertEquals(1, installedSession.startCalls)
+    }
+
+    @Test
+    fun `failed predecessor cleanup is replayed identically to every inheriting reservation`() = runTest {
+        val releaseEnd = CountDownLatch(1)
+        val endFailure = NonCopyableCleanupException(Any(), "predecessor end failed")
+        val predecessor = BlockingEndManagedVoiceCallSession(releaseEnd, endFailure)
+        val factory = FakeVoiceAgentCallFactory(
+            predecessor,
+            FakeManagedVoiceCallSession(),
+            FakeManagedVoiceCallSession(),
+            FakeManagedVoiceCallSession(),
+        )
+        val manager = VoiceAgentCallManager(factory)
+        val predecessorLease = CountingTelecomLease()
+        manager.start(Uuid.random(), fakeLaunchConfig(), predecessorLease.lease, this)
+        val inheritingLeases = List(3) { CountingTelecomLease() }
+        val first = async(Dispatchers.Default) {
+            manager.start(Uuid.random(), fakeLaunchConfig("first"), inheritingLeases[0].lease, this@runTest)
+        }
+        assertTrue(predecessor.endEntered.await(1, TimeUnit.SECONDS))
+        val second = async(Dispatchers.Default, start = CoroutineStart.UNDISPATCHED) {
+            manager.start(Uuid.random(), fakeLaunchConfig("second"), inheritingLeases[1].lease, this@runTest)
+        }
+        val third = async(Dispatchers.Default, start = CoroutineStart.UNDISPATCHED) {
+            manager.start(Uuid.random(), fakeLaunchConfig("third"), inheritingLeases[2].lease, this@runTest)
+        }
+
+        assertFalse(first.isCompleted)
+        assertFalse(second.isCompleted)
+        assertFalse(third.isCompleted)
+        assertEquals(1, factory.created.size)
+
+        releaseEnd.countDown()
+        listOf(first, second, third).forEach { owner ->
+            assertSame(endFailure, runCatching { owner.await() }.exceptionOrNull())
+        }
+        assertEquals(1, predecessorLease.retireCalls)
+        inheritingLeases.forEach { assertEquals(1, it.retireCalls) }
+        assertEquals(1, factory.created.size)
+        assertEquals(null, manager.activeConversationId.value)
     }
 
     @Test
@@ -486,6 +744,83 @@ class VoiceAgentCallManagerTest {
     }
 }
 
+private enum class StartingTerminalAction {
+    End,
+    DetachForEndAndDrain,
+    CloseNow,
+}
+
+private suspend fun assertTerminalInvalidatesBlockedFactory(
+    action: StartingTerminalAction,
+    scope: CoroutineScope,
+) {
+    val releaseFactory = CountDownLatch(1)
+    val factory = BlockingFirstVoiceAgentCallFactory(releaseFactory)
+    val manager = VoiceAgentCallManager(factory)
+    val conversationId = Uuid.random()
+    val config = fakeLaunchConfig()
+    val lease = CountingTelecomLease()
+    val waiterLease = CountingTelecomLease()
+    val owner = scope.async(Dispatchers.Default) {
+        manager.start(conversationId, config, lease.lease, scope)
+    }
+    assertTrue(factory.factoryEntered.await(1, TimeUnit.SECONDS))
+    val waiter = scope.async(Dispatchers.Default, start = CoroutineStart.UNDISPATCHED) {
+        manager.start(conversationId, config, waiterLease.lease, scope)
+    }
+
+    invokeTerminal(action, manager)
+    assertEquals(VoiceAgentManagerStartResult.Superseded, waiter.await())
+    releaseFactory.countDown()
+
+    assertEquals(VoiceAgentManagerStartResult.Superseded, owner.await())
+    assertEquals(1, lease.retireCalls)
+    assertEquals(1, waiterLease.retireCalls)
+    assertEquals(0, factory.session.startCalls)
+    assertEquals(1, factory.session.closeNowCalls)
+    assertEquals(null, manager.activeConversationId.value)
+    assertEquals(VoiceAgentRouteMatchResult.NoMatch, manager.matchingRoute(conversationId, config))
+}
+
+private suspend fun assertTerminalInvalidatesBlockedSessionStart(
+    action: StartingTerminalAction,
+    scope: CoroutineScope,
+) {
+    val releaseStart = CountDownLatch(1)
+    val session = BlockingStartManagedVoiceCallSession(releaseStart)
+    val manager = VoiceAgentCallManager(FakeVoiceAgentCallFactory(session))
+    val conversationId = Uuid.random()
+    val config = fakeLaunchConfig()
+    val lease = CountingTelecomLease()
+    val waiterLease = CountingTelecomLease()
+    val owner = scope.async(Dispatchers.Default) {
+        manager.start(conversationId, config, lease.lease, scope)
+    }
+    assertTrue(session.startEntered.await(1, TimeUnit.SECONDS))
+    val waiter = scope.async(Dispatchers.Default, start = CoroutineStart.UNDISPATCHED) {
+        manager.start(conversationId, config, waiterLease.lease, scope)
+    }
+
+    invokeTerminal(action, manager)
+    assertEquals(VoiceAgentManagerStartResult.Superseded, waiter.await())
+    releaseStart.countDown()
+
+    assertEquals(VoiceAgentManagerStartResult.Superseded, owner.await())
+    assertEquals(1, lease.retireCalls)
+    assertEquals(1, waiterLease.retireCalls)
+    assertEquals(1, session.closeNowCalls)
+    assertEquals(null, manager.activeConversationId.value)
+    assertEquals(VoiceAgentRouteMatchResult.NoMatch, manager.matchingRoute(conversationId, config))
+}
+
+private fun invokeTerminal(action: StartingTerminalAction, manager: VoiceAgentCallManager) {
+    when (action) {
+        StartingTerminalAction.End -> manager.end()
+        StartingTerminalAction.DetachForEndAndDrain -> assertEquals(null, manager.detachForEndAndDrain())
+        StartingTerminalAction.CloseNow -> manager.closeNow()
+    }
+}
+
 private class FakeManagedVoiceCallSession(
     initialState: VoiceAgentUiState = VoiceAgentUiState(),
     private val startFailure: Throwable? = null,
@@ -511,6 +846,7 @@ private class FakeManagedVoiceCallSession(
 
 private class BlockingEndManagedVoiceCallSession(
     private val releaseEnd: CountDownLatch,
+    private val endFailure: Throwable? = null,
 ) : ManagedVoiceCallSession {
     override val state = MutableStateFlow(VoiceAgentUiState())
     val endEntered = CountDownLatch(1)
@@ -523,6 +859,7 @@ private class BlockingEndManagedVoiceCallSession(
     override fun end() {
         endEntered.countDown()
         check(releaseEnd.await(1, TimeUnit.SECONDS)) { "timed out waiting to release session end" }
+        endFailure?.let { throw it }
     }
     override suspend fun endAndDrain() = Unit
     override fun closeNow() = Unit
@@ -530,7 +867,7 @@ private class BlockingEndManagedVoiceCallSession(
 
 private class BlockingStartManagedVoiceCallSession(
     private val releaseStart: CountDownLatch,
-    private val closeFailure: Throwable,
+    private val closeFailure: Throwable? = null,
 ) : ManagedVoiceCallSession {
     override val state = MutableStateFlow(VoiceAgentUiState())
     val startEntered = CountDownLatch(1)
@@ -548,7 +885,7 @@ private class BlockingStartManagedVoiceCallSession(
     override suspend fun endAndDrain() = Unit
     override fun closeNow() {
         closeNowCalls += 1
-        throw closeFailure
+        closeFailure?.let { throw it }
     }
 }
 
@@ -643,6 +980,65 @@ private class BlockingFirstThenFailingVoiceAgentCallFactory(
         }
         routeLease.retire()
         throw failure
+    }
+}
+
+private class BlockingFirstFailingVoiceAgentCallFactory(
+    private val releaseFirstFailure: CountDownLatch,
+    private val firstFailure: Throwable,
+    private val releaseSecondCreate: CountDownLatch? = null,
+    private val subsequentSessions: Array<out ManagedVoiceCallSession>,
+) : VoiceAgentCallFactory {
+    val firstCreateEntered = CountDownLatch(1)
+    val secondCreateEntered = CountDownLatch(1)
+    private val createdCalls = AtomicInteger()
+
+    override fun create(
+        conversationId: Uuid,
+        config: VoiceAgentLaunchConfig,
+        routeLease: VoiceAgentRouteLease,
+        scope: CoroutineScope,
+    ): RouteOwnedManagedVoiceCallSession {
+        return when (val index = createdCalls.getAndIncrement()) {
+            0 -> {
+                firstCreateEntered.countDown()
+                check(releaseFirstFailure.await(1, TimeUnit.SECONDS)) {
+                    "timed out waiting to release first factory failure"
+                }
+                routeLease.retire()
+                throw firstFailure
+            }
+            else -> {
+                if (index == 1 && releaseSecondCreate != null) {
+                    secondCreateEntered.countDown()
+                    check(releaseSecondCreate.await(1, TimeUnit.SECONDS)) {
+                        "timed out waiting to release second factory invocation"
+                    }
+                }
+                RouteOwnedVoiceCallSession(subsequentSessions[index - 1], routeLease)
+            }
+        }
+    }
+}
+
+private class BlockedRetryDispatcher {
+    val dispatcher = Executors.newSingleThreadExecutor().asCoroutineDispatcher()
+    private val releaseLatch = CountDownLatch(1)
+    private val blockerEntered = CountDownLatch(1)
+
+    init {
+        dispatcher.executor.execute {
+            blockerEntered.countDown()
+            check(releaseLatch.await(5, TimeUnit.SECONDS)) { "timed out waiting to release retry dispatcher" }
+        }
+        check(blockerEntered.await(1, TimeUnit.SECONDS)) { "retry dispatcher blocker did not start" }
+    }
+
+    fun release() = releaseLatch.countDown()
+
+    fun close() {
+        release()
+        dispatcher.close()
     }
 }
 

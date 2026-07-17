@@ -201,33 +201,58 @@ class VoiceAgentCallManager(
         activeSessionSnapshot()?.recordDiagnostic(name = name, detail = detail)
 
     fun end() {
-        val active = synchronized(lock) {
+        val detached = synchronized(lock) {
             callStatus = VoiceCallStatus.Ending
             _state.value = _state.value.copy(call = VoiceCallStatus.Ending)
-            detachActiveLocked()
+            detachTerminalLocked()
         }
-        active?.stateCollectionJob?.cancel()
-        active?.session?.end()
+        when (detached) {
+            null, CallSlot.Idle -> Unit
+            is CallSlot.Starting -> {
+                detached.resolution.complete(VoiceAgentStartupResolution.Superseded)
+            }
+            is CallSlot.Active -> {
+                detached.stateCollectionJob?.cancel()
+                detached.session.end()
+            }
+        }
     }
 
     fun detachForEndAndDrain(): RouteOwnedManagedVoiceCallSession? {
-        val active = synchronized(lock) {
+        val detached = synchronized(lock) {
             callStatus = VoiceCallStatus.Ending
             _state.value = _state.value.copy(call = VoiceCallStatus.Ending)
-            detachActiveLocked()
+            detachTerminalLocked()
         }
-        active?.stateCollectionJob?.cancel()
-        return active?.session
+        return when (detached) {
+            null, CallSlot.Idle -> null
+            is CallSlot.Starting -> {
+                detached.resolution.complete(VoiceAgentStartupResolution.Superseded)
+                null
+            }
+            is CallSlot.Active -> {
+                detached.stateCollectionJob?.cancel()
+                detached.session
+            }
+        }
     }
 
     fun closeNow() {
-        val active = synchronized(lock) {
+        val detached = synchronized(lock) {
             callStatus = VoiceCallStatus.Ended
             _state.value = VoiceAgentUiState(call = VoiceCallStatus.Ended)
-            detachActiveLocked()
+            detachTerminalLocked()
         }
-        active?.stateCollectionJob?.cancel()
-        active?.session?.closeNow()
+        when (detached) {
+            null, CallSlot.Idle -> Unit
+            is CallSlot.Starting -> {
+                detached.resolution.complete(VoiceAgentStartupResolution.Superseded)
+            }
+            is CallSlot.Active -> {
+                detached.stateCollectionJob?.cancel()
+                detached.session.closeNow()
+            }
+        }
     }
 
     private fun decideStartLocked(
@@ -424,8 +449,13 @@ class VoiceAgentCallManager(
         (slot as? CallSlot.Active)?.session
     }
 
-    private fun detachActiveLocked(): CallSlot.Active? = (slot as? CallSlot.Active)?.also {
-        slot = CallSlot.Idle
-        _activeConversationId.value = null
+    private fun detachTerminalLocked(): CallSlot? = when (val current = slot) {
+        CallSlot.Idle -> null
+        is CallSlot.Starting,
+        is CallSlot.Active,
+        -> current.also {
+            slot = CallSlot.Idle
+            _activeConversationId.value = null
+        }
     }
 }
