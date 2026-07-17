@@ -63,8 +63,11 @@ class VoiceAgentCallStartupTest {
         assertEquals(2, factory.created.size)
         assertEquals(1, previousLease.retireCalls)
         assertEquals(0, installedLiveLease.retireCalls)
-        assertEquals(null, manager.matchingRouteMetadata(conversationId, firstConfig))
-        assertEquals(installedLiveLease.lease.metadata, manager.matchingRouteMetadata(conversationId, secondConfig))
+        assertEquals(VoiceAgentRouteMatchResult.NoMatch, manager.matchingRoute(conversationId, firstConfig))
+        assertEquals(
+            VoiceAgentRouteMatchResult.Existing(installedLiveLease.lease.metadata),
+            manager.matchingRoute(conversationId, secondConfig),
+        )
     }
 
     @Test
