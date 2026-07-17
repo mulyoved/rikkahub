@@ -1,7 +1,7 @@
 # Voice Concurrency and State Boundaries Design
 
 **Date:** 2026-07-17
-**Status:** Design approved; awaiting written-spec review
+**Status:** Design approved; implementation plans reviewed
 
 ## Context
 
@@ -50,16 +50,18 @@ A minimal patch was rejected because merely moving `Thread.sleep` to an IO threa
 | State | Owned data | Meaning |
 |---|---|---|
 | `Idle` | No session or startup resources | No call can receive commands or publish session state. |
-| `Starting` | Unique token, conversation/config identity, immutable route metadata, completion deferred | A specific startup attempt owns publication rights, but no session is active yet. |
+| `Starting` | Unique token, conversation/config identity, immutable route metadata, completion deferred, optional shared predecessor-cleanup barrier | A specific startup attempt owns publication rights, but no session is active yet and predecessor cleanup may still be pending. |
 | `Active` | Conversation/config identity, route metadata, route-owned session, optional collector job | The exact session may receive commands and publish state. |
 
-The public active conversation remains `null` while `Starting`; it is published only with `Active`. `matchingRouteMetadata()` recognizes matching `Starting` and `Active` slots. `VoiceAgentCallManager.start()` becomes suspending so a matching caller can await the existing reservation outside the monitor without blocking a thread.
+The public active conversation remains `null` while `Starting`; it is published only with `Active`. Suspending `matchingRoute()` returns an explicit `NoMatch`, `Existing`, or terminal `Superseded` result for matching `Starting` and `Active` slots. `VoiceAgentCallManager.start()` becomes suspending so a matching caller can await the existing reservation outside the monitor without blocking a thread.
 
-If the matching reservation publishes successfully, the waiter retires its unused incoming lease and returns the existing-session result. If the reservation fails or is superseded, the waiter re-enters reservation selection with its still-owned incoming lease. Cancellation while waiting retires that incoming lease and propagates cancellation.
+If the matching reservation publishes successfully, the waiter retires its unused incoming lease and returns the existing-session result. If the reservation fails, the waiter may re-enter reservation selection with its still-owned incoming lease only while the slot is idle or still matching; a different non-idle slot is newer and cannot be displaced by that retry. Supersession is terminal: the waiter retires its lease and returns the superseded result so an older request cannot resurrect an ended call or displace the newer call. Cancellation while waiting also retires that incoming lease, suppresses retirement failure onto the canonical cancellation, and propagates cancellation.
 
 Reservation completion has exactly three terminal signals: `Published`, `Failed`, and `Superseded`. Every owner path completes its deferred exactly once, including caller cancellation and unexpected factory/session failures, so matching waiters cannot remain suspended indefinitely.
 
 The slot token is an identity object, not a reusable counter. Every publish, collector update, cleanup, and failure rollback compares exact token or call identity before changing manager state.
+
+Replacing an `Active` slot creates a predecessor-cleanup barrier before detaching the exact session and collector. Any later reservation that supersedes this `Starting` slot inherits the same barrier. Factory creation, session start, and publication all await it outside the manager monitor, so a newer request cannot overlap the predecessor merely because the intermediate reservation was superseded.
 
 ### Capture Ownership State
 
@@ -70,11 +72,14 @@ Move capture coordination from `AndroidVoiceAudioEngine.kt` into a dedicated cap
 | `Idle` | No capture resources | A new capture may reserve a token. |
 | `Starting.Reserved` | Unique capture token | Startup exists, but no route lease has been transferred to the state owner. |
 | `Starting.Routed` | Token and immediately-retireable capture route lease | Bluetooth preparation or recorder construction may be in progress. |
+| `Starting.Activating` | Token, recorder, lazy task, route lease, activation barrier, and retirement barrier | Recorder startup is admitted outside the state lock, but all cleanup-order resources are already state-owned. |
 | `Active` | Token, recorder, capture task, and route lease | Recorder and capture loop are current. |
 | `Retiring` | Exact detached resource bundle, retirement barrier, and terminal target | One owner cleans resources while concurrent callers join the same result. |
 | `Released` | No resources | The engine permanently rejects future capture starts. |
 
 Resources under construction remain local until atomically transferred into a legal state. If transfer is rejected because the token is stale, the local owner cleans them outside the state lock. No nullable field group represents lifecycle state.
+
+Before `startRecorder` begins, recorder and lazy task transfer with the route into `Starting.Activating`. Stop or release may claim that state for retirement, but ordered cleanup waits outside the state lock for the admitted activation operation. Routing therefore remains owned until task cancellation, recorder stop, and recorder release can occur in order. Reentrant retirement on the activation-owner thread records `Retiring` without self-waiting; the activation owner completes the barrier and finishes or joins cleanup after the external call returns.
 
 The `Retiring` terminal target is `Idle` or `Released`. A release racing retirement may upgrade the target to `Released`; no later operation may downgrade it to `Idle`.
 
@@ -117,16 +122,17 @@ The direct-audio implementation is split so that policy, Android Bluetooth integ
 
 1. Under the manager lock, inspect the current slot.
 2. If matching `Active` exists, reject the new start, then retire its incoming route lease outside the lock.
-3. If matching `Starting` exists, capture its completion deferred, release the lock, and suspend. Successful publication rejects the duplicate; failure or supersession retries slot selection with the incoming lease.
-4. Otherwise install a new `Starting` token and detach the previous `Active` session and collector references.
-5. Outside the lock, cancel the detached collector and end the previous session.
-6. Recheck token ownership after previous-session end and before factory consumption. If superseded, retire the still-unconsumed incoming route lease and stop.
-7. Outside the lock, call `factory.create()`.
-8. Recheck ownership before `session.start()`. If superseded, close the created route-owned session without starting it.
-9. Outside the lock, call `session.start()`.
-10. Under the lock, publish `Active` only if the exact `Starting` token still owns the slot.
-11. Launch state collection outside the lock. Attach its job under the lock only if the exact `Active` call still owns the slot; otherwise cancel it outside the lock.
-12. If the startup token was superseded during factory or start work, close the created route-owned session outside the lock and leave the winning slot untouched.
+3. If matching `Starting` exists, capture its completion deferred, release the lock, and suspend. Successful publication rejects the duplicate; failure alone may retry. Supersession or waiter cancellation retires the incoming lease and terminates that request.
+4. Otherwise install a new `Starting` token. When replacing `Active`, create a predecessor-cleanup barrier and detach the previous session/collector; when replacing `Starting`, inherit its existing barrier.
+5. Outside the lock, the exact cleanup owner cancels the detached collector and ends the previous session, completing the shared barrier with the ordered result.
+6. Every current or inheriting reservation awaits that barrier outside the lock before factory consumption. Barrier failure retires its unconsumed incoming lease and is thrown as primary.
+7. Recheck token ownership after predecessor cleanup and before factory consumption. If superseded, retire the still-unconsumed incoming route lease and stop.
+8. Outside the lock, call `factory.create()`.
+9. Recheck ownership before `session.start()`. If superseded, close the created route-owned session without starting it.
+10. Outside the lock, call `session.start()`.
+11. Under the lock, publish `Active` only if the exact `Starting` token still owns the slot and its predecessor barrier completed successfully.
+12. Launch state collection outside the lock. Attach its job under the lock only if the exact `Active` call still owns the slot; otherwise cancel it outside the lock.
+13. If the startup token was superseded during factory or start work, close the created route-owned session outside the lock and leave the winning slot untouched.
 
 Matching concurrent starts suspend without holding the monitor or blocking a thread. Different concurrent starts use latest-reservation-wins semantics. `end()` and `closeNow()` invalidate `Starting` immediately and complete its deferred as superseded; a later factory result observes the stale token and cleans itself up.
 
@@ -138,8 +144,10 @@ Manager commands read the current `Active` session under the lock, then invoke `
 2. Off the main dispatcher and outside the lock, open an immediately-retireable route lease.
 3. Transfer that lease into `Starting.Routed` only if the reservation is current. Retire it locally if publication loses the race.
 4. Suspend on the Bluetooth profile callback with the existing one-second bound. No thread sleeps and no route or state lock is held while waiting.
-5. Outside the lock, configure the route, construct the recorder and task, and start recording.
-6. Publish `Active` only if the token and route lease remain current. Otherwise clean the local recorder, task, and lease.
+5. Outside the lock, configure the route and construct the recorder and lazy task.
+6. Under the state lock, transfer recorder and task with the route into `Starting.Activating`, then start/check the recorder outside the lock as an admitted operation.
+7. Stop or release may transition this state to `Retiring`, but cleanup waits for activation before canceling the task, stopping/releasing the recorder, and finally retiring the route.
+8. Publish `Active` only if the exact activation remains current, then start the cancellation-safe lazy task. Otherwise perform or join exact ordered retirement.
 
 Initial connected-session capture may await setup so fatal capture failures retain their current propagation behavior. Unmute launches the suspending capture start in the session scope. Mute, reconnect, end, and release invalidate the token and cancel the focused startup job.
 
@@ -210,7 +218,8 @@ Expected test responsibilities:
 
 - Block the first factory call and prove a matching start suspends without entering `Thread.State.BLOCKED` or blocking unrelated manager operations.
 - Prove matching `Starting` retires only the rejected incoming lease after the owner publishes.
-- Prove matching `Starting` retries with its incoming lease after owner failure or supersession.
+- Prove matching `Starting` retries only after owner failure; supersession and cancellation retire the waiter terminally.
+- Prove a superseding reservation inherits and awaits predecessor cleanup, including cleanup failure replay.
 - Prove different concurrent starts publish only the latest request and close a stale created session once.
 - Prove collector launch and attachment cannot publish after supersession.
 - Prove state collection, mute, reconnect, end, and close are not blocked by external lifecycle work.
@@ -219,9 +228,10 @@ Expected test responsibilities:
 
 ### Capture and Bluetooth Tests
 
-- Cover `Idle -> Starting.Reserved -> Starting.Routed -> Active`.
+- Cover `Idle -> Starting.Reserved -> Starting.Routed -> Starting.Activating -> Active`.
 - Cover stop and release from both starting phases.
 - Cover stale route, recorder, and task publication.
+- Block recorder startup and prove stop/release cannot retire routing before task/recorder cleanup; cover reentrant activation-owner retirement without deadlock.
 - Cover active retirement, autonomous termination, concurrent joining, and permanent release.
 - Preserve exact-once cleanup and replayed failure results.
 - Use coroutine test time to cover callback before timeout, timeout, callback after timeout, cancellation, and retirement racing callback delivery.
@@ -275,8 +285,11 @@ Each slice begins with failing or behavior-locking tests, preserves a compilable
 - Bluetooth profile waiting does not block a single-thread dispatcher or Android main thread.
 - No manager or capture-state lock encloses an Android API call, session/factory lifecycle call, coroutine launch, cleanup, retirement, or blocking wait.
 - Matching concurrent starts may suspend on reservation completion but never block a thread, hold the manager monitor, or prevent unrelated manager operations.
+- Superseded or canceled matching waiters retire their exact incoming lease and cannot resurrect an ended or displaced request.
+- Superseding reservations share and await predecessor cleanup before factory creation, session start, or publication.
 - Only the current startup token may publish a session or attach a collector.
 - Capture lifecycle resources are representable only in legal sealed states.
+- An admitted recorder activation keeps route ownership until ordered task/recorder cleanup completes.
 - Marker-handle interfaces and Android recovery casts are absent from direct-audio contracts.
 - Timed end and drain returns `Unit` and preserves timeout/cancellation/failure identity and ordering.
 - `DefaultVoiceAgentCallFactory` tests live in `VoiceAgentCallFactoryTest.kt`.
