@@ -315,7 +315,9 @@ class VoiceAgentCallManager(
         predecessor: CallSlot.Active?,
     ): VoiceAgentManagerStartResult {
         var factoryOwnsLease = false
+        var routeLeaseCleanupAttempted = false
         var createdSession: RouteOwnedManagedVoiceCallSession? = null
+        var createdSessionCleanupAttempted = false
         try {
             if (predecessor != null) {
                 val cleanupResult = runCatching {
@@ -327,6 +329,7 @@ class VoiceAgentCallManager(
             reservation.predecessorCleanup?.await()?.getOrThrow()
             currentCoroutineContext().ensureActive()
             if (!owns(reservation)) {
+                routeLeaseCleanupAttempted = true
                 routeLease.retire()
                 return VoiceAgentManagerStartResult.Superseded
             }
@@ -341,6 +344,7 @@ class VoiceAgentCallManager(
             createdSession = session
             currentCoroutineContext().ensureActive()
             if (!owns(reservation)) {
+                createdSessionCleanupAttempted = true
                 session.closeNow()
                 return VoiceAgentManagerStartResult.Superseded
             }
@@ -348,6 +352,7 @@ class VoiceAgentCallManager(
             session.start()
             currentCoroutineContext().ensureActive()
             if (!owns(reservation)) {
+                createdSessionCleanupAttempted = true
                 session.closeNow()
                 return VoiceAgentManagerStartResult.Superseded
             }
@@ -371,6 +376,7 @@ class VoiceAgentCallManager(
                 }
             }
             if (!published) {
+                createdSessionCleanupAttempted = true
                 session.closeNow()
                 return VoiceAgentManagerStartResult.Superseded
             }
@@ -412,12 +418,18 @@ class VoiceAgentCallManager(
                 }
             }
             if (wasOwner) reservation.resolution.complete(VoiceAgentStartupResolution.Failed)
-            val cleanupFailure = if (factoryOwnsLease) {
-                createdSession?.let { runCatching(it::closeNow).exceptionOrNull() }
-            } else {
-                runCatching(routeLease::retire).exceptionOrNull()
+            val cleanupFailure = when {
+                factoryOwnsLease && createdSession != null && !createdSessionCleanupAttempted -> {
+                    createdSessionCleanupAttempted = true
+                    runCatching(createdSession::closeNow).exceptionOrNull()
+                }
+                !factoryOwnsLease && !routeLeaseCleanupAttempted -> {
+                    routeLeaseCleanupAttempted = true
+                    runCatching(routeLease::retire).exceptionOrNull()
+                }
+                else -> null
             }
-            cleanupFailure?.let(failure::addSuppressed)
+            cleanupFailure?.takeIf { it !== failure }?.let(failure::addSuppressed)
             throw failure
         }
     }
