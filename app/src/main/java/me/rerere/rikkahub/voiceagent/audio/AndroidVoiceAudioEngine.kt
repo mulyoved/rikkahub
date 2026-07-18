@@ -318,7 +318,7 @@ class AndroidVoiceAudioEngine(
         onPcm16: (ByteArray) -> Unit,
         onInjectionComplete: () -> Unit,
     ) {
-        val registration = VoiceAudioDebugInjector.registerCapture(
+        val registration = VoiceAudioDebugInjector.registerCaptureIfCurrent(
             onPcm16 = { buffer ->
                 deliverInjectedCaptureBuffer(
                     token = token,
@@ -332,7 +332,8 @@ class AndroidVoiceAudioEngine(
                     onInjectionComplete()
                 }
             },
-        )
+            isCurrent = { captureOwnership.isCurrent(token, recorder) },
+        ) ?: return
         debugCaptureRegistrations.publish(token, recorder, registration) {
             captureOwnership.isCurrent(token, recorder)
         }
