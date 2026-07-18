@@ -219,6 +219,8 @@ private class SystemBluetoothCaptureLease<Headset : Any, Device : Any>(
     private var closed = false
     private var routingOpen = false
     private var headset: Headset? = null
+    private val ownedHeadsets = mutableListOf<Headset>()
+    private val closedHeadsets = mutableListOf<Headset>()
     private var recognitionHeadset: Headset? = null
     private var recognitionDevice: Device? = null
     private var recognitionAttempted = false
@@ -231,6 +233,7 @@ private class SystemBluetoothCaptureLease<Headset : Any, Device : Any>(
                     true
                 } else {
                     this@SystemBluetoothCaptureLease.headset = headset
+                    if (ownedHeadsets.none { it === headset }) ownedHeadsets += headset
                     false
                 }
             }
@@ -285,13 +288,12 @@ private class SystemBluetoothCaptureLease<Headset : Any, Device : Any>(
         mutationAdmission.awaitUnlessAdmitted()
         val owned = synchronized(lock) {
             BluetoothCaptureResources(
-                headset = headset.also { headset = null },
+                headsets = ownedHeadsets.toList().also { ownedHeadsets.clear() },
                 recognitionHeadset = recognitionHeadset.also { recognitionHeadset = null },
                 recognitionDevice = recognitionDevice.also { recognitionDevice = null },
                 stoppedSco = startedSco.also { startedSco = false },
-            )
+            ).also { headset = null }
         }
-        val connected = owned.headset
         val recognizedHeadset = owned.recognitionHeadset
         val recognized = owned.recognitionDevice
         if (recognizedHeadset != null && recognized != null) {
@@ -304,7 +306,7 @@ private class SystemBluetoothCaptureLease<Headset : Any, Device : Any>(
             runCatching(operations::stopBluetoothSco)
                 .onFailure { logCapabilityWarning("Direct Bluetooth SCO stop failed", it) }
         }
-        connected?.let(::closeHeadsetProxy)
+        owned.headsets.forEach(::closeHeadsetProxy)
         runCatching(callbackDispatcher::close)
             .onFailure { logCapabilityWarning("Direct Bluetooth callback dispatcher close failed", it) }
     }
@@ -342,6 +344,14 @@ private class SystemBluetoothCaptureLease<Headset : Any, Device : Any>(
             }
             runCatching { operations.setBluetoothScoEnabled(true) }
                 .onFailure { logCapabilityWarning("Direct Bluetooth SCO enable failed", it) }
+            val stillOwned = synchronized(lock) { !closed && startedSco }
+            if (!stillOwned) {
+                runCatching { operations.setBluetoothScoEnabled(false) }
+                    .onFailure { logCapabilityWarning("Direct Bluetooth SCO disable rollback failed", it) }
+                runCatching(operations::stopBluetoothSco)
+                    .onFailure { logCapabilityWarning("Direct Bluetooth SCO stop rollback failed", it) }
+                return
+            }
             logCapabilityDebug("Direct requested Bluetooth SCO")
         } finally {
             mutationAdmission.leave()
@@ -400,6 +410,15 @@ private class SystemBluetoothCaptureLease<Headset : Any, Device : Any>(
     }
 
     private fun closeHeadsetProxy(connected: Headset) {
+        val claimed = synchronized(lock) {
+            if (closedHeadsets.any { it === connected }) {
+                false
+            } else {
+                closedHeadsets += connected
+                true
+            }
+        }
+        if (!claimed) return
         runCatching { operations.closeHeadsetProxy(connected) }
             .onFailure { logCapabilityWarning("Direct Bluetooth headset profile close failed", it) }
     }
@@ -479,7 +498,7 @@ private class AndroidDirectCaptureDeviceOperations(
 }
 
 private data class BluetoothCaptureResources<Headset : Any, Device : Any>(
-    val headset: Headset?,
+    val headsets: List<Headset>,
     val recognitionHeadset: Headset?,
     val recognitionDevice: Device?,
     val stoppedSco: Boolean,

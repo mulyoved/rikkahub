@@ -170,6 +170,26 @@ class DirectAudioRouteCapabilitiesTest {
     }
 
     @Test
+    fun `reentrant retirement rolls back SCO enable that completes late`() = runTest {
+        val operations = FakeBluetoothCaptureOperations()
+        val capability = SystemDirectBluetoothCaptureCapability(operations)
+        lateinit var lease: DirectBluetoothCaptureLease
+        operations.beforeSetScoEnabled = { enabled ->
+            if (enabled) lease.retire()
+        }
+        lease = requireNotNull(capability.acquire())
+
+        lease.prepare()
+        val mutationsAfterPrepare = operations.mutations.toList()
+        lease.retire()
+
+        assertFalse(operations.scoEnabled)
+        assertEquals(1, operations.startScoCalls)
+        assertEquals(mutationsAfterPrepare, operations.mutations)
+        capability.close()
+    }
+
+    @Test
     fun `accepted recognition stops exact pair and proxy closes once`() = runTest {
         val operations = FakeBluetoothCaptureOperations().apply {
             deliverHeadsetDuringRequest = true
@@ -192,7 +212,7 @@ class DirectAudioRouteCapabilitiesTest {
     }
 
     @Test
-    fun `replacement profile does not change the accepted recognition owner`() = runTest {
+    fun `replacement profile closes every exact proxy after retiring original recognition`() = runTest {
         val operations = FakeBluetoothCaptureOperations().apply {
             deliverHeadsetDuringRequest = true
             recognitionAccepted = true
@@ -206,7 +226,30 @@ class DirectAudioRouteCapabilitiesTest {
         lease.retire()
 
         assertEquals(listOf(operations.headset to operations.device), operations.recognitionStops)
-        assertEquals(listOf(replacement), operations.closedHeadsets)
+        assertEquals(listOf(operations.headset, replacement), operations.closedHeadsets)
+        assertTrue(
+            operations.mutations.indexOf("stop-recognition") <
+                operations.mutations.indexOf("close-proxy"),
+        )
+        capability.close()
+    }
+
+    @Test
+    fun `disconnect without reconnect still closes its exact proxy once`() = runTest {
+        val operations = FakeBluetoothCaptureOperations().apply {
+            deliverHeadsetDuringRequest = true
+            recognitionAccepted = true
+        }
+        val capability = SystemDirectBluetoothCaptureCapability(operations)
+        val lease = requireNotNull(capability.acquire())
+        lease.prepare()
+
+        operations.disconnectHeadset()
+        lease.retire()
+        lease.retire()
+
+        assertEquals(listOf(operations.headset to operations.device), operations.recognitionStops)
+        assertEquals(listOf(operations.headset), operations.closedHeadsets)
         capability.close()
     }
 
@@ -418,8 +461,11 @@ internal class FakeBluetoothCaptureOperations :
     var dispatchImmediately = true
     var permissionProbeFailure: Throwable? = null
     var beforeStartRecognition: () -> Unit = {}
+    var beforeSetScoEnabled: (Boolean) -> Unit = {}
     var permissionChecks = 0
     var startScoCalls = 0
+    var scoEnabled = false
+        private set
     val scoEnabledValues = mutableListOf<Boolean>()
     var stopScoCalls = 0
     val recognitionStarts = mutableListOf<Pair<FakeBluetoothHeadset, FakeBluetoothDevice>>()
@@ -496,8 +542,10 @@ internal class FakeBluetoothCaptureOperations :
     override fun setBluetoothScoEnabled(enabled: Boolean) {
         scoEnabledValues += enabled
         mutations += "sco-enabled:$enabled"
+        beforeSetScoEnabled(enabled)
         if (enabled && throwWhenEnablingSco) error("SCO enable failed")
         if (!enabled && throwWhenDisablingSco) error("SCO disable failed")
+        scoEnabled = enabled
     }
 
     override fun stopBluetoothSco() {
