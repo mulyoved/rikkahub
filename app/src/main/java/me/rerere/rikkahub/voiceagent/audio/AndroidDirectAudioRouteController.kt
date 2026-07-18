@@ -45,12 +45,14 @@ internal class AndroidDirectAudioRouteController(
                 message = "Direct communication mode setup failed",
                 action = capabilities.communicationMode::acquire,
             )?.let(acquired::add)
-            acquireBestEffort(
+            val bluetoothLease = acquireBestEffort(
                 message = "Direct Bluetooth capture setup failed",
                 action = capabilities.bluetoothCapture::acquire,
-            )?.let(acquired::add)
+            )
+            bluetoothLease?.let(acquired::add)
             DirectVoiceAudioCaptureRouteLease(
                 captureDevice = capabilities.captureDevice,
+                bluetoothCapture = bluetoothLease,
                 focusCallbackGate = focusCallbackGate,
                 initialLeases = acquired,
                 logWarning = ::logWarning,
@@ -80,10 +82,10 @@ internal class AndroidDirectAudioRouteController(
             .onFailure { logWarning("Direct audio capabilities close failed", it) }
     }
 
-    private fun acquireBestEffort(
+    private fun <Lease : DirectAudioResourceLease> acquireBestEffort(
         message: String,
-        action: () -> DirectAudioResourceLease?,
-    ): DirectAudioResourceLease? = runCatching(action)
+        action: () -> Lease?,
+    ): Lease? = runCatching(action)
         .onFailure { logWarning(message, it) }
         .getOrNull()
 
@@ -118,6 +120,7 @@ private class DirectAudioFocusCallbackGate {
 
 private class DirectVoiceAudioCaptureRouteLease(
     private val captureDevice: DirectCaptureDeviceCapability,
+    private val bluetoothCapture: DirectBluetoothCaptureLease?,
     private val focusCallbackGate: DirectAudioFocusCallbackGate,
     initialLeases: List<DirectAudioResourceLease>,
     private val logWarning: (String, Throwable?) -> Unit,
@@ -127,7 +130,10 @@ private class DirectVoiceAudioCaptureRouteLease(
     private val leases = initialLeases.toMutableList()
     private var retired = false
 
-    override suspend fun prepare() = Unit
+    override suspend fun prepare() {
+        val bluetooth = synchronized(lock) { bluetoothCapture.takeUnless { retired } }
+        bluetooth?.prepare()
+    }
 
     override fun configureRecorder(recorder: AudioRecord) {
         val admitted = synchronized(lock) { !retired }

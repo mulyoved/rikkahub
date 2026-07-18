@@ -8,6 +8,7 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.thread
+import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertThrows
@@ -17,7 +18,7 @@ import sun.misc.Unsafe
 
 class AndroidDirectAudioRouteControllerTest {
     @Test
-    fun `focused capabilities acquire and retire in policy order`() {
+    fun `focused capabilities prepare Bluetooth and retire in policy order`() = runTest {
         val fixture = DirectAudioCapabilitiesFixture()
         val controller = fixture.controller()
 
@@ -28,6 +29,7 @@ class AndroidDirectAudioRouteControllerTest {
             fixture.events,
         )
 
+        lease.prepare()
         lease.configureRecorder(uninitializedAudioRecord())
         lease.retire()
         lease.retire()
@@ -37,6 +39,7 @@ class AndroidDirectAudioRouteControllerTest {
                 "focus-acquire",
                 "mode-acquire",
                 "bluetooth-acquire",
+                "bluetooth-prepare",
                 "device-configure",
                 "device-retire",
                 "bluetooth-retire",
@@ -567,15 +570,21 @@ private class FakeDirectBluetoothCaptureCapability(
     var acquireCalls = 0
     var retireCalls = 0
 
-    override fun acquire(): DirectAudioResourceLease? {
+    override fun acquire(): DirectBluetoothCaptureLease? {
         acquireCalls += 1
         events += "bluetooth-acquire"
         acquireFailure?.let { throw it }
         if (!acquisitionAvailable) return null
-        return DirectAudioResourceLease {
-            retireCalls += 1
-            events += "bluetooth-retire"
-            retireFailure?.let { throw it }
+        return object : DirectBluetoothCaptureLease {
+            override suspend fun prepare() {
+                events += "bluetooth-prepare"
+            }
+
+            override fun retire() {
+                retireCalls += 1
+                events += "bluetooth-retire"
+                retireFailure?.let { throw it }
+            }
         }
     }
 }
