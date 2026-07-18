@@ -98,6 +98,7 @@ class VoiceAgentCallSession internal constructor(
     )
     private var startJob: Job? = null
     private var captureStartJob: Job? = null
+    private var captureStartFailureJob: Job? = null
     private var muted = false
     private var sessionId = 0L
     private var ended = false
@@ -934,12 +935,23 @@ class VoiceAgentCallSession internal constructor(
     }
 
     private fun launchCaptureStart(currentSessionId: Long) {
-        val job = scope.launch(start = CoroutineStart.LAZY) {
-            startCapture(currentSessionId)
+        lateinit var job: Job
+        job = scope.launch(start = CoroutineStart.LAZY) {
+            try {
+                startCapture(currentSessionId)
+            } catch (cancellation: CancellationException) {
+                throw cancellation
+            } catch (failure: Throwable) {
+                handleCaptureStartFailure(job, currentSessionId, failure)
+            }
         }
         var accepted = false
         val previous = synchronized(sessionLock) {
-            if (muted || !isSessionOpenAndActiveLocked(currentSessionId, automaticReconnectJob = null)) {
+            if (
+                captureStartFailureJob != null ||
+                muted ||
+                !isSessionOpenAndActiveLocked(currentSessionId, automaticReconnectJob = null)
+            ) {
                 null
             } else {
                 accepted = true
@@ -954,16 +966,73 @@ class VoiceAgentCallSession internal constructor(
         job.invokeOnCompletion {
             synchronized(sessionLock) {
                 if (captureStartJob === job) captureStartJob = null
+                if (captureStartFailureJob === job) captureStartFailureJob = null
             }
         }
         job.start()
     }
 
     private fun cancelCaptureStartJob() {
+        cancelCaptureStartJob(expectedJob = null)
+    }
+
+    private fun cancelCaptureStartJob(expectedJob: Job?) {
         val job = synchronized(sessionLock) {
-            captureStartJob.also { captureStartJob = null }
+            captureStartJob
+                ?.takeIf { expectedJob == null || it === expectedJob }
+                ?.also {
+                    captureStartJob = null
+                    if (captureStartFailureJob === it) captureStartFailureJob = null
+                }
         }
         job?.cancel()
+    }
+
+    private fun handleCaptureStartFailure(job: Job, currentSessionId: Long, failure: Throwable) {
+        val claimed = synchronized(sessionLock) {
+            if (
+                captureStartJob !== job ||
+                captureStartFailureJob != null ||
+                muted ||
+                ended ||
+                sessionId != currentSessionId ||
+                !coordinator.isActiveSession(currentSessionId)
+            ) {
+                false
+            } else {
+                captureStartFailureJob = job
+                true
+            }
+        }
+        if (!claimed) return
+
+        val message = failure.message ?: failure.javaClass.simpleName
+        VoiceAgentLog.w(
+            TAG,
+            "audio capture failed sessionId=$currentSessionId detail=${failure.toVoiceAgentLogDetail()}",
+        )
+        coordinator.recordDiagnostic(
+            name = VoiceSessionStopReason.AudioCaptureFailure.diagnosticReason,
+            detail = failure.toVoiceAgentLogDetail(),
+        )
+        runCatching {
+            recordSessionFailedSafely(
+                sessionId = currentSessionId,
+                endReason = VoiceSessionStopReason.AudioCaptureFailure.diagnosticReason,
+                failureKind = VoiceSessionStopReason.AudioCaptureFailure.diagnosticReason,
+                failureSummary = message,
+            )
+        }.onFailure(failure::addSuppressed)
+        runCatching {
+            prepareFailedSession(
+                sessionId = currentSessionId,
+                reason = VoiceSessionStopReason.AudioCaptureFailure,
+                closeGemini = true,
+            )
+        }.onFailure(failure::addSuppressed)
+        cancelCaptureStartJob(expectedJob = job)
+        clearReconnectEligibility()
+        updateSessionStatusIfNotEnded(VoiceSessionStatus.Error(message))
     }
 
     private suspend fun startCapture(currentSessionId: Long) {
@@ -1189,6 +1258,7 @@ internal sealed class VoiceSessionStopReason(
     val autoReconnectEligible: Boolean = false,
 ) {
     data object StartupFailure : VoiceSessionStopReason("startup_failure")
+    data object AudioCaptureFailure : VoiceSessionStopReason("audio_capture_failure")
     data object ManualReconnect : VoiceSessionStopReason("manual_reconnect")
     data object GeminiError : VoiceSessionStopReason("gemini_error")
     data object WebSocketClosed : VoiceSessionStopReason("websocket_closed", autoReconnectEligible = true)

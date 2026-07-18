@@ -350,14 +350,12 @@ class AndroidDirectAudioRouteControllerTest {
             acquisitionFailure.set(runCatching { controller.acquireCapture() }.exceptionOrNull())
         }
         assertTrue(focusEntered.await(5, TimeUnit.SECONDS))
-        val closeCompleted = CountDownLatch(1)
         val close = thread(name = "direct-close-during-focus") {
             controller.close()
-            closeCompleted.countDown()
         }
 
         try {
-            assertTrue(closeCompleted.await(1, TimeUnit.SECONDS))
+            close.join(1_000)
             assertFalse(close.isAlive)
             assertEquals(1, fixture.closeCalls)
         } finally {
