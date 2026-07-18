@@ -13,115 +13,122 @@ import org.junit.Test
 
 class VoiceAudioRouteControllerTest {
     @Test
-    fun `buffer size failure clears and retires exact acquired lease before recorder creation`() {
+    fun `buffer size failure aborts published route before recorder creation`() {
         val failure = IllegalStateException("minimum buffer unavailable")
         val events = mutableListOf<String>()
         val lease = FakeCaptureRouteLease { events += "routeRetired" }
+        val ownership = fakeSetupOwnership()
         var recorderCreationCalls = 0
 
         val thrown = runCatching {
-            val bufferSize = acquireVoiceAudioCaptureBufferSize(
+            setupVoiceAudioCapture(
+                ownership = ownership,
+                acquireRoute = { lease },
                 lookupBufferSize = {
                     events += "bufferLookup"
                     throw failure
                 },
-                clearRouteLease = { events += "routeCleared" },
-                routeLease = lease,
-            )
-            createVoiceAudioCaptureRecorder(
                 createRecorder = {
                     recorderCreationCalls += 1
-                    bufferSize
+                    Any()
                 },
-                clearRouteLease = { events += "unexpectedClear" },
-                routeLease = lease,
+                configureRecorder = { _, _ -> events += "configure" },
+                isRecorderInitialized = { true },
+                releaseRecorder = { events += "recorderReleased" },
             )
         }.exceptionOrNull()
 
         assertSame(failure, thrown)
         assertEquals(0, recorderCreationCalls)
-        assertEquals(listOf("bufferLookup", "routeCleared", "routeRetired"), events)
+        assertEquals(listOf("bufferLookup", "routeRetired"), events)
         assertEquals(1, lease.retireCalls)
+        assertTrue(ownership.abort(ownership.reserve()))
     }
 
     @Test
-    fun `recorder creation failure clears and retires exact acquired lease`() {
+    fun `recorder creation failure wraps cause and aborts published route`() {
         val cause = IllegalArgumentException("factory failed")
         val events = mutableListOf<String>()
         val lease = FakeCaptureRouteLease { events += "routeRetired" }
+        val ownership = fakeSetupOwnership()
 
         val thrown = runCatching {
-            createVoiceAudioCaptureRecorder(
+            setupVoiceAudioCapture(
+                ownership = ownership,
+                acquireRoute = { lease },
+                lookupBufferSize = { 64 },
                 createRecorder = { throw cause },
-                clearRouteLease = { events += "routeCleared" },
-                routeLease = lease,
+                configureRecorder = { _, _ -> events += "configure" },
+                isRecorderInitialized = { true },
+                releaseRecorder = { events += "recorderReleased" },
             )
         }.exceptionOrNull()
 
         assertTrue(thrown is IllegalStateException)
         assertEquals("AudioRecord creation failed", thrown?.message)
-        assertTrue(thrown?.cause === cause)
-        assertEquals(listOf("routeCleared", "routeRetired"), events)
-        lease.retire()
-        assertEquals(listOf("routeCleared", "routeRetired"), events)
+        assertSame(cause, thrown?.cause)
+        assertEquals(listOf("routeRetired"), events)
+        assertEquals(1, lease.retireCalls)
     }
 
     @Test
-    fun `recorder configuration failure releases recorder and exact route lease before escaping`() {
-        val failure = IllegalStateException("configuration failed")
+    fun `configuration failure keeps primary and suppresses recorder then route cleanup failures`() {
+        val configureFailure = IllegalStateException("configuration failed")
+        val releaseFailure = IllegalArgumentException("release failed")
+        val routeFailure = UnsupportedOperationException("route retirement failed")
         val events = mutableListOf<String>()
-        val lease = FakeCaptureRouteLease { events += "routeRetired" }
+        val lease = FakeCaptureRouteLease {
+            events += "routeRetired"
+            throw routeFailure
+        }
+        val ownership = fakeSetupOwnership()
 
         val thrown = runCatching {
-            configureVoiceAudioCaptureRecorder(
-                configureRecorder = { throw failure },
-                releaseRecorder = { events += "recorderReleased" },
-                clearRouteLease = { events += "routeCleared" },
-                routeLease = lease,
+            setupVoiceAudioCapture(
+                ownership = ownership,
+                acquireRoute = { lease },
+                lookupBufferSize = { 64 },
+                createRecorder = { Any() },
+                configureRecorder = { _, _ ->
+                    events += "configure"
+                    throw configureFailure
+                },
+                isRecorderInitialized = { true },
+                releaseRecorder = {
+                    events += "recorderReleased"
+                    throw releaseFailure
+                },
             )
         }.exceptionOrNull()
 
-        assertTrue(thrown === failure)
-        assertEquals(listOf("recorderReleased", "routeCleared", "routeRetired"), events)
-        lease.retire()
-        assertEquals(listOf("recorderReleased", "routeCleared", "routeRetired"), events)
+        assertSame(configureFailure, thrown)
+        assertEquals(listOf(releaseFailure, routeFailure), configureFailure.suppressed.toList())
+        assertEquals(listOf("configure", "recorderReleased", "routeRetired"), events)
+        assertEquals(1, lease.retireCalls)
     }
 
     @Test
-    fun `uninitialized recorder retires installed route lease before setup error escapes`() {
-        var directResourcesAcquired = false
-        var retireCalls = 0
-        var recorderReleaseCalls = 0
-        var installedLease: VoiceAudioCaptureRouteLease? = null
-        directResourcesAcquired = true
-        val lease = FakeCaptureRouteLease {
-            retireCalls += 1
-            directResourcesAcquired = false
-        }.also { installedLease = it }
+    fun `uninitialized recorder releases recorder then aborts published route`() {
+        val events = mutableListOf<String>()
+        val lease = FakeCaptureRouteLease { events += "routeRetired" }
+        val ownership = fakeSetupOwnership()
 
         val thrown = runCatching {
-            ensureVoiceAudioCaptureRecorderInitialized(
-                initialized = false,
-                releaseRecorder = { recorderReleaseCalls += 1 },
-                clearRouteLease = {
-                    if (installedLease === lease) installedLease = null
-                },
-                routeLease = lease,
+            setupVoiceAudioCapture(
+                ownership = ownership,
+                acquireRoute = { lease },
+                lookupBufferSize = { 64 },
+                createRecorder = { Any() },
+                configureRecorder = { _, _ -> events += "configure" },
+                isRecorderInitialized = { false },
+                releaseRecorder = { events += "recorderReleased" },
             )
         }.exceptionOrNull()
 
         assertTrue(thrown is IllegalStateException)
         assertEquals("AudioRecord initialization failed", thrown?.message)
-        assertEquals(1, recorderReleaseCalls)
-        assertEquals(null, installedLease)
-        assertFalse(directResourcesAcquired)
-        assertEquals(1, retireCalls)
-
-        lease.retire() // later stop
-        lease.retire() // later release
-
-        assertEquals(1, retireCalls)
-        assertFalse(directResourcesAcquired)
+        assertEquals(listOf("configure", "recorderReleased", "routeRetired"), events)
+        assertEquals(1, lease.retireCalls)
     }
 
     @Test
@@ -293,6 +300,15 @@ class VoiceAudioRouteControllerTest {
             calls += "close"
         }
     }
+
+    private fun fakeSetupOwnership() = VoiceAudioCaptureOwnership<Any, Any>(
+        startRecorder = {},
+        isRecorderRecording = { true },
+        stopRecorder = {},
+        releaseRecorder = {},
+        startTask = { true },
+        cancelTask = {},
+    )
 
     private class FakeCaptureRouteLease(
         private val onRetire: () -> Unit,

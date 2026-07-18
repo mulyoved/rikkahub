@@ -72,65 +72,61 @@ internal fun runVoiceAudioCaptureLoop(
     }
 }
 
-internal fun ensureVoiceAudioCaptureRecorderInitialized(
-    initialized: Boolean,
-    releaseRecorder: () -> Unit,
-    clearRouteLease: () -> Unit,
-    routeLease: VoiceAudioCaptureRouteLease,
-) {
-    if (initialized) return
-    throwVoiceAudioCaptureSetupFailure(
-        IllegalStateException("AudioRecord initialization failed"),
-        releaseRecorder,
-        clearRouteLease,
-        routeLease::retire,
-    )
-}
+internal data class VoiceAudioCaptureSetup<Recorder : Any>(
+    val token: VoiceAudioCaptureToken,
+    val bufferSize: Int,
+    val recorder: Recorder,
+)
 
-internal fun configureVoiceAudioCaptureRecorder(
-    configureRecorder: () -> Unit,
-    releaseRecorder: () -> Unit,
-    clearRouteLease: () -> Unit,
-    routeLease: VoiceAudioCaptureRouteLease,
-) {
+internal fun <Recorder : Any, CaptureTask : Any> setupVoiceAudioCapture(
+    ownership: VoiceAudioCaptureOwnership<Recorder, CaptureTask>,
+    acquireRoute: () -> VoiceAudioCaptureRouteLease,
+    lookupBufferSize: () -> Int,
+    createRecorder: (Int) -> Recorder,
+    configureRecorder: (VoiceAudioCaptureRouteLease, Recorder) -> Unit,
+    isRecorderInitialized: (Recorder) -> Boolean,
+    releaseRecorder: (Recorder) -> Unit,
+): VoiceAudioCaptureSetup<Recorder>? {
+    val token = ownership.reserve()
+    val routeLease = try {
+        acquireRoute()
+    } catch (failure: Throwable) {
+        throwVoiceAudioCaptureSetupFailure(failure, { ownership.abort(token) })
+    }
+    if (!ownership.publishRoute(token, routeLease)) {
+        routeLease.retire()
+        return null
+    }
+    val bufferSize = try {
+        lookupBufferSize()
+    } catch (failure: Throwable) {
+        throwVoiceAudioCaptureSetupFailure(failure, { ownership.abort(token) })
+    }
+    val recorder = try {
+        createRecorder(bufferSize)
+    } catch (cause: Throwable) {
+        throwVoiceAudioCaptureSetupFailure(
+            IllegalStateException("AudioRecord creation failed", cause),
+            { ownership.abort(token) },
+        )
+    }
     try {
-        configureRecorder()
+        configureRecorder(routeLease, recorder)
     } catch (failure: Throwable) {
         throwVoiceAudioCaptureSetupFailure(
             failure,
-            releaseRecorder,
-            clearRouteLease,
-            routeLease::retire,
+            { releaseRecorder(recorder) },
+            { ownership.abort(token) },
         )
     }
-}
-
-internal fun <Recorder> createVoiceAudioCaptureRecorder(
-    createRecorder: () -> Recorder,
-    clearRouteLease: () -> Unit,
-    routeLease: VoiceAudioCaptureRouteLease,
-): Recorder = try {
-    createRecorder()
-} catch (cause: Throwable) {
-    throwVoiceAudioCaptureSetupFailure(
-        IllegalStateException("AudioRecord creation failed", cause),
-        clearRouteLease,
-        routeLease::retire,
-    )
-}
-
-internal fun acquireVoiceAudioCaptureBufferSize(
-    lookupBufferSize: () -> Int,
-    clearRouteLease: () -> Unit,
-    routeLease: VoiceAudioCaptureRouteLease,
-): Int = try {
-    lookupBufferSize()
-} catch (failure: Throwable) {
-    throwVoiceAudioCaptureSetupFailure(
-        failure,
-        clearRouteLease,
-        routeLease::retire,
-    )
+    if (!isRecorderInitialized(recorder)) {
+        throwVoiceAudioCaptureSetupFailure(
+            IllegalStateException("AudioRecord initialization failed"),
+            { releaseRecorder(recorder) },
+            { ownership.abort(token) },
+        )
+    }
+    return VoiceAudioCaptureSetup(token, bufferSize, recorder)
 }
 
 private fun throwVoiceAudioCaptureSetupFailure(
@@ -173,7 +169,12 @@ class AndroidVoiceAudioEngine(
         onDiagnostic = ::handlePlaybackDiagnostic,
         onPlaybackEvent = ::notifyPlaybackEvent,
     )
-    private var debugCaptureRegistration: VoiceAudioDebugInjector.Registration? = null
+    private val debugCaptureRegistrations =
+        VoiceAudioDebugCaptureRegistrationOwner<
+            VoiceAudioCaptureToken,
+            AudioRecord,
+            VoiceAudioDebugInjector.Registration,
+        >(VoiceAudioDebugInjector.Registration::close)
     private var errorHandler: ((String) -> Unit)? = null
 
     init {
@@ -203,45 +204,18 @@ class AndroidVoiceAudioEngine(
         }
 
         stopCaptureInternal()
-        val token = captureOwnership.reserve()
-        val routeLease = try {
-            routeController.acquireCapture()
-        } catch (failure: Throwable) {
-            throwVoiceAudioCaptureSetupFailure(failure, { captureOwnership.abort(token) })
-        }
-        if (!captureOwnership.publishRoute(token, routeLease)) {
-            routeLease.retire()
-            return
-        }
-        val bufferSize = try {
-            captureBufferSize()
-        } catch (failure: Throwable) {
-            throwVoiceAudioCaptureSetupFailure(failure, { captureOwnership.abort(token) })
-        }
-        val recorder = try {
-            createCaptureRecord(bufferSize = bufferSize)
-        } catch (cause: Throwable) {
-            throwVoiceAudioCaptureSetupFailure(
-                IllegalStateException("AudioRecord creation failed", cause),
-                { captureOwnership.abort(token) },
-            )
-        }
-        try {
-            routeLease.configureRecorder(recorder)
-        } catch (failure: Throwable) {
-            throwVoiceAudioCaptureSetupFailure(
-                failure,
-                { recorder.releaseSafely() },
-                { captureOwnership.abort(token) },
-            )
-        }
-        if (recorder.state != AudioRecord.STATE_INITIALIZED) {
-            throwVoiceAudioCaptureSetupFailure(
-                IllegalStateException("AudioRecord initialization failed"),
-                { recorder.releaseSafely() },
-                { captureOwnership.abort(token) },
-            )
-        }
+        val setup = setupVoiceAudioCapture(
+            ownership = captureOwnership,
+            acquireRoute = routeController::acquireCapture,
+            lookupBufferSize = ::captureBufferSize,
+            createRecorder = { bufferSize -> createCaptureRecord(bufferSize) },
+            configureRecorder = { routeLease, recorder -> routeLease.configureRecorder(recorder) },
+            isRecorderInitialized = { recorder -> recorder.state == AudioRecord.STATE_INITIALIZED },
+            releaseRecorder = { recorder -> recorder.releaseSafely() },
+        ) ?: return
+        val token = setup.token
+        val bufferSize = setup.bufferSize
+        val recorder = setup.recorder
 
         val job = scope.launch(start = CoroutineStart.LAZY) {
             var captureLevelChunks = 0
@@ -275,7 +249,11 @@ class AndroidVoiceAudioEngine(
                     }
                 },
                 onTerminated = {
-                    if (captureOwnership.terminate(token, recorder)) unregisterDebugCapture()
+                    try {
+                        captureOwnership.terminate(token, recorder)
+                    } finally {
+                        debugCaptureRegistrations.unregister(token, recorder)
+                    }
                 },
             )
         }
@@ -290,8 +268,11 @@ class AndroidVoiceAudioEngine(
     }
 
     private fun stopCaptureInternal() {
-        unregisterDebugCapture()
-        captureOwnership.stop()
+        try {
+            captureOwnership.stop()
+        } finally {
+            unregisterDebugCapture()
+        }
     }
 
     override fun playPcm16(base64Pcm16: String, sessionId: Long?): Boolean {
@@ -318,8 +299,12 @@ class AndroidVoiceAudioEngine(
     }
 
     private fun releaseInternal() {
-        unregisterDebugCapture()
-        if (!captureOwnership.release()) return
+        val firstRelease = try {
+            captureOwnership.release()
+        } finally {
+            unregisterDebugCapture()
+        }
+        if (!firstRelease) return
         playbackTracks.markReleased()
         playbackEventOwner.releasePlayback(playbackWriter::release)
         playbackTracks.releaseAll()
@@ -348,23 +333,13 @@ class AndroidVoiceAudioEngine(
                 }
             },
         )
-        synchronized(lock) {
-            if (captureOwnership.isCurrent(token, recorder)) {
-                unregisterDebugCaptureLocked()
-                debugCaptureRegistration = registration
-            } else {
-                registration.close()
-            }
+        debugCaptureRegistrations.publish(token, recorder, registration) {
+            captureOwnership.isCurrent(token, recorder)
         }
     }
 
-    private fun unregisterDebugCaptureLocked() {
-        debugCaptureRegistration?.close()
-        debugCaptureRegistration = null
-    }
-
     private fun unregisterDebugCapture() {
-        synchronized(lock, ::unregisterDebugCaptureLocked)
+        debugCaptureRegistrations.unregister()
     }
 
     private fun deliverCaptureBuffer(
@@ -384,13 +359,17 @@ class AndroidVoiceAudioEngine(
         buffer: ByteArray,
         onPcm16: (ByteArray) -> Unit,
     ) {
-        if (!captureOwnership.isCurrent(token, recorder)) return
-        try {
-            onPcm16(buffer)
-        } catch (e: Exception) {
-            Log.w(TAG, "Stopping capture after debug PCM injection callback failure", e)
-            captureOwnership.terminate(token, recorder)
-        }
+        debugCaptureRegistrations.deliver(
+            token = token,
+            recorder = recorder,
+            buffer = buffer,
+            isCurrent = { captureOwnership.isCurrent(token, recorder) },
+            onPcm16 = onPcm16,
+            terminate = { captureOwnership.terminate(token, recorder) },
+            onFailure = { error ->
+                Log.w(TAG, "Stopping capture after debug PCM injection callback failure", error)
+            },
+        )
     }
 
     @RequiresPermission(Manifest.permission.RECORD_AUDIO)
