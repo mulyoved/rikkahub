@@ -1,7 +1,7 @@
 ## Current Result
 
 - Status: DONE
-- Commit: the CE1-T8-001 fix commit containing this report
+- Commit: `22623daf5cf6e49d76c724591af52b1cd0633886` (`fix(voice): prove direct capture adapter contracts`)
 - Summary: Restored executable proof for the Android capture-device boundary without restoring a platform handle or domain operations abstraction. `AndroidDirectCaptureDeviceAdapter` now owns a candidate-local action seam whose production closures retain each private `AudioDeviceInfo`; focused tests execute the adapter and prove permission short-circuiting, exact selected-candidate actions, accepted-only cleanup ownership, exactly-once clearing, and best-effort platform failures.
 
 ## Tests

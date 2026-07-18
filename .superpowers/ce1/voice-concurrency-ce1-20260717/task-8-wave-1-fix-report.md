@@ -5,7 +5,7 @@
 - Status: DONE
 - Queue item: `CE1-T8-001` / `android-capture-adapter-contracts-unproved`
 - Scope: Only the admitted Android capture-adapter executable coverage gap was fixed. `CE1-T7-007` device-label logging was not changed.
-- Commit: the CE1-T8-001 fix commit containing this report
+- Commit: `22623daf5cf6e49d76c724591af52b1cd0633886` (`fix(voice): prove direct capture adapter contracts`)
 
 ## Root Cause
 
