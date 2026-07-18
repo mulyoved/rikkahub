@@ -222,8 +222,7 @@ private class SystemBluetoothCaptureLease<Headset : Any, Device : Any>(
     private var headset: Headset? = null
     private val ownedHeadsets = mutableListOf<Headset>()
     private val closedHeadsets = mutableListOf<Headset>()
-    private var recognitionHeadset: Headset? = null
-    private var recognitionDevice: Device? = null
+    private var recognition: RecognitionOwnership<Headset, Device>? = null
     private var recognitionAttempted = false
     private var scoAttempted = false
     private var startedSco = false
@@ -281,25 +280,27 @@ private class SystemBluetoothCaptureLease<Headset : Any, Device : Any>(
         requestBluetoothSco()
     }
 
-    override fun retire() = retirement.retire {
+    override fun retire() {
         synchronized(lock) {
             closed = true
             mutationAdmission.close()
             profile.complete(null)
         }
-        mutationAdmission.awaitUnlessAdmitted()
+        if (mutationAdmission.isCurrentThreadAdmitted()) return
+        completeRetirement()
+    }
+
+    private fun completeRetirement() = retirement.retire {
+        mutationAdmission.awaitDrained()
         val owned = synchronized(lock) {
             BluetoothCaptureResources(
                 headsets = ownedHeadsets.toList().also { ownedHeadsets.clear() },
-                recognitionHeadset = recognitionHeadset.also { recognitionHeadset = null },
-                recognitionDevice = recognitionDevice.also { recognitionDevice = null },
+                recognition = recognition.also { recognition = null },
                 stoppedSco = startedSco.also { startedSco = false },
             ).also { headset = null }
         }
-        val recognizedHeadset = owned.recognitionHeadset
-        val recognized = owned.recognitionDevice
-        if (recognizedHeadset != null && recognized != null) {
-            runCatching { operations.stopVoiceRecognition(recognizedHeadset, recognized) }
+        owned.recognition?.let { recognized ->
+            runCatching { operations.stopVoiceRecognition(recognized.headset, recognized.device) }
                 .onFailure { logCapabilityWarning("Direct Bluetooth headset voice recognition stop failed", it) }
         }
         if (owned.stoppedSco) {
@@ -346,8 +347,15 @@ private class SystemBluetoothCaptureLease<Headset : Any, Device : Any>(
             }
             runCatching { operations.setBluetoothScoEnabled(true) }
                 .onFailure { logCapabilityWarning("Direct Bluetooth SCO enable failed", it) }
-            val stillOwned = synchronized(lock) { !closed && startedSco }
-            if (!stillOwned) {
+            val rollback = synchronized(lock) {
+                if (!closed && startedSco) {
+                    false
+                } else {
+                    startedSco = false
+                    true
+                }
+            }
+            if (rollback) {
                 runCatching { operations.setBluetoothScoEnabled(false) }
                     .onFailure { logCapabilityWarning("Direct Bluetooth SCO disable rollback failed", it) }
                 runCatching(operations::stopBluetoothSco)
@@ -356,7 +364,7 @@ private class SystemBluetoothCaptureLease<Headset : Any, Device : Any>(
             }
             logCapabilityDebug("Direct requested Bluetooth SCO")
         } finally {
-            mutationAdmission.leave()
+            if (mutationAdmission.leave()) completeRetirement()
         }
     }
 
@@ -386,11 +394,10 @@ private class SystemBluetoothCaptureLease<Headset : Any, Device : Any>(
                 .getOrDefault(false)
             val accepted = if (started) {
                 synchronized(lock) {
-                    if (closed || headset !== connected || recognitionDevice != null) {
+                    if (closed || headset !== connected || recognition != null) {
                         false
                     } else {
-                        recognitionHeadset = connected
-                        recognitionDevice = device
+                        recognition = RecognitionOwnership(connected, device)
                         true
                     }
                 }
@@ -407,7 +414,7 @@ private class SystemBluetoothCaptureLease<Headset : Any, Device : Any>(
                     "device=$safeLabel accepted=$accepted",
             )
         } finally {
-            mutationAdmission.leave()
+            if (mutationAdmission.leave()) completeRetirement()
         }
     }
 
@@ -501,9 +508,13 @@ private class AndroidDirectCaptureDeviceOperations(
 
 private data class BluetoothCaptureResources<Headset : Any, Device : Any>(
     val headsets: List<Headset>,
-    val recognitionHeadset: Headset?,
-    val recognitionDevice: Device?,
+    val recognition: RecognitionOwnership<Headset, Device>?,
     val stoppedSco: Boolean,
+)
+
+private data class RecognitionOwnership<Headset : Any, Device : Any>(
+    val headset: Headset,
+    val device: Device,
 )
 
 private class DirectBluetoothMutationAdmission {
@@ -526,7 +537,11 @@ private class DirectBluetoothMutationAdmission {
         admissionsChanged.signalAll()
     }
 
-    fun leave() = lock.withLock {
+    fun isCurrentThreadAdmitted(): Boolean = lock.withLock {
+        admissionsByThread.containsKey(Thread.currentThread())
+    }
+
+    fun leave(): Boolean = lock.withLock {
         val thread = Thread.currentThread()
         val threadAdmissions = requireNotNull(admissionsByThread[thread])
         if (threadAdmissions == 1) {
@@ -536,14 +551,14 @@ private class DirectBluetoothMutationAdmission {
         }
         admissionCount -= 1
         admissionsChanged.signalAll()
+        !accepting && !admissionsByThread.containsKey(thread)
     }
 
-    fun awaitUnlessAdmitted() {
+    fun awaitDrained() {
         val currentThread = Thread.currentThread()
         var interrupted = false
         lock.withLock {
-            val ownAdmissions = admissionsByThread[currentThread] ?: 0
-            while (admissionCount > ownAdmissions) {
+            while (admissionCount > 0) {
                 try {
                     admissionsChanged.await()
                 } catch (_: InterruptedException) {

@@ -9,6 +9,7 @@ import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
@@ -170,6 +171,28 @@ class DirectAudioRouteCapabilitiesTest {
     }
 
     @Test
+    fun `retirement wakes pending profile prepare without routing mutation`() = runTest {
+        val operations = FakeBluetoothCaptureOperations()
+        val capability = SystemDirectBluetoothCaptureCapability(operations, profileWaitMillis = 1_000L)
+        val lease = requireNotNull(capability.acquire())
+        val preparing = async { lease.prepare() }
+        runCurrent()
+        assertFalse(preparing.isCompleted)
+        assertEquals(0L, testScheduler.currentTime)
+
+        lease.retire()
+        runCurrent()
+        preparing.await()
+
+        assertEquals(0L, testScheduler.currentTime)
+        assertTrue(operations.recognitionStarts.isEmpty())
+        assertEquals(0, operations.startScoCalls)
+        assertTrue(operations.scoEnabledValues.isEmpty())
+        assertEquals(0, operations.stopScoCalls)
+        capability.close()
+    }
+
+    @Test
     fun `partial SCO setup retires once and stop continues after disable failure`() = runTest {
         val operations = FakeBluetoothCaptureOperations().apply {
             deliverHeadsetDuringRequest = true
@@ -207,6 +230,49 @@ class DirectAudioRouteCapabilitiesTest {
         assertFalse(operations.scoEnabled)
         assertEquals(1, operations.startScoCalls)
         assertEquals(mutationsAfterPrepare, operations.mutations)
+        capability.close()
+    }
+
+    @Test
+    fun `different thread retirement claims late SCO rollback once`() {
+        val scoEnableEntered = CountDownLatch(1)
+        val releaseScoEnable = CountDownLatch(1)
+        val retirementCompleted = CountDownLatch(1)
+        val operations = FakeBluetoothCaptureOperations().apply {
+            profileRequestAccepted = false
+            beforeSetScoEnabled = { enabled ->
+                if (enabled) {
+                    scoEnableEntered.countDown()
+                    assertTrue(releaseScoEnable.await(5, TimeUnit.SECONDS))
+                }
+            }
+        }
+        val capability = SystemDirectBluetoothCaptureCapability(operations)
+        val lease = requireNotNull(capability.acquire())
+        val preparing = thread(name = "direct-bluetooth-blocked-sco-enable") {
+            runBlocking { lease.prepare() }
+        }
+        assertTrue(scoEnableEntered.await(5, TimeUnit.SECONDS))
+        val retirement = thread(name = "direct-bluetooth-cross-thread-retirement") {
+            lease.retire()
+            retirementCompleted.countDown()
+        }
+
+        try {
+            assertTrue(retirement.awaitState(Thread.State.WAITING, 5, TimeUnit.SECONDS))
+            assertFalse(retirementCompleted.await(100, TimeUnit.MILLISECONDS))
+        } finally {
+            releaseScoEnable.countDown()
+            preparing.join(5_000)
+            retirement.join(5_000)
+        }
+
+        assertFalse(preparing.isAlive)
+        assertFalse(retirement.isAlive)
+        assertEquals(0L, retirementCompleted.count)
+        assertFalse(operations.scoEnabled)
+        assertEquals(listOf(true, false), operations.scoEnabledValues)
+        assertEquals(1, operations.stopScoCalls)
         capability.close()
     }
 
@@ -434,6 +500,77 @@ class DirectAudioRouteCapabilitiesTest {
             operations.mutations.indexOf("stop-recognition") <
                 operations.mutations.indexOf("close-proxy"),
         )
+        capability.close()
+    }
+
+    @Test
+    fun `admitted retirement releases admission before joining cleanup`() {
+        val scoEnableEntered = CountDownLatch(1)
+        val recognitionEntered = CountDownLatch(1)
+        val allowScoRetirement = CountDownLatch(1)
+        val allowRecognitionRetirement = CountDownLatch(1)
+        val admittedOperationsCompleted = CountDownLatch(2)
+        val operations = FakeBluetoothCaptureOperations().apply {
+            profileRequestAccepted = false
+            recognitionAccepted = true
+        }
+        val capability = SystemDirectBluetoothCaptureCapability(operations)
+        lateinit var lease: DirectBluetoothCaptureLease
+        operations.beforeSetScoEnabled = { enabled ->
+            if (enabled) {
+                scoEnableEntered.countDown()
+                assertTrue(allowScoRetirement.await(5, TimeUnit.SECONDS))
+                lease.retire()
+            }
+        }
+        operations.beforeStartRecognition = {
+            recognitionEntered.countDown()
+            assertTrue(allowRecognitionRetirement.await(5, TimeUnit.SECONDS))
+            lease.retire()
+        }
+        lease = requireNotNull(capability.acquire())
+        val preparing = thread(
+            name = "direct-bluetooth-admitted-sco-retirement",
+            isDaemon = true,
+        ) {
+            runBlocking { lease.prepare() }
+            admittedOperationsCompleted.countDown()
+        }
+        assertTrue(scoEnableEntered.await(5, TimeUnit.SECONDS))
+        val callback = thread(
+            name = "direct-bluetooth-admitted-recognition-retirement",
+            isDaemon = true,
+        ) {
+            operations.deliverHeadset()
+            admittedOperationsCompleted.countDown()
+        }
+        assertTrue(recognitionEntered.await(5, TimeUnit.SECONDS))
+
+        try {
+            allowRecognitionRetirement.countDown()
+            assertTrue(callback.awaitState(Thread.State.WAITING, 5, TimeUnit.SECONDS))
+            allowScoRetirement.countDown()
+            assertTrue(admittedOperationsCompleted.await(5, TimeUnit.SECONDS))
+        } finally {
+            allowRecognitionRetirement.countDown()
+            allowScoRetirement.countDown()
+            preparing.join(5_000)
+            callback.join(5_000)
+        }
+
+        assertFalse(preparing.isAlive)
+        assertFalse(callback.isAlive)
+        assertEquals(0L, admittedOperationsCompleted.count)
+        assertEquals(listOf(operations.headset to operations.device), operations.recognitionStarts)
+        assertEquals(listOf(operations.headset to operations.device), operations.recognitionStops)
+        assertEquals(listOf(true, false), operations.scoEnabledValues)
+        assertEquals(1, operations.stopScoCalls)
+        assertEquals(listOf(operations.headset), operations.closedHeadsets)
+        assertEquals(1, operations.closeCalls)
+
+        val mutationsAfterRetirement = operations.mutations.toList()
+        lease.retire()
+        assertEquals(mutationsAfterRetirement, operations.mutations)
         capability.close()
     }
 
@@ -711,4 +848,16 @@ private fun uninitializedAudioRecord(): AudioRecord {
     val unsafeField = Unsafe::class.java.getDeclaredField("theUnsafe")
     unsafeField.isAccessible = true
     return (unsafeField.get(null) as Unsafe).allocateInstance(AudioRecord::class.java) as AudioRecord
+}
+
+private fun Thread.awaitState(
+    expected: Thread.State,
+    timeout: Long,
+    unit: TimeUnit,
+): Boolean {
+    val deadline = System.nanoTime() + unit.toNanos(timeout)
+    while (isAlive && state != expected && System.nanoTime() < deadline) {
+        Thread.yield()
+    }
+    return state == expected
 }
