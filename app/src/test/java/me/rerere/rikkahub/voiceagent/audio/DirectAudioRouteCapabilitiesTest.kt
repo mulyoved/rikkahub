@@ -1,5 +1,6 @@
 package me.rerere.rikkahub.voiceagent.audio
 
+import android.media.AudioRecord
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -17,6 +18,7 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import sun.misc.Unsafe
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class DirectAudioRouteCapabilitiesTest {
@@ -628,6 +630,179 @@ class DirectAudioRouteCapabilitiesTest {
         lease.retire()
     }
 
+    @Test
+    fun `capture device permission denial performs no enumeration or mutation`() {
+        var enumerations = 0
+        val mutations = mutableListOf<String>()
+        val adapter = AndroidDirectCaptureDeviceAdapter(
+            hasConnectPermission = { false },
+            captureDevices = {
+                enumerations += 1
+                listOf(captureCandidate(id = 7, mutations = mutations))
+            },
+            clearCommunicationDevice = { mutations += "clear" },
+        )
+
+        assertNull(adapter.configure(uninitializedCaptureAudioRecord()))
+
+        assertEquals(0, enumerations)
+        assertTrue(mutations.isEmpty())
+    }
+
+    @Test
+    fun `capture adapter configures the exact selected candidate`() {
+        val mutations = mutableListOf<String>()
+        val adapter = AndroidDirectCaptureDeviceAdapter(
+            hasConnectPermission = { true },
+            captureDevices = {
+                listOf(
+                    captureCandidate(
+                        id = 1,
+                        type = VoiceAudioRouteDeviceType.BuiltInMic,
+                        mutations = mutations,
+                    ),
+                    captureCandidate(id = 7, mutations = mutations),
+                )
+            },
+            clearCommunicationDevice = { mutations += "clear" },
+        )
+
+        val lease = requireNotNull(adapter.configure(uninitializedCaptureAudioRecord()))
+
+        assertEquals(listOf("preferred:7", "communication:7"), mutations)
+        lease.retire()
+    }
+
+    @Test
+    fun `rejected communication device owns no clear action`() {
+        val mutations = mutableListOf<String>()
+        val adapter = AndroidDirectCaptureDeviceAdapter(
+            hasConnectPermission = { true },
+            captureDevices = {
+                listOf(
+                    captureCandidate(
+                        id = 7,
+                        mutations = mutations,
+                        communicationAccepted = false,
+                    ),
+                )
+            },
+            clearCommunicationDevice = { mutations += "clear" },
+        )
+
+        assertNull(adapter.configure(uninitializedCaptureAudioRecord()))
+
+        assertEquals(listOf("preferred:7", "communication:7"), mutations)
+    }
+
+    @Test
+    fun `accepted communication device clears exactly once`() {
+        val mutations = mutableListOf<String>()
+        val adapter = AndroidDirectCaptureDeviceAdapter(
+            hasConnectPermission = { true },
+            captureDevices = { listOf(captureCandidate(id = 7, mutations = mutations)) },
+            clearCommunicationDevice = { mutations += "clear" },
+        )
+        val lease = requireNotNull(adapter.configure(uninitializedCaptureAudioRecord()))
+
+        lease.retire()
+        lease.retire()
+
+        assertEquals(listOf("preferred:7", "communication:7", "clear"), mutations)
+    }
+
+    @Test
+    fun `capture adapter platform failures remain best effort`() {
+        var permissionFailureEnumerations = 0
+        val permissionFailure = AndroidDirectCaptureDeviceAdapter(
+            hasConnectPermission = { error("permission") },
+            captureDevices = {
+                permissionFailureEnumerations += 1
+                emptyList()
+            },
+            clearCommunicationDevice = {},
+        )
+        assertNull(permissionFailure.configure(uninitializedCaptureAudioRecord()))
+        assertEquals(0, permissionFailureEnumerations)
+
+        val enumerationFailure = AndroidDirectCaptureDeviceAdapter(
+            hasConnectPermission = { true },
+            captureDevices = { error("enumeration") },
+            clearCommunicationDevice = {},
+        )
+        assertNull(enumerationFailure.configure(uninitializedCaptureAudioRecord()))
+
+        val preferredFailureMutations = mutableListOf<String>()
+        val preferredFailure = AndroidDirectCaptureDeviceAdapter(
+            hasConnectPermission = { true },
+            captureDevices = {
+                listOf(
+                    captureCandidate(
+                        id = 7,
+                        mutations = preferredFailureMutations,
+                        preferredFailure = IllegalStateException("preferred"),
+                    ),
+                )
+            },
+            clearCommunicationDevice = { preferredFailureMutations += "clear" },
+        )
+        val preferredFailureLease = requireNotNull(
+            preferredFailure.configure(uninitializedCaptureAudioRecord()),
+        )
+        preferredFailureLease.retire()
+        assertEquals(
+            listOf("preferred:7", "communication:7", "clear"),
+            preferredFailureMutations,
+        )
+
+        val communicationFailureMutations = mutableListOf<String>()
+        val communicationFailure = AndroidDirectCaptureDeviceAdapter(
+            hasConnectPermission = { true },
+            captureDevices = {
+                listOf(
+                    captureCandidate(
+                        id = 7,
+                        mutations = communicationFailureMutations,
+                        communicationFailure = IllegalStateException("communication"),
+                    ),
+                )
+            },
+            clearCommunicationDevice = { communicationFailureMutations += "clear" },
+        )
+        assertNull(communicationFailure.configure(uninitializedCaptureAudioRecord()))
+        assertEquals(
+            listOf("preferred:7", "communication:7"),
+            communicationFailureMutations,
+        )
+    }
+
+}
+
+private fun captureCandidate(
+    id: Int,
+    type: VoiceAudioRouteDeviceType = VoiceAudioRouteDeviceType.BluetoothSco,
+    mutations: MutableList<String>,
+    communicationAccepted: Boolean = true,
+    preferredFailure: Throwable? = null,
+    communicationFailure: Throwable? = null,
+): AndroidDirectCaptureDeviceCandidate = AndroidDirectCaptureDeviceCandidate(
+    routeDevice = VoiceAudioRouteDevice(id = id, type = type, name = "device-$id"),
+    setPreferredDevice = {
+        mutations += "preferred:$id"
+        preferredFailure?.let { throw it }
+        true
+    },
+    setCommunicationDevice = {
+        mutations += "communication:$id"
+        communicationFailure?.let { throw it }
+        communicationAccepted
+    },
+)
+
+private fun uninitializedCaptureAudioRecord(): AudioRecord {
+    val unsafeField = Unsafe::class.java.getDeclaredField("theUnsafe")
+    unsafeField.isAccessible = true
+    return (unsafeField.get(null) as Unsafe).allocateInstance(AudioRecord::class.java) as AudioRecord
 }
 
 internal class FakeBluetoothCaptureOperations :
