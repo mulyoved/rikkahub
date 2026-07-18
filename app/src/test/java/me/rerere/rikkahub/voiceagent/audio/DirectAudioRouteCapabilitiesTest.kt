@@ -3,6 +3,7 @@ package me.rerere.rikkahub.voiceagent.audio
 import android.media.AudioRecord
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.concurrent.thread
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.async
@@ -83,6 +84,26 @@ class DirectAudioRouteCapabilitiesTest {
         assertEquals(1, operations.startScoCalls)
         lease.retire()
         assertTrue(operations.recognitionStops.isEmpty())
+        capability.close()
+    }
+
+    @Test
+    fun `prepare routes the current replacement when two proxies connect before routing opens`() = runTest {
+        val operations = FakeBluetoothCaptureOperations().apply {
+            deliverHeadsetDuringRequest = true
+            recognitionAccepted = true
+        }
+        val capability = SystemDirectBluetoothCaptureCapability(operations)
+        val lease = requireNotNull(capability.acquire())
+        val replacement = FakeBluetoothHeadset("replacement")
+        operations.deliverHeadset(replacement)
+
+        lease.prepare()
+        lease.retire()
+
+        assertEquals(listOf(replacement to operations.device), operations.recognitionStarts)
+        assertEquals(listOf(replacement to operations.device), operations.recognitionStops)
+        assertEquals(listOf(operations.headset, replacement), operations.closedHeadsets)
         capability.close()
     }
 
@@ -353,6 +374,70 @@ class DirectAudioRouteCapabilitiesTest {
     }
 
     @Test
+    fun `reentrant SCO retirement waits for another threads admitted recognition`() = runTest {
+        val recognitionEntered = CountDownLatch(1)
+        val releaseRecognition = CountDownLatch(1)
+        val scoEnableEntered = CountDownLatch(1)
+        val proxyCloseStarted = CountDownLatch(1)
+        val sawScoEnable = AtomicBoolean(false)
+        val proxyClosedBeforeRecognitionRelease = AtomicBoolean(false)
+        val operations = FakeBluetoothCaptureOperations().apply {
+            recognitionAccepted = true
+            beforeStartRecognition = {
+                recognitionEntered.countDown()
+                releaseRecognition.await(5, TimeUnit.SECONDS)
+            }
+            beforeCloseHeadsetProxy = { proxyCloseStarted.countDown() }
+        }
+        val capability = SystemDirectBluetoothCaptureCapability(operations)
+        lateinit var lease: DirectBluetoothCaptureLease
+        operations.beforeSetScoEnabled = { enabled ->
+            if (enabled) {
+                scoEnableEntered.countDown()
+                lease.retire()
+            }
+        }
+        lease = requireNotNull(capability.acquire())
+        val preparing = async { lease.prepare() }
+        runCurrent()
+        val callback = thread(name = "direct-bluetooth-mixed-recognition") {
+            operations.deliverHeadset()
+        }
+        assertTrue(recognitionEntered.await(5, TimeUnit.SECONDS))
+        val observer = thread(name = "direct-bluetooth-mixed-observer") {
+            sawScoEnable.set(scoEnableEntered.await(5, TimeUnit.SECONDS))
+            if (sawScoEnable.get()) {
+                proxyClosedBeforeRecognitionRelease.set(
+                    proxyCloseStarted.await(100, TimeUnit.MILLISECONDS),
+                )
+            }
+            releaseRecognition.countDown()
+        }
+
+        try {
+            runCurrent()
+            preparing.await()
+        } finally {
+            releaseRecognition.countDown()
+            callback.join(5_000)
+            observer.join(5_000)
+        }
+
+        assertTrue(sawScoEnable.get())
+        assertFalse(proxyClosedBeforeRecognitionRelease.get())
+        assertFalse(callback.isAlive)
+        assertFalse(observer.isAlive)
+        assertEquals(listOf(operations.headset to operations.device), operations.recognitionStarts)
+        assertEquals(listOf(operations.headset to operations.device), operations.recognitionStops)
+        assertEquals(listOf(operations.headset), operations.closedHeadsets)
+        assertTrue(
+            operations.mutations.indexOf("stop-recognition") <
+                operations.mutations.indexOf("close-proxy"),
+        )
+        capability.close()
+    }
+
+    @Test
     fun `each Bluetooth acquisition owns an independent callback listener`() = runTest {
         val operations = FakeBluetoothCaptureOperations()
         val capability = SystemDirectBluetoothCaptureCapability(operations)
@@ -462,6 +547,7 @@ internal class FakeBluetoothCaptureOperations :
     var permissionProbeFailure: Throwable? = null
     var beforeStartRecognition: () -> Unit = {}
     var beforeSetScoEnabled: (Boolean) -> Unit = {}
+    var beforeCloseHeadsetProxy: (FakeBluetoothHeadset) -> Unit = {}
     var permissionChecks = 0
     var startScoCalls = 0
     var scoEnabled = false
@@ -511,6 +597,7 @@ internal class FakeBluetoothCaptureOperations :
     }
 
     override fun closeHeadsetProxy(headset: FakeBluetoothHeadset) {
+        beforeCloseHeadsetProxy(headset)
         closedHeadsets += headset
         mutations += "close-proxy"
     }

@@ -10,7 +10,8 @@ import android.media.AudioRecord
 import android.os.Build
 import android.util.Log
 import java.util.IdentityHashMap
-import java.util.concurrent.CountDownLatch
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.withTimeoutOrNull
 import me.rerere.rikkahub.voiceagent.RetirementBarrier
@@ -270,7 +271,8 @@ private class SystemBluetoothCaptureLease<Headset : Any, Device : Any>(
             if (closed) false else true.also { routingOpen = true }
         }
         if (!admitted) return
-        val connected = withTimeoutOrNull(profileWaitMillis) { profile.await() }
+        withTimeoutOrNull(profileWaitMillis) { profile.await() }
+        val connected = synchronized(lock) { if (closed) null else headset }
         if (connected == null) {
             logCapabilityDebug("Direct Bluetooth headset voice recognition skipped: profile unavailable")
         } else {
@@ -505,13 +507,13 @@ private data class BluetoothCaptureResources<Headset : Any, Device : Any>(
 )
 
 private class DirectBluetoothMutationAdmission {
-    private val lock = Any()
-    private val quiescent = CountDownLatch(1)
+    private val lock = ReentrantLock()
+    private val admissionsChanged = lock.newCondition()
     private val admissionsByThread = IdentityHashMap<Thread, Int>()
     private var accepting = true
     private var admissionCount = 0
 
-    fun tryAdmit(): Boolean = synchronized(lock) {
+    fun tryAdmit(): Boolean = lock.withLock {
         if (!accepting) return false
         val thread = Thread.currentThread()
         admissionsByThread[thread] = (admissionsByThread[thread] ?: 0) + 1
@@ -519,12 +521,12 @@ private class DirectBluetoothMutationAdmission {
         true
     }
 
-    fun close() = synchronized(lock) {
+    fun close() = lock.withLock {
         accepting = false
-        if (admissionCount == 0) quiescent.countDown()
+        admissionsChanged.signalAll()
     }
 
-    fun leave() = synchronized(lock) {
+    fun leave() = lock.withLock {
         val thread = Thread.currentThread()
         val threadAdmissions = requireNotNull(admissionsByThread[thread])
         if (threadAdmissions == 1) {
@@ -533,23 +535,23 @@ private class DirectBluetoothMutationAdmission {
             admissionsByThread[thread] = threadAdmissions - 1
         }
         admissionCount -= 1
-        if (!accepting && admissionCount == 0) quiescent.countDown()
+        admissionsChanged.signalAll()
     }
 
     fun awaitUnlessAdmitted() {
-        synchronized(lock) {
-            if (admissionCount == 0 || admissionsByThread.containsKey(Thread.currentThread())) return
-        }
+        val currentThread = Thread.currentThread()
         var interrupted = false
-        while (true) {
-            try {
-                quiescent.await()
-                break
-            } catch (_: InterruptedException) {
-                interrupted = true
+        lock.withLock {
+            val ownAdmissions = admissionsByThread[currentThread] ?: 0
+            while (admissionCount > ownAdmissions) {
+                try {
+                    admissionsChanged.await()
+                } catch (_: InterruptedException) {
+                    interrupted = true
+                }
             }
         }
-        if (interrupted) Thread.currentThread().interrupt()
+        if (interrupted) currentThread.interrupt()
     }
 }
 
