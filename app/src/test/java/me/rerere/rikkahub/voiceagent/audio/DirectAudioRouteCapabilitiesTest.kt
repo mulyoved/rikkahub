@@ -1,6 +1,5 @@
 package me.rerere.rikkahub.voiceagent.audio
 
-import android.media.AudioRecord
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -18,7 +17,6 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
-import sun.misc.Unsafe
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class DirectAudioRouteCapabilitiesTest {
@@ -630,44 +628,6 @@ class DirectAudioRouteCapabilitiesTest {
         lease.retire()
     }
 
-    @Test
-    fun `accepted communication device clears once while rejected device never clears`() {
-        val acceptedOperations = FakeCaptureDeviceOperations().apply {
-            communicationDeviceAccepted = true
-        }
-        val accepted = SystemDirectCaptureDeviceCapability(acceptedOperations)
-        val acceptedLease = requireNotNull(accepted.configure(uninitializedAudioRecord()))
-
-        acceptedLease.retire()
-        acceptedLease.retire()
-
-        assertEquals(listOf(acceptedOperations.device), acceptedOperations.preferredDevices)
-        assertEquals(listOf(acceptedOperations.device), acceptedOperations.communicationDevices)
-        assertEquals(1, acceptedOperations.clearCommunicationDeviceCalls)
-
-        val rejectedOperations = FakeCaptureDeviceOperations().apply {
-            communicationDeviceAccepted = false
-        }
-        val rejected = SystemDirectCaptureDeviceCapability(rejectedOperations)
-
-        assertNull(rejected.configure(uninitializedAudioRecord()))
-        assertEquals(listOf(rejectedOperations.device), rejectedOperations.preferredDevices)
-        assertEquals(listOf(rejectedOperations.device), rejectedOperations.communicationDevices)
-        assertEquals(0, rejectedOperations.clearCommunicationDeviceCalls)
-    }
-
-    @Test
-    fun `capture device permission denial skips enumeration and recorder mutation`() {
-        val operations = FakeCaptureDeviceOperations().apply { permissionGranted = false }
-        val capability = SystemDirectCaptureDeviceCapability(operations)
-
-        assertNull(capability.configure(uninitializedAudioRecord()))
-
-        assertEquals(1, operations.permissionChecks)
-        assertEquals(0, operations.captureDeviceQueries)
-        assertTrue(operations.preferredDevices.isEmpty())
-        assertTrue(operations.communicationDevices.isEmpty())
-    }
 }
 
 internal class FakeBluetoothCaptureOperations :
@@ -793,62 +753,9 @@ internal class FakeBluetoothCaptureOperations :
     }
 }
 
-internal class FakeCaptureDeviceOperations : DirectCaptureDeviceOperations {
-    val device = DirectAudioCaptureDevice(
-        routeDevice = VoiceAudioRouteDevice(
-            id = 7,
-            type = VoiceAudioRouteDeviceType.BluetoothSco,
-            name = "headset microphone",
-        ),
-        safeLabel = "7:BluetoothSco:headset microphone",
-        handle = FakeCaptureDeviceHandle,
-    )
-    var permissionGranted = true
-    var communicationDeviceAccepted = false
-    var permissionProbeFailure: Throwable? = null
-    var permissionChecks = 0
-    var captureDeviceQueries = 0
-    val preferredDevices = mutableListOf<DirectAudioCaptureDevice>()
-    val communicationDevices = mutableListOf<DirectAudioCaptureDevice>()
-    var clearCommunicationDeviceCalls = 0
-
-    override fun hasConnectPermission(): Boolean {
-        permissionChecks += 1
-        permissionProbeFailure?.let { throw it }
-        return permissionGranted
-    }
-
-    override fun captureDevices(): List<DirectAudioCaptureDevice> {
-        captureDeviceQueries += 1
-        return listOf(device)
-    }
-
-    override fun setPreferredDevice(recorder: AudioRecord, device: DirectAudioCaptureDevice): Boolean {
-        preferredDevices += device
-        return true
-    }
-
-    override fun setCommunicationDevice(device: DirectAudioCaptureDevice): Boolean {
-        communicationDevices += device
-        return communicationDeviceAccepted
-    }
-
-    override fun clearCommunicationDevice() {
-        clearCommunicationDeviceCalls += 1
-    }
-}
-
 internal data class FakeBluetoothHeadset(val id: String)
 
 internal data class FakeBluetoothDevice(val safeLabel: String)
-
-private data object FakeCaptureDeviceHandle : DirectAudioCaptureDeviceHandle
-
-private fun uninitializedAudioRecord(): AudioRecord {
-    val unsafeField = Unsafe::class.java.getDeclaredField("theUnsafe")
-    unsafeField.isAccessible = true
-    return (unsafeField.get(null) as Unsafe).allocateInstance(AudioRecord::class.java) as AudioRecord
-}
 
 private fun Thread.awaitState(
     expected: Thread.State,

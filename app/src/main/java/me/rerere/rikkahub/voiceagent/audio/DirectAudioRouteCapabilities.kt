@@ -1,9 +1,7 @@
 package me.rerere.rikkahub.voiceagent.audio
 
-import android.annotation.SuppressLint
 import android.content.Context
 import android.media.AudioAttributes
-import android.media.AudioDeviceInfo
 import android.media.AudioFocusRequest
 import android.media.AudioManager
 import android.media.AudioRecord
@@ -72,22 +70,6 @@ internal interface DirectBluetoothCallbackDispatcher {
     fun close()
 }
 
-internal data class DirectAudioCaptureDevice(
-    val routeDevice: VoiceAudioRouteDevice,
-    val safeLabel: String,
-    val handle: DirectAudioCaptureDeviceHandle,
-)
-
-internal interface DirectAudioCaptureDeviceHandle
-
-internal interface DirectCaptureDeviceOperations {
-    fun hasConnectPermission(): Boolean
-    fun captureDevices(): List<DirectAudioCaptureDevice>
-    fun setPreferredDevice(recorder: AudioRecord, device: DirectAudioCaptureDevice): Boolean
-    fun setCommunicationDevice(device: DirectAudioCaptureDevice): Boolean
-    fun clearCommunicationDevice()
-}
-
 internal fun systemDirectAudioRouteCapabilities(context: Context): DirectAudioRouteCapabilities {
     val audioManager = context.getSystemService(AudioManager::class.java)
     val bluetoothCapture = SystemDirectBluetoothCaptureCapability(
@@ -97,9 +79,7 @@ internal fun systemDirectAudioRouteCapabilities(context: Context): DirectAudioRo
         focus = SystemDirectAudioFocusCapability(audioManager),
         communicationMode = SystemDirectCommunicationModeCapability(audioManager),
         bluetoothCapture = bluetoothCapture,
-        captureDevice = SystemDirectCaptureDeviceCapability(
-            AndroidDirectCaptureDeviceOperations(context, audioManager),
-        ),
+        captureDevice = AndroidDirectCaptureDeviceAdapter(context, audioManager),
         close = bluetoothCapture::close,
     )
 }
@@ -433,78 +413,10 @@ private class SystemBluetoothCaptureLease<Headset : Any, Device : Any>(
     }
 }
 
-internal class SystemDirectCaptureDeviceCapability(
-    private val operations: DirectCaptureDeviceOperations,
-) : DirectCaptureDeviceCapability {
-    override fun configure(recorder: AudioRecord): DirectAudioResourceLease? {
-        if (!operations.hasConnectPermission()) {
-            logCapabilityDebug("Direct Bluetooth route skipped: BLUETOOTH_CONNECT not granted")
-            return null
-        }
-        val devices = runCatching(operations::captureDevices)
-            .onFailure { logCapabilityWarning("Direct capture route enumeration failed", it) }
-            .getOrDefault(emptyList())
-        val routeDevices = devices.map { it.routeDevice }
-        val selectedRoute = selectPreferredCaptureRoute(routeDevices)
-        logCapabilityDebug(
-            "Direct capture routes available=${routeDevices.joinToString { it.debugLabel() }} " +
-                "selected=${selectedRoute?.debugLabel() ?: "default"}",
-        )
-        val selected = selectedRoute?.let { route -> devices.firstOrNull { it.routeDevice.id == route.id } }
-            ?: return null
-        val preferredAccepted = runCatching { operations.setPreferredDevice(recorder, selected) }
-            .onFailure { logCapabilityWarning("Direct preferred Bluetooth device failed", it) }
-            .getOrDefault(false)
-        val communicationAccepted = runCatching { operations.setCommunicationDevice(selected) }
-            .onFailure { logCapabilityWarning("Direct communication route failed", it) }
-            .getOrDefault(false)
-        logCapabilityDebug(
-            "Direct capture route=${selected.safeLabel} " +
-                "preferredAccepted=$preferredAccepted communicationAccepted=$communicationAccepted",
-        )
-        if (!communicationAccepted) return null
-        return retirementLease(operations::clearCommunicationDevice)
-    }
-}
-
 internal fun directBluetoothCaptureAvailable(
     audioManagerAvailable: Boolean,
     hasConnectPermission: () -> Boolean,
 ): Boolean = audioManagerAvailable && hasConnectPermission()
-
-private class AndroidDirectCaptureDeviceOperations(
-    private val context: Context,
-    private val audioManager: AudioManager?,
-) : DirectCaptureDeviceOperations {
-    override fun hasConnectPermission(): Boolean = audioManager != null && hasBluetoothConnectPermission(context)
-
-    override fun captureDevices(): List<DirectAudioCaptureDevice> =
-        audioManager?.getDevices(AudioManager.GET_DEVICES_INPUTS).orEmpty().map { device ->
-            val routeDevice = device.toVoiceAudioRouteDevice()
-            DirectAudioCaptureDevice(
-                routeDevice = routeDevice,
-                safeLabel = routeDevice.debugLabel(),
-                handle = AndroidDirectAudioCaptureDeviceHandle(device),
-            )
-        }
-
-    override fun setPreferredDevice(recorder: AudioRecord, device: DirectAudioCaptureDevice): Boolean =
-        recorder.setPreferredDevice(device.requireAudioDeviceInfo())
-
-    @SuppressLint("MissingPermission")
-    override fun setCommunicationDevice(device: DirectAudioCaptureDevice): Boolean =
-        Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
-            audioManager?.setCommunicationDevice(device.requireAudioDeviceInfo()) == true
-
-    override fun clearCommunicationDevice() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) audioManager?.clearCommunicationDevice()
-    }
-
-    private fun DirectAudioCaptureDevice.requireAudioDeviceInfo(): AudioDeviceInfo =
-        requireNotNull(handle as? AndroidDirectAudioCaptureDeviceHandle) {
-            "Unexpected direct capture device handle"
-        }.device
-}
 
 private data class BluetoothCaptureResources<Headset : Any, Device : Any>(
     val headsets: List<Headset>,
@@ -570,30 +482,10 @@ private class DirectBluetoothMutationAdmission {
     }
 }
 
-private data class AndroidDirectAudioCaptureDeviceHandle(
-    val device: AudioDeviceInfo,
-) : DirectAudioCaptureDeviceHandle
-
 private fun retirementLease(retire: () -> Unit): DirectAudioResourceLease {
     val retirement = RetirementBarrier()
     return DirectAudioResourceLease { retirement.retire(retire) }
 }
-
-private fun AudioDeviceInfo.toVoiceAudioRouteDevice(): VoiceAudioRouteDevice =
-    VoiceAudioRouteDevice(
-        id = id,
-        type = when (type) {
-            AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> VoiceAudioRouteDeviceType.BluetoothSco
-            AudioDeviceInfo.TYPE_BLE_HEADSET -> VoiceAudioRouteDeviceType.BluetoothBleHeadset
-            AudioDeviceInfo.TYPE_BUILTIN_MIC -> VoiceAudioRouteDeviceType.BuiltInMic
-            AudioDeviceInfo.TYPE_WIRED_HEADSET -> VoiceAudioRouteDeviceType.WiredHeadset
-            else -> VoiceAudioRouteDeviceType.Other
-        },
-        name = productName?.toString().orEmpty(),
-    )
-
-private fun VoiceAudioRouteDevice.debugLabel(): String =
-    "$id:${type.name}:${name.ifBlank { "unnamed" }}"
 
 private fun logCapabilityDebug(message: String) {
     runCatching { Log.d(CAPABILITY_TAG, message) }

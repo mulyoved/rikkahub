@@ -132,22 +132,17 @@ class AndroidDirectAudioRouteControllerTest {
     }
 
     @Test
-    fun `recorder permission probe failure is best effort without device mutation`() {
-        val permissionFailure = IllegalStateException("Bluetooth permission lookup failed")
-        val operations = FakeCaptureDeviceOperations().apply {
-            permissionProbeFailure = permissionFailure
+    fun `capture device configuration failure is best effort`() {
+        val fixture = DirectAudioCapabilitiesFixture().apply {
+            device.configureFailure = IllegalStateException("capture device unavailable")
         }
-        val fixture = DirectAudioCapabilitiesFixture(
-            captureDeviceOverride = SystemDirectCaptureDeviceCapability(operations),
-        )
         val controller = fixture.controller()
         val lease = controller.acquireCapture()
 
         lease.configureRecorder(uninitializedAudioRecord())
 
-        assertEquals(0, operations.captureDeviceQueries)
-        assertTrue(operations.preferredDevices.isEmpty())
-        assertTrue(operations.communicationDevices.isEmpty())
+        assertEquals(1, fixture.device.configureCalls)
+        assertEquals(0, fixture.device.retireCalls)
         lease.retire()
         controller.close()
     }
@@ -593,6 +588,7 @@ private class FakeDirectCaptureDeviceCapability(
     private val events: MutableList<String>,
 ) : DirectCaptureDeviceCapability {
     var configurationAvailable = true
+    var configureFailure: Throwable? = null
     var retireFailure: Throwable? = null
     var beforeConfigure: () -> Unit = {}
     var recordConfigured = false
@@ -603,6 +599,7 @@ private class FakeDirectCaptureDeviceCapability(
         configureCalls += 1
         events += "device-configure"
         beforeConfigure()
+        configureFailure?.let { throw it }
         if (!configurationAvailable) return null
         if (recordConfigured) events += "device-configured"
         return DirectAudioResourceLease {
