@@ -11,6 +11,7 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.yield
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import kotlin.uuid.Uuid
@@ -140,6 +141,63 @@ class VoiceAgentCallManagerPublicationTest {
                 collectorDispatcher.close()
             }
         }
+
+    @Test
+    fun `cancelled owner after active install fails publication and wakes matching retry`() = runPublicationTest {
+        val cancelledSession = FakeManagedVoiceCallSession()
+        val retrySession = FakeManagedVoiceCallSession(
+            initialState = VoiceAgentUiState(session = VoiceSessionStatus.PreparingContext),
+        )
+        val factory = FakeVoiceAgentCallFactory(cancelledSession, retrySession)
+        val manager = VoiceAgentCallManager(factory)
+        val conversationId = Uuid.random()
+        val config = fakeManagerLaunchConfig()
+        val ownerLease = CountingTelecomLease()
+        val waiterLease = CountingTelecomLease()
+        val collectorDispatcher = BlockingCollectorDispatcher()
+        val collectorScope = CoroutineScope(SupervisorJob() + collectorDispatcher)
+        try {
+            val owner = async(Dispatchers.Default) {
+                manager.start(conversationId, config, ownerLease.lease, collectorScope)
+            }
+            assertTrue(collectorDispatcher.dispatchEntered.await(1, TimeUnit.SECONDS))
+            val waiter = async(Dispatchers.Default, start = CoroutineStart.UNDISPATCHED) {
+                manager.start(conversationId, config, waiterLease.lease, this@runPublicationTest)
+            }
+            val cancellation = CanonicalCancellationException(Any())
+
+            owner.cancel(cancellation)
+            assertFalse(waiter.isCompleted)
+            collectorDispatcher.release()
+
+            assertSame(cancellation, runCatching { owner.await() }.exceptionOrNull())
+            assertEquals(
+                VoiceAgentManagerStartResult.Started(waiterLease.lease.metadata),
+                waiter.await(),
+            )
+            cancelledSession.state.value = VoiceAgentUiState(session = VoiceSessionStatus.Error("stale"))
+            yield()
+
+            assertEquals(conversationId, manager.activeConversationId.value)
+            assertEquals(VoiceSessionStatus.PreparingContext, manager.state.value.session)
+            assertEquals(1, cancelledSession.startCalls)
+            assertEquals(1, cancelledSession.closeNowCalls)
+            assertEquals(0, cancelledSession.endCalls)
+            assertEquals(1, ownerLease.retireCalls)
+            assertEquals(1, retrySession.startCalls)
+            assertEquals(0, retrySession.closeNowCalls)
+            assertEquals(0, waiterLease.retireCalls)
+            assertEquals(2, factory.created.size)
+            assertEquals(
+                VoiceAgentRouteMatchResult.Existing(waiterLease.lease.metadata),
+                manager.matchingRoute(conversationId, config),
+            )
+        } finally {
+            collectorDispatcher.release()
+            collectorScope.cancel()
+            collectorDispatcher.close()
+        }
+    }
 }
 
 private fun runPublicationTest(block: suspend CoroutineScope.() -> Unit) = runBlocking {

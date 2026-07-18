@@ -138,3 +138,28 @@
 ### Concerns
 
 - None known. Existing unrelated compiler and web sourcemap warnings remain unchanged.
+
+## CE1 Wave 3 Stable-Review Repair
+
+### Result
+
+- Status: DONE; cancellation between pending `Active` installation and collector attachment can no longer publish a stale session.
+- Commit: this report is included in the stable-review repair commit; the completion handoff supplies its full SHA.
+
+### Summary
+
+- Immediately after collector launch returns, the reservation owner now checks its own coroutine context before attaching the collector or selecting `Published`.
+- If cancellation won while launch was synchronously blocked, the still-unattached collector is canceled before the exact cancellation is rethrown. The existing shared catch then closes the exact route-owned session before atomically selecting `Failed`; deferred completion remains outside the monitor.
+- Added a deterministic `BlockingCollectorDispatcher` regression that cancels the owner while dispatch is blocked. It proves exact cancellation identity, one session close and one lease retirement, a matching waiter's `Failed` wake-up and retry, and no stale publication or state overwrite.
+
+### TDD and Verification
+
+- RED: `./gradlew :app:testDebugUnitTest --tests '*VoiceAgentCallManager*Test' --tests '*VoiceAgentCallStartupTest' --rerun-tasks` executed all 179 tasks and 47 tests; only `cancelled owner after active install fails publication and wakes matching retry` failed because the waiter observed `Existing` instead of becoming the retry owner. `BUILD FAILED in 1m 23s`.
+- Targeted GREEN: `./gradlew :app:testDebugUnitTest --tests '*VoiceAgentCallManagerPublicationTest' --rerun-tasks` executed all 179 tasks and passed all 3 publication tests; `BUILD SUCCESSFUL in 1m 27s`.
+- Authoritative GREEN: the broadened fresh command executed all 179 tasks and passed 47 tests: 30 manager, 6 barrier, 3 publication, and 8 startup; zero failures/errors; `BUILD SUCCESSFUL in 1m 20s`.
+- XML confirms the same 30/6/3/8 split with zero skipped, failures, or errors. `git diff --check` is clean.
+- Final line counts: production manager 577, manager tests 981, barrier tests 281, publication tests 210, fixtures 376, startup tests 328.
+
+### Concerns
+
+- None known. Existing unrelated compiler and web sourcemap warnings remain unchanged.

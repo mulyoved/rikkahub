@@ -110,3 +110,26 @@ Every test file is below 1,000 lines.
 ## Concerns
 
 None known. The fresh build retains pre-existing unrelated Kotlin opt-in/deprecation and web sourcemap warnings; no warning originates from the touched voice concurrency files.
+
+## Post-Fix Stable Review Repair
+
+Stable review found one remaining cancellation window: after the pending `Active` slot was installed, `scope.launch` could synchronously block in its dispatcher. If the reservation owner was canceled during that dispatch and launch later returned, the owner had no cancellation checkpoint before collector attachment and `Published` selection, so the canceled session could become observable as live.
+
+The manager now calls `currentCoroutineContext().ensureActive()` immediately after collector launch returns and before either attachment or publication. On cancellation, it first cancels the newly created, still-unattached collector, then rethrows the same `CancellationException`. The shared owner catch retains cleanup ownership: it closes the exact route-owned session once, preserves the cancellation as primary, changes only the still-token-owned slot to `Idle`, selects `Failed`, and completes the publication deferred outside the monitor. A newer slot remains protected by the existing identity checks.
+
+The new deterministic publication regression uses `BlockingCollectorDispatcher` to pause launch after pending `Active` installation, starts a matching waiter, cancels the owner with a canonical cancellation instance, and releases dispatch. It proves:
+
+- the owner receives the same cancellation instance;
+- the unattached collector cannot publish stale session state;
+- the canceled session closes exactly once and its lease retires exactly once;
+- the matching waiter wakes from `Failed`, retries, and becomes the sole published owner;
+- the retry session remains active with its own state and route metadata.
+
+TDD evidence:
+
+- RED: the authoritative broadened `--rerun-tasks` command executed all 179 tasks and 47 tests. Only `cancelled owner after active install fails publication and wakes matching retry` failed: the waiter observed `Existing` instead of the expected retry-owner `Started`. Gradle reported `BUILD FAILED in 1m 23s`.
+- Targeted GREEN: the publication-class `--rerun-tasks` command executed all 179 tasks and passed its 3 tests, with `BUILD SUCCESSFUL in 1m 27s`.
+- Authoritative GREEN: `./gradlew :app:testDebugUnitTest --tests '*VoiceAgentCallManager*Test' --tests '*VoiceAgentCallStartupTest' --rerun-tasks` executed all 179 tasks and passed 47 tests: manager 30, barrier 6, publication 3, startup 8; zero failures/errors; `BUILD SUCCESSFUL in 1m 20s`.
+- XML independently confirms the 30/6/3/8 test split with zero skipped, failures, or errors. `git diff --check` is clean.
+
+Final line counts are 577 for `VoiceAgentCallManager.kt`, 981 for the manager tests, 281 for barrier tests, 210 for publication tests, 376 for fixtures, and 328 for startup tests. Every test file remains below 1,000 lines. No residual concern is known beyond the unchanged unrelated compiler and web sourcemap warnings.

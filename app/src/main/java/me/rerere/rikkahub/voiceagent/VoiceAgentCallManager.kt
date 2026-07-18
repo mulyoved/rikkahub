@@ -454,6 +454,12 @@ class VoiceAgentCallManager(
                     }
                 }
             }
+            try {
+                currentCoroutineContext().ensureActive()
+            } catch (cancellation: CancellationException) {
+                collector.cancel()
+                throw cancellation
+            }
             val attached = synchronized(lock) {
                 val current = slot
                 if (current === active) {
