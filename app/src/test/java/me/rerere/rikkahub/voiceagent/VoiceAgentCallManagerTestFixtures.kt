@@ -37,6 +37,52 @@ internal class FakeManagedVoiceCallSession(
     override fun closeNow() { closeNowCalls += 1 }
 }
 
+internal class BlockingCloseManagedVoiceCallSession(
+    private val releaseClose: CountDownLatch,
+    private val closeFailure: Throwable? = null,
+) : ManagedVoiceCallSession {
+    override val state = MutableStateFlow(VoiceAgentUiState())
+    val closeEntered = CountDownLatch(1)
+    private val activeCleanupCalls = AtomicInteger()
+    private val closeCallCount = AtomicInteger()
+    private val endCallCount = AtomicInteger()
+    private val overlapCallCount = AtomicInteger()
+    val closeNowCalls: Int get() = closeCallCount.get()
+    val endCalls: Int get() = endCallCount.get()
+    val lifecycleOverlapCalls: Int get() = overlapCallCount.get()
+
+    override fun start() = Unit
+    override fun interrupt() = Unit
+    override fun setMuted(value: Boolean) = Unit
+    override fun reconnect() = Unit
+    override fun recordDiagnostic(name: String, detail: String) = Unit
+    override fun end() {
+        endCallCount.incrementAndGet()
+        enterCleanup()
+        activeCleanupCalls.decrementAndGet()
+    }
+    override suspend fun endAndDrain() = Unit
+    override fun closeNow() {
+        closeCallCount.incrementAndGet()
+        enterCleanup()
+        closeEntered.countDown()
+        try {
+            check(releaseClose.await(5, TimeUnit.SECONDS)) {
+                "timed out waiting to release session close"
+            }
+        } finally {
+            activeCleanupCalls.decrementAndGet()
+        }
+        closeFailure?.let { throw it }
+    }
+
+    private fun enterCleanup() {
+        if (activeCleanupCalls.incrementAndGet() > 1) {
+            overlapCallCount.incrementAndGet()
+        }
+    }
+}
+
 internal class BlockingEndManagedVoiceCallSession(
     private val releaseEnd: CountDownLatch,
     private val endFailure: Throwable? = null,

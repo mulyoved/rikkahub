@@ -163,3 +163,31 @@
 ### Concerns
 
 - None known. Existing unrelated compiler and web sourcemap warnings remain unchanged.
+
+## CE1 Wave 3 Cleanup-Ownership Follow-Up
+
+### Result
+
+- Status: DONE; a canceled pending-`Active` owner now claims sole session-cleanup ownership before external close begins.
+- Review baseline: `84615fd6cebbe595985f3d94e24ceafd7da71c57`.
+- Commit: this report is included in the follow-up repair commit; the completion handoff supplies its full SHA.
+
+### Summary
+
+- Added an unpublishable, un-detachable `CleanupClaim` slot containing only a completion gate. The catch path installs it and selects `Failed` atomically while the exact token/publication still owns pending `Active`.
+- Terminal APIs cannot recover or clean the claimed session. Manager starts and `matchingRoute` await the claim gate; no factory, replacement, or retry admission occurs until the owner finishes exact external cleanup.
+- After cleanup, the owner transitions the exact claim to `Idle` under the monitor, then completes `Failed` publication and the cleanup gate outside it. If another path already detached pending `Active` before the claim, that path retains cleanup ownership and the canceled owner does not close the session.
+- Incoming callers canceled while awaiting the claim retire their exact route lease with the existing canonical cancellation and suppression rules.
+
+### TDD and Verification
+
+- RED: the authoritative broadened `--rerun-tasks` command executed all 179 tasks and 48 tests. Only `cancelled owner claims cleanup before blocked close and gates terminal retry` failed: a matching waiter completed during the blocked owner close after concurrent terminal detach. `BUILD FAILED in 1m 15s`.
+- Targeted GREEN: the publication-class `--rerun-tasks` command executed all 179 tasks and passed all 4 publication tests; `BUILD SUCCESSFUL in 1m 17s`.
+- Strengthened targeted GREEN: the regression additionally injects an exact close failure and proves the canonical cancellation remains primary with that failure suppressed; it passed after the test-only strengthening.
+- Authoritative GREEN: `./gradlew :app:testDebugUnitTest --tests '*VoiceAgentCallManager*Test' --tests '*VoiceAgentCallStartupTest' --rerun-tasks` executed all 179 tasks and passed 48 tests: 30 manager, 6 barrier, 4 publication, and 8 startup; zero failures/errors; `BUILD SUCCESSFUL in 1m 16s`.
+- XML confirms the same 30/6/4/8 split with zero skipped, failures, or errors. `git diff --check` is clean.
+- Final line counts: production manager 634, manager tests 981, barrier tests 281, publication tests 293, fixtures 422, startup tests 328.
+
+### Concerns
+
+- None known. Existing unrelated compiler and web sourcemap warnings remain unchanged.

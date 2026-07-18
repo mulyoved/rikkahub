@@ -198,6 +198,89 @@ class VoiceAgentCallManagerPublicationTest {
             collectorDispatcher.close()
         }
     }
+
+    @Test
+    fun `cancelled owner claims cleanup before blocked close and gates terminal retry`() = runPublicationTest {
+        val releaseClose = java.util.concurrent.CountDownLatch(1)
+        val closeFailure = NonCopyableCleanupException(Any(), "claimed session close failed")
+        val cancelledSession = BlockingCloseManagedVoiceCallSession(releaseClose, closeFailure)
+        val retrySession = FakeManagedVoiceCallSession(
+            initialState = VoiceAgentUiState(session = VoiceSessionStatus.PreparingContext),
+        )
+        val factory = FakeVoiceAgentCallFactory(cancelledSession, retrySession)
+        val manager = VoiceAgentCallManager(factory)
+        val conversationId = Uuid.random()
+        val config = fakeManagerLaunchConfig()
+        val ownerLease = CountingTelecomLease()
+        val waiterLease = CountingTelecomLease()
+        val freshLease = CountingTelecomLease()
+        val collectorDispatcher = BlockingCollectorDispatcher()
+        val collectorScope = CoroutineScope(SupervisorJob() + collectorDispatcher)
+        try {
+            val owner = async(Dispatchers.Default) {
+                manager.start(conversationId, config, ownerLease.lease, collectorScope)
+            }
+            assertTrue(collectorDispatcher.dispatchEntered.await(1, TimeUnit.SECONDS))
+            val waiter = async(Dispatchers.Default, start = CoroutineStart.UNDISPATCHED) {
+                manager.start(conversationId, config, waiterLease.lease, this@runPublicationTest)
+            }
+            val cancellation = CanonicalCancellationException(Any())
+
+            owner.cancel(cancellation)
+            collectorDispatcher.release()
+            assertTrue(cancelledSession.closeEntered.await(1, TimeUnit.SECONDS))
+
+            manager.end()
+            val fresh = async(Dispatchers.Default, start = CoroutineStart.UNDISPATCHED) {
+                manager.start(conversationId, config, freshLease.lease, this@runPublicationTest)
+            }
+
+            assertFalse(waiter.isCompleted)
+            assertFalse(fresh.isCompleted)
+            assertEquals(1, factory.created.size)
+            assertEquals(1, cancelledSession.closeNowCalls)
+            assertEquals(0, cancelledSession.endCalls)
+            assertEquals(0, cancelledSession.lifecycleOverlapCalls)
+
+            releaseClose.countDown()
+            val ownerFailure = runCatching { owner.await() }.exceptionOrNull()
+            assertSame(cancellation, ownerFailure)
+            assertEquals(listOf(closeFailure), ownerFailure?.suppressed?.toList())
+            val waiterResult = waiter.await()
+            val freshResult = fresh.await()
+            when (waiterResult) {
+                is VoiceAgentManagerStartResult.Started -> {
+                    assertEquals(waiterLease.lease.metadata, waiterResult.route)
+                    assertEquals(VoiceAgentManagerStartResult.Existing(waiterResult.route), freshResult)
+                    assertEquals(0, waiterLease.retireCalls)
+                    assertEquals(1, freshLease.retireCalls)
+                }
+                is VoiceAgentManagerStartResult.Existing -> {
+                    val started = freshResult as VoiceAgentManagerStartResult.Started
+                    assertEquals(freshLease.lease.metadata, started.route)
+                    assertEquals(VoiceAgentManagerStartResult.Existing(started.route), waiterResult)
+                    assertEquals(1, waiterLease.retireCalls)
+                    assertEquals(0, freshLease.retireCalls)
+                }
+                VoiceAgentManagerStartResult.Superseded -> error("matching waiter must retry after Failed")
+            }
+
+            assertEquals(1, cancelledSession.closeNowCalls)
+            assertEquals(0, cancelledSession.endCalls)
+            assertEquals(0, cancelledSession.lifecycleOverlapCalls)
+            assertEquals(1, ownerLease.retireCalls)
+            assertEquals(2, factory.created.size)
+            assertEquals(1, retrySession.startCalls)
+            assertEquals(conversationId, manager.activeConversationId.value)
+            assertEquals(VoiceSessionStatus.PreparingContext, manager.state.value.session)
+            assertEquals(VoiceCallStatus.Ending, manager.state.value.call)
+        } finally {
+            releaseClose.countDown()
+            collectorDispatcher.release()
+            collectorScope.cancel()
+            collectorDispatcher.close()
+        }
+    }
 }
 
 private fun runPublicationTest(block: suspend CoroutineScope.() -> Unit) = runBlocking {

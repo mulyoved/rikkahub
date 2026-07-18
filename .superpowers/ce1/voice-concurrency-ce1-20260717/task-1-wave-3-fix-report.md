@@ -133,3 +133,32 @@ TDD evidence:
 - XML independently confirms the 30/6/3/8 test split with zero skipped, failures, or errors. `git diff --check` is clean.
 
 Final line counts are 577 for `VoiceAgentCallManager.kt`, 981 for the manager tests, 281 for barrier tests, 210 for publication tests, 376 for fixtures, and 328 for startup tests. Every test file remains below 1,000 lines. No residual concern is known beyond the unchanged unrelated compiler and web sourcemap warnings.
+
+## Cleanup-Ownership Stable Review Follow-Up
+
+Stable review identified a second-order race in the cancellation repair. Although the owner checked cancellation before attachment, its outer catch left the exact pending `Active` installed while calling `session.closeNow()`. If close blocked, a terminal API could detach that same `Active` and invoke `end()` or `closeNow()` concurrently; a fresh start could also bypass the still-running owner cleanup.
+
+The catch path now performs one atomic ownership transition before external cleanup. While holding the manager monitor, it verifies the exact active token and pending-publication identity, selects `Failed`, and replaces `Active` with an unpublishable `CleanupClaim`. The claim contains only a completion gate, not the session:
+
+- terminal and detach APIs treat it as already cleanup-owned and perform no lifecycle call;
+- `start` waits on the gate without retiring or replacing its route lease, while cancellation of that wait retains the existing exact retirement and suppression rules;
+- `matchingRoute` waits on the same gate and re-evaluates the complete slot afterward;
+- active-session commands cannot snapshot the claimed session.
+
+The owner then closes the exact session outside the monitor. Cleanup failure remains suppressed onto the original canonical cancellation in the same order. After cleanup, it changes only the identical claim to `Idle` under the monitor, then completes the selected `Failed` publication and cleanup gate outside the monitor. Existing matching waiters retry, fresh callers compete normally only after release, and terminal call status is preserved. Conversely, if terminal or replacement detached the pending `Active` before the catch could claim it, an `activeInstalled` ownership marker prevents the canceled owner from cleaning a session now owned by that detach path.
+
+The deterministic regression combines `BlockingCollectorDispatcher` with a session whose `closeNow()` blocks and records overlapping lifecycle calls. It installs an existing matching waiter, cancels the owner, releases collector dispatch until owner cleanup blocks, invokes `end()`, and adds a fresh matching caller. Before close release it proves both callers remain pending, the factory remains at one admission, exactly one close is running, and no `end()` or overlapping cleanup occurred. After release it proves:
+
+- the owner receives the exact canonical cancellation with the injected close failure as its sole suppressed throwable;
+- the session is closed once, never ended, and never cleaned concurrently;
+- exactly one matching retry starts and the other caller reuses its route, with exact loser-lease retirement;
+- the replacement state is live while terminal `Ending` call status remains intact.
+
+TDD evidence:
+
+- RED: the authoritative broadened `--rerun-tasks` command executed all 179 tasks and 48 tests. Only `cancelled owner claims cleanup before blocked close and gates terminal retry` failed because the matching waiter completed before the blocked close was released. Gradle reported `BUILD FAILED in 1m 15s`.
+- Targeted GREEN: the publication-class `--rerun-tasks` command executed all 179 tasks and passed all 4 publication tests, with `BUILD SUCCESSFUL in 1m 17s`.
+- Authoritative GREEN: `./gradlew :app:testDebugUnitTest --tests '*VoiceAgentCallManager*Test' --tests '*VoiceAgentCallStartupTest' --rerun-tasks` executed all 179 tasks and passed 48 tests: manager 30, barrier 6, publication 4, startup 8; zero failures/errors; `BUILD SUCCESSFUL in 1m 16s`.
+- XML independently confirms the 30/6/4/8 split with zero skipped, failures, or errors. `git diff --check` is clean.
+
+Final line counts are 634 for `VoiceAgentCallManager.kt`, 981 for manager tests, 281 for barrier tests, 293 for publication tests, 422 for fixtures, and 328 for startup tests. Every test file remains below 1,000 lines. No residual concern is known beyond unchanged unrelated compiler and web sourcemap warnings.
