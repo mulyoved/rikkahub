@@ -187,7 +187,7 @@ Add a cancellation test that cancels a matching `manager.start` waiter while the
 Run:
 
 ```bash
-./gradlew :app:testDebugUnitTest --tests '*VoiceAgentCallManagerTest' --tests '*VoiceAgentCallStartupTest'
+./gradlew :app:testDebugUnitTest --tests '*VoiceAgentCallManager*Test' --tests '*VoiceAgentCallStartupTest'
 ```
 
 Expected: compilation fails because manager start still returns `Boolean`, `matchingRoute` and the new result types do not exist, and waiter cancellation does not own retirement.
@@ -272,7 +272,7 @@ Install active session A. Make `A.end()` signal entry and block. Start B so it d
 Run:
 
 ```bash
-./gradlew :app:testDebugUnitTest --tests '*VoiceAgentCallManagerTest'
+./gradlew :app:testDebugUnitTest --tests '*VoiceAgentCallManager*Test'
 ```
 
 Expected: retry, terminal-supersession, or predecessor-serialization assertions fail because the complete resolution paths are not implemented.
@@ -329,7 +329,7 @@ Add a reentrancy test whose `session.start()` launches a worker that calls `mana
 - [ ] **Step 2: Run manager tests and verify failure**
 
 ```bash
-./gradlew :app:testDebugUnitTest --tests '*VoiceAgentCallManagerTest'
+./gradlew :app:testDebugUnitTest --tests '*VoiceAgentCallManager*Test'
 ```
 
 Expected: the new collector or lifecycle test fails while collector launch/cancellation or stale completion still occurs under the monitor.
@@ -342,7 +342,7 @@ Publish `Active` first, launch its collector outside the monitor, and attach the
 
 ```bash
 ./gradlew :app:testDebugUnitTest \
-  --tests '*VoiceAgentCallManagerTest' \
+  --tests '*VoiceAgentCallManager*Test' \
   --tests '*VoiceAgentCallStartupTest' \
   --tests '*VoiceAgentCallServiceLifecycleTest' \
   --tests '*VoiceAgentCallServicePolicyTest'

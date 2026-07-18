@@ -55,7 +55,7 @@ Command:
 
 ```bash
 ./gradlew :app:testDebugUnitTest \
-  --tests '*VoiceAgentCallManagerTest' \
+  --tests '*VoiceAgentCallManager*Test' \
   --tests '*VoiceAgentCallStartupTest' \
   --rerun-tasks
 ```
@@ -179,3 +179,7 @@ Final `VoiceAgentCallManagerBarrierTest.kt` size: 276 lines.
 
 - This report is included in the stable-review repair commit; the completion handoff supplies its full SHA.
 - No known residual concerns.
+
+## Wave 3 Follow-Up
+
+Wave 3 preserved the cleanup-fence design and added direct proof for both early exits introduced here. While a successful or failed predecessor cleanup is blocked, `matchingRoute` returns `NoMatch` without consuming the fence, a second terminal API leaves the fence installed, and the next start remains gated before receiving the exact result or throwable. The authoritative Task 1 filter is now `*VoiceAgentCallManager*Test`, so the split barrier suite is included in every focused run. Full evidence is in `task-1-wave-3-fix-report.md`.

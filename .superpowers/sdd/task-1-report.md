@@ -7,14 +7,14 @@
   - 5d818a16 fix(voice): keep failed route matching retryable
 - Summary: Added suspending call-start reservations and pre-route matching so duplicate callers reuse one published session without blocking the manager monitor. Stable-review cleanup records each stale lease/session cleanup attempt before invoking it, preventing catch-side retries and preserving the original cleanup failure. Matching-waiter cancellation ignores an identical retirement throwable so self-suppression cannot replace the canonical cancellation. `matchingRoute` now preserves the complete slot snapshot so a failed matching chain ending in `Idle` remains retryable `NoMatch`, while genuinely newer nonmatching ownership remains `Superseded`.
 ## Tests
-- RED: `./gradlew :app:testDebugUnitTest --tests '*VoiceAgentCallManagerTest' --tests '*VoiceAgentCallStartupTest'` failed during test compilation as expected because `VoiceAgentManagerStartResult`, `VoiceAgentRouteMatchResult`, and `matchingRoute` did not exist.
-- GREEN: `./gradlew :app:testDebugUnitTest --tests '*VoiceAgentCallManagerTest' --tests '*VoiceAgentCallStartupTest'` passed with 20 selected tests and `BUILD SUCCESSFUL`.
+- RED: `./gradlew :app:testDebugUnitTest --tests '*VoiceAgentCallManager*Test' --tests '*VoiceAgentCallStartupTest'` failed during test compilation as expected because `VoiceAgentManagerStartResult`, `VoiceAgentRouteMatchResult`, and `matchingRoute` did not exist.
+- GREEN: `./gradlew :app:testDebugUnitTest --tests '*VoiceAgentCallManager*Test' --tests '*VoiceAgentCallStartupTest'` passed with 20 selected tests and `BUILD SUCCESSFUL`.
 - Stable-review RED: With the cleanup-attempt fix reverted and the failure-injecting regressions present, the focused command ran 23 tests and failed only the stale unconsumed-lease, created-session, and started-session exact-once tests.
-- Stable-review GREEN: `./gradlew :app:testDebugUnitTest --tests '*VoiceAgentCallManagerTest' --tests '*VoiceAgentCallStartupTest'` passed with 23 selected tests (16 manager, 7 startup), zero failures/errors, and `BUILD SUCCESSFUL`.
+- Stable-review GREEN: `./gradlew :app:testDebugUnitTest --tests '*VoiceAgentCallManager*Test' --tests '*VoiceAgentCallStartupTest'` passed with 23 selected tests (16 manager, 7 startup), zero failures/errors, and `BUILD SUCCESSFUL`.
 - Stable re-review RED: The focused command ran 24 tests and failed only `cancelled matching waiter ignores self suppression from exact retirement failure`; the canonical cancellation was replaced by `IllegalArgumentException: Self-suppression not permitted`.
-- Stable re-review GREEN: `./gradlew :app:testDebugUnitTest --tests '*VoiceAgentCallManagerTest' --tests '*VoiceAgentCallStartupTest'` passed with 24 selected tests (17 manager, 7 startup), zero failures/errors, and `BUILD SUCCESSFUL`.
+- Stable re-review GREEN: `./gradlew :app:testDebugUnitTest --tests '*VoiceAgentCallManager*Test' --tests '*VoiceAgentCallStartupTest'` passed with 24 selected tests (17 manager, 7 startup), zero failures/errors, and `BUILD SUCCESSFUL`.
 - Third stable-review RED: The focused command ran 25 tests and failed only `matching route failure chain ending idle remains retryable`; on failure-chain attempt 9, `matchingRoute` returned `Superseded` instead of retryable `NoMatch` after all matching reservations retired to `Idle`.
-- Third stable-review GREEN: `./gradlew :app:testDebugUnitTest --tests '*VoiceAgentCallManagerTest' --tests '*VoiceAgentCallStartupTest'` passed with 25 selected tests (18 manager, 7 startup), zero failures/errors, and `BUILD SUCCESSFUL`.
+- Third stable-review GREEN: `./gradlew :app:testDebugUnitTest --tests '*VoiceAgentCallManager*Test' --tests '*VoiceAgentCallStartupTest'` passed with 25 selected tests (18 manager, 7 startup), zero failures/errors, and `BUILD SUCCESSFUL`.
 ## Files Changed
 - `app/src/main/java/me/rerere/rikkahub/voiceagent/VoiceAgentCallManager.kt`: owns sealed call-slot reservations, deferred publication results, suspending start/match APIs, full-slot matching snapshots, exact lease cleanup, monitor-safe session snapshots, exact-once stale cleanup-attempt bookkeeping, and cancellation-safe suppression identity guards.
 - `app/src/main/java/me/rerere/rikkahub/voiceagent/VoiceAgentCallStartup.kt`: maps route-match and manager-start results directly to service-level Started or Stale results.
@@ -84,7 +84,7 @@
 - Cancellation tests: Deterministic cancellation before factory transfer, after factory creation, and after supersession proves canonical cancellation identity, `Failed` wake-up/retry for a matching waiter, exact lease/session cleanup, idle state, and preservation of a newer active slot.
 - Supersession/startup tests: Delayed retry continuations prove terminal manager and pre-route supersession for newer `Starting` and `Active` slots. Startup maps the immutable awaited route to `Stale` without invoking route resolution again.
 - Barrier tests: The successful inherited-barrier test now proves no successor factory admission before predecessor cleanup release. A failure variant passes one shared cleanup failure through three inheritors, with the exact failure replayed, one retirement per lease, and no successor factory admission.
-- RED: `./gradlew :app:testDebugUnitTest --tests '*VoiceAgentCallManagerTest' --tests '*VoiceAgentCallStartupTest'` ran 35 tests and failed exactly the three new terminal regressions because owners returned `Started` instead of `Superseded` after `end`, detach, or close.
+- RED: `./gradlew :app:testDebugUnitTest --tests '*VoiceAgentCallManager*Test' --tests '*VoiceAgentCallStartupTest'` ran 35 tests and failed exactly the three new terminal regressions because owners returned `Started` instead of `Superseded` after `end`, detach, or close.
 - GREEN: The same focused command passed 35 tests (27 manager, 8 startup), zero failures/errors, with `BUILD SUCCESSFUL`.
 - Fix commit: `470f087fc1447e1a7f934cceb88fe6c2da1f38d2 fix(voice): terminate in-flight call reservations`.
 - Detailed report: `.superpowers/ce1/voice-concurrency-ce1-20260717/task-1-wave-1-fix-report.md`.
@@ -95,8 +95,8 @@
 - Production repair: The catch path now attempts exact current-resource cleanup and applies any distinct cleanup failure as suppressed first, outside the monitor. Only afterward does it atomically clear the slot if the reservation/token is still current, followed by `Failed` completion outside the monitor.
 - Regression coverage: Added a failed pre-factory owner with blocked Telecom lease retirement and a canceled post-factory owner with blocked session close. In each case, one existing matching waiter and one fresh matching caller remain suspended, and the factory remains at its original admission, until cleanup release. After release, exactly one retry starts and the other reuses it.
 - Preserved contracts: canonical cancellation identity, exact-once lease/session cleanup, primary/suppressed identity and order, newer-slot protection, and the prohibition on external work or deferred completion under the manager monitor.
-- RED: `./gradlew :app:testDebugUnitTest --tests '*VoiceAgentCallManagerTest' --tests '*VoiceAgentCallStartupTest'` ran 37 tests and failed exactly the two new blocked-cleanup regressions because a second factory admission occurred before cleanup release.
-- GREEN: `./gradlew :app:testDebugUnitTest --tests '*VoiceAgentCallManagerTest' --tests '*VoiceAgentCallStartupTest' --rerun-tasks` executed all 179 Gradle tasks and passed 37 tests (29 manager, 8 startup), zero failures/errors, with `BUILD SUCCESSFUL`.
+- RED: `./gradlew :app:testDebugUnitTest --tests '*VoiceAgentCallManager*Test' --tests '*VoiceAgentCallStartupTest'` ran 37 tests and failed exactly the two new blocked-cleanup regressions because a second factory admission occurred before cleanup release.
+- GREEN: `./gradlew :app:testDebugUnitTest --tests '*VoiceAgentCallManager*Test' --tests '*VoiceAgentCallStartupTest' --rerun-tasks` executed all 179 Gradle tasks and passed 37 tests (29 manager, 8 startup), zero failures/errors, with `BUILD SUCCESSFUL`.
 - Commit: `746a458d34a3c62ff83046312ebe7755a615a8d9 fix(voice): finish owner cleanup before retry`.
 - Residual concerns: none known.
 
@@ -110,3 +110,31 @@
 - Final focused barrier test file size: 276 lines. `git diff --check` is clean.
 - Commit: this report is included in the stable-review repair commit; its full SHA is supplied in the completion handoff.
 - Residual concerns: none known.
+
+## CE1 Wave 3 Repair
+
+### Result
+
+- Status: DONE; CE1-T1-008, CE1-T1-009, and CE1-T1-010 are fixed or directly proved.
+- Commit: this report is included in the single wave-3 fix commit; the completion handoff supplies its full SHA.
+
+### Summary
+
+- `Active` now retains the exact pending startup-publication identity until one locked ownership transition selects `Published`, `Failed`, or `Superseded`. Deferred completion remains outside the monitor.
+- Matching manager starts and pre-route startup callers await a pending `Active` publication instead of treating the just-installed session as live.
+- Terminal and nonmatching-replacement detach paths select `Superseded` while they still own the exact slot, complete it outside the monitor, and retain sole responsibility for session/collector cleanup.
+- Added deterministic terminal and replacement races paused after `Active` installation but before collector attachment. Both prove manager owners/waiters return `Superseded`, startup waiters return `Stale` without route resolution, stale session state cannot overwrite the winning manager state, and cleanup remains exact once.
+- Cleanup-fence success and failure coverage now calls `matchingRoute`, invokes a second terminal API while still fenced, and proves the subsequent fresh start remains gated and receives the exact cleanup result.
+- Every authoritative Task 1 filter now uses `*VoiceAgentCallManager*Test`, including the tracked reservation plan and the ignored Task 1 brief.
+
+### TDD and Verification
+
+- RED: `./gradlew :app:testDebugUnitTest --tests '*VoiceAgentCallManager*Test' --tests '*VoiceAgentCallStartupTest' --rerun-tasks` executed all 179 tasks and 46 tests; only the two new publication-race tests failed. The six barrier tests, including the new fence-exit assertions, passed.
+- GREEN: the identical fresh command executed all 179 tasks and passed 46 tests: 30 manager, 6 barrier, 2 publication-race, and 8 startup; zero failures/errors; `BUILD SUCCESSFUL in 1m 27s`.
+- XML: `VoiceAgentCallManagerTest` 30, `VoiceAgentCallManagerBarrierTest` 6, `VoiceAgentCallManagerPublicationTest` 2, `VoiceAgentCallStartupTest` 8.
+- `git diff --check`: clean.
+- Test line counts: manager 981, barrier 281, publication 152, fixtures 376, startup 328.
+
+### Concerns
+
+- None known. Existing unrelated compiler and web sourcemap warnings remain unchanged.

@@ -33,6 +33,11 @@ internal sealed interface VoiceAgentRouteMatchResult {
 class VoiceAgentCallManager(
     private val factory: VoiceAgentCallFactory,
 ) {
+    private class PendingPublication(
+        val resolution: CompletableDeferred<VoiceAgentStartupResolution>,
+        var selected: VoiceAgentStartupResolution? = null,
+    )
+
     private sealed interface CallSlot {
         data object Idle : CallSlot
 
@@ -46,6 +51,7 @@ class VoiceAgentCallManager(
             val launchConfig: VoiceAgentLaunchConfig,
             val route: VoiceAgentRouteMetadata,
             val resolution: CompletableDeferred<VoiceAgentStartupResolution>,
+            val publication: PendingPublication,
             val predecessorCleanup: CompletableDeferred<Result<Unit>>?,
         ) : CallSlot
 
@@ -56,6 +62,7 @@ class VoiceAgentCallManager(
             val route: VoiceAgentRouteMetadata,
             val session: RouteOwnedManagedVoiceCallSession,
             val stateCollectionJob: Job?,
+            val pendingPublication: PendingPublication?,
         ) : CallSlot
     }
 
@@ -63,10 +70,13 @@ class VoiceAgentCallManager(
         data class Own(
             val reservation: CallSlot.Starting,
             val predecessor: CallSlot.Active?,
-            val displaced: CallSlot.Starting?,
+            val displacedPublication: PendingPublication?,
         ) : StartDecision
 
-        data class Await(val reservation: CallSlot.Starting) : StartDecision
+        data class Await(
+            val route: VoiceAgentRouteMetadata,
+            val resolution: CompletableDeferred<VoiceAgentStartupResolution>,
+        ) : StartDecision
         data class Reuse(val route: VoiceAgentRouteMetadata) : StartDecision
         data object RetrySuperseded : StartDecision
     }
@@ -109,7 +119,7 @@ class VoiceAgentCallManager(
 
                 is StartDecision.Await -> {
                     val resolution = try {
-                        decision.reservation.resolution.await()
+                        decision.resolution.await()
                     } catch (cancellation: CancellationException) {
                         runCatching(routeLease::retire)
                             .exceptionOrNull()
@@ -120,7 +130,7 @@ class VoiceAgentCallManager(
                     when (resolution) {
                         VoiceAgentStartupResolution.Published -> {
                             routeLease.retire()
-                            return VoiceAgentManagerStartResult.Existing(decision.reservation.route)
+                            return VoiceAgentManagerStartResult.Existing(decision.route)
                         }
 
                         VoiceAgentStartupResolution.Superseded -> {
@@ -133,7 +143,7 @@ class VoiceAgentCallManager(
                 }
 
                 is StartDecision.Own -> {
-                    decision.displaced?.resolution?.complete(VoiceAgentStartupResolution.Superseded)
+                    decision.displacedPublication?.resolution?.complete(VoiceAgentStartupResolution.Superseded)
                     return runReservationOwner(
                         reservation = decision.reservation,
                         routeLease = routeLease,
@@ -154,13 +164,25 @@ class VoiceAgentCallManager(
             when (val current = synchronized(lock) { slot }) {
                 CallSlot.Idle -> return VoiceAgentRouteMatchResult.NoMatch
                 is CallSlot.CleanupFence -> return VoiceAgentRouteMatchResult.NoMatch
-                is CallSlot.Active -> if (
-                    current.conversationId == conversationId && current.launchConfig == config
-                ) {
-                    return VoiceAgentRouteMatchResult.Existing(current.route)
-                } else {
-                    return awaitedRoute?.let(VoiceAgentRouteMatchResult::Superseded)
-                        ?: VoiceAgentRouteMatchResult.NoMatch
+                is CallSlot.Active -> {
+                    if (current.conversationId != conversationId || current.launchConfig != config) {
+                        return awaitedRoute?.let(VoiceAgentRouteMatchResult::Superseded)
+                            ?: VoiceAgentRouteMatchResult.NoMatch
+                    }
+                    val pendingPublication = current.pendingPublication?.resolution
+                    if (pendingPublication == null) {
+                        return VoiceAgentRouteMatchResult.Existing(current.route)
+                    }
+                    awaitedRoute = current.route
+                    when (pendingPublication.await()) {
+                        VoiceAgentStartupResolution.Published -> {
+                            return VoiceAgentRouteMatchResult.Existing(current.route)
+                        }
+                        VoiceAgentStartupResolution.Superseded -> {
+                            return VoiceAgentRouteMatchResult.Superseded(current.route)
+                        }
+                        VoiceAgentStartupResolution.Failed -> Unit
+                    }
                 }
                 is CallSlot.Starting -> {
                     if (current.conversationId != conversationId || current.launchConfig != config) {
@@ -214,9 +236,10 @@ class VoiceAgentCallManager(
         when (detached) {
             null, CallSlot.Idle, is CallSlot.CleanupFence -> Unit
             is CallSlot.Starting -> {
-                detached.resolution.complete(VoiceAgentStartupResolution.Superseded)
+                detached.publication.resolution.complete(VoiceAgentStartupResolution.Superseded)
             }
             is CallSlot.Active -> {
+                detached.pendingPublication?.resolution?.complete(VoiceAgentStartupResolution.Superseded)
                 detached.stateCollectionJob?.cancel()
                 detached.session.end()
             }
@@ -232,10 +255,11 @@ class VoiceAgentCallManager(
         return when (detached) {
             null, CallSlot.Idle, is CallSlot.CleanupFence -> null
             is CallSlot.Starting -> {
-                detached.resolution.complete(VoiceAgentStartupResolution.Superseded)
+                detached.publication.resolution.complete(VoiceAgentStartupResolution.Superseded)
                 null
             }
             is CallSlot.Active -> {
+                detached.pendingPublication?.resolution?.complete(VoiceAgentStartupResolution.Superseded)
                 detached.stateCollectionJob?.cancel()
                 detached.session
             }
@@ -251,9 +275,10 @@ class VoiceAgentCallManager(
         when (detached) {
             null, CallSlot.Idle, is CallSlot.CleanupFence -> Unit
             is CallSlot.Starting -> {
-                detached.resolution.complete(VoiceAgentStartupResolution.Superseded)
+                detached.publication.resolution.complete(VoiceAgentStartupResolution.Superseded)
             }
             is CallSlot.Active -> {
+                detached.pendingPublication?.resolution?.complete(VoiceAgentStartupResolution.Superseded)
                 detached.stateCollectionJob?.cancel()
                 detached.session.closeNow()
             }
@@ -269,7 +294,7 @@ class VoiceAgentCallManager(
         CallSlot.Idle -> StartDecision.Own(
             reservation = installReservationLocked(conversationId, config, route, predecessorCleanup = null),
             predecessor = null,
-            displaced = null,
+            displacedPublication = null,
         )
 
         is CallSlot.CleanupFence -> StartDecision.Own(
@@ -280,27 +305,37 @@ class VoiceAgentCallManager(
                 current.predecessorCleanup,
             ),
             predecessor = null,
-            displaced = null,
+            displacedPublication = null,
         )
 
         is CallSlot.Active -> if (current.conversationId == conversationId && current.launchConfig == config) {
-            StartDecision.Reuse(current.route)
+            current.pendingPublication?.let {
+                StartDecision.Await(current.route, it.resolution)
+            } ?: StartDecision.Reuse(current.route)
         } else if (retryingFailedMatch) {
             StartDecision.RetrySuperseded
         } else {
             val cleanup = CompletableDeferred<Result<Unit>>()
+            val displacedPublication = selectPublicationLocked(
+                current.pendingPublication,
+                VoiceAgentStartupResolution.Superseded,
+            )
             StartDecision.Own(
                 reservation = installReservationLocked(conversationId, config, route, cleanup),
                 predecessor = current,
-                displaced = null,
+                displacedPublication = displacedPublication,
             )
         }
 
         is CallSlot.Starting -> if (current.conversationId == conversationId && current.launchConfig == config) {
-            StartDecision.Await(current)
+            StartDecision.Await(current.route, current.resolution)
         } else if (retryingFailedMatch) {
             StartDecision.RetrySuperseded
         } else {
+            val displacedPublication = selectPublicationLocked(
+                current.publication,
+                VoiceAgentStartupResolution.Superseded,
+            )
             StartDecision.Own(
                 reservation = installReservationLocked(
                     conversationId,
@@ -309,7 +344,7 @@ class VoiceAgentCallManager(
                     current.predecessorCleanup,
                 ),
                 predecessor = null,
-                displaced = current,
+                displacedPublication = displacedPublication,
             )
         }
     }
@@ -319,16 +354,20 @@ class VoiceAgentCallManager(
         config: VoiceAgentLaunchConfig,
         route: VoiceAgentRouteMetadata,
         predecessorCleanup: CompletableDeferred<Result<Unit>>?,
-    ) = CallSlot.Starting(
-        token = Any(),
-        conversationId = conversationId,
-        launchConfig = config,
-        route = route,
-        resolution = CompletableDeferred(),
-        predecessorCleanup = predecessorCleanup,
-    ).also {
-        slot = it
-        _activeConversationId.value = null
+    ): CallSlot.Starting {
+        val resolution = CompletableDeferred<VoiceAgentStartupResolution>()
+        return CallSlot.Starting(
+            token = Any(),
+            conversationId = conversationId,
+            launchConfig = config,
+            route = route,
+            resolution = resolution,
+            publication = PendingPublication(resolution),
+            predecessorCleanup = predecessorCleanup,
+        ).also {
+            slot = it
+            _activeConversationId.value = null
+        }
     }
 
     private suspend fun runReservationOwner(
@@ -387,6 +426,7 @@ class VoiceAgentCallManager(
                 route = session.routeMetadata,
                 session = session,
                 stateCollectionJob = null,
+                pendingPublication = reservation.publication,
             )
             val published = synchronized(lock) {
                 if (slot === reservation) {
@@ -423,8 +463,27 @@ class VoiceAgentCallManager(
                     false
                 }
             }
-            if (!attached) collector.cancel()
-            reservation.resolution.complete(VoiceAgentStartupResolution.Published)
+            if (!attached) {
+                collector.cancel()
+                return VoiceAgentManagerStartResult.Superseded
+            }
+            val publicationWon = synchronized(lock) {
+                val current = slot
+                if (current is CallSlot.Active &&
+                    current.token === reservation.token &&
+                    selectPublicationLocked(
+                        reservation.publication,
+                        VoiceAgentStartupResolution.Published,
+                    ) != null
+                ) {
+                    slot = current.copy(pendingPublication = null)
+                    true
+                } else {
+                    false
+                }
+            }
+            if (!publicationWon) return VoiceAgentManagerStartResult.Superseded
+            reservation.publication.resolution.complete(VoiceAgentStartupResolution.Published)
             return VoiceAgentManagerStartResult.Started(session.routeMetadata)
         } catch (failure: Throwable) {
             val predecessorCleanupToPreserve = synchronized(lock) {
@@ -452,6 +511,10 @@ class VoiceAgentCallManager(
                 if (current === reservation ||
                     current is CallSlot.Active && current.token === reservation.token
                 ) {
+                    selectPublicationLocked(
+                        reservation.publication,
+                        VoiceAgentStartupResolution.Failed,
+                    )
                     slot = predecessorCleanupToPreserve
                         ?.let { CallSlot.CleanupFence(it) }
                         ?: CallSlot.Idle
@@ -475,12 +538,28 @@ class VoiceAgentCallManager(
         (slot as? CallSlot.Active)?.session
     }
 
+    private fun selectPublicationLocked(
+        publication: PendingPublication?,
+        resolution: VoiceAgentStartupResolution,
+    ): PendingPublication? = publication?.takeIf { pending ->
+        pending.selected == null
+    }?.also { pending ->
+        pending.selected = resolution
+    }
+
     private fun detachTerminalLocked(): CallSlot? = when (val current = slot) {
         CallSlot.Idle -> null
         is CallSlot.CleanupFence -> null
         is CallSlot.Starting,
         is CallSlot.Active,
         -> current.also {
+            selectPublicationLocked(
+                when (current) {
+                    is CallSlot.Starting -> current.publication
+                    is CallSlot.Active -> current.pendingPublication
+                },
+                VoiceAgentStartupResolution.Superseded,
+            )
             slot = if (current is CallSlot.Starting) {
                 current.predecessorCleanup?.let { CallSlot.CleanupFence(it) } ?: CallSlot.Idle
             } else {

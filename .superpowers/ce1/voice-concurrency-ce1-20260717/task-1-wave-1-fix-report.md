@@ -65,7 +65,7 @@ A new failure-replay test installs three successive inheriting reservations whil
 Command:
 
 ```bash
-./gradlew :app:testDebugUnitTest --tests '*VoiceAgentCallManagerTest' --tests '*VoiceAgentCallStartupTest'
+./gradlew :app:testDebugUnitTest --tests '*VoiceAgentCallManager*Test' --tests '*VoiceAgentCallStartupTest'
 ```
 
 Result before the production change:
@@ -84,7 +84,7 @@ Result before the production change:
 Command:
 
 ```bash
-./gradlew :app:testDebugUnitTest --tests '*VoiceAgentCallManagerTest' --tests '*VoiceAgentCallStartupTest'
+./gradlew :app:testDebugUnitTest --tests '*VoiceAgentCallManager*Test' --tests '*VoiceAgentCallStartupTest'
 ```
 
 Result after the production change:
@@ -154,7 +154,7 @@ The test Telecom call gained optional deterministic retirement-entry/release lat
 RED command:
 
 ```bash
-./gradlew :app:testDebugUnitTest --tests '*VoiceAgentCallManagerTest' --tests '*VoiceAgentCallStartupTest'
+./gradlew :app:testDebugUnitTest --tests '*VoiceAgentCallManager*Test' --tests '*VoiceAgentCallStartupTest'
 ```
 
 RED result:
@@ -167,7 +167,7 @@ RED result:
 Fresh GREEN command:
 
 ```bash
-./gradlew :app:testDebugUnitTest --tests '*VoiceAgentCallManagerTest' --tests '*VoiceAgentCallStartupTest' --rerun-tasks
+./gradlew :app:testDebugUnitTest --tests '*VoiceAgentCallManager*Test' --tests '*VoiceAgentCallStartupTest' --rerun-tasks
 ```
 
 GREEN result:
@@ -194,3 +194,7 @@ None known. The repair is a catch-path ordering change only; it adds no manager 
 Wave 2 found a narrower transition not covered by the wave-1 repair: terminal invalidation or cancellation of a reservation that only inherited an incomplete predecessor-cleanup barrier still exposed barrier-free `Idle`. The wave-2 fix adds a non-publishable cleanup fence that carries the exact deferred to the next reservation, preserving admission ordering and identical failure replay without monitor-held external work.
 
 Four deterministic regressions now cover terminal invalidation and inheriting-owner cancellation against both successful and failed predecessor cleanup. The manager test suite was also split below 1,000 lines, and direct `matchingRoute` replacement/supersession branches now have immutable-route and zero-redundant-work coverage. Full evidence is in `task-1-wave-2-fix-report.md`; the final fix SHA is supplied in the completion handoff.
+
+## Wave 3 Follow-Up
+
+Wave 3 closed the post-`Active` publication window left beyond the wave-1 `Starting` terminal fix. Pending publication now remains part of exact `Active` ownership: terminal or replacement detachment selects `Superseded` under the manager monitor, completes the reservation outside it, and exclusively owns session/collector cleanup. Deterministic terminal and replacement races prove manager owners/waiters cannot report success and production startup maps the same outcomes to `Stale`. The broadened authoritative filter and direct cleanup-fence exit coverage are recorded in `task-1-wave-3-fix-report.md`.

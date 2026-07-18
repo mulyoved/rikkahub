@@ -178,6 +178,11 @@ private suspend fun assertTerminalPreservesInheritedBarrier(
     }
 
     manager.end()
+    assertEquals(
+        VoiceAgentRouteMatchResult.NoMatch,
+        manager.matchingRoute(Uuid.random(), fakeManagerLaunchConfig("fenced-match")),
+    )
+    manager.closeNow()
     val freshLease = CountingTelecomLease()
     val fresh = scope.async(Dispatchers.Default, start = CoroutineStart.UNDISPATCHED) {
         manager.start(Uuid.random(), fakeManagerLaunchConfig("fresh"), freshLease.lease, scope)

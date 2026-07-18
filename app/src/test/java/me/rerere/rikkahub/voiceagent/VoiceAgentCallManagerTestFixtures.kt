@@ -6,10 +6,12 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.flow.MutableStateFlow
 import me.rerere.rikkahub.voiceagent.audio.VoiceAudioRouteOwner
 import me.rerere.rikkahub.voiceagent.hermesvoice.HermesVoiceCredentials
+import kotlin.coroutines.CoroutineContext
 import kotlin.uuid.Uuid
 
 internal class FakeManagedVoiceCallSession(
@@ -254,6 +256,27 @@ internal class BlockedRetryDispatcher {
     fun close() {
         release()
         dispatcher.close()
+    }
+}
+
+internal class BlockingCollectorDispatcher : CoroutineDispatcher(), AutoCloseable {
+    private val delegate = Executors.newSingleThreadExecutor().asCoroutineDispatcher()
+    private val releaseDispatch = CountDownLatch(1)
+    val dispatchEntered = CountDownLatch(1)
+
+    override fun dispatch(context: CoroutineContext, block: Runnable) {
+        dispatchEntered.countDown()
+        check(releaseDispatch.await(5, TimeUnit.SECONDS)) {
+            "timed out waiting to release collector dispatch"
+        }
+        delegate.dispatch(context, block)
+    }
+
+    fun release() = releaseDispatch.countDown()
+
+    override fun close() {
+        release()
+        delegate.close()
     }
 }
 
