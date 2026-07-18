@@ -154,6 +154,26 @@ private fun throwVoiceAudioCaptureSetupFailure(
     error("Capture setup cleanup returned without its primary failure")
 }
 
+internal suspend fun <Recorder : Any, CaptureTask : Any> publishVoiceAudioCapture(
+    ownership: VoiceAudioCaptureOwnership<Recorder, CaptureTask>,
+    setup: VoiceAudioCaptureSetup<Recorder>,
+    task: CaptureTask,
+    cancelTask: (CaptureTask) -> Unit,
+    releaseRecorder: (Recorder) -> Unit,
+): VoiceAudioCaptureStartOutcome {
+    try {
+        currentCoroutineContext().ensureActive()
+    } catch (cancellation: CancellationException) {
+        throwVoiceAudioCaptureSetupFailure(
+            cancellation,
+            { cancelTask(task) },
+            { releaseRecorder(setup.recorder) },
+            { ownership.abort(setup.token) },
+        )
+    }
+    return ownership.publishAndStart(setup.token, setup.recorder, task)
+}
+
 class AndroidVoiceAudioEngine(
     context: Context,
     routeOwner: VoiceAudioRouteOwner,
@@ -278,7 +298,15 @@ class AndroidVoiceAudioEngine(
             )
         }
 
-        if (captureOwnership.publishAndStart(token, recorder, job) == VoiceAudioCaptureStartOutcome.Started) {
+        if (
+            publishVoiceAudioCapture(
+                ownership = captureOwnership,
+                setup = setup,
+                task = job,
+                cancelTask = Job::cancel,
+                releaseRecorder = { it.releaseSafely() },
+            ) == VoiceAudioCaptureStartOutcome.Started
+        ) {
             registerDebugCapture(token, recorder, onPcm16, onDebugInjectionComplete)
         }
     }

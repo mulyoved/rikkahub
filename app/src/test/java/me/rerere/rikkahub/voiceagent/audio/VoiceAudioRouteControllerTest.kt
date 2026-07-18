@@ -10,10 +10,12 @@ import kotlin.concurrent.thread
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertSame
@@ -62,6 +64,73 @@ class VoiceAudioRouteControllerTest {
     }
 
     @Test
+    fun `cancellation after setup checkpoint cleans locals before activation`() = runBlocking {
+        val cancellation = CancellationException("late capture start cancellation")
+        val recorderReleaseFailure = IllegalStateException("recorder release failed")
+        val routeRetirementFailure = IllegalArgumentException("route retirement failed")
+        val configureEntered = CountDownLatch(1)
+        val releaseConfiguration = CountDownLatch(1)
+        val events = CopyOnWriteArrayList<String>()
+        val lease = FakeCaptureRouteLease(
+            onRetire = {
+                events += "routeRetired"
+                throw routeRetirementFailure
+            },
+        )
+        val ownership = VoiceAudioCaptureOwnership<Any, Any>(
+            startRecorder = { events += "startRecorder" },
+            isRecorderRecording = { true },
+            stopRecorder = { events += "stopRecorder" },
+            releaseRecorder = { events += "releaseRecorder" },
+            startTask = { events += "startTask"; true },
+            cancelTask = { events += "cancelTask" },
+        )
+        val observedFailure = AtomicReference<Throwable?>()
+        val setup = launch(Dispatchers.Default) {
+            try {
+                val captureSetup = requireNotNull(
+                    setupVoiceAudioCapture(
+                        ownership = ownership,
+                        acquireRoute = { lease },
+                        lookupBufferSize = { 64 },
+                        createRecorder = { Any() },
+                        configureRecorder = { _, _ ->
+                            configureEntered.countDown()
+                            releaseConfiguration.await(5, TimeUnit.SECONDS)
+                        },
+                        isRecorderInitialized = { true },
+                        releaseRecorder = { events += "releaseRecorder" },
+                    )
+                )
+                publishVoiceAudioCapture(
+                    ownership = ownership,
+                    setup = captureSetup,
+                    task = Any(),
+                    cancelTask = { events += "cancelTask" },
+                    releaseRecorder = {
+                        events += "releaseRecorder"
+                        throw recorderReleaseFailure
+                    },
+                )
+            } catch (failure: Throwable) {
+                observedFailure.set(failure)
+                throw failure
+            }
+        }
+        assertTrue(configureEntered.await(5, TimeUnit.SECONDS))
+
+        setup.cancel(cancellation)
+        releaseConfiguration.countDown()
+        withTimeout(TEST_TIMEOUT_MS) { setup.join() }
+
+        assertSame(cancellation, observedFailure.get())
+        assertEquals(listOf(recorderReleaseFailure, routeRetirementFailure), cancellation.suppressed.toList())
+        assertEquals(listOf("cancelTask", "releaseRecorder", "routeRetired"), events)
+        assertEquals(1, lease.retireCalls)
+        assertTrue(ownership.abort(ownership.reserve()))
+    }
+
+    @Test
     fun `cancellation during route preparation keeps primary and retires exact route once`() = runBlocking {
         val cancellation = CancellationException("route preparation cancelled")
         val retirementFailure = IllegalStateException("route retirement failed")
@@ -106,11 +175,11 @@ class VoiceAudioRouteControllerTest {
                 throw failure
             }
         }
-        prepareEntered.await()
+        withTimeout(TEST_TIMEOUT_MS) { prepareEntered.await() }
 
         prepareRelease.complete(Unit)
-        setup.join()
-        val thrown = observedFailure.await()
+        withTimeout(TEST_TIMEOUT_MS) { setup.join() }
+        val thrown = withTimeout(TEST_TIMEOUT_MS) { observedFailure.await() }
 
         assertSame(cancellation, thrown)
         assertEquals(listOf(retirementFailure), cancellation.suppressed.toList())
@@ -599,6 +668,10 @@ class VoiceAudioRouteControllerTest {
                 onRetire()
             }
         }
+    }
+
+    private companion object {
+        const val TEST_TIMEOUT_MS = 500L
     }
 
 }
