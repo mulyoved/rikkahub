@@ -603,6 +603,80 @@ class VoiceAudioCaptureOwnershipTest {
         assertRetiredExactlyOnce(lease, recorder, task)
     }
 
+    @Test
+    fun `interrupted activation waiter restores interrupt after exact retirement`() {
+        val startEntered = CountDownLatch(1)
+        val allowStart = CountDownLatch(1)
+        val waiterReturned = CountDownLatch(1)
+        val interruptedOnReturn = AtomicReference(false)
+        val ownership = fakeOwnership()
+        val lease = FakeCaptureRouteLease()
+        val recorder = FakeCaptureRecorder(
+            onStart = {
+                startEntered.countDown()
+                allowStart.await(5, TimeUnit.SECONDS)
+            },
+        )
+        val task = FakeCaptureTask()
+        val token = ownership.reserve()
+        assertTrue(ownership.publishRoute(token, lease))
+        val activation = thread(name = "interrupted-activation-owner") {
+            ownership.publishAndStart(token, recorder, task)
+        }
+        assertTrue(startEntered.await(5, TimeUnit.SECONDS))
+        val waiter = thread(name = "interrupted-activation-waiter") {
+            Thread.currentThread().interrupt()
+            ownership.stop()
+            interruptedOnReturn.set(Thread.currentThread().isInterrupted)
+            waiterReturned.countDown()
+        }
+
+        try {
+            assertFalse(waiterReturned.await(100, TimeUnit.MILLISECONDS))
+        } finally {
+            allowStart.countDown()
+            activation.join(5_000)
+            waiter.join(5_000)
+        }
+
+        assertFalse(activation.isAlive)
+        assertFalse(waiter.isAlive)
+        assertTrue(interruptedOnReturn.get())
+        assertRetiredExactlyOnce(lease, recorder, task)
+    }
+
+    @Test
+    fun `thrown task start stays primary and exact cleanup failure replays`() {
+        val startFailure = IllegalStateException("task start failed")
+        val cancelFailure = IllegalArgumentException("task cancel failed")
+        val stopFailure = UnsupportedOperationException("recorder stop failed")
+        val releaseFailure = AssertionError("recorder release failed")
+        val routeFailure = RuntimeException("route retirement failed")
+        val ownership = fakeOwnership()
+        val lease = FakeCaptureRouteLease { throw routeFailure }
+        val recorder = FakeCaptureRecorder(
+            stopFailure = stopFailure,
+            releaseFailure = releaseFailure,
+        )
+        val task = FakeCaptureTask(
+            onCancel = { throw cancelFailure },
+            startFailure = startFailure,
+        )
+        val token = ownership.reserve()
+        assertTrue(ownership.publishRoute(token, lease))
+
+        val thrown = runCatching {
+            ownership.publishAndStart(token, recorder, task)
+        }.exceptionOrNull()
+        val replayed = runCatching { ownership.terminate(token, recorder) }.exceptionOrNull()
+
+        assertSame(startFailure, thrown)
+        assertEquals(listOf(cancelFailure), startFailure.suppressed.toList())
+        assertSame(cancelFailure, replayed)
+        assertEquals(listOf(stopFailure, releaseFailure, routeFailure), cancelFailure.suppressed.toList())
+        assertRetiredExactlyOnce(lease, recorder, task)
+    }
+
     private fun assertActivationRetirement(release: Boolean) {
         val startEntered = CountDownLatch(1)
         val allowStart = CountDownLatch(1)
@@ -738,6 +812,7 @@ class VoiceAudioCaptureOwnershipTest {
     private class FakeCaptureTask(
         private val onCancel: () -> Unit = {},
         private val startResult: Boolean = true,
+        private val startFailure: Throwable? = null,
     ) {
         var startCalls = 0
             private set
@@ -746,6 +821,7 @@ class VoiceAudioCaptureOwnershipTest {
 
         fun start(): Boolean {
             startCalls += 1
+            startFailure?.let { throw it }
             return startResult
         }
 

@@ -328,7 +328,7 @@ class AndroidVoiceAudioEngine(
                 )
             },
             onInjectionComplete = {
-                if (captureOwnership.isCurrent(token, recorder)) {
+                captureOwnership.runCallbackIfCurrent(token, recorder) {
                     onInjectionComplete()
                 }
             },
@@ -349,7 +349,7 @@ class AndroidVoiceAudioEngine(
         buffer: ByteArray,
         onPcm16: (ByteArray) -> Unit,
     ) {
-        if (captureOwnership.isCurrent(token, recorder)) {
+        captureOwnership.runCallbackIfCurrent(token, recorder) {
             onPcm16(buffer)
         }
     }
@@ -365,7 +365,11 @@ class AndroidVoiceAudioEngine(
             recorder = recorder,
             buffer = buffer,
             isCurrent = { captureOwnership.isCurrent(token, recorder) },
-            onPcm16 = onPcm16,
+            onPcm16 = { admittedBuffer ->
+                captureOwnership.runCallbackIfCurrent(token, recorder) {
+                    onPcm16(admittedBuffer)
+                }
+            },
             terminate = { captureOwnership.terminate(token, recorder) },
             onFailure = { error ->
                 Log.w(TAG, "Stopping capture after debug PCM injection callback failure", error)

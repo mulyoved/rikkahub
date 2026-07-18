@@ -8,6 +8,63 @@ import org.junit.Test
 
 class VoiceAudioDebugCaptureRegistrationOwnerTest {
     @Test
+    fun `delayed stale second stage publish closes stale registration without displacing current`() {
+        val owner = VoiceAudioDebugCaptureRegistrationOwner<Any, Any, FakeRegistration>(
+            closeRegistration = FakeRegistration::close,
+        )
+        val currentToken = Any()
+        val currentRecorder = Any()
+        val currentRegistration = FakeRegistration()
+        val staleRegistration = FakeRegistration()
+        assertTrue(owner.publish(currentToken, currentRecorder, currentRegistration) { true })
+
+        val stalePublished = owner.publish(Any(), Any(), staleRegistration) { false }
+
+        assertFalse(stalePublished)
+        assertEquals(1, staleRegistration.closeCalls)
+        assertEquals(0, currentRegistration.closeCalls)
+        assertTrue(owner.unregister(currentToken, currentRecorder))
+        assertEquals(1, currentRegistration.closeCalls)
+    }
+
+    @Test
+    fun `termination failure escapes while exact stale registration closes and newer stays active`() {
+        val owner = VoiceAudioDebugCaptureRegistrationOwner<Any, Any, FakeRegistration>(
+            closeRegistration = FakeRegistration::close,
+        )
+        val staleToken = Any()
+        val staleRecorder = Any()
+        val staleRegistration = FakeRegistration()
+        val currentToken = Any()
+        val currentRecorder = Any()
+        val currentRegistration = FakeRegistration()
+        val terminationFailure = IllegalStateException("termination failed")
+        assertTrue(owner.publish(staleToken, staleRecorder, staleRegistration) { true })
+
+        val thrown = runCatching {
+            owner.deliver(
+                token = staleToken,
+                recorder = staleRecorder,
+                buffer = byteArrayOf(1, 2),
+                isCurrent = { true },
+                onPcm16 = { throw IllegalArgumentException("callback failed") },
+                terminate = {
+                    assertTrue(owner.publish(currentToken, currentRecorder, currentRegistration) { true })
+                    throw terminationFailure
+                },
+                onFailure = {},
+            )
+        }.exceptionOrNull()
+
+        assertSame(terminationFailure, thrown)
+        assertEquals(1, staleRegistration.closeCalls)
+        assertEquals(0, currentRegistration.closeCalls)
+        assertFalse(owner.unregister(staleToken, staleRecorder))
+        assertTrue(owner.unregister(currentToken, currentRecorder))
+        assertEquals(1, currentRegistration.closeCalls)
+    }
+
+    @Test
     fun `callback failure terminates and unregisters exact capture`() {
         val owner = VoiceAudioDebugCaptureRegistrationOwner<Any, Any, FakeRegistration>(
             closeRegistration = FakeRegistration::close,

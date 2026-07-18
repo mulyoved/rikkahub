@@ -1,14 +1,12 @@
 package me.rerere.rikkahub.voiceagent.audio
 
 import java.util.concurrent.CountDownLatch
+import java.util.IdentityHashMap
+import java.util.WeakHashMap
 import me.rerere.rikkahub.voiceagent.RetirementBarrier
 import me.rerere.rikkahub.voiceagent.runVoiceAgentCleanupStages
 
-internal class VoiceAudioCaptureToken internal constructor() {
-    internal val retirementBarrier = RetirementBarrier()
-    @Volatile
-    internal var retirementStarted = false
-}
+internal class VoiceAudioCaptureToken internal constructor()
 
 internal enum class VoiceAudioCaptureStartOutcome {
     Started,
@@ -25,6 +23,7 @@ internal class VoiceAudioCaptureOwnership<Recorder : Any, CaptureTask : Any>(
     private val onRetirementResultPublished: (Result<Unit>) -> Unit = {},
 ) {
     private val lock = Any()
+    private val retirementBarriers = WeakHashMap<VoiceAudioCaptureToken, RetirementBarrier>()
     private var state: CaptureState<Recorder, CaptureTask> = CaptureState.Idle
 
     fun reserve(): VoiceAudioCaptureToken {
@@ -33,7 +32,9 @@ internal class VoiceAudioCaptureOwnership<Recorder : Any, CaptureTask : Any>(
                 when (val current = state) {
                     CaptureState.Idle -> {
                         val token = VoiceAudioCaptureToken()
-                        state = CaptureState.Starting.Reserved(token)
+                        val retirementBarrier = RetirementBarrier()
+                        retirementBarriers[token] = retirementBarrier
+                        state = CaptureState.Starting.Reserved(token, retirementBarrier)
                         return token
                     }
 
@@ -53,7 +54,7 @@ internal class VoiceAudioCaptureOwnership<Recorder : Any, CaptureTask : Any>(
                 state = CaptureState.Starting.Routed(
                     token = token,
                     routeLease = routeLease,
-                    retirementBarrier = token.retirementBarrier,
+                    retirementBarrier = current.retirementBarrier,
                 )
                 true
             } else {
@@ -119,6 +120,7 @@ internal class VoiceAudioCaptureOwnership<Recorder : Any, CaptureTask : Any>(
                     recorder = recorder,
                     task = task,
                     routeLease = current.routeLease,
+                    callbackAdmission = CallbackAdmissionBarrier(),
                     retirementBarrier = current.retirementBarrier,
                 )
                 null
@@ -261,6 +263,34 @@ internal class VoiceAudioCaptureOwnership<Recorder : Any, CaptureTask : Any>(
         current is CaptureState.Active && current.token === token && current.recorder === recorder
     }
 
+    fun runCallbackIfCurrent(
+        token: VoiceAudioCaptureToken,
+        recorder: Recorder,
+        callback: () -> Unit,
+    ): Boolean {
+        val admission = synchronized(lock) {
+            val current = state
+            if (
+                current is CaptureState.Active &&
+                current.token === token &&
+                current.recorder === recorder &&
+                current.callbackAdmission.tryAdmit()
+            ) {
+                current.callbackAdmission
+            } else {
+                null
+            }
+        } ?: return false
+
+        runVoiceAgentCleanupStages(
+            callback,
+            {
+                if (admission.leave()) resumeRetirementAfterCallback(token, recorder)
+            },
+        )
+        return true
+    }
+
     fun isReleased(): Boolean = synchronized(lock) {
         state === CaptureState.Released ||
             (state as? CaptureState.Retiring)?.terminalTarget == TerminalTarget.Released
@@ -339,6 +369,9 @@ internal class VoiceAudioCaptureOwnership<Recorder : Any, CaptureTask : Any>(
     private fun retireOwnedCapture(retirement: CaptureState.Retiring<Recorder, CaptureTask>) {
         val activation = (retirement.ownedResources as? OwnedCaptureResources.Activating)?.activationBarrier
         if (activation != null && !activation.awaitUnlessOwner()) return
+        val callbackAdmission =
+            (retirement.ownedResources as? OwnedCaptureResources.Active)?.callbackAdmission
+        if (callbackAdmission != null && !callbackAdmission.awaitUnlessAdmitted()) return
 
         retirement.retirementBarrier.retire(
             afterResultPublished = { result ->
@@ -403,8 +436,19 @@ internal class VoiceAudioCaptureOwnership<Recorder : Any, CaptureTask : Any>(
         )
     }
 
+    private fun resumeRetirementAfterCallback(
+        token: VoiceAudioCaptureToken,
+        recorder: Recorder,
+    ) {
+        val retirement = synchronized(lock) {
+            (state as? CaptureState.Retiring)?.takeIf { it.matches(token, recorder) }
+        }
+        retirement?.let(::retireOwnedCapture)
+    }
+
     private fun replayRetirement(token: VoiceAudioCaptureToken) {
-        if (token.retirementStarted) token.retirementBarrier.retire {}
+        val retirementBarrier = synchronized(lock) { retirementBarriers[token] }
+        retirementBarrier?.replayIfStarted()
     }
 
     private fun throwWithRetirementFailure(
@@ -453,6 +497,60 @@ private class ActivationBarrier(
     }
 }
 
+private class CallbackAdmissionBarrier {
+    private val lock = Any()
+    private val quiescent = CountDownLatch(1)
+    private val admissionsByThread = IdentityHashMap<Thread, Int>()
+    private var accepting = true
+    private var admissionCount = 0
+
+    fun tryAdmit(): Boolean = synchronized(lock) {
+        if (!accepting) return false
+        val thread = Thread.currentThread()
+        admissionsByThread[thread] = (admissionsByThread[thread] ?: 0) + 1
+        admissionCount += 1
+        true
+    }
+
+    fun close() {
+        synchronized(lock) {
+            accepting = false
+            if (admissionCount == 0) quiescent.countDown()
+        }
+    }
+
+    fun leave(): Boolean = synchronized(lock) {
+        val thread = Thread.currentThread()
+        val threadAdmissions = requireNotNull(admissionsByThread[thread])
+        if (threadAdmissions == 1) {
+            admissionsByThread.remove(thread)
+        } else {
+            admissionsByThread[thread] = threadAdmissions - 1
+        }
+        admissionCount -= 1
+        if (!accepting && admissionCount == 0) quiescent.countDown()
+        !accepting && admissionCount == 0
+    }
+
+    fun awaitUnlessAdmitted(): Boolean {
+        synchronized(lock) {
+            if (admissionCount == 0) return true
+            if (admissionsByThread.containsKey(Thread.currentThread())) return false
+        }
+        var interrupted = false
+        while (true) {
+            try {
+                quiescent.await()
+                break
+            } catch (_: InterruptedException) {
+                interrupted = true
+            }
+        }
+        if (interrupted) Thread.currentThread().interrupt()
+        return true
+    }
+}
+
 private enum class TerminalTarget {
     Idle,
     Released,
@@ -479,6 +577,7 @@ private sealed interface OwnedCaptureResources<out Recorder : Any, out CaptureTa
         val recorder: Recorder,
         val task: CaptureTask,
         val routeLease: VoiceAudioCaptureRouteLease,
+        val callbackAdmission: CallbackAdmissionBarrier,
     ) : OwnedCaptureResources<Recorder, CaptureTask>
 }
 
@@ -488,6 +587,7 @@ private sealed interface CaptureState<out Recorder : Any, out CaptureTask : Any>
     sealed interface Starting<out Recorder : Any, out CaptureTask : Any> : CaptureState<Recorder, CaptureTask> {
         data class Reserved(
             val token: VoiceAudioCaptureToken,
+            val retirementBarrier: RetirementBarrier,
         ) : Starting<Nothing, Nothing>
 
         data class Routed<Recorder : Any, CaptureTask : Any>(
@@ -511,6 +611,7 @@ private sealed interface CaptureState<out Recorder : Any, out CaptureTask : Any>
         val recorder: Recorder,
         val task: CaptureTask,
         val routeLease: VoiceAudioCaptureRouteLease,
+        val callbackAdmission: CallbackAdmissionBarrier,
         val retirementBarrier: RetirementBarrier,
     ) : CaptureState<Recorder, CaptureTask>
 
@@ -527,10 +628,10 @@ private fun <Recorder : Any, CaptureTask : Any> CaptureState.Starting.Routed<Rec
     terminalTarget: TerminalTarget,
 ): CaptureState.Retiring<Recorder, CaptureTask> = CaptureState.Retiring(
     ownedResources = OwnedCaptureResources.RouteOnly(
-        token = token.also { it.retirementStarted = true },
+        token = token,
         routeLease = routeLease,
     ),
-    retirementBarrier = retirementBarrier,
+    retirementBarrier = retirementBarrier.also(RetirementBarrier::begin),
     terminalTarget = terminalTarget,
 )
 
@@ -538,28 +639,32 @@ private fun <Recorder : Any, CaptureTask : Any> CaptureState.Starting.Activating
     terminalTarget: TerminalTarget,
 ): CaptureState.Retiring<Recorder, CaptureTask> = CaptureState.Retiring(
     ownedResources = OwnedCaptureResources.Activating(
-        token = token.also { it.retirementStarted = true },
+        token = token,
         recorder = recorder,
         task = task,
         routeLease = routeLease,
         activationBarrier = activationBarrier,
     ),
-    retirementBarrier = retirementBarrier,
+    retirementBarrier = retirementBarrier.also(RetirementBarrier::begin),
     terminalTarget = terminalTarget,
 )
 
 private fun <Recorder : Any, CaptureTask : Any> CaptureState.Active<Recorder, CaptureTask>.toRetiring(
     terminalTarget: TerminalTarget,
-): CaptureState.Retiring<Recorder, CaptureTask> = CaptureState.Retiring(
-    ownedResources = OwnedCaptureResources.Active(
-        token = token.also { it.retirementStarted = true },
-        recorder = recorder,
-        task = task,
-        routeLease = routeLease,
-    ),
-    retirementBarrier = retirementBarrier,
-    terminalTarget = terminalTarget,
-)
+): CaptureState.Retiring<Recorder, CaptureTask> {
+    callbackAdmission.close()
+    return CaptureState.Retiring(
+        ownedResources = OwnedCaptureResources.Active(
+            token = token,
+            recorder = recorder,
+            task = task,
+            routeLease = routeLease,
+            callbackAdmission = callbackAdmission,
+        ),
+        retirementBarrier = retirementBarrier.also(RetirementBarrier::begin),
+        terminalTarget = terminalTarget,
+    )
+}
 
 private fun <Recorder : Any, CaptureTask : Any> CaptureState<Recorder, CaptureTask>.asRetirementFor(
     token: VoiceAudioCaptureToken,
