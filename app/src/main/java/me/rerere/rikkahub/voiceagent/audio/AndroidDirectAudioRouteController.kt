@@ -16,12 +16,17 @@ internal class AndroidDirectAudioRouteController(
 
     private val lock = Any()
     private var closed = false
+    private var nextAcquisitionId = 0L
+    private val acquisitions = mutableSetOf<Long>()
 
-    override fun acquireCapture(): VoiceAudioCaptureRouteLease = synchronized(lock) {
-        check(!closed) { "Direct audio route controller is closed" }
+    override fun acquireCapture(): VoiceAudioCaptureRouteLease {
+        val acquisitionId = synchronized(lock) {
+            check(!closed) { "Direct audio route controller is closed" }
+            (++nextAcquisitionId).also(acquisitions::add)
+        }
         val acquired = mutableListOf<DirectAudioResourceLease>()
         val focusCallbackGate = DirectAudioFocusCallbackGate()
-        try {
+        val routeLease = try {
             val acquiredFocus = capabilities.focus.acquire { focusChange ->
                 focusCallbackGate.deliver {
                     if (VoiceAudioFocusPolicy.isFocusChangeFatal(focusChange)) {
@@ -51,20 +56,27 @@ internal class AndroidDirectAudioRouteController(
                 logWarning = ::logWarning,
             )
         } catch (fatal: Throwable) {
+            synchronized(lock) { acquisitions.remove(acquisitionId) }
             focusCallbackGate.close()
             acquired.asReversed().forEach { lease ->
                 retireBestEffort("Direct audio rollback failed", lease)
             }
             throw fatal
         }
+        val accepted = synchronized(lock) {
+            acquisitions.remove(acquisitionId) && !closed
+        }
+        if (accepted) return routeLease
+        routeLease.retire()
+        throw IllegalStateException("Direct audio route controller is closed")
     }
 
     override fun close() {
-        val shouldClose = synchronized(lock) {
-            if (closed) false else true.also { closed = true }
+        val closeCapabilities = synchronized(lock) {
+            if (closed) null else capabilities.close.also { closed = true }
         }
-        if (!shouldClose) return
-        runCatching(capabilities.close)
+        closeCapabilities ?: return
+        runCatching(closeCapabilities)
             .onFailure { logWarning("Direct audio capabilities close failed", it) }
     }
 
@@ -115,13 +127,21 @@ private class DirectVoiceAudioCaptureRouteLease(
     private val leases = initialLeases.toMutableList()
     private var retired = false
 
+    override suspend fun prepare() = Unit
+
     override fun configureRecorder(recorder: AudioRecord) {
-        synchronized(lock) {
-            if (retired) return
-            runCatching { captureDevice.configure(recorder) }
-                .onFailure { logWarning("Direct capture device configuration failed", it) }
-                .getOrNull()
-                ?.let(leases::add)
+        val admitted = synchronized(lock) { !retired }
+        if (!admitted) return
+        val configured = runCatching { captureDevice.configure(recorder) }
+            .onFailure { logWarning("Direct capture device configuration failed", it) }
+            .getOrNull()
+            ?: return
+        val accepted = synchronized(lock) {
+            if (retired) false else true.also { leases += configured }
+        }
+        if (!accepted) {
+            runCatching(configured::retire)
+                .onFailure { logWarning("Direct capture device rollback failed", it) }
         }
     }
 

@@ -7,6 +7,7 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.thread
+import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertSame
@@ -25,7 +26,7 @@ class VoiceAudioRouteControllerTest {
         val setupResult = AtomicReference<VoiceAudioCaptureSetup<Any>?>()
         val setup = thread(name = "blocked-route-stop-setup") {
             setupResult.set(
-                setupVoiceAudioCapture(
+                runBlocking { setupVoiceAudioCapture(
                     ownership = ownership,
                     acquireRoute = {
                         acquireEntered.countDown()
@@ -37,7 +38,7 @@ class VoiceAudioRouteControllerTest {
                     configureRecorder = { _, _ -> events += "configure" },
                     isRecorderInitialized = { true },
                     releaseRecorder = { events += "recorderReleased" },
-                ),
+                ) },
             )
             setupReturned.countDown()
         }
@@ -65,7 +66,7 @@ class VoiceAudioRouteControllerTest {
         val setupResult = AtomicReference<VoiceAudioCaptureSetup<Any>?>()
         val setup = thread(name = "blocked-route-release-setup") {
             setupResult.set(
-                setupVoiceAudioCapture(
+                runBlocking { setupVoiceAudioCapture(
                     ownership = ownership,
                     acquireRoute = {
                         acquireEntered.countDown()
@@ -77,7 +78,7 @@ class VoiceAudioRouteControllerTest {
                     configureRecorder = { _, _ -> events += "configure" },
                     isRecorderInitialized = { true },
                     releaseRecorder = { events += "recorderReleased" },
-                ),
+                ) },
             )
         }
         assertTrue(acquireEntered.await(5, TimeUnit.SECONDS))
@@ -97,7 +98,7 @@ class VoiceAudioRouteControllerTest {
     }
 
     @Test
-    fun `route acquisition failure keeps primary and aborts reserved owner for reuse`() {
+    fun `route acquisition failure keeps primary and aborts reserved owner for reuse`() = runBlocking {
         val acquireFailure = IllegalStateException("route unavailable")
         val ownership = fakeSetupOwnership()
         val events = mutableListOf<String>()
@@ -124,7 +125,7 @@ class VoiceAudioRouteControllerTest {
     }
 
     @Test
-    fun `buffer size failure aborts published route before recorder creation`() {
+    fun `buffer size failure aborts published route before recorder creation`() = runBlocking {
         val failure = IllegalStateException("minimum buffer unavailable")
         val events = mutableListOf<String>()
         val lease = FakeCaptureRouteLease { events += "routeRetired" }
@@ -157,7 +158,7 @@ class VoiceAudioRouteControllerTest {
     }
 
     @Test
-    fun `recorder creation failure wraps cause and aborts published route`() {
+    fun `recorder creation failure wraps cause and aborts published route`() = runBlocking {
         val cause = IllegalArgumentException("factory failed")
         val events = mutableListOf<String>()
         val lease = FakeCaptureRouteLease { events += "routeRetired" }
@@ -183,7 +184,7 @@ class VoiceAudioRouteControllerTest {
     }
 
     @Test
-    fun `configuration failure keeps primary and suppresses recorder then route cleanup failures`() {
+    fun `configuration failure keeps primary and suppresses recorder then route cleanup failures`() = runBlocking {
         val configureFailure = IllegalStateException("configuration failed")
         val releaseFailure = IllegalArgumentException("release failed")
         val routeFailure = UnsupportedOperationException("route retirement failed")
@@ -219,7 +220,7 @@ class VoiceAudioRouteControllerTest {
     }
 
     @Test
-    fun `uninitialized recorder releases recorder then aborts published route`() {
+    fun `uninitialized recorder releases recorder then aborts published route`() = runBlocking {
         val events = mutableListOf<String>()
         val lease = FakeCaptureRouteLease { events += "routeRetired" }
         val ownership = fakeSetupOwnership()
@@ -379,6 +380,7 @@ class VoiceAudioRouteControllerTest {
         }
 
         val lease = selected.acquireCapture()
+        runBlocking { lease.prepare() }
         lease.retire()
         lease.retire()
         selected.close()
@@ -431,6 +433,8 @@ class VoiceAudioRouteControllerTest {
 
         var retireCalls = 0
             private set
+
+        override suspend fun prepare() = Unit
 
         override fun configureRecorder(recorder: AudioRecord) {
             configureCalls += 1

@@ -92,10 +92,12 @@ class VoiceAgentCallSession internal constructor(
         coordinator = coordinator,
         gemini = gemini,
         audio = audio,
+        cancelCaptureStart = ::cancelCaptureStartJob,
         hermesBridgeProvider = { hermesBridge },
         clearHermesBridge = { hermesBridge = null },
     )
     private var startJob: Job? = null
+    private var captureStartJob: Job? = null
     private var muted = false
     private var sessionId = 0L
     private var ended = false
@@ -140,14 +142,17 @@ class VoiceAgentCallSession internal constructor(
     }
 
     override fun setMuted(value: Boolean) {
-        if (ended || muted == value) return
-        muted = value
+        val changed = synchronized(sessionLock) {
+            if (ended || muted == value) false else true.also { muted = value }
+        }
+        if (!changed) return
         if (muted) {
+            cancelCaptureStartJob()
             gemini.sendAudioStreamEnd(sessionId)
             audio.stopCapture()
             coordinator.updateAudioStatus(VoiceAudioStatus.Muted)
         } else if (state.value.session == VoiceSessionStatus.Connected) {
-            startCapture(sessionId)
+            launchCaptureStart(sessionId)
         }
         recordEventSafely(
             name = if (muted) {
@@ -924,11 +929,44 @@ class VoiceAgentCallSession internal constructor(
         if (debugInjectionCaptureRestartSessionId != sessionId) return
         debugInjectionCaptureRestartSessionId = null
         if (isSessionOpenAndActive(sessionId)) {
-            startCapture(sessionId)
+            launchCaptureStart(sessionId)
         }
     }
 
-    private fun startCapture(currentSessionId: Long) {
+    private fun launchCaptureStart(currentSessionId: Long) {
+        val job = scope.launch(start = CoroutineStart.LAZY) {
+            startCapture(currentSessionId)
+        }
+        var accepted = false
+        val previous = synchronized(sessionLock) {
+            if (muted || !isSessionOpenAndActiveLocked(currentSessionId, automaticReconnectJob = null)) {
+                null
+            } else {
+                accepted = true
+                captureStartJob.also { captureStartJob = job }
+            }
+        }
+        if (!accepted) {
+            job.cancel()
+            return
+        }
+        previous?.cancel()
+        job.invokeOnCompletion {
+            synchronized(sessionLock) {
+                if (captureStartJob === job) captureStartJob = null
+            }
+        }
+        job.start()
+    }
+
+    private fun cancelCaptureStartJob() {
+        val job = synchronized(sessionLock) {
+            captureStartJob.also { captureStartJob = null }
+        }
+        job?.cancel()
+    }
+
+    private suspend fun startCapture(currentSessionId: Long) {
         VoiceAgentLog.d(TAG, "starting audio capture sessionId=$currentSessionId muted=$muted")
         audio.startCapture(
             onPcm16 = { pcm16 ->

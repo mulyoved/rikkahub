@@ -1,5 +1,7 @@
 package me.rerere.rikkahub.voiceagent
 
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withTimeout
 import me.rerere.rikkahub.voiceagent.audio.VoiceAudioEngine
@@ -27,6 +29,7 @@ internal class FakeVoiceAudioEngine : VoiceAudioEngine {
         private set
     private var captureCallback: ((ByteArray) -> Unit)? = null
     private var debugInjectionCompleteCallback: (() -> Unit)? = null
+    private val suspendedStartCaptures = mutableListOf<SuspendedCaptureStart>()
     private val blockedStartCaptures = mutableListOf<BlockedPlayback>()
     private val blockedStopCaptures = mutableListOf<BlockedPlayback>()
     private val blockedPlaybacks = mutableListOf<BlockedPlayback>()
@@ -43,9 +46,21 @@ internal class FakeVoiceAudioEngine : VoiceAudioEngine {
         playbackEventHandler = onEvent
     }
 
-    override fun startCapture(onPcm16: (ByteArray) -> Unit, onDebugInjectionComplete: () -> Unit) {
+    override suspend fun startCapture(onPcm16: (ByteArray) -> Unit, onDebugInjectionComplete: () -> Unit) {
         startCaptureCalls += 1
         startCaptureError?.let { throw it }
+        val suspended = synchronized(suspendedStartCaptures) {
+            suspendedStartCaptures.removeFirstOrNull()
+        }
+        if (suspended != null) {
+            suspended.entered.complete(Unit)
+            try {
+                suspended.release.await()
+            } catch (cancellation: CancellationException) {
+                suspended.cancelled.complete(Unit)
+                throw cancellation
+            }
+        }
         val blocked = synchronized(blockedStartCaptures) { blockedStartCaptures.removeFirstOrNull() }
         if (blocked != null) {
             blocked.started.countDown()
@@ -53,6 +68,7 @@ internal class FakeVoiceAudioEngine : VoiceAudioEngine {
         }
         captureCallback = onPcm16
         debugInjectionCompleteCallback = onDebugInjectionComplete
+        suspended?.installed?.complete(Unit)
     }
 
     override fun stopCapture() {
@@ -184,6 +200,14 @@ internal class FakeVoiceAudioEngine : VoiceAudioEngine {
         }
     }
 
+    fun suspendNextStartCapture(): SuspendedCaptureStart {
+        return SuspendedCaptureStart().also { suspended ->
+            synchronized(suspendedStartCaptures) {
+                suspendedStartCaptures += suspended
+            }
+        }
+    }
+
     fun blockNextStopCapture(): BlockedPlayback {
         return BlockedPlayback().also { blocked ->
             synchronized(blockedStopCaptures) {
@@ -240,4 +264,11 @@ internal class FakeVoiceAudioEngine : VoiceAudioEngine {
 internal class BlockedPlayback {
     val started = CountDownLatch(1)
     val release = CountDownLatch(1)
+}
+
+internal class SuspendedCaptureStart {
+    val entered = CompletableDeferred<Unit>()
+    val release = CompletableDeferred<Unit>()
+    val cancelled = CompletableDeferred<Unit>()
+    val installed = CompletableDeferred<Unit>()
 }

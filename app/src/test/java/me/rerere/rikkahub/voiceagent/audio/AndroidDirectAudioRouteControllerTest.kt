@@ -6,6 +6,7 @@ import java.util.Collections
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.thread
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -334,7 +335,7 @@ class AndroidDirectAudioRouteControllerTest {
     }
 
     @Test
-    fun `close waits for an admitted acquisition and active lease keeps exact ownership`() {
+    fun `close does not wait for blocked focus acquisition and late leases roll back`() {
         val focusEntered = CountDownLatch(1)
         val releaseFocus = CountDownLatch(1)
         val fixture = DirectAudioCapabilitiesFixture().apply {
@@ -344,9 +345,9 @@ class AndroidDirectAudioRouteControllerTest {
             }
         }
         val controller = fixture.controller()
-        var acquired: VoiceAudioCaptureRouteLease? = null
+        val acquisitionFailure = AtomicReference<Throwable?>()
         val acquisition = thread(name = "direct-focus-acquisition") {
-            acquired = controller.acquireCapture()
+            acquisitionFailure.set(runCatching { controller.acquireCapture() }.exceptionOrNull())
         }
         assertTrue(focusEntered.await(5, TimeUnit.SECONDS))
         val closeCompleted = CountDownLatch(1)
@@ -356,8 +357,9 @@ class AndroidDirectAudioRouteControllerTest {
         }
 
         try {
-            assertTrue(awaitThreadState(close, Thread.State.BLOCKED))
-            assertFalse(closeCompleted.await(100, TimeUnit.MILLISECONDS))
+            assertTrue(closeCompleted.await(1, TimeUnit.SECONDS))
+            assertFalse(close.isAlive)
+            assertEquals(1, fixture.closeCalls)
         } finally {
             releaseFocus.countDown()
             acquisition.join(5_000)
@@ -366,14 +368,14 @@ class AndroidDirectAudioRouteControllerTest {
 
         assertFalse(acquisition.isAlive)
         assertFalse(close.isAlive)
-        assertTrue(closeCompleted.await(0, TimeUnit.MILLISECONDS))
-        assertEquals(0, fixture.focus.retireCalls)
-        requireNotNull(acquired).retire()
+        assertTrue(acquisitionFailure.get() is IllegalStateException)
         assertEquals(1, fixture.focus.retireCalls)
+        assertEquals(1, fixture.mode.retireCalls)
+        assertEquals(1, fixture.bluetooth.retireCalls)
     }
 
     @Test
-    fun `retire joins recorder configuration and retires late device before returning`() {
+    fun `retire does not wait for recorder configuration and late device lease retires locally`() {
         val deviceEntered = CountDownLatch(1)
         val releaseDevice = CountDownLatch(1)
         val retirementCompleted = CountDownLatch(1)
@@ -396,8 +398,9 @@ class AndroidDirectAudioRouteControllerTest {
         }
 
         try {
-            assertTrue(awaitThreadState(retirement, Thread.State.BLOCKED))
-            assertFalse(retirementCompleted.await(100, TimeUnit.MILLISECONDS))
+            assertTrue(retirementCompleted.await(1, TimeUnit.SECONDS))
+            assertFalse(retirement.isAlive)
+            assertEquals(0, fixture.device.retireCalls)
         } finally {
             releaseDevice.countDown()
             configuration.join(5_000)

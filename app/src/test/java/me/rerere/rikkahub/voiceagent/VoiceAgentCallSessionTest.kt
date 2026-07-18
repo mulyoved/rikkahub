@@ -481,6 +481,9 @@ class VoiceAgentCallSessionTest {
 
         gemini.eventHandlers.single()(GeminiLiveEvent.GenerationComplete)
 
+        withTimeout(500) {
+            while (audio.startCaptureCalls < 2) delay(10)
+        }
         assertEquals(2, audio.startCaptureCalls)
     }
 
@@ -512,6 +515,16 @@ class VoiceAgentCallSessionTest {
         session.setMuted(true)
         session.setMuted(false)
 
+        withTimeout(500) {
+            while (
+                observability.events.count {
+                    it.name == "hermes_voice.mobile.audio.capture_started"
+                } < 2
+            ) {
+                delay(10)
+            }
+        }
+
         assertEquals(
             listOf(
                 mapOf("sessionId" to 1L, "audio.muted" to false),
@@ -533,6 +546,81 @@ class VoiceAgentCallSessionTest {
                 .filter { it.name == "hermes_voice.mobile.audio.capture_unmuted" }
                 .map { it.attributes },
         )
+    }
+
+    @Test
+    fun `mute cancels suspended unmute capture before callback installation`() = runTest {
+        val fixture = connectedMutedSession()
+        val suspended = fixture.audio.suspendNextStartCapture()
+
+        fixture.session.setMuted(false)
+        suspended.entered.await()
+        fixture.session.setMuted(true)
+
+        suspended.cancelled.await()
+        suspended.release.complete(Unit)
+        delay(10)
+        assertFalse(suspended.installed.isCompleted)
+        assertEquals(1, fixture.audio.startCaptureCalls)
+        assertTrue(fixture.audio.stopCaptureCalls >= 1)
+        fixture.session.closeNow()
+    }
+
+    @Test
+    fun `manual reconnect cancels suspended unmute capture before cleanup continues`() = runTest {
+        val fixture = connectedMutedSession()
+        val suspended = fixture.audio.suspendNextStartCapture()
+
+        fixture.session.setMuted(false)
+        suspended.entered.await()
+        fixture.session.reconnect()
+
+        suspended.cancelled.await()
+        suspended.release.complete(Unit)
+        delay(10)
+        assertFalse(suspended.installed.isCompleted)
+        assertTrue(fixture.audio.stopCaptureCalls >= 2)
+        assertTrue(fixture.audio.suppressPlaybackCalls >= 1)
+        assertTrue(fixture.gemini.closeCalls >= 1)
+        fixture.session.closeNow()
+    }
+
+    @Test
+    fun `end cancels suspended unmute capture before cleanup continues`() = runTest {
+        val fixture = connectedMutedSession()
+        val suspended = fixture.audio.suspendNextStartCapture()
+
+        fixture.session.setMuted(false)
+        suspended.entered.await()
+        fixture.session.end()
+
+        suspended.cancelled.await()
+        suspended.release.complete(Unit)
+        withTimeout(500) {
+            while (fixture.audio.releaseCalls < 1) delay(10)
+        }
+        assertFalse(suspended.installed.isCompleted)
+        assertTrue(fixture.audio.stopCaptureCalls >= 2)
+        assertTrue(fixture.audio.suppressPlaybackCalls >= 1)
+        assertTrue(fixture.gemini.closeCalls >= 1)
+    }
+
+    @Test
+    fun `close now cancels suspended unmute capture before cleanup continues`() = runTest {
+        val fixture = connectedMutedSession()
+        val suspended = fixture.audio.suspendNextStartCapture()
+
+        fixture.session.setMuted(false)
+        suspended.entered.await()
+        fixture.session.closeNow()
+
+        suspended.cancelled.await()
+        suspended.release.complete(Unit)
+        delay(10)
+        assertFalse(suspended.installed.isCompleted)
+        assertTrue(fixture.audio.stopCaptureCalls >= 2)
+        assertTrue(fixture.audio.suppressPlaybackCalls >= 1)
+        assertTrue(fixture.gemini.closeCalls >= 1)
     }
 
     @Test
@@ -856,6 +944,36 @@ class VoiceAgentCallSessionTest {
                 .map { it.attributes },
         )
     }
+
+    private suspend fun CoroutineScope.connectedMutedSession(): CaptureCancellationFixture {
+        val gemini = FakeGeminiLiveVoiceClient()
+        val audio = FakeVoiceAudioEngine()
+        val session = VoiceAgentCallSession(
+            modelId = "gemini-flash",
+            sessionApi = FakeVoiceSessionApi(),
+            toolApi = FakeVoiceToolApi(),
+            gemini = gemini,
+            audio = audio,
+            conversationStore = FakeVoiceConversationStore(),
+            contextProvider = FakeVoiceAgentContextProvider(
+                VoiceContext(systemInstruction = "system", turns = emptyList())
+            ),
+            scope = this,
+        )
+        session.setMuted(true)
+        session.start()
+        gemini.awaitConnect()
+        withTimeout(500) {
+            while (session.state.value.session != VoiceSessionStatus.Connected) delay(10)
+        }
+        return CaptureCancellationFixture(session = session, gemini = gemini, audio = audio)
+    }
+
+    private data class CaptureCancellationFixture(
+        val session: VoiceAgentCallSession,
+        val gemini: FakeGeminiLiveVoiceClient,
+        val audio: FakeVoiceAudioEngine,
+    )
 
     private fun runTest(block: suspend CoroutineScope.() -> Unit) = runBlocking(block = block)
 }

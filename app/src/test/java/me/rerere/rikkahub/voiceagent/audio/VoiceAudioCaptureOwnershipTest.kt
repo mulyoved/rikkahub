@@ -898,6 +898,8 @@ class VoiceAudioCaptureOwnershipTest {
         var retireCalls = 0
             private set
 
+        override suspend fun prepare() = Unit
+
         override fun configureRecorder(recorder: AudioRecord) = Unit
 
         override fun retire() {

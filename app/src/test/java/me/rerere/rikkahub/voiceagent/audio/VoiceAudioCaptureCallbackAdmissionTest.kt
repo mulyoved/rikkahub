@@ -207,6 +207,8 @@ class VoiceAudioCaptureCallbackAdmissionTest {
     private class FakeRouteLease(
         private val events: MutableList<String>,
     ) : VoiceAudioCaptureRouteLease {
+        override suspend fun prepare() = Unit
+
         override fun configureRecorder(recorder: android.media.AudioRecord) = Unit
 
         override fun retire() {

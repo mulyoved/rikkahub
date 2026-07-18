@@ -17,6 +17,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import me.rerere.rikkahub.voiceagent.runVoiceAgentCleanupStages
 
 private fun VoicePlaybackDiagnostic.audioErrorMessageOrNull(): String? = when (this) {
@@ -78,7 +79,7 @@ internal data class VoiceAudioCaptureSetup<Recorder : Any>(
     val recorder: Recorder,
 )
 
-internal fun <Recorder : Any, CaptureTask : Any> setupVoiceAudioCapture(
+internal suspend fun <Recorder : Any, CaptureTask : Any> setupVoiceAudioCapture(
     ownership: VoiceAudioCaptureOwnership<Recorder, CaptureTask>,
     acquireRoute: () -> VoiceAudioCaptureRouteLease,
     lookupBufferSize: () -> Int,
@@ -96,6 +97,11 @@ internal fun <Recorder : Any, CaptureTask : Any> setupVoiceAudioCapture(
     if (!ownership.publishRoute(token, routeLease)) {
         routeLease.retire()
         return null
+    }
+    try {
+        routeLease.prepare()
+    } catch (failure: Throwable) {
+        throwVoiceAudioCaptureSetupFailure(failure, { ownership.abort(token) })
     }
     val bufferSize = try {
         lookupBufferSize()
@@ -191,11 +197,17 @@ class AndroidVoiceAudioEngine(
         playbackEventOwner.setHandler(onEvent)
     }
 
-    override fun startCapture(onPcm16: (ByteArray) -> Unit, onDebugInjectionComplete: () -> Unit) {
+    override suspend fun startCapture(
+        onPcm16: (ByteArray) -> Unit,
+        onDebugInjectionComplete: () -> Unit,
+    ) = withContext(Dispatchers.IO) {
         startCaptureInternal(onPcm16, onDebugInjectionComplete)
     }
 
-    private fun startCaptureInternal(onPcm16: (ByteArray) -> Unit, onDebugInjectionComplete: () -> Unit) {
+    private suspend fun startCaptureInternal(
+        onPcm16: (ByteArray) -> Unit,
+        onDebugInjectionComplete: () -> Unit,
+    ) {
         if (
             ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) !=
             PackageManager.PERMISSION_GRANTED

@@ -8,6 +8,7 @@ internal class VoiceSessionResourceCleaner(
     private val coordinator: VoiceAgentCoordinator,
     private val gemini: GeminiLiveVoiceClient,
     private val audio: VoiceAudioEngine,
+    private val cancelCaptureStart: () -> Unit,
     private val hermesBridgeProvider: () -> HermesSessionBridge?,
     private val clearHermesBridge: () -> Unit,
 ) {
@@ -30,6 +31,7 @@ internal class VoiceSessionResourceCleaner(
     ): Boolean {
         if (!isAutomaticReconnectCurrentUnderCleanupLock()) return false
         prepare()
+        cancelCaptureStart()
         detachHermesBridge()
         if (!isAutomaticReconnectCurrentUnderCleanupLock()) return false
         invalidateAudioSessions()
