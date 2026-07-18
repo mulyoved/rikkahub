@@ -18,6 +18,10 @@ internal class FakeVoiceAudioEngine : VoiceAudioEngine {
     var startCaptureCalls = 0
     var stopCaptureCalls = 0
     var startCaptureError: Throwable? = null
+    var stopCaptureError: Throwable? = null
+    var suppressPlaybackError: Throwable? = null
+    var onStopCapture: (() -> Unit)? = null
+    var onSuppressPlayback: (() -> Unit)? = null
     private var errorHandler: ((String) -> Unit)? = null
     var playbackSessionId: Long? = null
         private set
@@ -78,8 +82,10 @@ internal class FakeVoiceAudioEngine : VoiceAudioEngine {
             blocked.release.await(500, TimeUnit.MILLISECONDS)
         }
         stopCaptureCalls += 1
+        onStopCapture?.invoke()
         captureCallback = null
         debugInjectionCompleteCallback = null
+        stopCaptureError?.let { throw it }
     }
 
     override fun playPcm16(base64Pcm16: String, sessionId: Long?): Boolean {
@@ -130,7 +136,9 @@ internal class FakeVoiceAudioEngine : VoiceAudioEngine {
             blocked.release.await(500, TimeUnit.MILLISECONDS)
         }
         suppressPlaybackCalls += 1
+        onSuppressPlayback?.invoke()
         retirePlaybackEpochs().forEach { playbackEventHandler?.invoke(VoicePlaybackEvent.Drained(it)) }
+        suppressPlaybackError?.let { throw it }
     }
 
     override fun markPlaybackTurnComplete(sessionId: Long?): Boolean {

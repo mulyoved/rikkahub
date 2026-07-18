@@ -7,6 +7,12 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.thread
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -15,6 +21,152 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class VoiceAudioRouteControllerTest {
+    @Test
+    fun `cancellation after prior stop aborts exact reserved owner before route acquisition`() {
+        val cancellation = CancellationException("capture start cancelled")
+        val ownership = fakeSetupOwnership()
+        var acquireCalls = 0
+        var bufferLookupCalls = 0
+        var recorderCreationCalls = 0
+
+        val thrown = runCatching {
+            runBlocking {
+                currentCoroutineContext()[Job]!!.cancel(cancellation)
+                ownership.stop()
+                setupVoiceAudioCapture(
+                    ownership = ownership,
+                    acquireRoute = {
+                        acquireCalls += 1
+                        FakeCaptureRouteLease()
+                    },
+                    lookupBufferSize = {
+                        bufferLookupCalls += 1
+                        64
+                    },
+                    createRecorder = {
+                        recorderCreationCalls += 1
+                        Any()
+                    },
+                    configureRecorder = { _, _ -> },
+                    isRecorderInitialized = { true },
+                    releaseRecorder = {},
+                )
+            }
+        }.exceptionOrNull()
+
+        assertSame(cancellation, thrown)
+        assertEquals(0, acquireCalls)
+        assertEquals(0, bufferLookupCalls)
+        assertEquals(0, recorderCreationCalls)
+        assertTrue(ownership.abort(ownership.reserve()))
+    }
+
+    @Test
+    fun `cancellation during route preparation keeps primary and retires exact route once`() = runBlocking {
+        val cancellation = CancellationException("route preparation cancelled")
+        val retirementFailure = IllegalStateException("route retirement failed")
+        val prepareEntered = CompletableDeferred<Unit>()
+        val prepareRelease = CompletableDeferred<Unit>()
+        val events = mutableListOf<String>()
+        val lease = FakeCaptureRouteLease(
+            onPrepare = {
+                events += "prepare"
+                prepareEntered.complete(Unit)
+                prepareRelease.await()
+                throw cancellation
+            },
+            onRetire = {
+                events += "routeRetired"
+                throw retirementFailure
+            },
+        )
+        val ownership = fakeSetupOwnership()
+        var bufferLookupCalls = 0
+        var recorderCreationCalls = 0
+        val observedFailure = CompletableDeferred<Throwable>()
+        val setup = launch(start = CoroutineStart.UNDISPATCHED) {
+            try {
+                setupVoiceAudioCapture(
+                    ownership = ownership,
+                    acquireRoute = { lease },
+                    lookupBufferSize = {
+                        bufferLookupCalls += 1
+                        64
+                    },
+                    createRecorder = {
+                        recorderCreationCalls += 1
+                        Any()
+                    },
+                    configureRecorder = { _, _ -> events += "configure" },
+                    isRecorderInitialized = { true },
+                    releaseRecorder = { events += "recorderReleased" },
+                )
+            } catch (failure: Throwable) {
+                observedFailure.complete(failure)
+                throw failure
+            }
+        }
+        prepareEntered.await()
+
+        prepareRelease.complete(Unit)
+        setup.join()
+        val thrown = observedFailure.await()
+
+        assertSame(cancellation, thrown)
+        assertEquals(listOf(retirementFailure), cancellation.suppressed.toList())
+        assertEquals(listOf("prepare", "routeRetired"), events)
+        assertEquals(1, lease.retireCalls)
+        assertEquals(0, bufferLookupCalls)
+        assertEquals(0, recorderCreationCalls)
+        assertTrue(ownership.abort(ownership.reserve()))
+    }
+
+    @Test
+    fun `route preparation failure stays primary and suppresses exact retirement failure`() = runBlocking {
+        val preparationFailure = IllegalArgumentException("route preparation failed")
+        val retirementFailure = IllegalStateException("route retirement failed")
+        val events = mutableListOf<String>()
+        val lease = FakeCaptureRouteLease(
+            onPrepare = {
+                events += "prepare"
+                throw preparationFailure
+            },
+            onRetire = {
+                events += "routeRetired"
+                throw retirementFailure
+            },
+        )
+        val ownership = fakeSetupOwnership()
+        var bufferLookupCalls = 0
+        var recorderCreationCalls = 0
+
+        val thrown = runCatching {
+            setupVoiceAudioCapture(
+                ownership = ownership,
+                acquireRoute = { lease },
+                lookupBufferSize = {
+                    bufferLookupCalls += 1
+                    64
+                },
+                createRecorder = {
+                    recorderCreationCalls += 1
+                    Any()
+                },
+                configureRecorder = { _, _ -> events += "configure" },
+                isRecorderInitialized = { true },
+                releaseRecorder = { events += "recorderReleased" },
+            )
+        }.exceptionOrNull()
+
+        assertSame(preparationFailure, thrown)
+        assertEquals(listOf(retirementFailure), preparationFailure.suppressed.toList())
+        assertEquals(listOf("prepare", "routeRetired"), events)
+        assertEquals(1, lease.retireCalls)
+        assertEquals(0, bufferLookupCalls)
+        assertEquals(0, recorderCreationCalls)
+        assertTrue(ownership.abort(ownership.reserve()))
+    }
+
     @Test
     fun `stop winning blocked route acquisition retires late route and skips remaining setup`() {
         val ownership = fakeSetupOwnership()
@@ -424,7 +576,8 @@ class VoiceAudioRouteControllerTest {
     )
 
     private class FakeCaptureRouteLease(
-        private val onRetire: () -> Unit,
+        private val onPrepare: suspend () -> Unit = {},
+        private val onRetire: () -> Unit = {},
     ) : VoiceAudioCaptureRouteLease {
         private val retirement = me.rerere.rikkahub.voiceagent.RetirementBarrier()
 
@@ -434,7 +587,7 @@ class VoiceAudioRouteControllerTest {
         var retireCalls = 0
             private set
 
-        override suspend fun prepare() = Unit
+        override suspend fun prepare() = onPrepare()
 
         override fun configureRecorder(recorder: AudioRecord) {
             configureCalls += 1

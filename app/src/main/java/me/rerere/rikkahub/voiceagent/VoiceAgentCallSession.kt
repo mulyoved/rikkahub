@@ -88,17 +88,8 @@ class VoiceAgentCallSession internal constructor(
         writeVoiceE2EArtifact = voiceE2EArtifacts::write,
         scope = scope,
     )
-    private val resourceCleaner = VoiceSessionResourceCleaner(
-        coordinator = coordinator,
-        gemini = gemini,
-        audio = audio,
-        cancelCaptureStart = ::cancelCaptureStartJob,
-        hermesBridgeProvider = { hermesBridge },
-        clearHermesBridge = { hermesBridge = null },
-    )
+    private val sessionLock = Any()
     private var startJob: Job? = null
-    private var captureStartJob: Job? = null
-    private var captureStartFailureJob: Job? = null
     private var muted = false
     private var sessionId = 0L
     private var ended = false
@@ -107,10 +98,32 @@ class VoiceAgentCallSession internal constructor(
     private var runtimeFailureTelemetrySessionId: Long? = null
     private var hermesBridge: HermesSessionBridge? = null
     private var debugInjectionCaptureRestartSessionId: Long? = null
-    private val sessionLock = Any()
     private val reconnectController = VoiceReconnectController(
         policy = reconnectPolicy,
         nowMs = nowMs,
+    )
+    private val captureStartController = VoiceCaptureStartController(
+        scope = scope,
+        lock = sessionLock,
+        canStart = { currentSessionId ->
+            !muted && isSessionOpenAndActiveLocked(currentSessionId, automaticReconnectJob = null)
+        },
+        canHandleFailure = { currentSessionId ->
+            !muted &&
+                !ended &&
+                sessionId == currentSessionId &&
+                coordinator.isActiveSession(currentSessionId)
+        },
+        startCapture = ::startCapture,
+        onFailure = ::handleCaptureStartFailure,
+    )
+    private val resourceCleaner = VoiceSessionResourceCleaner(
+        coordinator = coordinator,
+        gemini = gemini,
+        audio = audio,
+        cancelCaptureStart = captureStartController::cancel,
+        hermesBridgeProvider = { hermesBridge },
+        clearHermesBridge = { hermesBridge = null },
     )
 
     override val state: StateFlow<VoiceAgentUiState> = coordinator.state
@@ -148,12 +161,12 @@ class VoiceAgentCallSession internal constructor(
         }
         if (!changed) return
         if (muted) {
-            cancelCaptureStartJob()
+            captureStartController.cancel()
             gemini.sendAudioStreamEnd(sessionId)
             audio.stopCapture()
             coordinator.updateAudioStatus(VoiceAudioStatus.Muted)
         } else if (state.value.session == VoiceSessionStatus.Connected) {
-            launchCaptureStart(sessionId)
+            captureStartController.launch(sessionId)
         }
         recordEventSafely(
             name = if (muted) {
@@ -930,107 +943,42 @@ class VoiceAgentCallSession internal constructor(
         if (debugInjectionCaptureRestartSessionId != sessionId) return
         debugInjectionCaptureRestartSessionId = null
         if (isSessionOpenAndActive(sessionId)) {
-            launchCaptureStart(sessionId)
+            captureStartController.launch(sessionId)
         }
     }
 
-    private fun launchCaptureStart(currentSessionId: Long) {
-        lateinit var job: Job
-        job = scope.launch(start = CoroutineStart.LAZY) {
-            try {
-                startCapture(currentSessionId)
-            } catch (cancellation: CancellationException) {
-                throw cancellation
-            } catch (failure: Throwable) {
-                handleCaptureStartFailure(job, currentSessionId, failure)
-            }
-        }
-        var accepted = false
-        val previous = synchronized(sessionLock) {
-            if (
-                captureStartFailureJob != null ||
-                muted ||
-                !isSessionOpenAndActiveLocked(currentSessionId, automaticReconnectJob = null)
-            ) {
-                null
-            } else {
-                accepted = true
-                captureStartJob.also { captureStartJob = job }
-            }
-        }
-        if (!accepted) {
-            job.cancel()
-            return
-        }
-        previous?.cancel()
-        job.invokeOnCompletion {
-            synchronized(sessionLock) {
-                if (captureStartJob === job) captureStartJob = null
-                if (captureStartFailureJob === job) captureStartFailureJob = null
-            }
-        }
-        job.start()
-    }
-
-    private fun cancelCaptureStartJob() {
-        cancelCaptureStartJob(expectedJob = null)
-    }
-
-    private fun cancelCaptureStartJob(expectedJob: Job?) {
-        val job = synchronized(sessionLock) {
-            captureStartJob
-                ?.takeIf { expectedJob == null || it === expectedJob }
-                ?.also {
-                    captureStartJob = null
-                    if (captureStartFailureJob === it) captureStartFailureJob = null
-                }
-        }
-        job?.cancel()
-    }
-
-    private fun handleCaptureStartFailure(job: Job, currentSessionId: Long, failure: Throwable) {
-        val claimed = synchronized(sessionLock) {
-            if (
-                captureStartJob !== job ||
-                captureStartFailureJob != null ||
-                muted ||
-                ended ||
-                sessionId != currentSessionId ||
-                !coordinator.isActiveSession(currentSessionId)
-            ) {
-                false
-            } else {
-                captureStartFailureJob = job
-                true
-            }
-        }
-        if (!claimed) return
-
+    private fun handleCaptureStartFailure(currentSessionId: Long, failure: Throwable) {
         val message = failure.message ?: failure.javaClass.simpleName
+        val combinedFailure = runCatching {
+            runVoiceAgentCleanupStages(
+                { throw failure },
+                {
+                    recordSessionFailedSafely(
+                        sessionId = currentSessionId,
+                        endReason = VoiceSessionStopReason.AudioCaptureFailure.diagnosticReason,
+                        failureKind = VoiceSessionStopReason.AudioCaptureFailure.diagnosticReason,
+                        failureSummary = message,
+                    )
+                },
+                {
+                    prepareFailedSession(
+                        sessionId = currentSessionId,
+                        reason = VoiceSessionStopReason.AudioCaptureFailure,
+                        closeGemini = true,
+                    )
+                },
+            )
+        }.exceptionOrNull() ?: failure
+        val failureDetail = combinedFailure.toVoiceAgentCombinedFailureLogDetail()
         VoiceAgentLog.w(
             TAG,
-            "audio capture failed sessionId=$currentSessionId detail=${failure.toVoiceAgentLogDetail()}",
+            "audio capture failed sessionId=$currentSessionId detail=$failureDetail",
         )
         coordinator.recordDiagnostic(
             name = VoiceSessionStopReason.AudioCaptureFailure.diagnosticReason,
-            detail = failure.toVoiceAgentLogDetail(),
+            detail = failureDetail,
         )
-        runCatching {
-            recordSessionFailedSafely(
-                sessionId = currentSessionId,
-                endReason = VoiceSessionStopReason.AudioCaptureFailure.diagnosticReason,
-                failureKind = VoiceSessionStopReason.AudioCaptureFailure.diagnosticReason,
-                failureSummary = message,
-            )
-        }.onFailure(failure::addSuppressed)
-        runCatching {
-            prepareFailedSession(
-                sessionId = currentSessionId,
-                reason = VoiceSessionStopReason.AudioCaptureFailure,
-                closeGemini = true,
-            )
-        }.onFailure(failure::addSuppressed)
-        cancelCaptureStartJob(expectedJob = job)
+        captureStartController.cancel()
         clearReconnectEligibility()
         updateSessionStatusIfNotEnded(VoiceSessionStatus.Error(message))
     }
@@ -1226,6 +1174,22 @@ private fun GeminiLiveEvent.failureSummary(): String =
         is GeminiLiveEvent.WebSocketFailure -> message
         else -> this::class.simpleName ?: "Gemini terminal event"
     }
+
+private fun Throwable.toVoiceAgentCombinedFailureLogDetail(): String = buildString {
+    val visited = java.util.IdentityHashMap<Throwable, Unit>()
+
+    fun appendFailure(failure: Throwable, path: String) {
+        if (visited.put(failure, Unit) != null) return
+        if (isNotEmpty()) append("; ")
+        if (path.isNotEmpty()) append("suppressed[").append(path).append("]=")
+        append(failure.toVoiceAgentLogDetail())
+        failure.suppressed.forEachIndexed { index, suppressed ->
+            appendFailure(suppressed, if (path.isEmpty()) "$index" else "$path.$index")
+        }
+    }
+
+    appendFailure(this@toVoiceAgentCombinedFailureLogDetail, path = "")
+}
 
 private fun sanitizeVoiceFailureSummary(value: String): String =
     value

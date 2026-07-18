@@ -9,12 +9,15 @@ import android.media.MediaRecorder
 import android.util.Log
 import androidx.annotation.RequiresPermission
 import androidx.core.content.ContextCompat
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -89,6 +92,11 @@ internal suspend fun <Recorder : Any, CaptureTask : Any> setupVoiceAudioCapture(
     releaseRecorder: (Recorder) -> Unit,
 ): VoiceAudioCaptureSetup<Recorder>? {
     val token = ownership.reserve()
+    try {
+        currentCoroutineContext().ensureActive()
+    } catch (cancellation: CancellationException) {
+        throwVoiceAudioCaptureSetupFailure(cancellation, { ownership.abort(token) })
+    }
     val routeLease = try {
         acquireRoute()
     } catch (failure: Throwable) {
