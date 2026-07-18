@@ -115,3 +115,67 @@ Result:
 ## Concerns
 
 None known.
+
+## Post-Fix Stable Review Repair
+
+### Finding
+
+The initial cleanup-fence catch path checked `predecessorCleanup.isCompleted` only after exact lease/session cleanup. That cleanup may block. If cancellation started while the inherited barrier was incomplete and the predecessor completed it with failure during blocked cleanup, the later check discarded the barrier and published `Idle`. A matching waiter then woke from the canceled reservation's `Failed` resolution and entered a barrier-free retry.
+
+### Narrow Repair
+
+The catch path now performs a read-only pre-cleanup snapshot under the monitor:
+
+- Verify the exact reservation or its active token still owns the current slot.
+- Capture the exact inherited deferred only if it is incomplete at that point.
+- Perform the existing exact lease/session cleanup outside the monitor.
+- In the existing post-cleanup identity-guarded transition, install `CleanupFence` from the captured deferred regardless of whether it completed during cleanup.
+- If any newer slot replaced the owner, leave it unchanged.
+- Complete `Failed` only after cleanup and outside the monitor, preserving canonical cancellation and primary/suppressed failure identity.
+
+No external work, deferred completion, or state mutation was added to the pre-cleanup monitor section.
+
+### Deterministic Regression
+
+`cancellation preserves barrier that fails during blocked lease retirement` establishes this ordering:
+
+1. Active A is replaced by cleanup owner B, which blocks in `A.end()`.
+2. Inheriting owner C is canceled while awaiting B's shared barrier.
+3. C's exact Telecom lease retirement enters and blocks.
+4. A's end is released and completes the shared barrier with a non-copyable failure while C cleanup remains blocked.
+5. A matching fresh caller awaits C's still-uncompleted reservation resolution.
+6. Retirement is released.
+
+The assertions prove C rethrows the exact canonical cancellation, the fresh caller receives the same predecessor failure instance, the original factory admission count stays at one, and every involved lease retires exactly once.
+
+### RED/GREEN Evidence
+
+Fresh RED command:
+
+```bash
+./gradlew :app:testDebugUnitTest \
+  --tests '*VoiceAgentCallManager*Test' \
+  --tests '*VoiceAgentCallStartupTest' \
+  --rerun-tasks
+```
+
+- 44 tests executed; exactly the new regression failed.
+- Failure: the fresh waiter returned a started result instead of the exact predecessor failure after cleanup release.
+- `BUILD FAILED in 2m 27s`.
+
+Fresh GREEN command: identical to RED.
+
+- All 179 Gradle tasks executed.
+- `VoiceAgentCallManagerTest`: 30 tests, 0 failures, 0 errors.
+- `VoiceAgentCallManagerBarrierTest`: 6 tests, 0 failures, 0 errors.
+- `VoiceAgentCallStartupTest`: 8 tests, 0 failures, 0 errors.
+- Total: 44 tests, 0 failures, 0 errors.
+- `BUILD SUCCESSFUL in 1m 33s`.
+- `git diff --check`: clean.
+
+Final `VoiceAgentCallManagerBarrierTest.kt` size: 276 lines.
+
+### Commit and Concerns
+
+- This report is included in the stable-review repair commit; the completion handoff supplies its full SHA.
+- No known residual concerns.

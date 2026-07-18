@@ -98,6 +98,62 @@ class VoiceAgentCallManagerBarrierTest {
             scope = this,
         )
     }
+
+    @Test
+    fun `cancellation preserves barrier that fails during blocked lease retirement`() = runBarrierTest {
+        val releaseEnd = CountDownLatch(1)
+        val releaseRetirement = CountDownLatch(1)
+        val endFailure = NonCopyableCleanupException(Any(), "predecessor end failed")
+        val predecessor = BlockingEndManagedVoiceCallSession(releaseEnd, endFailure)
+        val factory = FakeVoiceAgentCallFactory(predecessor, FakeManagedVoiceCallSession())
+        val manager = VoiceAgentCallManager(factory)
+        val predecessorLease = CountingTelecomLease()
+        manager.start(Uuid.random(), fakeManagerLaunchConfig(), predecessorLease.lease, this)
+        val cleanupOwnerLease = CountingTelecomLease()
+        val cleanupOwner = async(Dispatchers.Default) {
+            manager.start(
+                Uuid.random(),
+                fakeManagerLaunchConfig("cleanup-owner"),
+                cleanupOwnerLease.lease,
+                this@runBarrierTest,
+            )
+        }
+        assertTrue(predecessor.endEntered.await(1, TimeUnit.SECONDS))
+        val conversationId = Uuid.random()
+        val config = fakeManagerLaunchConfig("cancelled-inheritor")
+        val retirementEntered = CountDownLatch(1)
+        val cancelledLease = CountingTelecomLease(
+            disconnectEntered = retirementEntered,
+            releaseRetirement = releaseRetirement,
+        )
+        val cancelled = async(Dispatchers.Default, start = CoroutineStart.UNDISPATCHED) {
+            manager.start(conversationId, config, cancelledLease.lease, this@runBarrierTest)
+        }
+        val cancellation = CanonicalCancellationException(Any())
+
+        cancelled.cancel(cancellation)
+        assertTrue(retirementEntered.await(1, TimeUnit.SECONDS))
+        releaseEnd.countDown()
+        assertSame(endFailure, runCatching { cleanupOwner.await() }.exceptionOrNull())
+        val freshLease = CountingTelecomLease()
+        val fresh = async(Dispatchers.Default, start = CoroutineStart.UNDISPATCHED) {
+            manager.start(conversationId, config, freshLease.lease, this@runBarrierTest)
+        }
+        try {
+            assertFalse(fresh.isCompleted)
+            assertEquals(1, factory.created.size)
+        } finally {
+            releaseRetirement.countDown()
+        }
+
+        assertSame(cancellation, runCatching { cancelled.await() }.exceptionOrNull())
+        assertSame(endFailure, runCatching { fresh.await() }.exceptionOrNull())
+        assertEquals(1, factory.created.size)
+        assertEquals(1, predecessorLease.retireCalls)
+        assertEquals(1, cleanupOwnerLease.retireCalls)
+        assertEquals(1, cancelledLease.retireCalls)
+        assertEquals(1, freshLease.retireCalls)
+    }
 }
 
 private suspend fun assertTerminalPreservesInheritedBarrier(

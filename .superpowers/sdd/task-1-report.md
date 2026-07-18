@@ -99,3 +99,14 @@
 - GREEN: `./gradlew :app:testDebugUnitTest --tests '*VoiceAgentCallManagerTest' --tests '*VoiceAgentCallStartupTest' --rerun-tasks` executed all 179 Gradle tasks and passed 37 tests (29 manager, 8 startup), zero failures/errors, with `BUILD SUCCESSFUL`.
 - Commit: `746a458d34a3c62ff83046312ebe7755a615a8d9 fix(voice): finish owner cleanup before retry`.
 - Residual concerns: none known.
+
+### Wave 2 stable-review repair: snapshot barrier preservation before cleanup
+
+- Stable finding: The cancellation catch decided whether to preserve an inherited predecessor barrier only after potentially blocking exact lease/session cleanup. If the barrier completed with failure during that cleanup, the later `isCompleted` check selected `Idle`, allowing a matching waiter to retry without the exact failed barrier.
+- Production repair: Before external cleanup begins, the catch path snapshots the exact incomplete inherited barrier only while the reservation/token still owns the slot. After cleanup, the existing identity-guarded transition installs a fence from that captured identity even if the barrier completed during cleanup. A newer slot still wins and is never mutated.
+- Regression: Cancel an inheriting owner, block its exact Telecom lease retirement, complete its predecessor barrier with a non-copyable failure during retirement, and attach a matching fresh waiter. After retirement release, the canceled owner retains its canonical cancellation, the waiter receives the exact predecessor failure, all leases retire once, and the factory remains at one admission.
+- RED: `./gradlew :app:testDebugUnitTest --tests '*VoiceAgentCallManager*Test' --tests '*VoiceAgentCallStartupTest' --rerun-tasks` executed 44 tests and failed only `cancellation preserves barrier that fails during blocked lease retirement`; the fresh waiter returned a started result instead of the exact predecessor failure. `BUILD FAILED in 2m 27s`.
+- GREEN: The same fresh command executed all 179 Gradle tasks and passed 44 tests (30 manager, 6 barrier, 8 startup), zero failures/errors, with `BUILD SUCCESSFUL in 1m 33s`.
+- Final focused barrier test file size: 276 lines. `git diff --check` is clean.
+- Commit: this report is included in the stable-review repair commit; its full SHA is supplied in the completion handoff.
+- Residual concerns: none known.

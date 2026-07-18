@@ -427,6 +427,14 @@ class VoiceAgentCallManager(
             reservation.resolution.complete(VoiceAgentStartupResolution.Published)
             return VoiceAgentManagerStartResult.Started(session.routeMetadata)
         } catch (failure: Throwable) {
+            val predecessorCleanupToPreserve = synchronized(lock) {
+                val current = slot
+                val ownsCurrentSlot = current === reservation ||
+                    current is CallSlot.Active && current.token === reservation.token
+                reservation.predecessorCleanup?.takeIf {
+                    ownsCurrentSlot && !it.isCompleted
+                }
+            }
             val cleanupFailure = when {
                 factoryOwnsLease && createdSession != null && !createdSessionCleanupAttempted -> {
                     createdSessionCleanupAttempted = true
@@ -444,12 +452,9 @@ class VoiceAgentCallManager(
                 if (current === reservation ||
                     current is CallSlot.Active && current.token === reservation.token
                 ) {
-                    val predecessorCleanup = reservation.predecessorCleanup
-                    slot = if (predecessorCleanup != null && !predecessorCleanup.isCompleted) {
-                        CallSlot.CleanupFence(predecessorCleanup)
-                    } else {
-                        CallSlot.Idle
-                    }
+                    slot = predecessorCleanupToPreserve
+                        ?.let { CallSlot.CleanupFence(it) }
+                        ?: CallSlot.Idle
                     _activeConversationId.value = null
                     _state.value = VoiceAgentUiState()
                     true
