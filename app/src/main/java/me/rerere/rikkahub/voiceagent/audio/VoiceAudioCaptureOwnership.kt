@@ -13,6 +13,16 @@ internal enum class VoiceAudioCaptureStartOutcome {
     Rejected,
 }
 
+private sealed interface ActivePublicationDecision<out Recorder : Any, out CaptureTask : Any> {
+    data object Published : ActivePublicationDecision<Nothing, Nothing>
+
+    data class Retiring<Recorder : Any, CaptureTask : Any>(
+        val retirement: CaptureState.Retiring<Recorder, CaptureTask>,
+    ) : ActivePublicationDecision<Recorder, CaptureTask>
+
+    data object Rejected : ActivePublicationDecision<Nothing, Nothing>
+}
+
 internal class VoiceAudioCaptureOwnership<Recorder : Any, CaptureTask : Any>(
     private val startRecorder: (Recorder) -> Unit,
     private val isRecorderRecording: (Recorder) -> Boolean,
@@ -21,6 +31,7 @@ internal class VoiceAudioCaptureOwnership<Recorder : Any, CaptureTask : Any>(
     private val startTask: (CaptureTask) -> Boolean,
     private val cancelTask: (CaptureTask) -> Unit,
     private val onRetirementResultPublished: (Result<Unit>) -> Unit = {},
+    private val beforeActivePublication: () -> Unit = {},
 ) {
     private val lock = Any()
     private val retirementBarriers = WeakHashMap<VoiceAudioCaptureToken, RetirementBarrier>()
@@ -107,30 +118,42 @@ internal class VoiceAudioCaptureOwnership<Recorder : Any, CaptureTask : Any>(
             throwWithRetirementFailure(activationFailure, requireNotNull(retirement))
         }
 
-        val retirementAfterActivation = synchronized(lock) {
+        beforeActivePublication()
+        val activePublication: ActivePublicationDecision<Recorder, CaptureTask> = synchronized(lock) {
             val current = state
-            if (
+            when {
                 current is CaptureState.Starting.Activating &&
-                current.token === token &&
-                current.recorder === recorder &&
-                current.activationBarrier === activationBarrier
-            ) {
-                state = CaptureState.Active(
-                    token = token,
-                    recorder = recorder,
-                    task = task,
-                    routeLease = current.routeLease,
-                    callbackAdmission = CallbackAdmissionBarrier(),
-                    retirementBarrier = current.retirementBarrier,
-                )
-                null
-            } else {
-                current.asRetirementFor(token, recorder)
+                    current.token === token &&
+                    current.recorder === recorder &&
+                    current.activationBarrier === activationBarrier -> {
+                    state = CaptureState.Active(
+                        token = token,
+                        recorder = recorder,
+                        task = task,
+                        routeLease = current.routeLease,
+                        callbackAdmission = CallbackAdmissionBarrier(),
+                        retirementBarrier = current.retirementBarrier,
+                    )
+                    ActivePublicationDecision.Published
+                }
+
+                current is CaptureState.Retiring && current.matches(token, recorder) ->
+                    ActivePublicationDecision.Retiring(current)
+
+                else -> ActivePublicationDecision.Rejected
             }
         }
-        if (retirementAfterActivation != null) {
-            retireOwnedCapture(retirementAfterActivation)
-            return VoiceAudioCaptureStartOutcome.Rejected
+        when (activePublication) {
+            ActivePublicationDecision.Published -> Unit
+            is ActivePublicationDecision.Retiring -> {
+                retireOwnedCapture(activePublication.retirement)
+                return VoiceAudioCaptureStartOutcome.Rejected
+            }
+
+            ActivePublicationDecision.Rejected -> {
+                replayRetirement(token)
+                return VoiceAudioCaptureStartOutcome.Rejected
+            }
         }
 
         val taskStarted = try {
@@ -665,12 +688,6 @@ private fun <Recorder : Any, CaptureTask : Any> CaptureState.Active<Recorder, Ca
         terminalTarget = terminalTarget,
     )
 }
-
-private fun <Recorder : Any, CaptureTask : Any> CaptureState<Recorder, CaptureTask>.asRetirementFor(
-    token: VoiceAudioCaptureToken,
-    recorder: Recorder,
-): CaptureState.Retiring<Recorder, CaptureTask>? =
-    (this as? CaptureState.Retiring)?.takeIf { it.matches(token, recorder) }
 
 private fun <Recorder : Any, CaptureTask : Any> CaptureState.Retiring<Recorder, CaptureTask>.matches(
     token: VoiceAudioCaptureToken,
