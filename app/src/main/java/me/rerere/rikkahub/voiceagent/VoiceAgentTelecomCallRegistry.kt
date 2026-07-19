@@ -73,7 +73,7 @@ class VoiceAgentTelecomCallRegistry internal constructor(
                     checkNotNull(previousRecord).phase = AttemptPhase.Retiring(
                         connection = phase.connection,
                         failure = checkNotNull(supersededFailure),
-                        attempt = RetirementAttempt(),
+                        attempt = RetirementAttempt(synchronousOwnerActive = true),
                     )
                     previousConnection = phase.connection
                 }
@@ -147,7 +147,7 @@ class VoiceAgentTelecomCallRegistry internal constructor(
                         record.phase = AttemptPhase.Retiring(
                             connection = connection,
                             failure = failure,
-                            attempt = RetirementAttempt(),
+                            attempt = RetirementAttempt(synchronousOwnerActive = true),
                         )
                         publication = selectOutcomeLocked(
                             record,
@@ -160,7 +160,7 @@ class VoiceAgentTelecomCallRegistry internal constructor(
                         record.phase = AttemptPhase.Retiring(
                             connection = connection,
                             failure = failure,
-                            attempt = RetirementAttempt(),
+                            attempt = RetirementAttempt(synchronousOwnerActive = true),
                         )
                         publication = selectOutcomeLocked(
                             record,
@@ -178,6 +178,7 @@ class VoiceAgentTelecomCallRegistry internal constructor(
                 }
                 is AttemptPhase.Retiring -> {
                     if (phase.connection === connection) {
+                        phase.attempt.claimSynchronousOwner()
                         publication = selectOutcomeLocked(
                             record,
                             VoiceAgentTelecomOutcome.Failed(phase.failure),
@@ -320,7 +321,7 @@ class VoiceAgentTelecomCallRegistry internal constructor(
                     candidate.phase = AttemptPhase.Retiring(
                         connection = phase.connection,
                         failure = failure,
-                        attempt = RetirementAttempt(),
+                        attempt = RetirementAttempt(synchronousOwnerActive = true),
                     )
                     record = candidate
                     connection = phase.connection
@@ -329,7 +330,7 @@ class VoiceAgentTelecomCallRegistry internal constructor(
                     candidate.phase = AttemptPhase.Retiring(
                         connection = phase.connection,
                         failure = phase.outcomeFailure,
-                        attempt = RetirementAttempt(),
+                        attempt = RetirementAttempt(synchronousOwnerActive = true),
                     )
                     record = candidate
                     connection = phase.connection
@@ -381,6 +382,13 @@ class VoiceAgentTelecomCallRegistry internal constructor(
         var retirementAttempt: RetirementAttempt? = null
         synchronized(lock) {
             val (id, record) = attemptForConnectionLocked(connection) ?: return
+            val currentPhase = record.phase
+            if (
+                currentPhase is AttemptPhase.Retiring &&
+                currentPhase.attempt.synchronousOwnerActive
+            ) {
+                return@synchronized
+            }
             val failure = when (val phase = record.phase) {
                 is AttemptPhase.Activating -> disconnectedFailure(duringActivation = true)
                 is AttemptPhase.Active -> disconnectedFailure(duringActivation = false)
@@ -502,9 +510,16 @@ class VoiceAgentTelecomCallRegistry internal constructor(
         var outcomeAcknowledged = false
     }
 
-    private class RetirementAttempt {
+    private class RetirementAttempt(
+        var synchronousOwnerActive: Boolean = false,
+    ) {
         private val completed = CountDownLatch(1)
         private var result: Result<Unit>? = null
+
+        fun claimSynchronousOwner() {
+            check(!synchronousOwnerActive) { "Telecom retirement attempt already has an owner" }
+            synchronousOwnerActive = true
+        }
 
         fun publish(value: Result<Unit>) {
             check(result == null) { "Telecom retirement attempt already completed" }

@@ -2,7 +2,11 @@ package me.rerere.rikkahub.voiceagent
 
 import java.util.Collections
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.thread
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
@@ -14,6 +18,88 @@ import org.junit.Assert.assertSame
 import org.junit.Test
 
 class VoiceAgentTelecomRetirementTest {
+    @Test
+    fun `production callback ordering retains synchronous disconnect failure for exact retry`() = runBlocking {
+        val firstFailure = IllegalStateException("framework disconnect failed")
+        val disconnectFailure = AtomicReference<Throwable?>(firstFailure)
+        val cleanupReached = CountDownLatch(1)
+        val releaseCleanup = CountDownLatch(1)
+        val joiningLeaseStarted = CountDownLatch(1)
+        val registry = VoiceAgentTelecomCallRegistry()
+        val attempt = registry.beginAttempt()
+        val call = object : VoiceAgentTelecomCall {
+            var disconnectCalls = 0
+
+            override fun disconnectFromApp() {
+                disconnectCalls += 1
+                runVoiceAgentCleanupStages(
+                    { registry.retiring(this) },
+                    { disconnectFailure.get()?.let { throw it } },
+                    {
+                        cleanupReached.countDown()
+                        check(releaseCleanup.await(1, TimeUnit.SECONDS)) {
+                            "production cleanup callback was not released"
+                        }
+                    },
+                    { registry.clear(this) },
+                )
+            }
+        }
+        assertEquals(true, registry.activate(attempt, call))
+        assertEquals(VoiceAgentTelecomOutcome.Active, registry.awaitOutcome(attempt))
+        val lease = TelecomVoiceAgentRouteLease(attempt, registry)
+        val joiningLease = TelecomVoiceAgentRouteLease(attempt, registry)
+        val executor = Executors.newFixedThreadPool(2)
+        try {
+            val ownerRetirement = executor.submit<Throwable?> {
+                runCatching(lease::retire).exceptionOrNull()
+            }
+            check(cleanupReached.await(1, TimeUnit.SECONDS)) {
+                "production cleanup did not reach the pre-clear stage"
+            }
+            val joinedRetirement = executor.submit<Throwable?> {
+                joiningLeaseStarted.countDown()
+                runCatching(joiningLease::retire).exceptionOrNull()
+            }
+            check(joiningLeaseStarted.await(1, TimeUnit.SECONDS)) {
+                "joining lease retirement did not start"
+            }
+            assertEquals(
+                true,
+                runCatching { joinedRetirement.get(100, TimeUnit.MILLISECONDS) }
+                    .exceptionOrNull() is TimeoutException,
+            )
+            releaseCleanup.countDown()
+
+            assertSame(firstFailure, ownerRetirement.get(1, TimeUnit.SECONDS))
+            assertSame(firstFailure, joinedRetirement.get(1, TimeUnit.SECONDS))
+            assertEquals(1, call.disconnectCalls)
+            assertFalse(lease.isUsable)
+
+            val replacementAttempt = registry.beginAttempt()
+            val replacementCall = object : VoiceAgentTelecomCall {
+                var disconnectCalls = 0
+
+                override fun disconnectFromApp() {
+                    disconnectCalls += 1
+                }
+            }
+            assertEquals(true, registry.activate(replacementAttempt, replacementCall))
+            disconnectFailure.set(null)
+
+            lease.retire()
+            assertEquals(2, call.disconnectCalls)
+            assertEquals(0, replacementCall.disconnectCalls)
+
+            lease.retire()
+            assertEquals(2, call.disconnectCalls)
+            assertEquals(0, replacementCall.disconnectCalls)
+        } finally {
+            releaseCleanup.countDown()
+            executor.shutdownNow()
+        }
+    }
+
     @Test
     fun `retirement is one shot and callback follows framework retirement`() {
         val events = mutableListOf<String>()
