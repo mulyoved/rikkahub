@@ -19,12 +19,15 @@ import org.junit.Test
 
 class VoiceAgentTelecomRetirementTest {
     @Test
-    fun `framework onDisconnect cannot reopen failure before exact lease retry succeeds`() = runBlocking {
+    fun `framework onDisconnect joins active exact lease retry without reopening failure`() = runBlocking {
         val firstFailure = IllegalStateException("framework disconnect failed")
         val frameworkFailure = AtomicReference<Throwable?>(firstFailure)
         val callEndRequests = AtomicInteger()
         val setDisconnectedCalls = AtomicInteger()
         val destroyCalls = AtomicInteger()
+        val retryEntered = CountDownLatch(1)
+        val releaseRetry = CountDownLatch(1)
+        val frameworkRetryJoinStarted = CountDownLatch(1)
         val registry = VoiceAgentTelecomCallRegistry()
         val attempt = registry.beginAttempt()
         lateinit var registeredCall: VoiceAgentTelecomCall
@@ -32,8 +35,14 @@ class VoiceAgentTelecomRetirementTest {
             onCallEndRequested = { callEndRequests.incrementAndGet() },
             onRetiring = { registry.retiring(registeredCall) },
             setDisconnected = {
-                setDisconnectedCalls.incrementAndGet()
+                val call = setDisconnectedCalls.incrementAndGet()
                 frameworkFailure.getAndSet(null)?.let { throw it }
+                if (call == 2) {
+                    retryEntered.countDown()
+                    check(releaseRetry.await(1, TimeUnit.SECONDS)) {
+                        "exact route retry was not released"
+                    }
+                }
             },
             destroy = { destroyCalls.incrementAndGet() },
             onRetired = { result -> registry.retired(registeredCall, result) },
@@ -69,18 +78,50 @@ class VoiceAgentTelecomRetirementTest {
         }
         assertEquals(true, registry.activate(replacementAttempt, replacement))
 
-        lease.retire()
-        assertEquals(1, appDisconnectCalls.get())
-        assertEquals(2, setDisconnectedCalls.get())
-        assertEquals(2, destroyCalls.get())
-        assertEquals(0, replacementDisconnects.get())
-        assertFalse(lease.isUsable)
+        val executor = Executors.newFixedThreadPool(2)
+        try {
+            val retry = executor.submit<Throwable?> {
+                runCatching(lease::retire).exceptionOrNull()
+            }
+            check(retryEntered.await(1, TimeUnit.SECONDS)) {
+                "exact route retry did not start"
+            }
+            val frameworkJoin = executor.submit<Throwable?> {
+                frameworkRetryJoinStarted.countDown()
+                runCatching(connection::onDisconnect).exceptionOrNull()
+            }
+            check(frameworkRetryJoinStarted.await(1, TimeUnit.SECONDS)) {
+                "framework retry join did not start"
+            }
+            assertEquals(
+                true,
+                runCatching { frameworkJoin.get(100, TimeUnit.MILLISECONDS) }
+                    .exceptionOrNull() is TimeoutException,
+            )
+            assertEquals(3, callEndRequests.get())
+            assertEquals(2, setDisconnectedCalls.get())
+            assertEquals(1, destroyCalls.get())
+            assertEquals(0, replacementDisconnects.get())
+            assertFalse(lease.isUsable)
 
-        lease.retire()
-        assertEquals(1, appDisconnectCalls.get())
-        assertEquals(2, setDisconnectedCalls.get())
-        assertEquals(2, destroyCalls.get())
-        assertEquals(0, replacementDisconnects.get())
+            releaseRetry.countDown()
+            assertEquals(null, retry.get(1, TimeUnit.SECONDS))
+            assertEquals(null, frameworkJoin.get(1, TimeUnit.SECONDS))
+            assertEquals(1, appDisconnectCalls.get())
+            assertEquals(2, setDisconnectedCalls.get())
+            assertEquals(2, destroyCalls.get())
+            assertEquals(0, replacementDisconnects.get())
+            assertFalse(lease.isUsable)
+
+            lease.retire()
+            assertEquals(1, appDisconnectCalls.get())
+            assertEquals(2, setDisconnectedCalls.get())
+            assertEquals(2, destroyCalls.get())
+            assertEquals(0, replacementDisconnects.get())
+        } finally {
+            releaseRetry.countDown()
+            executor.shutdownNow()
+        }
     }
 
     @Test

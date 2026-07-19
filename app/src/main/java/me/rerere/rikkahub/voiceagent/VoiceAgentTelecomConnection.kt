@@ -217,16 +217,18 @@ internal class VoiceAgentTelecomRetirement<Cause>(
     private fun retire(cause: Cause, retryAfterFailure: Boolean) {
         val currentThread = Thread.currentThread()
         val attempt = synchronized(lock) {
-            terminalResult?.let { result ->
-                if (result.isSuccess || !retryAfterFailure) {
-                    result.getOrThrow()
-                    return
-                }
-            }
             activeAttempt?.also { currentAttempt ->
                 if (currentAttempt.ownerThread === currentThread) return
-            } ?: Attempt().also { newAttempt ->
-                activeAttempt = newAttempt
+            } ?: run {
+                terminalResult?.let { result ->
+                    if (result.isSuccess || !retryAfterFailure) {
+                        result.getOrThrow()
+                        return
+                    }
+                }
+                Attempt().also { newAttempt ->
+                    activeAttempt = newAttempt
+                }
             }
         }
 
