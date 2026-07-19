@@ -987,42 +987,81 @@ class VoiceAgentCallSession internal constructor(
         VoiceAgentLog.d(TAG, "starting audio capture sessionId=$currentSessionId muted=$muted")
         audio.startCapture(
             onPcm16 = { pcm16 ->
-                if (!coordinator.isActiveSession(currentSessionId)) {
+                if (!acceptsCaptureCallback(currentSessionId)) {
                     return@startCapture
                 }
                 val sent = gemini.sendAudio(
                     base64Pcm16 = Base64.getEncoder().encodeToString(pcm16),
                     sessionId = currentSessionId,
                 )
-                if (sent && coordinator.isActiveSession(currentSessionId)) {
-                    coordinator.updateAudioStatus(VoiceAudioStatus.UserSpeaking)
+                if (sent) {
+                    synchronized(sessionLock) {
+                        if (acceptsCaptureCallbackLocked(currentSessionId)) {
+                            coordinator.updateAudioStatus(VoiceAudioStatus.UserSpeaking)
+                        }
+                    }
                 }
             },
             onDebugInjectionComplete = {
-                if (coordinator.isActiveSession(currentSessionId)) {
-                    VoiceAgentLog.d(
-                        TAG,
-                        "debug injection complete; stopping capture and sending audio stream end " +
-                            "sessionId=$currentSessionId",
-                    )
-                    audio.stopCapture()
-                    debugInjectionCaptureRestartSessionId = currentSessionId
+                if (!acceptsCaptureCallback(currentSessionId)) {
+                    return@startCapture
+                }
+                VoiceAgentLog.d(
+                    TAG,
+                    "debug injection complete; stopping capture and sending audio stream end " +
+                        "sessionId=$currentSessionId",
+                )
+                audio.stopCapture()
+                val accepted = synchronized(sessionLock) {
+                    if (!acceptsCaptureCallbackLocked(currentSessionId)) {
+                        false
+                    } else {
+                        debugInjectionCaptureRestartSessionId = currentSessionId
+                        true
+                    }
+                }
+                if (accepted) {
                     gemini.sendAudioStreamEnd(currentSessionId)
-                    coordinator.updateAudioStatus(VoiceAudioStatus.Listening)
+                    synchronized(sessionLock) {
+                        if (acceptsCaptureCallbackLocked(currentSessionId)) {
+                            coordinator.updateAudioStatus(VoiceAudioStatus.Listening)
+                        }
+                    }
                 }
             },
         )
+        val committed = synchronized(sessionLock) {
+            if (!acceptsCaptureCallbackLocked(currentSessionId)) {
+                false
+            } else {
+                coordinator.updateAudioStatus(VoiceAudioStatus.Listening)
+                true
+            }
+        }
+        if (!committed) {
+            val exactSessionStillCurrent = synchronized(sessionLock) {
+                sessionId == currentSessionId
+            }
+            if (exactSessionStillCurrent) {
+                audio.stopCapture()
+            }
+            return
+        }
         recordEventSafely(
             name = "hermes_voice.mobile.audio.capture_started",
             attributes = mapOf(
                 "sessionId" to currentSessionId,
-                "audio.muted" to muted,
+                "audio.muted" to false,
             ),
         )
-        if (isSessionOpenAndActive(currentSessionId)) {
-            coordinator.updateAudioStatus(VoiceAudioStatus.Listening)
-        }
     }
+
+    private fun acceptsCaptureCallback(currentSessionId: Long): Boolean = synchronized(sessionLock) {
+        acceptsCaptureCallbackLocked(currentSessionId)
+    }
+
+    private fun acceptsCaptureCallbackLocked(currentSessionId: Long): Boolean =
+        !muted && isSessionOpenAndActiveLocked(currentSessionId, automaticReconnectJob = null)
 
     private data class EndPreparation(
         val previousJob: Job?,

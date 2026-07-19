@@ -10,6 +10,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.yield
 import me.rerere.rikkahub.voiceagent.persistence.VoiceContext
 import me.rerere.rikkahub.voiceagent.telemetry.RecordingVoiceObservability
 import me.rerere.rikkahub.voiceagent.telemetry.VoiceDiagnostics
@@ -19,6 +20,46 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class CaptureStartVoiceAgentCallSessionTest {
+    @Test
+    fun `mute wins against suspended initial capture completion`() = runTest {
+        val gemini = FakeGeminiLiveVoiceClient()
+        val audio = FakeVoiceAudioEngine()
+        val observability = RecordingVoiceObservability()
+        val suspended = audio.suspendNextStartCapture()
+        val session = VoiceAgentCallSession(
+            modelId = "gemini-flash",
+            sessionApi = FakeVoiceSessionApi(),
+            toolApi = FakeVoiceToolApi(),
+            gemini = gemini,
+            audio = audio,
+            conversationStore = FakeVoiceConversationStore(),
+            contextProvider = FakeVoiceAgentContextProvider(
+                VoiceContext(systemInstruction = "system", turns = emptyList())
+            ),
+            observability = observability,
+            scope = this,
+        )
+
+        session.start()
+        gemini.awaitConnect()
+        awaitCaptureSignal(suspended.entered)
+        session.setMuted(true)
+
+        suspended.release.complete(Unit)
+        awaitCaptureSignal(suspended.installed)
+        audio.emitCapture(byteArrayOf(1, 2, 3))
+        audio.completeDebugInjection()
+        yield()
+
+        assertTrue(gemini.audioMessages.isEmpty())
+        assertEquals(VoiceAudioStatus.Muted, session.state.value.audio)
+        assertEquals(2, audio.stopCaptureCalls)
+        assertFalse(
+            observability.events.any { it.name == "hermes_voice.mobile.audio.capture_started" }
+        )
+        session.closeNow()
+    }
+
     @Test
     fun `mute cancels suspended unmute capture before callback installation`() = runTest {
         val fixture = connectedMutedSession()
