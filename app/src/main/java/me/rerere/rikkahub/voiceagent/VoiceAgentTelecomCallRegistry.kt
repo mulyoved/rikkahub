@@ -1,6 +1,7 @@
 package me.rerere.rikkahub.voiceagent
 
 import kotlinx.coroutines.CompletableDeferred
+import java.util.concurrent.CountDownLatch
 
 interface VoiceAgentTelecomCall {
     fun disconnectFromApp()
@@ -65,12 +66,14 @@ class VoiceAgentTelecomCallRegistry internal constructor(
                     checkNotNull(previousRecord).phase = AttemptPhase.Retiring(
                         connection = phase.connection,
                         failure = checkNotNull(supersededFailure),
+                        attempt = RetirementAttempt(),
                     )
                 }
                 is AttemptPhase.Active -> {
                     checkNotNull(previousRecord).phase = AttemptPhase.Retiring(
                         connection = phase.connection,
                         failure = checkNotNull(supersededFailure),
+                        attempt = RetirementAttempt(),
                     )
                     previousConnection = phase.connection
                 }
@@ -141,7 +144,11 @@ class VoiceAgentTelecomCallRegistry internal constructor(
                 is AttemptPhase.Activating -> {
                     if (phase.connection !== connection || currentAttemptId != id) {
                         val failure = cancelledFailure(id)
-                        record.phase = AttemptPhase.Retiring(connection, failure)
+                        record.phase = AttemptPhase.Retiring(
+                            connection = connection,
+                            failure = failure,
+                            attempt = RetirementAttempt(),
+                        )
                         publication = selectOutcomeLocked(
                             record,
                             VoiceAgentTelecomOutcome.Failed(failure),
@@ -150,7 +157,11 @@ class VoiceAgentTelecomCallRegistry internal constructor(
                         false
                     } else if (activationError != null) {
                         val failure = activationFailure(activationError)
-                        record.phase = AttemptPhase.Retiring(connection, failure)
+                        record.phase = AttemptPhase.Retiring(
+                            connection = connection,
+                            failure = failure,
+                            attempt = RetirementAttempt(),
+                        )
                         publication = selectOutcomeLocked(
                             record,
                             VoiceAgentTelecomOutcome.Failed(failure),
@@ -216,7 +227,11 @@ class VoiceAgentTelecomCallRegistry internal constructor(
                     )
                 }
                 is AttemptPhase.Activating -> {
-                    record.phase = AttemptPhase.Retiring(phase.connection, failure)
+                    record.phase = AttemptPhase.Retiring(
+                        connection = phase.connection,
+                        failure = failure,
+                        attempt = RetirementAttempt(),
+                    )
                 }
                 is AttemptPhase.Active,
                 is AttemptPhase.Retiring,
@@ -282,6 +297,7 @@ class VoiceAgentTelecomCallRegistry internal constructor(
         var record: AttemptRecord? = null
         var connection: VoiceAgentTelecomCall? = null
         var publication: OutcomePublication? = null
+        var joinedAttempt: RetirementAttempt? = null
         synchronized(lock) {
             val candidate = attempts[id] ?: return
             when (val phase = candidate.phase) {
@@ -294,10 +310,18 @@ class VoiceAgentTelecomCallRegistry internal constructor(
                     if (currentAttemptId == id) currentAttemptId = null
                 }
                 is AttemptPhase.Activating -> {
-                    candidate.phase = AttemptPhase.Retiring(phase.connection, failure)
+                    candidate.phase = AttemptPhase.Retiring(
+                        connection = phase.connection,
+                        failure = failure,
+                        attempt = RetirementAttempt(),
+                    )
                 }
                 is AttemptPhase.Active -> {
-                    candidate.phase = AttemptPhase.Retiring(phase.connection, failure)
+                    candidate.phase = AttemptPhase.Retiring(
+                        connection = phase.connection,
+                        failure = failure,
+                        attempt = RetirementAttempt(),
+                    )
                     record = candidate
                     connection = phase.connection
                 }
@@ -305,16 +329,18 @@ class VoiceAgentTelecomCallRegistry internal constructor(
                     candidate.phase = AttemptPhase.Retiring(
                         connection = phase.connection,
                         failure = phase.outcomeFailure,
+                        attempt = RetirementAttempt(),
                     )
                     record = candidate
                     connection = phase.connection
                 }
-                is AttemptPhase.Retiring,
+                is AttemptPhase.Retiring -> joinedAttempt = phase.attempt
                 is AttemptPhase.Failed,
                 -> Unit
             }
         }
         publication?.publish()
+        joinedAttempt?.awaitResult()?.getOrThrow()
 
         val retiringRecord = record ?: return
         val retiringConnection = connection ?: return
@@ -339,6 +365,7 @@ class VoiceAgentTelecomCallRegistry internal constructor(
                 -> record.phase = AttemptPhase.Retiring(
                     connection = connection,
                     failure = disconnectedFailure(phase is AttemptPhase.Activating),
+                    attempt = RetirementAttempt(),
                 )
                 AttemptPhase.Pending,
                 is AttemptPhase.Retiring,
@@ -351,12 +378,16 @@ class VoiceAgentTelecomCallRegistry internal constructor(
 
     fun clear(connection: VoiceAgentTelecomCall) {
         var publication: OutcomePublication? = null
+        var retirementAttempt: RetirementAttempt? = null
         synchronized(lock) {
             val (id, record) = attemptForConnectionLocked(connection) ?: return
             val failure = when (val phase = record.phase) {
                 is AttemptPhase.Activating -> disconnectedFailure(duringActivation = true)
                 is AttemptPhase.Active -> disconnectedFailure(duringActivation = false)
-                is AttemptPhase.Retiring -> phase.failure
+                is AttemptPhase.Retiring -> {
+                    retirementAttempt = phase.attempt
+                    phase.failure
+                }
                 is AttemptPhase.RetirementFailed -> phase.outcomeFailure
                 AttemptPhase.Pending,
                 is AttemptPhase.Failed,
@@ -364,6 +395,7 @@ class VoiceAgentTelecomCallRegistry internal constructor(
             }
             publication = terminalizeLocked(id, record, failure)
         }
+        retirementAttempt?.publish(Result.success(Unit))
         publication?.publish()
     }
 
@@ -379,7 +411,9 @@ class VoiceAgentTelecomCallRegistry internal constructor(
             if (phase is AttemptPhase.Retiring && phase.connection === connection) {
                 if (cleanupError == null) {
                     publication = terminalizeLocked(id, record, phase.failure)
+                    phase.attempt.publish(Result.success(Unit))
                 } else {
+                    phase.attempt.publish(Result.failure(cleanupError))
                     record.phase = AttemptPhase.RetirementFailed(
                         connection = connection,
                         outcomeFailure = phase.failure,
@@ -468,6 +502,31 @@ class VoiceAgentTelecomCallRegistry internal constructor(
         var outcomeAcknowledged = false
     }
 
+    private class RetirementAttempt {
+        private val completed = CountDownLatch(1)
+        private var result: Result<Unit>? = null
+
+        fun publish(value: Result<Unit>) {
+            check(result == null) { "Telecom retirement attempt already completed" }
+            result = value
+            completed.countDown()
+        }
+
+        fun awaitResult(): Result<Unit> {
+            var interrupted = false
+            while (true) {
+                try {
+                    completed.await()
+                    break
+                } catch (_: InterruptedException) {
+                    interrupted = true
+                }
+            }
+            if (interrupted) Thread.currentThread().interrupt()
+            return requireNotNull(result)
+        }
+    }
+
     private sealed interface AttemptPhase {
         data object Pending : AttemptPhase
 
@@ -478,6 +537,7 @@ class VoiceAgentTelecomCallRegistry internal constructor(
         data class Retiring(
             val connection: VoiceAgentTelecomCall,
             val failure: VoiceAgentTelecomFailure,
+            val attempt: RetirementAttempt,
         ) : AttemptPhase
 
         data class RetirementFailed(

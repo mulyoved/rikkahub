@@ -15,8 +15,10 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicReference
 
 @OptIn(ExperimentalCoroutinesApi::class)
@@ -63,6 +65,77 @@ class VoiceAgentRouteLeaseTest {
         lease.retire()
         assertEquals(2, call.disconnectCalls)
         assertEquals(0, replacementCall.disconnectCalls)
+    }
+
+    @Test
+    fun `lease joins concurrent supersession failure before retrying exact connection`() {
+        val firstFailure = IllegalStateException("first retirement failed")
+        val retirementFailure = AtomicReference<Throwable?>(firstFailure)
+        val disconnectEntered = CountDownLatch(1)
+        val releaseDisconnect = CountDownLatch(1)
+        val leaseRetirementStarted = CountDownLatch(1)
+        val registry = VoiceAgentTelecomCallRegistry()
+        val attempt = registry.beginAttempt()
+        val call = object : VoiceAgentTelecomCall {
+            var disconnectCalls = 0
+
+            override fun disconnectFromApp() {
+                disconnectCalls += 1
+                disconnectEntered.countDown()
+                check(releaseDisconnect.await(1, TimeUnit.SECONDS)) {
+                    "supersession disconnect was not released"
+                }
+                retirementFailure.get()?.let { throw it }
+            }
+        }
+        assertTrue(registry.activate(attempt, call))
+        val lease = TelecomVoiceAgentRouteLease(attempt, registry)
+        val executor = Executors.newFixedThreadPool(2)
+        try {
+            val supersession = executor.submit<Throwable?> {
+                runCatching { registry.beginAttempt() }.exceptionOrNull()
+            }
+            check(disconnectEntered.await(1, TimeUnit.SECONDS)) {
+                "supersession disconnect did not start"
+            }
+            val leaseRetirement = executor.submit<Throwable?> {
+                leaseRetirementStarted.countDown()
+                runCatching(lease::retire).exceptionOrNull()
+            }
+            check(leaseRetirementStarted.await(1, TimeUnit.SECONDS)) {
+                "lease retirement did not start"
+            }
+
+            assertTrue(
+                "lease retirement did not join the supersession disconnect",
+                runCatching { leaseRetirement.get(100, TimeUnit.MILLISECONDS) }
+                    .exceptionOrNull() is TimeoutException,
+            )
+            releaseDisconnect.countDown()
+
+            val supersessionFailure = supersession.get(1, TimeUnit.SECONDS)
+            assertTrue(supersessionFailure is VoiceAgentTelecomAttemptStartException)
+            assertSame(firstFailure, supersessionFailure?.cause)
+            assertSame(firstFailure, leaseRetirement.get(1, TimeUnit.SECONDS))
+            assertEquals(1, call.disconnectCalls)
+            assertFalse(lease.isUsable)
+
+            retirementFailure.set(null)
+            val replacementAttempt = registry.beginAttempt()
+            val replacementCall = RecordingTelecomCall()
+            assertTrue(registry.activate(replacementAttempt, replacementCall))
+
+            lease.retire()
+            assertEquals(2, call.disconnectCalls)
+            assertEquals(0, replacementCall.disconnectCalls)
+
+            lease.retire()
+            assertEquals(2, call.disconnectCalls)
+            assertEquals(0, replacementCall.disconnectCalls)
+        } finally {
+            releaseDisconnect.countDown()
+            executor.shutdownNow()
+        }
     }
 
     @Test
