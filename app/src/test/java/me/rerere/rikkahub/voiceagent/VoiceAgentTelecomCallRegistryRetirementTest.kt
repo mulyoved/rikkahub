@@ -22,7 +22,9 @@ class VoiceAgentTelecomCallRegistryRetirementTest {
         val call = FakeTelecomCall()
         assertTrue(registry.activate(attempt, call))
 
-        val failure = runCatching { registry.retireOwnedAttempt(attempt) }.exceptionOrNull()
+        val failure = runCatching {
+            registry.retireOwnedAttempt(attempt, TelecomVoiceAgentRouteLease(attempt, registry))
+        }.exceptionOrNull()
 
         assertTrue(failure is IllegalStateException)
         assertEquals(0, call.disconnectCalls)

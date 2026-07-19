@@ -272,7 +272,7 @@ class VoiceAgentCallStartupTest {
         val registry = VoiceAgentTelecomCallRegistry(
             afterActivationOutcomeSelected = { _, _ -> },
             beforeFailedRetirementResultPublished = {},
-            beforeActiveOutcomeRetirementJoin = consumptionJoinEntered::countDown,
+            beforeRouteRetirementJoin = consumptionJoinEntered::countDown,
         )
         val previous = VoiceAgentTelecomAttemptId(1)
         val previousCall = StartupBlockingTelecomCall(
@@ -346,7 +346,7 @@ class VoiceAgentCallStartupTest {
         val registry = VoiceAgentTelecomCallRegistry(
             afterActivationOutcomeSelected = { _, _ -> },
             beforeFailedRetirementResultPublished = {},
-            beforeActiveOutcomeRetirementJoin = consumptionJoinEntered::countDown,
+            beforeRouteRetirementJoin = consumptionJoinEntered::countDown,
         )
         val previous = VoiceAgentTelecomAttemptId(1)
         val previousCall = StartupBlockingTelecomCall(
