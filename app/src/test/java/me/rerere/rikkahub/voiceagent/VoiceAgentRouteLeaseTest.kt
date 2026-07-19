@@ -19,6 +19,7 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 
 @OptIn(ExperimentalCoroutinesApi::class)
@@ -43,9 +44,24 @@ class VoiceAgentRouteLeaseTest {
     fun `failed exact Telecom retirement can retry same connection`() {
         val firstFailure = IllegalStateException("first retirement failed")
         val retirementFailure = AtomicReference<Throwable?>(firstFailure)
+        val retryEntered = CountDownLatch(1)
+        val releaseRetry = CountDownLatch(1)
         val registry = VoiceAgentTelecomCallRegistry()
         val attempt = registry.beginAttempt()
-        val call = RecordingTelecomCall(retirementFailure = retirementFailure)
+        val call = object : VoiceAgentTelecomCall {
+            var disconnectCalls = 0
+
+            override fun disconnectFromApp() {
+                disconnectCalls += 1
+                if (disconnectCalls == 2) {
+                    retryEntered.countDown()
+                    check(releaseRetry.await(1, TimeUnit.SECONDS)) {
+                        "retry disconnect was not released"
+                    }
+                }
+                retirementFailure.get()?.let { throw it }
+            }
+        }
         assertTrue(registry.activate(attempt, call))
         val lease = TelecomVoiceAgentRouteLease(attempt, registry)
 
@@ -57,14 +73,26 @@ class VoiceAgentRouteLeaseTest {
         val replacementCall = RecordingTelecomCall()
         assertTrue(registry.activate(replacementAttempt, replacementCall))
         retirementFailure.set(null)
+        val executor = Executors.newFixedThreadPool(2)
+        try {
+            val retry = executor.submit { lease.retire() }
+            check(retryEntered.await(1, TimeUnit.SECONDS)) {
+                "retry disconnect did not start"
+            }
 
-        lease.retire()
-        assertEquals(2, call.disconnectCalls)
-        assertEquals(0, replacementCall.disconnectCalls)
+            assertFalse(lease.isUsable)
+            releaseRetry.countDown()
+            retry.get(1, TimeUnit.SECONDS)
+            assertEquals(2, call.disconnectCalls)
+            assertEquals(0, replacementCall.disconnectCalls)
 
-        lease.retire()
-        assertEquals(2, call.disconnectCalls)
-        assertEquals(0, replacementCall.disconnectCalls)
+            lease.retire()
+            assertEquals(2, call.disconnectCalls)
+            assertEquals(0, replacementCall.disconnectCalls)
+        } finally {
+            releaseRetry.countDown()
+            executor.shutdownNow()
+        }
     }
 
     @Test
@@ -74,6 +102,8 @@ class VoiceAgentRouteLeaseTest {
         val disconnectEntered = CountDownLatch(1)
         val releaseDisconnect = CountDownLatch(1)
         val leaseRetirementStarted = CountDownLatch(1)
+        val leaseRetirementThread = AtomicReference<Thread>()
+        val leaseRetirementInterrupted = AtomicBoolean()
         val registry = VoiceAgentTelecomCallRegistry()
         val attempt = registry.beginAttempt()
         val call = object : VoiceAgentTelecomCall {
@@ -99,8 +129,11 @@ class VoiceAgentRouteLeaseTest {
                 "supersession disconnect did not start"
             }
             val leaseRetirement = executor.submit<Throwable?> {
+                leaseRetirementThread.set(Thread.currentThread())
                 leaseRetirementStarted.countDown()
-                runCatching(lease::retire).exceptionOrNull()
+                val failure = runCatching(lease::retire).exceptionOrNull()
+                leaseRetirementInterrupted.set(Thread.currentThread().isInterrupted)
+                failure
             }
             check(leaseRetirementStarted.await(1, TimeUnit.SECONDS)) {
                 "lease retirement did not start"
@@ -108,6 +141,12 @@ class VoiceAgentRouteLeaseTest {
 
             assertTrue(
                 "lease retirement did not join the supersession disconnect",
+                runCatching { leaseRetirement.get(100, TimeUnit.MILLISECONDS) }
+                    .exceptionOrNull() is TimeoutException,
+            )
+            leaseRetirementThread.get().interrupt()
+            assertTrue(
+                "interrupted lease retirement returned before the supersession result",
                 runCatching { leaseRetirement.get(100, TimeUnit.MILLISECONDS) }
                     .exceptionOrNull() is TimeoutException,
             )
@@ -119,6 +158,7 @@ class VoiceAgentRouteLeaseTest {
             assertSame(firstFailure, leaseRetirement.get(1, TimeUnit.SECONDS))
             assertEquals(1, call.disconnectCalls)
             assertFalse(lease.isUsable)
+            assertTrue(leaseRetirementInterrupted.get())
 
             retirementFailure.set(null)
             val replacementAttempt = registry.beginAttempt()

@@ -378,6 +378,10 @@ class VoiceAgentTelecomCallRegistry internal constructor(
     }
 
     fun clear(connection: VoiceAgentTelecomCall) {
+        retired(connection, Result.success(Unit))
+    }
+
+    fun retired(connection: VoiceAgentTelecomCall, result: Result<Unit>) {
         var publication: OutcomePublication? = null
         var retirementAttempt: RetirementAttempt? = null
         synchronized(lock) {
@@ -389,7 +393,8 @@ class VoiceAgentTelecomCallRegistry internal constructor(
             ) {
                 return@synchronized
             }
-            val failure = when (val phase = record.phase) {
+            val phase = record.phase
+            val failure = when (phase) {
                 is AttemptPhase.Activating -> disconnectedFailure(duringActivation = true)
                 is AttemptPhase.Active -> disconnectedFailure(duringActivation = false)
                 is AttemptPhase.Retiring -> {
@@ -401,9 +406,22 @@ class VoiceAgentTelecomCallRegistry internal constructor(
                 is AttemptPhase.Failed,
                 -> return
             }
-            publication = terminalizeLocked(id, record, failure)
+            val cleanupError = result.exceptionOrNull()
+            if (cleanupError == null) {
+                publication = terminalizeLocked(id, record, failure)
+            } else {
+                retirementAttempt?.publish(result)
+                record.phase = AttemptPhase.RetirementFailed(
+                    connection = connection,
+                    outcomeFailure = failure,
+                    cleanupError = cleanupError,
+                )
+                if (currentAttemptId == id) currentAttemptId = null
+            }
         }
-        retirementAttempt?.publish(Result.success(Unit))
+        if (result.isSuccess) {
+            retirementAttempt?.publish(result)
+        }
         publication?.publish()
     }
 

@@ -10,23 +10,59 @@ import android.telecom.CallEndpointException
 import android.telecom.Connection
 import android.telecom.DisconnectCause
 import androidx.annotation.RequiresApi
+import java.util.concurrent.Executor
 
-class VoiceAgentTelecomConnection(
-    private val context: Context,
+class VoiceAgentTelecomConnection private constructor(
+    private val onCallEndRequested: () -> Unit,
+    private val endpointRequestExecutor: Executor,
     onRetiring: (VoiceAgentTelecomConnection) -> Unit,
-    onRetired: (VoiceAgentTelecomConnection) -> Unit,
+    private val retirementSetDisconnected: ((DisconnectCause) -> Unit)?,
+    private val retirementDestroy: (() -> Unit)?,
+    onRetired: (VoiceAgentTelecomConnection, Result<Unit>) -> Unit,
 ) : Connection(), VoiceAgentTelecomCall {
+    constructor(
+        context: Context,
+        onRetiring: (VoiceAgentTelecomConnection) -> Unit,
+        onRetired: (VoiceAgentTelecomConnection, Result<Unit>) -> Unit,
+    ) : this(
+        onCallEndRequested = { context.startService(voiceAgentCallEndIntent(context)) },
+        endpointRequestExecutor = context.mainExecutor,
+        onRetiring = onRetiring,
+        retirementSetDisconnected = null,
+        retirementDestroy = null,
+        onRetired = onRetired,
+    )
+
+    internal constructor(
+        onCallEndRequested: () -> Unit,
+        onRetiring: () -> Unit,
+        setDisconnected: (DisconnectCause) -> Unit,
+        destroy: () -> Unit,
+        onRetired: (Result<Unit>) -> Unit,
+    ) : this(
+        onCallEndRequested = onCallEndRequested,
+        endpointRequestExecutor = Executor(Runnable::run),
+        onRetiring = { onRetiring() },
+        retirementSetDisconnected = setDisconnected,
+        retirementDestroy = destroy,
+        onRetired = { _, result -> onRetired(result) },
+    )
+
     private var requestedBluetoothEndpointId: ParcelUuid? = null
     private var requestedLegacyBluetoothRoute = false
-    private val retirement = VoiceAgentTelecomRetirement(
+    private val retirement = VoiceAgentTelecomRetirement<DisconnectCause>(
         onRetiring = { onRetiring(this) },
-        setDisconnected = ::setDisconnected,
-        destroy = ::destroy,
-        onRetired = { onRetired(this) },
+        setDisconnected = { cause ->
+            retirementSetDisconnected?.invoke(cause) ?: setDisconnected(cause)
+        },
+        destroy = {
+            retirementDestroy?.invoke() ?: destroy()
+        },
+        onRetired = { result -> onRetired(this, result) },
     )
 
     override fun onDisconnect() {
-        context.startService(voiceAgentCallEndIntent(context))
+        onCallEndRequested()
         disconnect(cause = DisconnectCause(DisconnectCause.LOCAL))
     }
 
@@ -57,7 +93,7 @@ class VoiceAgentTelecomConnection(
         requestedBluetoothEndpointId = endpoint.identifier
         requestCallEndpointChange(
             endpoint,
-            context.mainExecutor,
+            endpointRequestExecutor,
             object : OutcomeReceiver<Void?, CallEndpointException> {
                 override fun onResult(result: Void?) {
                     VoiceAgentLog.d(TAG, "Bluetooth call endpoint request accepted endpoint=${endpoint.safeLabel()}")
@@ -168,17 +204,22 @@ internal class VoiceAgentTelecomRetirement<Cause>(
     private val onRetiring: () -> Unit,
     private val setDisconnected: (Cause) -> Unit,
     private val destroy: () -> Unit,
-    private val onRetired: () -> Unit,
+    private val onRetired: (Result<Unit>) -> Unit,
 ) {
     private val retirement = RetirementBarrier()
 
     fun retire(cause: Cause) {
         retirement.retire {
+            val cleanupResult = runCatching {
+                runVoiceAgentCleanupStages(
+                    onRetiring,
+                    { setDisconnected(cause) },
+                    destroy,
+                )
+            }
             runVoiceAgentCleanupStages(
-                onRetiring,
-                { setDisconnected(cause) },
-                destroy,
-                onRetired,
+                { cleanupResult.getOrThrow() },
+                { onRetired(cleanupResult) },
             )
         }
     }

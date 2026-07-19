@@ -19,6 +19,48 @@ import org.junit.Test
 
 class VoiceAgentTelecomRetirementTest {
     @Test
+    fun `framework onDisconnect retains captured failure for later exact lease retry`() = runBlocking {
+        val firstFailure = IllegalStateException("framework disconnect failed")
+        val registry = VoiceAgentTelecomCallRegistry()
+        val attempt = registry.beginAttempt()
+        lateinit var registeredCall: VoiceAgentTelecomCall
+        val connection = VoiceAgentTelecomConnection(
+            onCallEndRequested = {},
+            onRetiring = { registry.retiring(registeredCall) },
+            setDisconnected = { throw firstFailure },
+            destroy = {},
+            onRetired = { result -> registry.retired(registeredCall, result) },
+        )
+        val appDisconnectCalls = AtomicInteger()
+        registeredCall = object : VoiceAgentTelecomCall {
+            override fun disconnectFromApp() {
+                appDisconnectCalls.incrementAndGet()
+                connection.disconnectFromApp()
+            }
+        }
+        assertEquals(true, registry.activate(attempt, registeredCall))
+        assertEquals(VoiceAgentTelecomOutcome.Active, registry.awaitOutcome(attempt))
+        val lease = TelecomVoiceAgentRouteLease(attempt, registry)
+
+        assertSame(firstFailure, runCatching(connection::onDisconnect).exceptionOrNull())
+        assertFalse(lease.isUsable)
+
+        val replacementAttempt = registry.beginAttempt()
+        val replacementDisconnects = AtomicInteger()
+        val replacement = object : VoiceAgentTelecomCall {
+            override fun disconnectFromApp() {
+                replacementDisconnects.incrementAndGet()
+            }
+        }
+        assertEquals(true, registry.activate(replacementAttempt, replacement))
+
+        assertSame(firstFailure, runCatching(lease::retire).exceptionOrNull())
+        assertEquals(1, appDisconnectCalls.get())
+        assertEquals(0, replacementDisconnects.get())
+        assertFalse(lease.isUsable)
+    }
+
+    @Test
     fun `production callback ordering retains synchronous disconnect failure for exact retry`() = runBlocking {
         val firstFailure = IllegalStateException("framework disconnect failed")
         val disconnectFailure = AtomicReference<Throwable?>(firstFailure)
@@ -107,7 +149,7 @@ class VoiceAgentTelecomRetirementTest {
             onRetiring = { events += "retiring" },
             setDisconnected = { events += "setDisconnected:$it" },
             destroy = { events += "destroy" },
-            onRetired = { events += "callback" },
+            onRetired = { _ -> events += "callback" },
         )
 
         retirement.retire("external")
@@ -126,7 +168,7 @@ class VoiceAgentTelecomRetirementTest {
                 error("framework failure")
             },
             destroy = { events += "destroy" },
-            onRetired = { events += "callback" },
+            onRetired = { _ -> events += "callback" },
         )
 
         runCatching { retirement.retire(Unit) }
@@ -155,7 +197,7 @@ class VoiceAgentTelecomRetirementTest {
                 events += "destroy"
                 throw destroyFailure
             },
-            onRetired = {
+            onRetired = { _ ->
                 events += "retired"
                 throw retiredFailure
             },
@@ -193,9 +235,9 @@ class VoiceAgentTelecomRetirementTest {
                 releaseFrameworkRetirement.await()
             },
             destroy = { events += "destroy" },
-            onRetired = {
+            onRetired = { result ->
                 events += "callback"
-                registry.clear(call)
+                registry.retired(call, result)
             },
         )
         call = object : VoiceAgentTelecomCall {
