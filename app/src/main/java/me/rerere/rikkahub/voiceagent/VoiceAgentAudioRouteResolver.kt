@@ -83,9 +83,17 @@ class VoiceAgentAudioRouteResolver internal constructor(
             currentCoroutineContext().ensureActive()
         }.exceptionOrNull() as? CancellationException
         if (cancellation != null) {
-            result.exceptionOrNull()?.let { cancellation.addSuppressedDistinct(it) }
+            val beginFailure = result.exceptionOrNull()
+            beginFailure?.let { cancellation.addSuppressedDistinct(it) }
             result.getOrNull()?.let { attempt ->
                 cleanupCancelledAttempt(attempt, cancellation)
+            }
+            (beginFailure as? VoiceAgentTelecomAttemptStartException)?.let { startFailure ->
+                withContext(NonCancellable) {
+                    runCatching {
+                        registry.awaitOutcome(startFailure.attemptId)
+                    }.exceptionOrNull()?.let { cancellation.addSuppressedDistinct(it) }
+                }
             }
             throw cancellation
         }

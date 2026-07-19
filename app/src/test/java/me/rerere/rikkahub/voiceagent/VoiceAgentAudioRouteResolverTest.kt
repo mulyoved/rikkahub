@@ -292,6 +292,81 @@ class VoiceAgentAudioRouteResolverTest {
     }
 
     @Test
+    fun `canceled allocated begin consumes terminal start failure attempt`() = runBlocking {
+        val cleanupFailure = IllegalStateException("allocated predecessor cleanup failed")
+        val cleanupFailureRef = AtomicReference<Throwable?>(cleanupFailure)
+        val cleanupEntered = CountDownLatch(1)
+        val releaseCleanup = CountDownLatch(1)
+        val registry = VoiceAgentTelecomCallRegistry()
+        val previous = registry.beginAttempt()
+        val previousCall = CallbackFaithfulResolverCall(
+            registry = registry,
+            cleanupFailure = cleanupFailureRef,
+            onCleanup = {
+                cleanupEntered.countDown()
+                check(releaseCleanup.await(5, TimeUnit.SECONDS)) {
+                    "allocated predecessor cleanup was not released"
+                }
+            },
+        )
+        assertTrue(registry.activate(previous, previousCall))
+        assertEquals(VoiceAgentTelecomOutcome.Active, registry.awaitOutcome(previous))
+        val previousLease = registry.claimRouteLease(previous)
+        val resolverExecutor = Executors.newSingleThreadExecutor()
+        val resolverDispatcher = resolverExecutor.asCoroutineDispatcher()
+        val gateway = FakeTelecomGateway()
+        val observedFailure = AtomicReference<Throwable>()
+        val resolutionReturned = CountDownLatch(1)
+
+        try {
+            val resolution = async(resolverDispatcher) {
+                try {
+                    VoiceAgentAudioRouteResolver(gateway, registry, 1_000).resolve()
+                } catch (error: Throwable) {
+                    observedFailure.set(error)
+                    throw error
+                } finally {
+                    resolutionReturned.countDown()
+                }
+            }
+            check(cleanupEntered.await(1, TimeUnit.SECONDS)) {
+                "allocated predecessor cleanup did not start"
+            }
+            val cancellation = CancellationException("cancel allocated begin")
+
+            resolution.cancel(cancellation)
+            releaseCleanup.countDown()
+
+            assertTrue(resolutionReturned.await(1, TimeUnit.SECONDS))
+            val thrown = observedFailure.get()
+            assertTrue(thrown is CancellationException)
+            assertEquals(cancellation.message, thrown.message)
+            assertEquals(1, thrown.suppressed.size)
+            val startFailure = thrown.suppressed.single()
+            assertTrue(startFailure is VoiceAgentTelecomAttemptStartException)
+            assertSame(cleanupFailure, startFailure.cause)
+            val allocatedAttempt = (startFailure as VoiceAgentTelecomAttemptStartException).attemptId
+            assertEquals(previous.value + 1, allocatedAttempt.value)
+            assertEquals(null, registry.awaitOutcomeIfPresent(allocatedAttempt))
+            assertEquals(1, previousCall.disconnectCalls.get())
+            assertEquals(0, gateway.registerCalls)
+            assertEquals(0, gateway.startCalls)
+
+            val next = registry.beginAttempt()
+            assertEquals(allocatedAttempt.value + 1, next.value)
+            registry.retireAttempt(next, VoiceAgentTelecomFailure("test_cleanup", "test cleanup"))
+            registry.awaitOutcome(next)
+        } finally {
+            releaseCleanup.countDown()
+            cleanupFailureRef.set(null)
+            previousLease.retire()
+            resolverDispatcher.close()
+            resolverExecutor.shutdownNow()
+        }
+        Unit
+    }
+
+    @Test
     fun `ConnectionService rejection is preserved`() = runBlocking {
         val registry = VoiceAgentTelecomCallRegistry()
         val gateway = FakeTelecomGateway(onStart = { id ->
