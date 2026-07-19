@@ -96,29 +96,120 @@ class VoiceAgentAudioRouteResolverTest {
     }
 
     @Test
-    fun `throwing previous-call supersession returns contained fallback and consumes replacement`() = runBlocking {
+    fun `throwing pre-lease supersession stays owned ahead of replacement allocation`() = runBlocking {
+        val cleanupFailure = AtomicReference<Throwable?>(
+            IllegalStateException("framework retirement failed"),
+        )
         val registry = VoiceAgentTelecomCallRegistry()
         val previous = registry.beginAttempt()
-        val previousCall = ThrowingResolverCall()
+        val previousCall = CallbackFaithfulResolverCall(registry, cleanupFailure)
         registry.activate(previous, previousCall)
         registry.awaitOutcome(previous)
         val gateway = FakeTelecomGateway()
 
-        val lease = VoiceAgentAudioRouteResolver(gateway, registry, 100).resolve()
+        val failure = runCatching {
+            VoiceAgentAudioRouteResolver(gateway, registry, 100).resolve()
+        }.exceptionOrNull()
 
-        assertEquals(VoiceAudioRouteOwner.DirectFallback, lease.metadata.owner)
-        assertEquals(
-            VoiceAgentTelecomFailure(
-                diagnosticName = "telecom_supersession_cleanup_failed",
-                detail = "framework retirement failed",
-            ),
-            lease.metadata.failure,
-        )
+        assertSame(cleanupFailure.get(), failure)
         assertEquals(0, gateway.registerCalls)
         assertEquals(0, gateway.startCalls)
-        assertEquals(1, previousCall.disconnectCalls)
+        assertEquals(1, previousCall.disconnectCalls.get())
         assertFalse(registry.isOwnedAttemptActive(previous))
         assertFalse(registry.isOwnedAttemptActive(VoiceAgentTelecomAttemptId(previous.value + 1)))
+
+        cleanupFailure.set(null)
+        val replacementCall = ResolverFakeCall()
+        val replacementGateway = FakeTelecomGateway(onStart = { attempt ->
+            assertEquals(previous.value + 1, attempt.value)
+            assertTrue(registry.activate(attempt, replacementCall))
+        })
+
+        val lease = VoiceAgentAudioRouteResolver(replacementGateway, registry, 100).resolve()
+
+        assertEquals(VoiceAudioRouteOwner.Telecom, lease.metadata.owner)
+        assertEquals(2, previousCall.disconnectCalls.get())
+        assertEquals(1, replacementGateway.registerCalls)
+        assertEquals(1, replacementGateway.startCalls)
+        assertEquals(0, replacementCall.disconnectCalls)
+        lease.retire()
+    }
+
+    @Test
+    fun `begin joins concurrent pre-lease retirement before allocating replacement`() = runBlocking {
+        val cleanupFailure = IllegalStateException("concurrent predecessor cleanup failed")
+        val cleanupFailureRef = AtomicReference<Throwable?>(cleanupFailure)
+        val cleanupEntered = CountDownLatch(1)
+        val releaseCleanup = CountDownLatch(1)
+        val registry = VoiceAgentTelecomCallRegistry()
+        val previous = registry.beginAttempt()
+        val previousCall = CallbackFaithfulResolverCall(
+            registry = registry,
+            cleanupFailure = cleanupFailureRef,
+            onCleanup = {
+                cleanupEntered.countDown()
+                check(releaseCleanup.await(1, TimeUnit.SECONDS)) {
+                    "concurrent predecessor cleanup was not released"
+                }
+            },
+        )
+        assertTrue(registry.activate(previous, previousCall))
+        registry.awaitOutcome(previous)
+        val executor = Executors.newFixedThreadPool(2)
+
+        try {
+            val retirement = executor.submit<Throwable?> {
+                runCatching {
+                    registry.retireAttempt(
+                        previous,
+                        VoiceAgentTelecomFailure(
+                            diagnosticName = "telecom_resolution_cancelled",
+                            detail = "concurrent cancellation",
+                        ),
+                    )
+                }.exceptionOrNull()
+            }
+            check(cleanupEntered.await(1, TimeUnit.SECONDS)) {
+                "concurrent predecessor cleanup did not start"
+            }
+            val beginThread = AtomicReference<Thread>()
+            val begin = executor.submit<Throwable?> {
+                beginThread.set(Thread.currentThread())
+                runCatching { registry.beginAttempt() }.exceptionOrNull()
+            }
+
+            val joinDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(1)
+            while (beginThread.get()?.state != Thread.State.WAITING) {
+                check(System.nanoTime() < joinDeadline) {
+                    "begin caller did not join concurrent predecessor cleanup"
+                }
+                Thread.yield()
+            }
+            assertFalse(begin.isDone)
+            releaseCleanup.countDown()
+
+            assertSame(cleanupFailure, retirement.get(1, TimeUnit.SECONDS))
+            assertSame(cleanupFailure, begin.get(1, TimeUnit.SECONDS))
+            assertEquals(1, previousCall.disconnectCalls.get())
+            assertFalse(registry.isOwnedAttemptActive(VoiceAgentTelecomAttemptId(previous.value + 1)))
+
+            cleanupFailureRef.set(null)
+            val replacementCall = ResolverFakeCall()
+            val gateway = FakeTelecomGateway(onStart = { attempt ->
+                assertEquals(previous.value + 1, attempt.value)
+                assertTrue(registry.activate(attempt, replacementCall))
+            })
+            val lease = VoiceAgentAudioRouteResolver(gateway, registry, 100).resolve()
+
+            assertEquals(VoiceAudioRouteOwner.Telecom, lease.metadata.owner)
+            assertEquals(2, previousCall.disconnectCalls.get())
+            assertEquals(1, gateway.registerCalls)
+            assertEquals(1, gateway.startCalls)
+            lease.retire()
+        } finally {
+            releaseCleanup.countDown()
+            executor.shutdownNow()
+        }
     }
 
     @Test
