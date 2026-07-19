@@ -13,6 +13,7 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeoutOrNull
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -41,6 +42,35 @@ class VoiceAgentTelecomCallRegistryTest {
         assertEquals(1, call.disconnectCalls)
         assertFalse(registry.isOwnedAttemptActive(attempt))
         assertAttemptWasConsumed(registry, attempt)
+    }
+
+    @Test
+    fun `failed exact Telecom retirement can retry same connection`() {
+        val firstFailure = IllegalStateException("first retirement failed")
+        val retirementFailure = AtomicReference<Throwable?>(firstFailure)
+        val registry = VoiceAgentTelecomCallRegistry()
+        val attempt = registry.beginAttempt()
+        val call = FakeTelecomCall {
+            retirementFailure.get()?.let { failure -> throw failure }
+        }
+        assertTrue(registry.activate(attempt, call))
+
+        assertSame(firstFailure, runCatching { registry.retireOwnedAttempt(attempt) }.exceptionOrNull())
+        assertEquals(1, call.disconnectCalls)
+        assertFalse(registry.isOwnedAttemptActive(attempt))
+
+        val replacementAttempt = registry.beginAttempt()
+        val replacementCall = FakeTelecomCall()
+        assertTrue(registry.activate(replacementAttempt, replacementCall))
+        retirementFailure.set(null)
+
+        registry.retireOwnedAttempt(attempt)
+        assertEquals(2, call.disconnectCalls)
+        assertEquals(0, replacementCall.disconnectCalls)
+
+        registry.retireOwnedAttempt(attempt)
+        assertEquals(2, call.disconnectCalls)
+        assertEquals(0, replacementCall.disconnectCalls)
     }
 
     @Test

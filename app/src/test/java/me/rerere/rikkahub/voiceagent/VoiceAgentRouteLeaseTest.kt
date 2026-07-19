@@ -17,6 +17,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class VoiceAgentRouteLeaseTest {
@@ -34,6 +35,34 @@ class VoiceAgentRouteLeaseTest {
         assertEquals(VoiceAgentRouteMetadata(VoiceAudioRouteOwner.Telecom), lease.metadata)
         assertEquals(1, call.disconnectCalls)
         assertFalse(registry.isOwnedAttemptActive(attempt))
+    }
+
+    @Test
+    fun `failed exact Telecom retirement can retry same connection`() {
+        val firstFailure = IllegalStateException("first retirement failed")
+        val retirementFailure = AtomicReference<Throwable?>(firstFailure)
+        val registry = VoiceAgentTelecomCallRegistry()
+        val attempt = registry.beginAttempt()
+        val call = RecordingTelecomCall(retirementFailure = retirementFailure)
+        assertTrue(registry.activate(attempt, call))
+        val lease = TelecomVoiceAgentRouteLease(attempt, registry)
+
+        assertSame(firstFailure, runCatching(lease::retire).exceptionOrNull())
+        assertEquals(1, call.disconnectCalls)
+        assertFalse(lease.isUsable)
+
+        val replacementAttempt = registry.beginAttempt()
+        val replacementCall = RecordingTelecomCall()
+        assertTrue(registry.activate(replacementAttempt, replacementCall))
+        retirementFailure.set(null)
+
+        lease.retire()
+        assertEquals(2, call.disconnectCalls)
+        assertEquals(0, replacementCall.disconnectCalls)
+
+        lease.retire()
+        assertEquals(2, call.disconnectCalls)
+        assertEquals(0, replacementCall.disconnectCalls)
     }
 
     @Test
@@ -534,14 +563,19 @@ class VoiceAgentRouteLeaseTest {
 
 private class RecordingTelecomCall(
     private val events: MutableList<String>? = null,
-    private val retirementFailure: Throwable? = null,
+    private val retirementFailure: AtomicReference<Throwable?>,
 ) : VoiceAgentTelecomCall {
+    constructor(
+        events: MutableList<String>? = null,
+        retirementFailure: Throwable? = null,
+    ) : this(events, AtomicReference(retirementFailure))
+
     var disconnectCalls = 0
 
     override fun disconnectFromApp() {
         disconnectCalls += 1
         events?.add("route-retire")
-        retirementFailure?.let { throw it }
+        retirementFailure.get()?.let { throw it }
     }
 }
 

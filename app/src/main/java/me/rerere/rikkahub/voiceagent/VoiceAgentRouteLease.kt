@@ -17,7 +17,7 @@ internal class TelecomVoiceAgentRouteLease(
     private val attemptId: VoiceAgentTelecomAttemptId,
     private val registry: VoiceAgentTelecomCallRegistry,
 ) : VoiceAgentRouteLease {
-    private val retirement = RetirementBarrier()
+    private val retirement = RetryableRetirement()
 
     override val metadata = VoiceAgentRouteMetadata(VoiceAudioRouteOwner.Telecom)
     override val isUsable: Boolean
