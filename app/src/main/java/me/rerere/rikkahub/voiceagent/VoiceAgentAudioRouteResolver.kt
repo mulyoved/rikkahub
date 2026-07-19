@@ -38,8 +38,11 @@ class VoiceAgentAudioRouteResolver internal constructor(
             val outcome = withContext(NonCancellable) {
                 registry.awaitOutcome(error.attemptId)
             }
-            val failure = (outcome as VoiceAgentTelecomOutcome.Failed).failure
-            return DirectFallbackVoiceAgentRouteLease(failure)
+            return when (outcome) {
+                VoiceAgentTelecomOutcome.Active -> registry.claimRouteLease(error.attemptId)
+                is VoiceAgentTelecomOutcome.Failed -> DirectFallbackVoiceAgentRouteLease(outcome.failure)
+                is VoiceAgentTelecomOutcome.CleanupFailed -> throw outcome.cleanupError
+            }
         }
         try {
             gateway.register().exceptionOrNull()?.let {
@@ -50,12 +53,15 @@ class VoiceAgentAudioRouteResolver internal constructor(
             }
             return when (val outcome = outcomeTimeout.awaitOutcome(timeoutMs) { registry.observeOutcome(attempt) }) {
                 VoiceAgentTelecomOutcome.Active -> {
-                    registry.acknowledgeOutcome(attempt)
-                    TelecomVoiceAgentRouteLease(attempt, registry)
+                    registry.claimRouteLease(attempt)
                 }
                 is VoiceAgentTelecomOutcome.Failed -> {
                     registry.acknowledgeOutcome(attempt)
                     DirectFallbackVoiceAgentRouteLease(outcome.failure)
+                }
+                is VoiceAgentTelecomOutcome.CleanupFailed -> {
+                    registry.acknowledgeOutcome(attempt)
+                    throw outcome.cleanupError
                 }
                 null -> fallback(
                     attempt,
@@ -95,8 +101,9 @@ class VoiceAgentAudioRouteResolver internal constructor(
             registry.awaitOutcome(attempt)
         }
         return when (retired) {
-            VoiceAgentTelecomOutcome.Active -> TelecomVoiceAgentRouteLease(attempt, registry)
+            VoiceAgentTelecomOutcome.Active -> registry.claimRouteLease(attempt)
             is VoiceAgentTelecomOutcome.Failed -> DirectFallbackVoiceAgentRouteLease(retired.failure)
+            is VoiceAgentTelecomOutcome.CleanupFailed -> throw retired.cleanupError
         }
     }
 }

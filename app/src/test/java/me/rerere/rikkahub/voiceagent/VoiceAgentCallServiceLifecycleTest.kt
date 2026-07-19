@@ -467,7 +467,7 @@ internal class LifecycleTelecomRoute(
     init {
         check(registry.activate(attempt, call))
         registry.acknowledgeOutcome(attempt)
-        lease = TelecomVoiceAgentRouteLease(attempt, registry)
+        lease = registry.claimRouteLease(attempt)
     }
 
     fun activateReplacement(): LifecycleTelecomReplacement {
