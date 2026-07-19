@@ -63,7 +63,7 @@ class VoiceAgentTelecomConnection private constructor(
 
     override fun onDisconnect() {
         onCallEndRequested()
-        disconnect(cause = DisconnectCause(DisconnectCause.LOCAL))
+        retirement.retire(cause = DisconnectCause(DisconnectCause.LOCAL))
     }
 
     override fun onAvailableCallEndpointsChanged(availableEndpoints: List<CallEndpoint>) {
@@ -130,11 +130,7 @@ class VoiceAgentTelecomConnection private constructor(
     }
 
     override fun disconnectFromApp() {
-        disconnect(cause = DisconnectCause(DisconnectCause.LOCAL))
-    }
-
-    private fun disconnect(cause: DisconnectCause) {
-        retirement.retire(cause)
+        retirement.retryFromRoute(cause = DisconnectCause(DisconnectCause.LOCAL))
     }
 
     @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
@@ -206,21 +202,70 @@ internal class VoiceAgentTelecomRetirement<Cause>(
     private val destroy: () -> Unit,
     private val onRetired: (Result<Unit>) -> Unit,
 ) {
-    private val retirement = RetryableRetirement()
+    private val lock = Any()
+    private var activeAttempt: Attempt? = null
+    private var terminalResult: Result<Unit>? = null
 
     fun retire(cause: Cause) {
-        retirement.retire {
-            val cleanupResult = runCatching {
-                runVoiceAgentCleanupStages(
-                    onRetiring,
-                    { setDisconnected(cause) },
-                    destroy,
-                )
+        retire(cause, retryAfterFailure = false)
+    }
+
+    fun retryFromRoute(cause: Cause) {
+        retire(cause, retryAfterFailure = true)
+    }
+
+    private fun retire(cause: Cause, retryAfterFailure: Boolean) {
+        val currentThread = Thread.currentThread()
+        val attempt = synchronized(lock) {
+            terminalResult?.let { result ->
+                if (result.isSuccess || !retryAfterFailure) {
+                    result.getOrThrow()
+                    return
+                }
             }
+            activeAttempt?.also { currentAttempt ->
+                if (currentAttempt.ownerThread === currentThread) return
+            } ?: Attempt().also { newAttempt ->
+                activeAttempt = newAttempt
+            }
+        }
+
+        val result = runCatching {
+            attempt.retirement.retire {
+                attempt.ownerThread = currentThread
+                try {
+                    runCleanup(cause)
+                } finally {
+                    attempt.ownerThread = null
+                }
+            }
+        }
+        synchronized(lock) {
+            if (activeAttempt === attempt) {
+                terminalResult = result
+                activeAttempt = null
+            }
+        }
+        result.getOrThrow()
+    }
+
+    private fun runCleanup(cause: Cause) {
+        val cleanupResult = runCatching {
             runVoiceAgentCleanupStages(
-                { cleanupResult.getOrThrow() },
-                { onRetired(cleanupResult) },
+                onRetiring,
+                { setDisconnected(cause) },
+                destroy,
             )
         }
+        runVoiceAgentCleanupStages(
+            { cleanupResult.getOrThrow() },
+            { onRetired(cleanupResult) },
+        )
+    }
+
+    private class Attempt {
+        @Volatile
+        var ownerThread: Thread? = null
+        val retirement = RetirementBarrier()
     }
 }

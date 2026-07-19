@@ -19,7 +19,7 @@ import org.junit.Test
 
 class VoiceAgentTelecomRetirementTest {
     @Test
-    fun `framework onDisconnect fail once can succeed on later exact lease retry`() = runBlocking {
+    fun `framework onDisconnect cannot reopen failure before exact lease retry succeeds`() = runBlocking {
         val firstFailure = IllegalStateException("framework disconnect failed")
         val frameworkFailure = AtomicReference<Throwable?>(firstFailure)
         val callEndRequests = AtomicInteger()
@@ -54,6 +54,11 @@ class VoiceAgentTelecomRetirementTest {
         assertEquals(1, setDisconnectedCalls.get())
         assertEquals(1, destroyCalls.get())
         assertFalse(lease.isUsable)
+
+        assertSame(firstFailure, runCatching(connection::onDisconnect).exceptionOrNull())
+        assertEquals(2, callEndRequests.get())
+        assertEquals(1, setDisconnectedCalls.get())
+        assertEquals(1, destroyCalls.get())
 
         val replacementAttempt = registry.beginAttempt()
         val replacementDisconnects = AtomicInteger()
@@ -259,7 +264,7 @@ class VoiceAgentTelecomRetirementTest {
             override fun disconnectFromApp() {
                 appRetirementRequests.incrementAndGet()
                 appRetirementRequested.countDown()
-                retirement.retire("app")
+                retirement.retryFromRoute("app")
             }
         }
         val outcome = async(Dispatchers.Default, start = CoroutineStart.UNDISPATCHED) {
