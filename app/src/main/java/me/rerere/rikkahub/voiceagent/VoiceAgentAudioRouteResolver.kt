@@ -2,6 +2,8 @@ package me.rerere.rikkahub.voiceagent
 
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 
@@ -33,7 +35,7 @@ class VoiceAgentAudioRouteResolver internal constructor(
 
     suspend fun resolve(): VoiceAgentRouteLease {
         val attempt = try {
-            registry.beginAttempt()
+            beginAttemptRespectingCancellation()
         } catch (error: VoiceAgentTelecomAttemptStartException) {
             val outcome = withContext(NonCancellable) {
                 registry.awaitOutcome(error.attemptId)
@@ -70,23 +72,45 @@ class VoiceAgentAudioRouteResolver internal constructor(
                 )
             }
         } catch (cancellation: CancellationException) {
-            withContext(NonCancellable) {
-                val retirementError = runCatching {
-                    registry.retireAttempt(
-                        attempt,
-                        VoiceAgentTelecomFailure(
-                            diagnosticName = "telecom_resolution_cancelled",
-                            detail = cancellation.message ?: cancellation.javaClass.simpleName,
-                        ),
-                    )
-                }.exceptionOrNull()
-                val acknowledgementError = runCatching {
-                    registry.awaitOutcome(attempt)
-                }.exceptionOrNull()
-                retirementError?.let(cancellation::addSuppressed)
-                acknowledgementError?.let(cancellation::addSuppressed)
+            cleanupCancelledAttempt(attempt, cancellation)
+            throw cancellation
+        }
+    }
+
+    private suspend fun beginAttemptRespectingCancellation(): VoiceAgentTelecomAttemptId {
+        val result = runCatching(registry::beginAttempt)
+        val cancellation = runCatching {
+            currentCoroutineContext().ensureActive()
+        }.exceptionOrNull() as? CancellationException
+        if (cancellation != null) {
+            result.exceptionOrNull()?.let { cancellation.addSuppressedDistinct(it) }
+            result.getOrNull()?.let { attempt ->
+                cleanupCancelledAttempt(attempt, cancellation)
             }
             throw cancellation
+        }
+        return result.getOrThrow()
+    }
+
+    private suspend fun cleanupCancelledAttempt(
+        attempt: VoiceAgentTelecomAttemptId,
+        cancellation: CancellationException,
+    ) {
+        withContext(NonCancellable) {
+            val retirementError = runCatching {
+                registry.retireAttempt(
+                    attempt,
+                    VoiceAgentTelecomFailure(
+                        diagnosticName = "telecom_resolution_cancelled",
+                        detail = cancellation.message ?: cancellation.javaClass.simpleName,
+                    ),
+                )
+            }.exceptionOrNull()
+            val acknowledgementError = runCatching {
+                registry.awaitOutcome(attempt)
+            }.exceptionOrNull()
+            retirementError?.let { cancellation.addSuppressedDistinct(it) }
+            acknowledgementError?.let { cancellation.addSuppressedDistinct(it) }
         }
     }
 
@@ -105,5 +129,9 @@ class VoiceAgentAudioRouteResolver internal constructor(
             is VoiceAgentTelecomOutcome.Failed -> DirectFallbackVoiceAgentRouteLease(retired.failure)
             is VoiceAgentTelecomOutcome.CleanupFailed -> throw retired.cleanupError
         }
+    }
+
+    private fun Throwable.addSuppressedDistinct(error: Throwable) {
+        if (error !== this && suppressed.none { it === error }) addSuppressed(error)
     }
 }

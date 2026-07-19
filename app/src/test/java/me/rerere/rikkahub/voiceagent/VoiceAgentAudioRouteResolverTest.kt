@@ -14,6 +14,7 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
@@ -71,14 +72,14 @@ class VoiceAgentAudioRouteResolverTest {
         val newerAttempt = registry.beginAttempt()
         val newerCall = ResolverFakeCall()
         assertTrue(registry.activate(newerAttempt, newerCall))
+        val newerLease = registry.claimRouteLease(newerAttempt)
 
         lease.retire()
 
         assertEquals(VoiceAudioRouteOwner.DirectFallback, lease.metadata.owner)
         assertEquals(0, newerCall.disconnectCalls)
         assertTrue(registry.isOwnedAttemptActive(newerAttempt))
-        registry.acknowledgeOutcome(newerAttempt)
-        registry.retireOwnedAttempt(newerAttempt)
+        newerLease.retire()
     }
 
     @Test
@@ -209,6 +210,84 @@ class VoiceAgentAudioRouteResolverTest {
         } finally {
             releaseCleanup.countDown()
             executor.shutdownNow()
+        }
+    }
+
+    @Test
+    fun `canceled blocked begin keeps cancellation primary over joined cleanup failure`() = runBlocking {
+        val cleanupFailure = IllegalStateException("joined pre-lease cleanup failed")
+        val cleanupFailureRef = AtomicReference<Throwable?>(cleanupFailure)
+        val cleanupEntered = CountDownLatch(1)
+        val releaseCleanup = CountDownLatch(1)
+        val registry = VoiceAgentTelecomCallRegistry()
+        val previous = registry.beginAttempt()
+        val previousCall = CallbackFaithfulResolverCall(
+            registry = registry,
+            cleanupFailure = cleanupFailureRef,
+            onCleanup = {
+                cleanupEntered.countDown()
+                check(releaseCleanup.await(5, TimeUnit.SECONDS)) {
+                    "joined pre-lease cleanup was not released"
+                }
+            },
+        )
+        assertTrue(registry.activate(previous, previousCall))
+        val cleanupExecutor = Executors.newSingleThreadExecutor()
+        val resolverThread = AtomicReference<Thread>()
+        val resolverExecutor = Executors.newSingleThreadExecutor { runnable ->
+            Thread(runnable, "canceled-begin-resolver").also(resolverThread::set)
+        }
+        val resolverDispatcher = resolverExecutor.asCoroutineDispatcher()
+        val gateway = FakeTelecomGateway()
+        val observedFailure = AtomicReference<Throwable>()
+        val resolutionReturned = CountDownLatch(1)
+
+        try {
+            val cleanupOwner = cleanupExecutor.submit<Throwable?> {
+                runCatching {
+                    registry.retireAttempt(
+                        previous,
+                        VoiceAgentTelecomFailure("prelease_cleanup", "blocked cleanup"),
+                    )
+                }.exceptionOrNull()
+            }
+            check(cleanupEntered.await(1, TimeUnit.SECONDS)) {
+                "joined pre-lease cleanup did not start"
+            }
+            val resolution = async(resolverDispatcher) {
+                try {
+                    VoiceAgentAudioRouteResolver(gateway, registry, 1_000).resolve()
+                } catch (error: Throwable) {
+                    observedFailure.set(error)
+                    throw error
+                } finally {
+                    resolutionReturned.countDown()
+                }
+            }
+            awaitBlocked(resolverThread)
+            val cancellation = CancellationException("cancel blocked begin")
+
+            resolution.cancel(cancellation)
+            releaseCleanup.countDown()
+
+            assertSame(cleanupFailure, cleanupOwner.get(1, TimeUnit.SECONDS))
+            assertTrue(resolutionReturned.await(1, TimeUnit.SECONDS))
+            val thrown = observedFailure.get()
+            assertTrue(thrown is CancellationException)
+            assertEquals(cancellation.message, thrown.message)
+            assertEquals(1, thrown.suppressed.size)
+            assertSame(cleanupFailure, thrown.suppressed.single())
+            assertEquals(0, gateway.registerCalls)
+            assertEquals(0, gateway.startCalls)
+
+            cleanupFailureRef.set(null)
+            val replacement = registry.beginAttempt()
+            assertEquals(previous.value + 1, replacement.value)
+        } finally {
+            releaseCleanup.countDown()
+            resolverDispatcher.close()
+            resolverExecutor.shutdownNow()
+            cleanupExecutor.shutdownNow()
         }
     }
 
@@ -635,6 +714,16 @@ class VoiceAgentAudioRouteResolverTest {
         assertFalse(accepted.get())
         assertEquals(1, call.disconnectCalls)
         assertEquals(listOf("setActive", "fallback"), events)
+    }
+
+    private fun awaitBlocked(thread: AtomicReference<Thread>) {
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(1)
+        while (thread.get()?.state !in setOf(Thread.State.WAITING, Thread.State.TIMED_WAITING)) {
+            check(System.nanoTime() < deadline) {
+                "resolver did not block joining pre-lease cleanup"
+            }
+            Thread.yield()
+        }
     }
 }
 

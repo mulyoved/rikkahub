@@ -14,6 +14,19 @@ import org.junit.Test
 
 class RetryableRetirementTest {
     @Test
+    fun `synchronous attempt result rejects double publication`() {
+        val attempt = SynchronousAttemptResult()
+
+        attempt.publish(Result.success(Unit))
+        val duplicate = runCatching {
+            attempt.publish(Result.failure(IllegalStateException("duplicate")))
+        }.exceptionOrNull()
+
+        assertTrue(duplicate is IllegalStateException)
+        assertTrue(attempt.awaitResult().isSuccess)
+    }
+
+    @Test
     fun `interrupted joiner waits for captured failure and restores interrupt status`() {
         val firstFailure = IllegalStateException("first retirement failed")
         val blockEntered = CountDownLatch(1)

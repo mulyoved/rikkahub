@@ -1,7 +1,5 @@
 package me.rerere.rikkahub.voiceagent
 
-import java.util.concurrent.CountDownLatch
-
 internal class RetryableRetirement {
     private val lock = Any()
     private var activeAttempt: Attempt? = null
@@ -23,13 +21,13 @@ internal class RetryableRetirement {
         val result = if (ownsAttempt) {
             runCatching(block).also { attemptResult ->
                 synchronized(lock) {
-                    attempt.publish(attemptResult)
+                    attempt.result.publish(attemptResult)
                     if (attemptResult.isSuccess) retired = true
                     if (activeAttempt === attempt) activeAttempt = null
                 }
             }
         } else {
-            attempt.awaitResult()
+            attempt.result.awaitResult()
         }
         result.getOrThrow()
     }
@@ -37,26 +35,6 @@ internal class RetryableRetirement {
     private class Attempt(
         val ownerThread: Thread,
     ) {
-        private val completed = CountDownLatch(1)
-        private var result: Result<Unit>? = null
-
-        fun publish(value: Result<Unit>) {
-            result = value
-            completed.countDown()
-        }
-
-        fun awaitResult(): Result<Unit> {
-            var interrupted = false
-            while (true) {
-                try {
-                    completed.await()
-                    break
-                } catch (_: InterruptedException) {
-                    interrupted = true
-                }
-            }
-            if (interrupted) Thread.currentThread().interrupt()
-            return requireNotNull(result)
-        }
+        val result = SynchronousAttemptResult()
     }
 }

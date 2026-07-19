@@ -486,7 +486,10 @@ internal class LifecycleTelecomReplacement(
 ) {
     val disconnectCalls: Int get() = call.disconnectCalls
 
-    fun retire() = registry.retireOwnedAttempt(attempt)
+    fun retire() = registry.retireAttempt(
+        attempt,
+        VoiceAgentTelecomFailure("test_cleanup", "test cleanup"),
+    )
 }
 
 internal class LifecycleTelecomCall(

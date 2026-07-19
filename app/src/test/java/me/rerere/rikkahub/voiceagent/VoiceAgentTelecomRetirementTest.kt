@@ -169,7 +169,6 @@ class VoiceAgentTelecomRetirementTest {
         assertEquals(true, registry.activate(attempt, call))
         assertEquals(VoiceAgentTelecomOutcome.Active, registry.awaitOutcome(attempt))
         val lease = registry.claimRouteLease(attempt)
-        val joiningLease = registry.claimRouteLease(attempt)
         val executor = Executors.newFixedThreadPool(2)
         try {
             val ownerRetirement = executor.submit<Throwable?> {
@@ -180,7 +179,7 @@ class VoiceAgentTelecomRetirementTest {
             }
             val joinedRetirement = executor.submit<Throwable?> {
                 joiningLeaseStarted.countDown()
-                runCatching(joiningLease::retire).exceptionOrNull()
+                runCatching(lease::retire).exceptionOrNull()
             }
             check(joiningLeaseStarted.await(1, TimeUnit.SECONDS)) {
                 "joining lease retirement did not start"

@@ -439,7 +439,7 @@ class VoiceAgentRouteLeaseTest {
                 events,
             )
         } finally {
-            replacementAttempt?.let(registry::retireOwnedAttempt)
+            replacementAttempt?.let { registry.claimRouteLease(it).retire() }
         }
     }
 
@@ -552,7 +552,7 @@ class VoiceAgentRouteLeaseTest {
         } finally {
             neverCompletes.complete(Unit)
             outcome.cancel()
-            replacementAttempt?.let(registry::retireOwnedAttempt)
+            replacementAttempt?.let { registry.claimRouteLease(it).retire() }
         }
     }
 
@@ -635,7 +635,7 @@ class VoiceAgentRouteLeaseTest {
             )
         } finally {
             neverCompletes.complete(Unit)
-            replacementAttempt?.let(registry::retireOwnedAttempt)
+            replacementAttempt?.let { registry.claimRouteLease(it).retire() }
         }
     }
 
