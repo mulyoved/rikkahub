@@ -141,7 +141,7 @@ class VoiceAgentTelecomCallRegistry internal constructor(
         is AttemptPhase.RetirementFailed -> {
             when (val ownership = phase.ownership) {
                 is RetirementOwnership.Registry -> {
-                    requireExactClaim(id, ownership)
+                    requireExactRegistryOwnership(id, ownership)
                     record.phase = AttemptPhase.Retiring(
                         connection = phase.connection,
                         failure = phase.outcomeFailure,
@@ -156,13 +156,13 @@ class VoiceAgentTelecomCallRegistry internal constructor(
         }
         is AttemptPhase.Retiring -> {
             (phase.ownership as? RetirementOwnership.Registry)?.let { ownership ->
-                requireExactClaim(id, ownership)
+                requireExactRegistryOwnership(id, ownership)
             }
             BeginAttemptDecision.Join(phase.attempt)
         }
         is AttemptPhase.Active -> {
             (phase.ownership as? RetirementOwnership.Registry)?.let { ownership ->
-                requireExactClaim(id, ownership)
+                requireExactRegistryOwnership(id, ownership)
             }
             record.phase = AttemptPhase.Retiring(
                 connection = phase.connection,
@@ -175,7 +175,7 @@ class VoiceAgentTelecomCallRegistry internal constructor(
         }
         is AttemptPhase.Activating -> {
             val ownership = phase.ownership as? RetirementOwnership.Registry ?: return null
-            requireExactClaim(id, ownership)
+            requireExactRegistryOwnership(id, ownership)
             val attempt = RetirementAttempt()
             record.phase = AttemptPhase.Retiring(
                 connection = phase.connection,
@@ -369,7 +369,7 @@ class VoiceAgentTelecomCallRegistry internal constructor(
             is AttemptPhase.Active -> {
                 val ownership = phase.ownership as? RetirementOwnership.Registry
                     ?: error("Telecom attempt ${id.value} cleanup already belongs to its route lease")
-                requireExactClaim(id, ownership)
+                requireExactRegistryOwnership(id, ownership)
                 record.phase = phase.copy(ownership = RetirementOwnership.RouteLease)
                 record.outcomeAcknowledged = true
                 TelecomVoiceAgentRouteLease(id, this)
@@ -410,7 +410,7 @@ class VoiceAgentTelecomCallRegistry internal constructor(
         retireAttempt(
             id = id,
             failure = failure,
-            expectedOwnership = RetirementOwnership.Registry(RegistryCleanupClaim(id)),
+            expectedOwnership = RetirementOwnership.Registry(id),
         )
     }
 
@@ -718,12 +718,12 @@ class VoiceAgentTelecomCallRegistry internal constructor(
         detail = "Telecom attempt ${id.value} superseded by replacement request",
     )
 
-    private fun requireExactClaim(
+    private fun requireExactRegistryOwnership(
         id: VoiceAgentTelecomAttemptId,
         ownership: RetirementOwnership.Registry,
     ) {
-        check(ownership.claim.attemptId == id) {
-            "Telecom cleanup claim does not match attempt ${id.value}"
+        check(ownership.attemptId == id) {
+            "Telecom registry ownership does not match attempt ${id.value}"
         }
     }
 
@@ -735,7 +735,7 @@ class VoiceAgentTelecomCallRegistry internal constructor(
         check(actual == expected) {
             "Telecom attempt ${id.value} cleanup ownership does not match its caller"
         }
-        (actual as? RetirementOwnership.Registry)?.let { requireExactClaim(id, it) }
+        (actual as? RetirementOwnership.Registry)?.let { requireExactRegistryOwnership(id, it) }
     }
 
     private fun activationFailure(error: Throwable) = VoiceAgentTelecomFailure(
@@ -772,7 +772,7 @@ class VoiceAgentTelecomCallRegistry internal constructor(
 
     private class AttemptRecord(id: VoiceAgentTelecomAttemptId) {
         val completion = CompletableDeferred<VoiceAgentTelecomOutcome>()
-        val registryOwnership = RetirementOwnership.Registry(RegistryCleanupClaim(id))
+        val registryOwnership = RetirementOwnership.Registry(id)
         var phase: AttemptPhase = AttemptPhase.Pending
         var selectedOutcome: VoiceAgentTelecomOutcome? = null
         var outcomeAcknowledged = false
@@ -812,12 +812,8 @@ class VoiceAgentTelecomCallRegistry internal constructor(
         val cleanupError: Throwable,
     )
 
-    private data class RegistryCleanupClaim(
-        val attemptId: VoiceAgentTelecomAttemptId,
-    )
-
     private sealed interface RetirementOwnership {
-        data class Registry(val claim: RegistryCleanupClaim) : RetirementOwnership
+        data class Registry(val attemptId: VoiceAgentTelecomAttemptId) : RetirementOwnership
 
         data object RouteLease : RetirementOwnership
     }
