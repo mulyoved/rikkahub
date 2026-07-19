@@ -2,7 +2,9 @@ package me.rerere.rikkahub.voiceagent
 
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import me.rerere.rikkahub.voiceagent.audio.VoiceAudioEngine
 import me.rerere.rikkahub.voiceagent.audio.PlaybackEpoch
@@ -62,7 +64,11 @@ internal class FakeVoiceAudioEngine : VoiceAudioEngine {
                 suspended.release.await()
             } catch (cancellation: CancellationException) {
                 suspended.cancelled.complete(Unit)
-                throw cancellation
+                if (suspended.ignoreCancellation) {
+                    withContext(NonCancellable) { suspended.release.await() }
+                } else {
+                    throw cancellation
+                }
             }
         }
         val blocked = synchronized(blockedStartCaptures) { blockedStartCaptures.removeFirstOrNull() }
@@ -216,6 +222,14 @@ internal class FakeVoiceAudioEngine : VoiceAudioEngine {
         }
     }
 
+    fun suspendNextUncancellableStartCapture(): SuspendedCaptureStart {
+        return SuspendedCaptureStart(ignoreCancellation = true).also { suspended ->
+            synchronized(suspendedStartCaptures) {
+                suspendedStartCaptures += suspended
+            }
+        }
+    }
+
     fun blockNextStopCapture(): BlockedPlayback {
         return BlockedPlayback().also { blocked ->
             synchronized(blockedStopCaptures) {
@@ -272,9 +286,16 @@ internal class FakeVoiceAudioEngine : VoiceAudioEngine {
 internal class BlockedPlayback {
     val started = CountDownLatch(1)
     val release = CountDownLatch(1)
+
+    fun awaitRelease() {
+        started.countDown()
+        check(release.await(500, TimeUnit.MILLISECONDS)) { "Timed out waiting to release blocked voice effect" }
+    }
 }
 
-internal class SuspendedCaptureStart {
+internal class SuspendedCaptureStart(
+    val ignoreCancellation: Boolean = false,
+) {
     val entered = CompletableDeferred<Unit>()
     val release = CompletableDeferred<Unit>()
     val cancelled = CompletableDeferred<Unit>()

@@ -1,6 +1,9 @@
 package me.rerere.rikkahub.voiceagent
 
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Deferred
@@ -8,18 +11,200 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.yield
 import me.rerere.rikkahub.voiceagent.persistence.VoiceContext
 import me.rerere.rikkahub.voiceagent.telemetry.RecordingVoiceObservability
+import me.rerere.rikkahub.voiceagent.telemetry.VoiceAttributes
 import me.rerere.rikkahub.voiceagent.telemetry.VoiceDiagnostics
+import me.rerere.rikkahub.voiceagent.telemetry.VoiceObservability
+import me.rerere.rikkahub.voiceagent.telemetry.VoiceSpan
+import me.rerere.rikkahub.voiceagent.telemetry.VoiceTraceContext
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class CaptureStartVoiceAgentCallSessionTest {
+    @Test
+    fun `mute joins admitted PCM before sending stream end`() = runTest {
+        val fixture = connectedSession(initiallyMuted = false)
+        val blockedSend = fixture.gemini.blockNextAudioSend()
+        val pcm = launch(Dispatchers.Default) {
+            fixture.audio.emitCapture(byteArrayOf(1, 2, 3))
+        }
+        assertTrue(blockedSend.started.await(TEST_TIMEOUT_MS, TimeUnit.MILLISECONDS))
+        val muteReturned = CountDownLatch(1)
+        val mute = launch(Dispatchers.Default) {
+            fixture.session.setMuted(true)
+            muteReturned.countDown()
+        }
+
+        val returnedBeforePcm = muteReturned.await(100, TimeUnit.MILLISECONDS)
+        blockedSend.release.countDown()
+        pcm.join()
+        mute.join()
+
+        assertFalse("mute must join admitted PCM", returnedBeforePcm)
+        assertEquals(listOf("audio", "stream_end"), fixture.gemini.audioControlEvents)
+        assertEquals(VoiceAudioStatus.Muted, fixture.session.state.value.audio)
+        fixture.session.closeNow()
+    }
+
+    @Test
+    fun `reentrant mute defers cleanup until other admitted PCM also leaves`() = runTest {
+        val fixture = connectedSession(initiallyMuted = false)
+        val firstBlockedSend = fixture.gemini.blockNextAudioSend()
+        val firstPcm = launch(Dispatchers.Default) {
+            fixture.audio.emitCapture(byteArrayOf(1))
+        }
+        assertTrue(firstBlockedSend.started.await(TEST_TIMEOUT_MS, TimeUnit.MILLISECONDS))
+        val reentrantMuteReturned = CountDownLatch(1)
+        fixture.gemini.onBeforeAudioSend = {
+            fixture.gemini.onBeforeAudioSend = null
+            fixture.session.setMuted(true)
+            reentrantMuteReturned.countDown()
+        }
+
+        val secondPcm = launch(Dispatchers.Default) {
+            fixture.audio.emitCapture(byteArrayOf(2))
+        }
+        assertTrue(reentrantMuteReturned.await(TEST_TIMEOUT_MS, TimeUnit.MILLISECONDS))
+        secondPcm.join()
+
+        assertFalse(
+            "reentrant cleanup must remain deferred while another PCM effect is admitted",
+            fixture.session.state.value.audio == VoiceAudioStatus.Muted,
+        )
+        firstBlockedSend.release.countDown()
+        firstPcm.join()
+
+        assertEquals(VoiceAudioStatus.Muted, fixture.session.state.value.audio)
+        assertEquals("stream_end", fixture.gemini.audioControlEvents.last())
+        fixture.session.closeNow()
+    }
+
+    @Test
+    fun `mute joins claimed debug completion before its final stream end`() = runTest {
+        val fixture = connectedSession(initiallyMuted = false)
+        val blockedEnd = fixture.gemini.blockNextAudioStreamEnd()
+        val debug = launch(Dispatchers.Default) {
+            fixture.audio.completeDebugInjection()
+        }
+        assertTrue(blockedEnd.started.await(TEST_TIMEOUT_MS, TimeUnit.MILLISECONDS))
+        val muteReturned = CountDownLatch(1)
+        val mute = launch(Dispatchers.Default) {
+            fixture.session.setMuted(true)
+            muteReturned.countDown()
+        }
+
+        val returnedBeforeDebug = muteReturned.await(100, TimeUnit.MILLISECONDS)
+        blockedEnd.release.countDown()
+        debug.join()
+        mute.join()
+
+        assertFalse("mute must join claimed debug completion", returnedBeforeDebug)
+        assertEquals(listOf("stream_end", "stream_end"), fixture.gemini.audioControlEvents)
+        assertEquals(VoiceAudioStatus.Muted, fixture.session.state.value.audio)
+        fixture.session.closeNow()
+    }
+
+    @Test
+    fun `mute joins committed capture before capture started observability`() = runTest {
+        val observability = BlockingCaptureObservability()
+        val sessionScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        val fixture = connectedSession(
+            initiallyMuted = true,
+            sessionScope = sessionScope,
+            observability = observability,
+        )
+        val blockedStarted = observability.blockNextCaptureStarted()
+        fixture.session.setMuted(false)
+        assertTrue(blockedStarted.started.await(TEST_TIMEOUT_MS, TimeUnit.MILLISECONDS))
+        val muteReturned = CountDownLatch(1)
+        val mute = launch(Dispatchers.Default) {
+            fixture.session.setMuted(true)
+            muteReturned.countDown()
+        }
+
+        val returnedBeforeEvent = muteReturned.await(100, TimeUnit.MILLISECONDS)
+        blockedStarted.release.countDown()
+        mute.join()
+
+        assertFalse("mute must join admitted capture-start observability", returnedBeforeEvent)
+        assertEquals(
+            listOf(
+                "hermes_voice.mobile.audio.capture_started",
+                "hermes_voice.mobile.audio.capture_muted",
+            ),
+            observability.eventNames.takeLast(2),
+        )
+        assertEquals(VoiceAudioStatus.Muted, fixture.session.state.value.audio)
+        sessionScope.cancel()
+    }
+
+    @Test
+    fun `audio status listener can reenter mute and leaves final status muted`() = runTest {
+        val diagnostics = VoiceDiagnostics()
+        val sessionScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        val fixture = connectedSession(
+            initiallyMuted = true,
+            sessionScope = sessionScope,
+            diagnostics = diagnostics,
+        )
+        val listenerEntered = CountDownLatch(1)
+        val mutedOnce = AtomicBoolean()
+        val removeListener = diagnostics.addListener { event ->
+            if (
+                event.name == "audio_status" &&
+                event.detail == "listening" &&
+                mutedOnce.compareAndSet(false, true)
+            ) {
+                fixture.session.setMuted(true)
+                listenerEntered.countDown()
+            }
+        }
+
+        fixture.session.setMuted(false)
+        assertTrue(listenerEntered.await(TEST_TIMEOUT_MS, TimeUnit.MILLISECONDS))
+        yield()
+
+        assertEquals(VoiceAudioStatus.Muted, fixture.session.state.value.audio)
+        removeListener()
+        sessionScope.cancel()
+    }
+
+    @Test
+    fun `late rejected start cleanup cannot stop a newer unmute capture`() = runTest {
+        val sessionScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        val fixture = connectedSession(initiallyMuted = true, sessionScope = sessionScope)
+        val old = fixture.audio.suspendNextUncancellableStartCapture()
+        fixture.session.setMuted(false)
+        awaitCaptureSignal(old.entered)
+        fixture.session.setMuted(true)
+        awaitCaptureSignal(old.cancelled)
+        val lateStop = fixture.audio.blockNextStopCapture()
+        old.release.complete(Unit)
+        assertTrue(lateStop.started.await(TEST_TIMEOUT_MS, TimeUnit.MILLISECONDS))
+        val newer = fixture.audio.suspendNextStartCapture()
+
+        fixture.session.setMuted(false)
+        yield()
+
+        assertFalse("new start must wait for the old global stop", newer.entered.isCompleted)
+        lateStop.release.countDown()
+        awaitCaptureSignal(newer.entered)
+        newer.release.complete(Unit)
+        awaitCaptureSignal(newer.installed)
+        fixture.audio.emitCapture(byteArrayOf(4, 5, 6))
+
+        assertEquals(1, fixture.gemini.audioMessages.size)
+        assertEquals(VoiceAudioStatus.UserSpeaking, fixture.session.state.value.audio)
+        sessionScope.cancel()
+    }
+
     @Test
     fun `mute wins against suspended initial capture completion`() = runTest {
         val gemini = FakeGeminiLiveVoiceClient()
@@ -230,10 +415,44 @@ class CaptureStartVoiceAgentCallSessionTest {
         sessionScope: CoroutineScope = this,
         observability: RecordingVoiceObservability = RecordingVoiceObservability(),
         diagnostics: VoiceDiagnostics = VoiceDiagnostics(),
+    ): CaptureCancellationFixture = connectedSession(
+        initiallyMuted = true,
+        sessionScope = sessionScope,
+        observability = observability,
+        diagnostics = diagnostics,
+    )
+
+    private suspend fun CoroutineScope.connectedSession(
+        initiallyMuted: Boolean,
+        sessionScope: CoroutineScope = this,
+        observability: VoiceObservability = RecordingVoiceObservability(),
+        diagnostics: VoiceDiagnostics = VoiceDiagnostics(),
     ): CaptureCancellationFixture {
         val gemini = FakeGeminiLiveVoiceClient()
         val audio = FakeVoiceAudioEngine()
-        val session = VoiceAgentCallSession(
+        val session = newSession(
+            gemini = gemini,
+            audio = audio,
+            scope = sessionScope,
+            observability = observability,
+            diagnostics = diagnostics,
+        )
+        if (initiallyMuted) session.setMuted(true)
+        session.start()
+        gemini.awaitConnect()
+        withTimeout(TEST_TIMEOUT_MS) {
+            while (session.state.value.session != VoiceSessionStatus.Connected) delay(10)
+        }
+        return CaptureCancellationFixture(session = session, gemini = gemini, audio = audio)
+    }
+
+    private fun newSession(
+        gemini: FakeGeminiLiveVoiceClient,
+        audio: FakeVoiceAudioEngine,
+        scope: CoroutineScope,
+        observability: VoiceObservability = RecordingVoiceObservability(),
+        diagnostics: VoiceDiagnostics = VoiceDiagnostics(),
+    ) = VoiceAgentCallSession(
             modelId = "gemini-flash",
             sessionApi = FakeVoiceSessionApi(),
             toolApi = FakeVoiceToolApi(),
@@ -245,16 +464,8 @@ class CaptureStartVoiceAgentCallSessionTest {
             ),
             diagnostics = diagnostics,
             observability = observability,
-            scope = sessionScope,
+            scope = scope,
         )
-        session.setMuted(true)
-        session.start()
-        gemini.awaitConnect()
-        withTimeout(TEST_TIMEOUT_MS) {
-            while (session.state.value.session != VoiceSessionStatus.Connected) delay(10)
-        }
-        return CaptureCancellationFixture(session = session, gemini = gemini, audio = audio)
-    }
 
     private suspend fun awaitCaptureSignal(signal: Deferred<Unit>) {
         withTimeout(TEST_TIMEOUT_MS) { signal.await() }
@@ -275,6 +486,42 @@ class CaptureStartVoiceAgentCallSessionTest {
         val gemini: FakeGeminiLiveVoiceClient,
         val audio: FakeVoiceAudioEngine,
     )
+
+    private class BlockingCaptureObservability : VoiceObservability {
+        private val delegate = RecordingVoiceObservability()
+        private var blockedCaptureStarted: BlockedPlayback? = null
+        val eventNames: List<String>
+            get() = synchronized(this) { delegate.events.map { it.name } }
+
+        fun blockNextCaptureStarted(): BlockedPlayback = BlockedPlayback().also { blocked ->
+            synchronized(this) {
+                blockedCaptureStarted = blocked
+            }
+        }
+
+        override fun recordEvent(name: String, trace: VoiceTraceContext, attributes: VoiceAttributes) {
+            if (name == "hermes_voice.mobile.audio.capture_started") {
+                synchronized(this) {
+                    blockedCaptureStarted.also { blockedCaptureStarted = null }
+                }?.awaitRelease()
+            }
+            synchronized(this) {
+                delegate.recordEvent(name = name, trace = trace, attributes = attributes)
+            }
+        }
+
+        override suspend fun <T> withSpan(
+            name: String,
+            trace: VoiceTraceContext,
+            block: suspend (VoiceSpan) -> T,
+        ): T = delegate.withSpan(name = name, trace = trace, block = block)
+
+        override fun captureException(
+            throwable: Throwable,
+            trace: VoiceTraceContext,
+            attributes: VoiceAttributes,
+        ) = delegate.captureException(throwable = throwable, trace = trace, attributes = attributes)
+    }
 
     private companion object {
         const val TEST_TIMEOUT_MS = 500L

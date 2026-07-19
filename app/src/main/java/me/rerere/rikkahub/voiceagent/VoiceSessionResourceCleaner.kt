@@ -9,6 +9,7 @@ internal class VoiceSessionResourceCleaner(
     private val gemini: GeminiLiveVoiceClient,
     private val audio: VoiceAudioEngine,
     private val cancelCaptureStart: () -> Unit,
+    private val retireCaptureEpoch: () -> Unit,
     private val hermesBridgeProvider: () -> HermesSessionBridge?,
     private val clearHermesBridge: () -> Unit,
 ) {
@@ -37,6 +38,7 @@ internal class VoiceSessionResourceCleaner(
         runVoiceAgentCleanupStages(
             prepare,
             cancelCaptureStart,
+            retireCaptureEpoch,
             ::detachHermesBridge,
             { runIfCurrent(::invalidateAudioSessions) },
             { runIfCurrent(audio::stopCapture) },
