@@ -35,7 +35,9 @@ class VoiceAgentCallStartupTest {
         var resolveCalls = 0
         val startup = VoiceAgentCallStartup(manager) {
             resolveCalls += 1
-            DirectFallbackVoiceAgentRouteLease(VoiceAgentTelecomFailure("unused", "unused"))
+            VoiceAgentRouteResolution.Resolved(
+                DirectFallbackVoiceAgentRouteLease(VoiceAgentTelecomFailure("unused", "unused")),
+            )
         }
 
         val result = startup.start(conversationId, config, this) { true }
@@ -60,7 +62,7 @@ class VoiceAgentCallStartupTest {
         var resolveCalls = 0
         val startup = VoiceAgentCallStartup(manager) {
             resolveCalls += 1
-            installedLiveLease.lease
+            VoiceAgentRouteResolution.Resolved(installedLiveLease.lease)
         }
 
         val result = startup.start(conversationId, secondConfig, this) { true }
@@ -81,7 +83,9 @@ class VoiceAgentCallStartupTest {
     fun `stale resolved lease is retired exactly once and metadata is returned`() = runTest {
         val staleLease = CountingTelecomLease()
         val factory = StartupFakeCallFactory(StartupFakeManagedSession())
-        val startup = VoiceAgentCallStartup(VoiceAgentCallManager(factory)) { staleLease.lease }
+        val startup = VoiceAgentCallStartup(VoiceAgentCallManager(factory)) {
+            VoiceAgentRouteResolution.Resolved(staleLease.lease)
+        }
 
         val result = startup.start(Uuid.random(), fakeStartupLaunchConfig(), this) { false }
 
@@ -97,7 +101,7 @@ class VoiceAgentCallStartupTest {
         val factory = StartupFakeCallFactory(StartupFakeManagedSession(events), events = events)
         val startup = VoiceAgentCallStartup(VoiceAgentCallManager(factory)) {
             events += "resolved"
-            installedLiveLease.lease
+            VoiceAgentRouteResolution.Resolved(installedLiveLease.lease)
         }
 
         val result = startup.start(Uuid.random(), fakeStartupLaunchConfig(), this) {
@@ -121,7 +125,7 @@ class VoiceAgentCallStartupTest {
         val raceRejectedLease = CountingTelecomLease()
         val startup = VoiceAgentCallStartup(manager) {
             manager.start(conversationId, config, installedLiveLease.lease, this)
-            raceRejectedLease.lease
+            VoiceAgentRouteResolution.Resolved(raceRejectedLease.lease)
         }
 
         val result = startup.start(conversationId, config, this) { true }
@@ -137,7 +141,9 @@ class VoiceAgentCallStartupTest {
         val creationFailure = IllegalStateException("factory failed")
         val factoryFailureLease = CountingTelecomLease()
         val manager = VoiceAgentCallManager(StartupConsumingFailingFactory(creationFailure))
-        val startup = VoiceAgentCallStartup(manager) { factoryFailureLease.lease }
+        val startup = VoiceAgentCallStartup(manager) {
+            VoiceAgentRouteResolution.Resolved(factoryFailureLease.lease)
+        }
 
         val thrown = runCatching {
             startup.start(Uuid.random(), fakeStartupLaunchConfig(), this) { true }
@@ -149,7 +155,7 @@ class VoiceAgentCallStartupTest {
 
     @Test
     fun `suspended resolution starts no manager session`() = runTest {
-        val resolved = CompletableDeferred<VoiceAgentRouteLease>()
+        val resolved = CompletableDeferred<VoiceAgentRouteResolution>()
         val factory = StartupFakeCallFactory(StartupFakeManagedSession())
         val manager = VoiceAgentCallManager(factory)
         val startup = VoiceAgentCallStartup(manager) { resolved.await() }
@@ -159,7 +165,11 @@ class VoiceAgentCallStartupTest {
 
         assertFalse(pending.isCompleted)
         assertEquals(0, factory.created.size)
-        resolved.complete(DirectFallbackVoiceAgentRouteLease(VoiceAgentTelecomFailure("fallback", "fallback")))
+        resolved.complete(
+            VoiceAgentRouteResolution.Resolved(
+                DirectFallbackVoiceAgentRouteLease(VoiceAgentTelecomFailure("fallback", "fallback")),
+            ),
+        )
         assertTrue((pending.await() as VoiceAgentCallStartupResult.Started).startedNewSession)
     }
 
@@ -213,6 +223,76 @@ class VoiceAgentCallStartupTest {
         } finally {
             retryGate.close()
         }
+    }
+
+    @Test
+    fun `active route superseded before ownership transfer maps to stale`() = runTest {
+        val registry = VoiceAgentTelecomCallRegistry()
+        val activeCall = StartupTelecomCall()
+        val outcomeGate = StartupActiveOutcomeGate()
+        val resolver = VoiceAgentAudioRouteResolver(
+            gateway = StartupTelecomGateway { attempt ->
+                assertTrue(registry.activate(attempt, activeCall))
+            },
+            registry = registry,
+            timeoutMs = 1_000,
+            outcomeTimeout = outcomeGate,
+        )
+        val manager = VoiceAgentCallManager(StartupFakeCallFactory())
+        val startup = VoiceAgentCallStartup(manager, resolver)
+        val pending = async(start = CoroutineStart.UNDISPATCHED) {
+            startup.start(Uuid.random(), fakeStartupLaunchConfig(), this@runTest) { true }
+        }
+        assertEquals(VoiceAgentTelecomOutcome.Active, outcomeGate.observed.await())
+
+        val replacementAttempt = registry.beginAttempt().requireAllocatedAttemptId()
+        assertEquals(1, activeCall.disconnectCalls)
+        outcomeGate.release.complete(Unit)
+
+        assertEquals(
+            VoiceAgentCallStartupResult.Stale(
+                VoiceAgentRouteMetadata(VoiceAudioRouteOwner.Telecom),
+            ),
+            pending.await(),
+        )
+        assertEquals(null, manager.activeConversationId.value)
+        registry.retireAttempt(
+            replacementAttempt,
+            VoiceAgentTelecomFailure("test_cleanup", "test cleanup"),
+        )
+        registry.awaitOutcome(replacementAttempt)
+    }
+}
+
+private class StartupActiveOutcomeGate : VoiceAgentTelecomOutcomeTimeout {
+    val observed = CompletableDeferred<VoiceAgentTelecomOutcome>()
+    val release = CompletableDeferred<Unit>()
+
+    override suspend fun awaitOutcome(
+        timeoutMs: Long,
+        observe: suspend () -> VoiceAgentTelecomOutcome,
+    ): VoiceAgentTelecomOutcome {
+        val outcome = observe()
+        observed.complete(outcome)
+        release.await()
+        return outcome
+    }
+}
+
+private class StartupTelecomGateway(
+    private val onStart: (VoiceAgentTelecomAttemptId) -> Unit,
+) : VoiceAgentTelecomGateway {
+    override fun register(): Result<Unit> = Result.success(Unit)
+
+    override fun startCall(attemptId: VoiceAgentTelecomAttemptId): Result<Unit> =
+        Result.success(Unit).also { onStart(attemptId) }
+}
+
+private class StartupTelecomCall : VoiceAgentTelecomCall {
+    var disconnectCalls = 0
+
+    override fun disconnectFromApp() {
+        disconnectCalls += 1
     }
 }
 

@@ -18,7 +18,7 @@ sealed interface VoiceAgentCallStartupResult {
 
 class VoiceAgentCallStartup internal constructor(
     private val manager: VoiceAgentCallManager,
-    private val resolveRoute: suspend () -> VoiceAgentRouteLease,
+    private val resolveRoute: suspend () -> VoiceAgentRouteResolution,
 ) {
     constructor(
         manager: VoiceAgentCallManager,
@@ -41,7 +41,12 @@ class VoiceAgentCallStartup internal constructor(
             VoiceAgentRouteMatchResult.NoMatch -> Unit
         }
 
-        val routeLease = resolveRoute()
+        val routeLease = when (val resolution = resolveRoute()) {
+            is VoiceAgentRouteResolution.Resolved -> resolution.lease
+            is VoiceAgentRouteResolution.Superseded -> {
+                return VoiceAgentCallStartupResult.Stale(resolution.metadata)
+            }
+        }
         val route = routeLease.metadata
         if (!isCurrent()) {
             routeLease.retire()

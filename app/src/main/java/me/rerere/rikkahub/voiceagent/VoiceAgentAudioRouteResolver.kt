@@ -7,6 +7,16 @@ import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 
+sealed interface VoiceAgentRouteResolution {
+    data class Resolved(
+        val lease: VoiceAgentRouteLease,
+    ) : VoiceAgentRouteResolution
+
+    data class Superseded(
+        val metadata: VoiceAgentRouteMetadata,
+    ) : VoiceAgentRouteResolution
+}
+
 internal fun interface VoiceAgentTelecomOutcomeTimeout {
     suspend fun awaitOutcome(
         timeoutMs: Long,
@@ -33,7 +43,7 @@ class VoiceAgentAudioRouteResolver internal constructor(
         timeoutMs: Long = 3_000L,
     ) : this(gateway, registry, timeoutMs, DefaultVoiceAgentTelecomOutcomeTimeout)
 
-    suspend fun resolve(): VoiceAgentRouteLease {
+    suspend fun resolve(): VoiceAgentRouteResolution {
         val attempt = beginAttemptRespectingCancellation()
         try {
             gateway.register().exceptionOrNull()?.let {
@@ -44,11 +54,13 @@ class VoiceAgentAudioRouteResolver internal constructor(
             }
             return when (val outcome = outcomeTimeout.awaitOutcome(timeoutMs) { registry.observeOutcome(attempt) }) {
                 VoiceAgentTelecomOutcome.Active -> {
-                    registry.claimRouteLease(attempt)
+                    consumeActiveOutcome(attempt)
                 }
                 is VoiceAgentTelecomOutcome.Failed -> {
                     registry.acknowledgeOutcome(attempt)
-                    DirectFallbackVoiceAgentRouteLease(outcome.failure)
+                    VoiceAgentRouteResolution.Resolved(
+                        DirectFallbackVoiceAgentRouteLease(outcome.failure),
+                    )
                 }
                 is VoiceAgentTelecomOutcome.CleanupFailed -> {
                     registry.acknowledgeOutcome(attempt)
@@ -117,16 +129,29 @@ class VoiceAgentAudioRouteResolver internal constructor(
         attempt: VoiceAgentTelecomAttemptId,
         name: String,
         error: Throwable,
-    ): VoiceAgentRouteLease {
+    ): VoiceAgentRouteResolution {
         val failure = VoiceAgentTelecomFailure(name, error.message ?: error.javaClass.simpleName)
         registry.fail(attempt, failure)
         val retired = withContext(NonCancellable) {
             registry.awaitOutcome(attempt)
         }
         return when (retired) {
-            VoiceAgentTelecomOutcome.Active -> registry.claimRouteLease(attempt)
-            is VoiceAgentTelecomOutcome.Failed -> DirectFallbackVoiceAgentRouteLease(retired.failure)
+            VoiceAgentTelecomOutcome.Active -> consumeActiveOutcome(attempt)
+            is VoiceAgentTelecomOutcome.Failed -> VoiceAgentRouteResolution.Resolved(
+                DirectFallbackVoiceAgentRouteLease(retired.failure),
+            )
             is VoiceAgentTelecomOutcome.CleanupFailed -> throw retired.cleanupError
+        }
+    }
+
+    private fun consumeActiveOutcome(
+        attempt: VoiceAgentTelecomAttemptId,
+    ): VoiceAgentRouteResolution = when (val result = registry.consumeActiveOutcome(attempt)) {
+        is VoiceAgentTelecomActiveConsumptionResult.Claimed -> {
+            VoiceAgentRouteResolution.Resolved(result.lease)
+        }
+        is VoiceAgentTelecomActiveConsumptionResult.Superseded -> {
+            VoiceAgentRouteResolution.Superseded(result.metadata)
         }
     }
 

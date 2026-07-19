@@ -18,6 +18,7 @@ import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
 import me.rerere.rikkahub.voiceagent.audio.VoiceAudioRouteOwner
 import org.junit.Assert.assertEquals
@@ -37,7 +38,7 @@ class VoiceAgentAudioRouteResolverTest {
             registry.activate(id, telecomCall)
         })
 
-        val lease = VoiceAgentAudioRouteResolver(gateway, registry, 100).resolve()
+        val lease = VoiceAgentAudioRouteResolver(gateway, registry, 100).resolve().requireResolvedLease()
 
         assertEquals(VoiceAudioRouteOwner.Telecom, lease.metadata.owner)
         assertEquals(null, lease.metadata.failure)
@@ -54,7 +55,7 @@ class VoiceAgentAudioRouteResolverTest {
             FakeTelecomGateway(registerResult = Result.failure(IllegalStateException("denied"))),
             registry,
             100,
-        ).resolve()
+        ).resolve().requireResolvedLease()
 
         assertEquals(VoiceAudioRouteOwner.DirectFallback, lease.metadata.owner)
         assertEquals("telecom_register_failed", lease.metadata.failure?.diagnosticName)
@@ -68,11 +69,11 @@ class VoiceAgentAudioRouteResolverTest {
             FakeTelecomGateway(registerResult = Result.failure(IllegalStateException("denied"))),
             registry,
             100,
-        ).resolve()
+        ).resolve().requireResolvedLease()
         val newerAttempt = registry.beginAttempt().requireAllocatedAttemptId()
         val newerCall = ResolverFakeCall()
         assertTrue(registry.activate(newerAttempt, newerCall))
-        val newerLease = registry.claimRouteLease(newerAttempt)
+        val newerLease = registry.consumeActiveOutcome(newerAttempt).requireClaimedLease()
 
         lease.retire()
 
@@ -90,7 +91,7 @@ class VoiceAgentAudioRouteResolverTest {
             FakeTelecomGateway(startResult = Result.failure(IllegalStateException("rejected"))),
             registry,
             100,
-        ).resolve()
+        ).resolve().requireResolvedLease()
 
         assertEquals(VoiceAudioRouteOwner.DirectFallback, lease.metadata.owner)
         assertEquals("telecom_start_failed", lease.metadata.failure?.diagnosticName)
@@ -126,7 +127,7 @@ class VoiceAgentAudioRouteResolverTest {
             assertTrue(registry.activate(attempt, replacementCall))
         })
 
-        val lease = VoiceAgentAudioRouteResolver(replacementGateway, registry, 100).resolve()
+        val lease = VoiceAgentAudioRouteResolver(replacementGateway, registry, 100).resolve().requireResolvedLease()
 
         assertEquals(VoiceAudioRouteOwner.Telecom, lease.metadata.owner)
         assertEquals(2, previousCall.disconnectCalls.get())
@@ -200,7 +201,7 @@ class VoiceAgentAudioRouteResolverTest {
                 assertEquals(previous.value + 1, attempt.value)
                 assertTrue(registry.activate(attempt, replacementCall))
             })
-            val lease = VoiceAgentAudioRouteResolver(gateway, registry, 100).resolve()
+            val lease = VoiceAgentAudioRouteResolver(gateway, registry, 100).resolve().requireResolvedLease()
 
             assertEquals(VoiceAudioRouteOwner.Telecom, lease.metadata.owner)
             assertEquals(2, previousCall.disconnectCalls.get())
@@ -311,7 +312,7 @@ class VoiceAgentAudioRouteResolverTest {
         )
         assertTrue(registry.activate(previous, previousCall))
         assertEquals(VoiceAgentTelecomOutcome.Active, registry.awaitOutcome(previous))
-        val previousLease = registry.claimRouteLease(previous)
+        val previousLease = registry.consumeActiveOutcome(previous).requireClaimedLease()
         val resolverExecutor = Executors.newSingleThreadExecutor()
         val resolverDispatcher = resolverExecutor.asCoroutineDispatcher()
         val gateway = FakeTelecomGateway()
@@ -368,13 +369,86 @@ class VoiceAgentAudioRouteResolverTest {
     }
 
     @Test
+    fun `canceled blocked route cleanup consumes successful allocation before rethrowing`() = runBlocking {
+        val cleanupEntered = CountDownLatch(1)
+        val releaseCleanup = CountDownLatch(1)
+        val registry = VoiceAgentTelecomCallRegistry()
+        val previous = registry.beginAttempt().requireAllocatedAttemptId()
+        val previousCall = CallbackFaithfulResolverCall(
+            registry = registry,
+            cleanupFailure = AtomicReference(null),
+            onCleanup = {
+                cleanupEntered.countDown()
+                check(releaseCleanup.await(5, TimeUnit.SECONDS)) {
+                    "successful route cleanup was not released"
+                }
+            },
+        )
+        assertTrue(registry.activate(previous, previousCall))
+        assertEquals(VoiceAgentTelecomOutcome.Active, registry.awaitOutcome(previous))
+        val previousLease = registry.consumeActiveOutcome(previous).requireClaimedLease()
+        val resolverThread = AtomicReference<Thread>()
+        val resolverExecutor = Executors.newSingleThreadExecutor { runnable ->
+            Thread(runnable, "canceled-successful-begin-resolver").also(resolverThread::set)
+        }
+        val resolverDispatcher = resolverExecutor.asCoroutineDispatcher()
+        val gateway = FakeTelecomGateway()
+        val observedFailure = AtomicReference<Throwable>()
+        val resolutionReturned = CountDownLatch(1)
+
+        try {
+            val resolution = async(resolverDispatcher) {
+                try {
+                    VoiceAgentAudioRouteResolver(gateway, registry, 1_000).resolve()
+                } catch (error: Throwable) {
+                    observedFailure.set(error)
+                    throw error
+                } finally {
+                    resolutionReturned.countDown()
+                }
+            }
+            check(cleanupEntered.await(1, TimeUnit.SECONDS)) {
+                "successful route cleanup did not start"
+            }
+            val cancellation = CancellationException("cancel successful route cleanup")
+
+            resolution.cancel(cancellation)
+            releaseCleanup.countDown()
+
+            assertTrue(resolutionReturned.await(1, TimeUnit.SECONDS))
+            val thrown = observedFailure.get()
+            assertTrue(thrown is CancellationException)
+            assertEquals(cancellation.message, thrown.message)
+            assertEquals(0, thrown.suppressed.size)
+            assertEquals(1, previousCall.disconnectCalls.get())
+            assertEquals(0, gateway.registerCalls)
+            assertEquals(0, gateway.startCalls)
+
+            val canceledAttempt = VoiceAgentTelecomAttemptId(previous.value + 1)
+            withTimeout(1_000) {
+                assertAttemptWasConsumed(registry, canceledAttempt)
+            }
+            val next = registry.beginAttempt().requireAllocatedAttemptId()
+            assertEquals(previous.value + 2, next.value)
+            registry.retireAttempt(next, VoiceAgentTelecomFailure("test_cleanup", "test cleanup"))
+            registry.awaitOutcome(next)
+        } finally {
+            releaseCleanup.countDown()
+            previousLease.retire()
+            resolverDispatcher.close()
+            resolverExecutor.shutdownNow()
+        }
+        Unit
+    }
+
+    @Test
     fun `ConnectionService rejection is preserved`() = runBlocking {
         val registry = VoiceAgentTelecomCallRegistry()
         val gateway = FakeTelecomGateway(onStart = { id ->
             registry.fail(id, VoiceAgentTelecomFailure("telecom_outgoing_failed", "framework rejected"))
         })
 
-        val lease = VoiceAgentAudioRouteResolver(gateway, registry, 100).resolve()
+        val lease = VoiceAgentAudioRouteResolver(gateway, registry, 100).resolve().requireResolvedLease()
 
         assertEquals(VoiceAudioRouteOwner.DirectFallback, lease.metadata.owner)
         assertEquals("telecom_outgoing_failed", lease.metadata.failure?.diagnosticName)
@@ -387,7 +461,7 @@ class VoiceAgentAudioRouteResolverTest {
         var attempt: VoiceAgentTelecomAttemptId? = null
         val gateway = FakeTelecomGateway(onStart = { attempt = it })
 
-        val lease = VoiceAgentAudioRouteResolver(gateway, registry, 1).resolve()
+        val lease = VoiceAgentAudioRouteResolver(gateway, registry, 1).resolve().requireResolvedLease()
         val late = ResolverFakeCall()
         val accepted = registry.activate(requireNotNull(attempt), late)
 
@@ -407,7 +481,7 @@ class VoiceAgentAudioRouteResolverTest {
             registry.activate(id, telecomCall)
         })
 
-        val lease = VoiceAgentAudioRouteResolver(gateway, registry, 0).resolve()
+        val lease = VoiceAgentAudioRouteResolver(gateway, registry, 0).resolve().requireResolvedLease()
 
         assertEquals(VoiceAudioRouteOwner.Telecom, lease.metadata.owner)
         assertEquals(null, lease.metadata.failure)
@@ -438,7 +512,7 @@ class VoiceAgentAudioRouteResolverTest {
 
         timeout.returnTimeout.complete(Unit)
         runCurrent()
-        val lease = resolution.await()
+        val lease = resolution.await().requireResolvedLease()
 
         assertEquals(VoiceAudioRouteOwner.Telecom, lease.metadata.owner)
         assertEquals(null, lease.metadata.failure)
@@ -577,7 +651,7 @@ class VoiceAgentAudioRouteResolverTest {
 
             events.clear()
             cleanupFailure.set(null)
-            val lease = retryResolver.resolve()
+            val lease = retryResolver.resolve().requireResolvedLease()
 
             assertEquals(VoiceAudioRouteOwner.Telecom, lease.metadata.owner)
             assertEquals(3, oldCall.disconnectCalls.get())
@@ -683,7 +757,7 @@ class VoiceAgentAudioRouteResolverTest {
 
         events.clear()
         cleanupFailure.set(null)
-        val lease = retryResolver.resolve()
+        val lease = retryResolver.resolve().requireResolvedLease()
 
         assertEquals(VoiceAudioRouteOwner.Telecom, lease.metadata.owner)
         assertEquals(3, oldCall.disconnectCalls.get())
@@ -783,7 +857,7 @@ class VoiceAgentAudioRouteResolverTest {
             releaseCallback.countDown()
             activation?.join()
         }
-        val lease = resolution.await()
+        val lease = resolution.await().requireResolvedLease()
 
         assertEquals(VoiceAudioRouteOwner.DirectFallback, lease.metadata.owner)
         assertEquals("telecom_connection_timeout", lease.metadata.failure?.diagnosticName)

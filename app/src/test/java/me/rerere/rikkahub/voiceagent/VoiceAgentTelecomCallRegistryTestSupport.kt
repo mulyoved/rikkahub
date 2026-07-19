@@ -13,6 +13,16 @@ internal fun VoiceAgentTelecomAttemptStartResult.requireAllocatedAttemptId(): Vo
     is VoiceAgentTelecomAttemptStartResult.CleanupFailed -> throw error
 }
 
+internal fun VoiceAgentTelecomActiveConsumptionResult.requireClaimedLease(): TelecomVoiceAgentRouteLease = when (this) {
+    is VoiceAgentTelecomActiveConsumptionResult.Claimed -> lease
+    is VoiceAgentTelecomActiveConsumptionResult.Superseded -> error("Telecom attempt was superseded")
+}
+
+internal fun VoiceAgentRouteResolution.requireResolvedLease(): VoiceAgentRouteLease = when (this) {
+    is VoiceAgentRouteResolution.Resolved -> lease
+    is VoiceAgentRouteResolution.Superseded -> error("Voice Agent route was superseded")
+}
+
 internal suspend fun assertAttemptWasConsumed(
     registry: VoiceAgentTelecomCallRegistry,
     attemptId: VoiceAgentTelecomAttemptId,

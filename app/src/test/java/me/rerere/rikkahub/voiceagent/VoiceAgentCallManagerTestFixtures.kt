@@ -398,7 +398,7 @@ internal class CountingTelecomLease(
     init {
         check(registry.activate(attempt, call))
         registry.acknowledgeOutcome(attempt)
-        lease = registry.claimRouteLease(attempt)
+        lease = registry.consumeActiveOutcome(attempt).requireClaimedLease()
     }
 }
 

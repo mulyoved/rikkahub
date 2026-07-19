@@ -3,9 +3,11 @@ package me.rerere.rikkahub.voiceagent
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.thread
 import kotlinx.coroutines.runBlocking
+import me.rerere.rikkahub.voiceagent.audio.VoiceAudioRouteOwner
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertSame
@@ -28,16 +30,21 @@ class VoiceAgentTelecomCallRegistryRetirementTest {
     }
 
     @Test
-    fun `route lease claim is one way`() {
+    fun `active outcome consumption transfers route ownership once`() {
         val registry = VoiceAgentTelecomCallRegistry()
         val attempt = registry.beginAttempt().requireAllocatedAttemptId()
         val call = FakeTelecomCall()
         assertTrue(registry.activate(attempt, call))
-        val lease = registry.claimRouteLease(attempt)
+        val lease = registry.consumeActiveOutcome(attempt).requireClaimedLease()
 
-        val duplicate = runCatching { registry.claimRouteLease(attempt) }.exceptionOrNull()
+        val duplicate = registry.consumeActiveOutcome(attempt)
 
-        assertTrue(duplicate is IllegalStateException)
+        assertEquals(
+            VoiceAgentTelecomActiveConsumptionResult.Superseded(
+                VoiceAgentRouteMetadata(VoiceAudioRouteOwner.Telecom),
+            ),
+            duplicate,
+        )
         assertEquals(0, call.disconnectCalls)
         lease.retire()
     }
@@ -48,7 +55,7 @@ class VoiceAgentTelecomCallRegistryRetirementTest {
         val attempt = registry.beginAttempt().requireAllocatedAttemptId()
         val call = FakeTelecomCall()
         assertTrue(registry.activate(attempt, call))
-        val lease = registry.claimRouteLease(attempt)
+        val lease = registry.consumeActiveOutcome(attempt).requireClaimedLease()
 
         val failure = runCatching {
             registry.retireAttempt(
@@ -72,7 +79,7 @@ class VoiceAgentTelecomCallRegistryRetirementTest {
         val previous = allocatedId(registry.beginAttempt())
         val previousCall = BlockingTelecomCall(cleanupFailureRef, cleanupEntered, releaseCleanup)
         assertTrue(registry.activate(previous, previousCall))
-        val lease = registry.claimRouteLease(previous)
+        val lease = registry.consumeActiveOutcome(previous).requireClaimedLease()
         val ownerGateway = CountingGateway()
         val joinerGateway = CountingGateway()
         val executor = Executors.newFixedThreadPool(2)
@@ -86,19 +93,27 @@ class VoiceAgentTelecomCallRegistryRetirementTest {
                 }
             }
             assertTrue(cleanupEntered.await(1, TimeUnit.SECONDS))
+            val joinerEntered = CountDownLatch(1)
+            val joinerThread = AtomicReference<Thread>()
             val joiner = executor.submit<Throwable?> {
                 runBlocking {
+                    joinerThread.set(Thread.currentThread())
+                    joinerEntered.countDown()
                     runCatching {
                         VoiceAgentAudioRouteResolver(joinerGateway, registry, 100).resolve()
                     }.exceptionOrNull()
                 }
             }
 
+            check(joinerEntered.await(1, TimeUnit.SECONDS)) {
+                "joining resolver did not enter route resolution"
+            }
+            awaitBlocked(joinerThread)
             assertFalse(joiner.isDone)
-            assertEquals(0, ownerGateway.registerCalls)
-            assertEquals(0, ownerGateway.startCalls)
-            assertEquals(0, joinerGateway.registerCalls)
-            assertEquals(0, joinerGateway.startCalls)
+            assertEquals(0, ownerGateway.registerCalls.get())
+            assertEquals(0, ownerGateway.startCalls.get())
+            assertEquals(0, joinerGateway.registerCalls.get())
+            assertEquals(0, joinerGateway.startCalls.get())
             assertEquals(
                 null,
                 registry.awaitOutcomeIfPresent(VoiceAgentTelecomAttemptId(previous.value + 1)),
@@ -130,7 +145,7 @@ class VoiceAgentTelecomCallRegistryRetirementTest {
         val previous = allocatedId(registry.beginAttempt())
         val previousCall = ThrowingTelecomCall(cleanupFailureRef)
         assertTrue(registry.activate(previous, previousCall))
-        val lease = registry.claimRouteLease(previous)
+        val lease = registry.consumeActiveOutcome(previous).requireClaimedLease()
         val gateway = CountingGateway()
 
         val thrown = runCatching {
@@ -138,8 +153,8 @@ class VoiceAgentTelecomCallRegistryRetirementTest {
         }.exceptionOrNull()
 
         assertSame(cleanupFailure, thrown)
-        assertEquals(0, gateway.registerCalls)
-        assertEquals(0, gateway.startCalls)
+        assertEquals(0, gateway.registerCalls.get())
+        assertEquals(0, gateway.startCalls.get())
         assertEquals(1, previousCall.disconnectCalls)
 
         cleanupFailureRef.set(null)
@@ -309,16 +324,16 @@ class VoiceAgentTelecomCallRegistryRetirementTest {
     }
 
     private class CountingGateway : VoiceAgentTelecomGateway {
-        var registerCalls = 0
-        var startCalls = 0
+        val registerCalls = AtomicInteger()
+        val startCalls = AtomicInteger()
 
         override fun register(): Result<Unit> {
-            registerCalls += 1
+            registerCalls.incrementAndGet()
             return Result.success(Unit)
         }
 
         override fun startCall(attemptId: VoiceAgentTelecomAttemptId): Result<Unit> {
-            startCalls += 1
+            startCalls.incrementAndGet()
             return Result.success(Unit)
         }
     }

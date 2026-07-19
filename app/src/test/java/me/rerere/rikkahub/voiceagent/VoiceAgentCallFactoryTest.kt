@@ -89,7 +89,7 @@ class VoiceAgentCallFactoryTest {
             val session = factory.create(
                 conversationId = conversationId,
                 config = factoryLaunchConfig(voiceModelId = "factory-gemini"),
-                routeLease = registry.claimRouteLease(attempt),
+                routeLease = registry.consumeActiveOutcome(attempt).requireClaimedLease(),
                 scope = sessionScope,
             )
             assertTrue(sessionMobileApi != null)
@@ -169,7 +169,7 @@ class VoiceAgentCallFactoryTest {
                 factory.create(
                     conversationId = Uuid.random(),
                     config = factoryLaunchConfig(),
-                    routeLease = registry.claimRouteLease(attempt),
+                    routeLease = registry.consumeActiveOutcome(attempt).requireClaimedLease(),
                     scope = this,
                 )
             }.exceptionOrNull()
