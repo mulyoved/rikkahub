@@ -3,15 +3,21 @@ package me.rerere.rikkahub.voiceagent.audio
 import android.media.AudioRecord
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.Executors
+import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.thread
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
@@ -23,6 +29,102 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class VoiceAudioRouteControllerTest {
+    @Test
+    fun `cancellation after active publication retires exact capture before dispatcher return`() {
+        val cancellation = CancellationException("capture dispatcher return cancelled")
+        val taskCancellationFailure = IllegalArgumentException("task cancellation failed")
+        val recorderStopFailure = UnsupportedOperationException("recorder stop failed")
+        val recorderReleaseFailure = AssertionError("recorder release failed")
+        val routeFailure = IllegalStateException("route retirement failed")
+        val events = CopyOnWriteArrayList<String>()
+        val ownership = VoiceAudioCaptureOwnership<Any, Any>(
+            startRecorder = {},
+            isRecorderRecording = { true },
+            stopRecorder = {
+                events += "stop-recorder"
+                throw recorderStopFailure
+            },
+            releaseRecorder = {
+                events += "release-recorder"
+                throw recorderReleaseFailure
+            },
+            startTask = { true },
+            cancelTask = {
+                events += "cancel-task"
+                throw taskCancellationFailure
+            },
+        )
+        val lease = FakeCaptureRouteLease(
+            onRetire = {
+                events += "retire-route"
+                throw routeFailure
+            },
+        )
+        val token = ownership.reserve()
+        assertTrue(ownership.publishRoute(token, lease))
+        val setup = VoiceAudioCaptureSetup(token, 64, Any())
+        val task = Any()
+        val callerDispatcher = QueuedCoroutineDispatcher()
+        val workerDispatcher = Executors.newSingleThreadExecutor().asCoroutineDispatcher()
+        val callerOwner = SupervisorJob()
+        val observedFailure = AtomicReference<Throwable?>()
+        val callerCompleted = CountDownLatch(1)
+        val caller = CoroutineScope(callerOwner + callerDispatcher).launch {
+            try {
+                runVoiceAudioCaptureStartOnDispatcher(
+                    dispatcher = workerDispatcher,
+                    startCapture = { onStarted ->
+                        assertEquals(
+                            VoiceAudioCaptureStartOutcome.Started,
+                            publishVoiceAudioCapture(
+                                ownership = ownership,
+                                setup = setup,
+                                task = task,
+                                cancelTask = { events += "local-cancel-task" },
+                                releaseRecorder = { events += "local-release-recorder" },
+                            ),
+                        )
+                        onStarted(token)
+                    },
+                    retireCapture = { admittedToken -> ownership.abort(admittedToken) },
+                )
+            } catch (failure: Throwable) {
+                observedFailure.set(failure)
+            } finally {
+                callerCompleted.countDown()
+            }
+        }
+
+        try {
+            callerDispatcher.takeNext().run()
+            val dispatcherReturn = callerDispatcher.takeNext()
+            assertTrue(ownership.isCurrent(token, setup.recorder))
+
+            caller.cancel(cancellation)
+            dispatcherReturn.run()
+            assertTrue(callerCompleted.await(5, TimeUnit.SECONDS))
+
+            assertEquals(
+                listOf("cancel-task", "stop-recorder", "release-recorder", "retire-route"),
+                events,
+            )
+            assertFalse(ownership.isCurrent(token, setup.recorder))
+            assertSame(cancellation, observedFailure.get())
+            assertEquals(
+                listOf(
+                    taskCancellationFailure,
+                    recorderStopFailure,
+                    recorderReleaseFailure,
+                    routeFailure,
+                ),
+                cancellation.suppressed.toList(),
+            )
+        } finally {
+            callerOwner.cancel()
+            workerDispatcher.close()
+        }
+    }
+
     @Test
     fun `cancellation after prior stop aborts exact reserved owner before route acquisition`() {
         val cancellation = CancellationException("capture start cancelled")
@@ -674,6 +776,18 @@ class VoiceAudioRouteControllerTest {
         const val TEST_TIMEOUT_MS = 500L
     }
 
+}
+
+private class QueuedCoroutineDispatcher : CoroutineDispatcher() {
+    private val tasks = LinkedBlockingQueue<Runnable>()
+
+    override fun dispatch(context: kotlin.coroutines.CoroutineContext, block: Runnable) {
+        tasks.add(block)
+    }
+
+    fun takeNext(): Runnable = checkNotNull(tasks.poll(5, TimeUnit.SECONDS)) {
+        "Timed out waiting for queued coroutine dispatch"
+    }
 }
 
 private fun awaitThreadState(

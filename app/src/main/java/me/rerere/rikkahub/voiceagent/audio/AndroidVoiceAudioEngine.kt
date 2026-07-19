@@ -9,7 +9,11 @@ import android.media.MediaRecorder
 import android.util.Log
 import androidx.annotation.RequiresPermission
 import androidx.core.content.ContextCompat
+import java.util.Collections
+import java.util.IdentityHashMap
+import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
@@ -174,6 +178,46 @@ internal suspend fun <Recorder : Any, CaptureTask : Any> publishVoiceAudioCaptur
     return ownership.publishAndStart(setup.token, setup.recorder, task)
 }
 
+internal suspend fun <Token : Any> runVoiceAudioCaptureStartOnDispatcher(
+    dispatcher: CoroutineDispatcher,
+    startCapture: suspend (onStarted: (Token) -> Unit) -> Unit,
+    retireCapture: (Token) -> Unit,
+) {
+    val admittedToken = AtomicReference<Token?>()
+    try {
+        withContext(dispatcher) {
+            startCapture(admittedToken::set)
+        }
+    } catch (cancellation: CancellationException) {
+        val callerCancellation = cancellation.canonicalVoiceAudioCaptureCancellation()
+        admittedToken.get()?.let { token ->
+            runCatching { retireCapture(token) }
+                .exceptionOrNull()
+                ?.let(callerCancellation::addVoiceAudioCaptureCleanupFailures)
+        }
+        throw callerCancellation
+    }
+}
+
+private fun CancellationException.addVoiceAudioCaptureCleanupFailures(failure: Throwable) {
+    (sequenceOf(failure) + failure.suppressed.asSequence())
+        .filter { cleanupFailure -> cleanupFailure !== this }
+        .forEach(::addSuppressed)
+}
+
+private fun CancellationException.canonicalVoiceAudioCaptureCancellation(): CancellationException {
+    var canonical = this
+    val visited = Collections.newSetFromMap(
+        IdentityHashMap<CancellationException, Boolean>(),
+    )
+    visited += canonical
+    while (true) {
+        val original = canonical.cause as? CancellationException ?: return canonical
+        if (original.message != canonical.message || !visited.add(original)) return canonical
+        canonical = original
+    }
+}
+
 class AndroidVoiceAudioEngine(
     context: Context,
     routeOwner: VoiceAudioRouteOwner,
@@ -228,13 +272,18 @@ class AndroidVoiceAudioEngine(
     override suspend fun startCapture(
         onPcm16: (ByteArray) -> Unit,
         onDebugInjectionComplete: () -> Unit,
-    ) = withContext(Dispatchers.IO) {
-        startCaptureInternal(onPcm16, onDebugInjectionComplete)
-    }
+    ) = runVoiceAudioCaptureStartOnDispatcher<VoiceAudioCaptureToken>(
+        dispatcher = Dispatchers.IO,
+        startCapture = { onStarted ->
+            startCaptureInternal(onPcm16, onDebugInjectionComplete, onStarted)
+        },
+        retireCapture = { token -> captureOwnership.abort(token) },
+    )
 
     private suspend fun startCaptureInternal(
         onPcm16: (ByteArray) -> Unit,
         onDebugInjectionComplete: () -> Unit,
+        onStarted: (VoiceAudioCaptureToken) -> Unit,
     ) {
         if (
             ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) !=
@@ -307,6 +356,7 @@ class AndroidVoiceAudioEngine(
                 releaseRecorder = { it.releaseSafely() },
             ) == VoiceAudioCaptureStartOutcome.Started
         ) {
+            onStarted(token)
             registerDebugCapture(token, recorder, onPcm16, onDebugInjectionComplete)
         }
     }
