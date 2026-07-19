@@ -98,24 +98,44 @@ class VoiceAudioDebugCaptureRegistrationOwnerTest {
 
     @Test
     fun `stale owner unregister cannot close newer registration`() {
-        val owner = VoiceAudioDebugCaptureRegistrationOwner<Any, Any, FakeRegistration>(
-            closeRegistration = FakeRegistration::close,
+        VoiceAudioDebugInjector.clearForTest()
+        val owner = VoiceAudioDebugCaptureRegistrationOwner<
+            Any,
+            Any,
+            VoiceAudioDebugInjector.Registration,
+        >(
+            closeRegistration = VoiceAudioDebugInjector.Registration::close,
         )
         val staleToken = Any()
         val staleRecorder = Any()
-        val staleRegistration = FakeRegistration()
         val currentToken = Any()
         val currentRecorder = Any()
-        val currentRegistration = FakeRegistration()
-        owner.publish(staleToken, staleRecorder, staleRegistration) { true }
-        owner.publish(currentToken, currentRecorder, currentRegistration) { true }
+        val staleChunks = mutableListOf<ByteArray>()
+        val currentChunks = mutableListOf<ByteArray>()
+        val staleRegistration = VoiceAudioDebugInjector.registerCapture(staleChunks::add)
+        assertTrue(owner.publish(staleToken, staleRecorder, staleRegistration) { true })
+        val currentRegistration = VoiceAudioDebugInjector.registerCapture(currentChunks::add)
+        assertTrue(owner.publish(currentToken, currentRecorder, currentRegistration) { true })
 
         assertFalse(owner.unregister(staleToken, staleRecorder))
 
-        assertEquals(1, staleRegistration.closeCalls)
-        assertEquals(0, currentRegistration.closeCalls)
+        val injection = VoiceAudioDebugInjector.injectPcm16(
+            pcm16 = byteArrayOf(1, 2),
+            chunkBytes = 2,
+            chunkDelayMs = 0L,
+        )
+        assertTrue(injection.delivered)
+        assertEquals(emptyList<ByteArray>(), staleChunks)
+        assertEquals(listOf(byteArrayOf(1, 2).toList()), currentChunks.map(ByteArray::toList))
         assertTrue(owner.unregister(currentToken, currentRecorder))
-        assertEquals(1, currentRegistration.closeCalls)
+        assertFalse(
+            VoiceAudioDebugInjector.injectPcm16(
+                pcm16 = byteArrayOf(3, 4),
+                chunkBytes = 2,
+                chunkDelayMs = 0L,
+            ).delivered,
+        )
+        VoiceAudioDebugInjector.clearForTest()
     }
 
     private class FakeRegistration {

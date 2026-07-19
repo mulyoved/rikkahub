@@ -86,6 +86,11 @@ internal data class VoiceAudioCaptureSetup<Recorder : Any>(
     val recorder: Recorder,
 )
 
+internal data class VoiceAudioCaptureAdmission<Recorder : Any>(
+    val token: VoiceAudioCaptureToken,
+    val recorder: Recorder,
+)
+
 internal suspend fun <Recorder : Any, CaptureTask : Any> setupVoiceAudioCapture(
     ownership: VoiceAudioCaptureOwnership<Recorder, CaptureTask>,
     acquireRoute: () -> VoiceAudioCaptureRouteLease,
@@ -178,20 +183,26 @@ internal suspend fun <Recorder : Any, CaptureTask : Any> publishVoiceAudioCaptur
     return ownership.publishAndStart(setup.token, setup.recorder, task)
 }
 
-internal suspend fun <Token : Any> runVoiceAudioCaptureStartOnDispatcher(
+internal suspend fun <Recorder : Any> runVoiceAudioCaptureStartOnDispatcher(
     dispatcher: CoroutineDispatcher,
-    startCapture: suspend (onStarted: (Token) -> Unit) -> Unit,
-    retireCapture: (Token) -> Unit,
+    startCapture: suspend (onStarted: (VoiceAudioCaptureAdmission<Recorder>) -> Unit) -> Unit,
+    retireCapture: (VoiceAudioCaptureAdmission<Recorder>) -> Unit,
+    unregisterDebugCapture: (VoiceAudioCaptureAdmission<Recorder>) -> Unit,
 ) {
-    val admittedToken = AtomicReference<Token?>()
+    val admission = AtomicReference<VoiceAudioCaptureAdmission<Recorder>?>()
     try {
         withContext(dispatcher) {
-            startCapture(admittedToken::set)
+            startCapture(admission::set)
         }
     } catch (cancellation: CancellationException) {
         val callerCancellation = cancellation.canonicalVoiceAudioCaptureCancellation()
-        admittedToken.get()?.let { token ->
-            runCatching { retireCapture(token) }
+        admission.get()?.let { admittedCapture ->
+            runCatching {
+                runVoiceAgentCleanupStages(
+                    { retireCapture(admittedCapture) },
+                    { unregisterDebugCapture(admittedCapture) },
+                )
+            }
                 .exceptionOrNull()
                 ?.let(callerCancellation::addVoiceAudioCaptureCleanupFailures)
         }
@@ -200,8 +211,11 @@ internal suspend fun <Token : Any> runVoiceAudioCaptureStartOnDispatcher(
 }
 
 private fun CancellationException.addVoiceAudioCaptureCleanupFailures(failure: Throwable) {
+    val seen = Collections.newSetFromMap(IdentityHashMap<Throwable, Boolean>())
+    seen += this
+    suppressed.forEach { seen += it }
     (sequenceOf(failure) + failure.suppressed.asSequence())
-        .filter { cleanupFailure -> cleanupFailure !== this }
+        .filter(seen::add)
         .forEach(::addSuppressed)
 }
 
@@ -272,18 +286,21 @@ class AndroidVoiceAudioEngine(
     override suspend fun startCapture(
         onPcm16: (ByteArray) -> Unit,
         onDebugInjectionComplete: () -> Unit,
-    ) = runVoiceAudioCaptureStartOnDispatcher<VoiceAudioCaptureToken>(
+    ) = runVoiceAudioCaptureStartOnDispatcher<AudioRecord>(
         dispatcher = Dispatchers.IO,
         startCapture = { onStarted ->
             startCaptureInternal(onPcm16, onDebugInjectionComplete, onStarted)
         },
-        retireCapture = { token -> captureOwnership.abort(token) },
+        retireCapture = { admission -> captureOwnership.abort(admission.token) },
+        unregisterDebugCapture = { admission ->
+            debugCaptureRegistrations.unregister(admission.token, admission.recorder)
+        },
     )
 
     private suspend fun startCaptureInternal(
         onPcm16: (ByteArray) -> Unit,
         onDebugInjectionComplete: () -> Unit,
-        onStarted: (VoiceAudioCaptureToken) -> Unit,
+        onStarted: (VoiceAudioCaptureAdmission<AudioRecord>) -> Unit,
     ) {
         if (
             ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) !=
@@ -356,7 +373,7 @@ class AndroidVoiceAudioEngine(
                 releaseRecorder = { it.releaseSafely() },
             ) == VoiceAudioCaptureStartOutcome.Started
         ) {
-            onStarted(token)
+            onStarted(VoiceAudioCaptureAdmission(token, recorder))
             registerDebugCapture(token, recorder, onPcm16, onDebugInjectionComplete)
         }
     }
