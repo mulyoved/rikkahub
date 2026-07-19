@@ -27,7 +27,7 @@ class VoiceAgentRouteLeaseTest {
     @Test
     fun `Telecom lease exposes metadata and retires its exact attempt once`() {
         val registry = VoiceAgentTelecomCallRegistry()
-        val attempt = registry.beginAttempt()
+        val attempt = registry.beginAttempt().requireAllocatedAttemptId()
         val call = RecordingTelecomCall()
         assertTrue(registry.activate(attempt, call))
         val lease = registry.claimRouteLease(attempt)
@@ -47,7 +47,7 @@ class VoiceAgentRouteLeaseTest {
         val retryEntered = CountDownLatch(1)
         val releaseRetry = CountDownLatch(1)
         val registry = VoiceAgentTelecomCallRegistry()
-        val attempt = registry.beginAttempt()
+        val attempt = registry.beginAttempt().requireAllocatedAttemptId()
         val call = object : VoiceAgentTelecomCall {
             var disconnectCalls = 0
 
@@ -69,9 +69,10 @@ class VoiceAgentRouteLeaseTest {
         assertEquals(1, call.disconnectCalls)
         assertFalse(lease.isUsable)
 
-        val replacementAttempt = registry.beginAttempt()
-        val replacementCall = RecordingTelecomCall()
-        assertTrue(registry.activate(replacementAttempt, replacementCall))
+        assertSame(
+            firstFailure,
+            runCatching { registry.beginAttempt().requireAllocatedAttemptId() }.exceptionOrNull(),
+        )
         retirementFailure.set(null)
         val executor = Executors.newFixedThreadPool(2)
         try {
@@ -84,6 +85,9 @@ class VoiceAgentRouteLeaseTest {
             releaseRetry.countDown()
             retry.get(1, TimeUnit.SECONDS)
             assertEquals(2, call.disconnectCalls)
+            val replacementAttempt = registry.beginAttempt().requireAllocatedAttemptId()
+            val replacementCall = RecordingTelecomCall()
+            assertTrue(registry.activate(replacementAttempt, replacementCall))
             assertEquals(0, replacementCall.disconnectCalls)
 
             lease.retire()
@@ -105,7 +109,7 @@ class VoiceAgentRouteLeaseTest {
         val leaseRetirementThread = AtomicReference<Thread>()
         val leaseRetirementInterrupted = AtomicBoolean()
         val registry = VoiceAgentTelecomCallRegistry()
-        val attempt = registry.beginAttempt()
+        val attempt = registry.beginAttempt().requireAllocatedAttemptId()
         val call = object : VoiceAgentTelecomCall {
             var disconnectCalls = 0
 
@@ -123,7 +127,7 @@ class VoiceAgentRouteLeaseTest {
         val executor = Executors.newFixedThreadPool(2)
         try {
             val supersession = executor.submit<Throwable?> {
-                runCatching { registry.beginAttempt() }.exceptionOrNull()
+                runCatching { registry.beginAttempt().requireAllocatedAttemptId() }.exceptionOrNull()
             }
             check(disconnectEntered.await(1, TimeUnit.SECONDS)) {
                 "supersession disconnect did not start"
@@ -153,19 +157,18 @@ class VoiceAgentRouteLeaseTest {
             releaseDisconnect.countDown()
 
             val supersessionFailure = supersession.get(1, TimeUnit.SECONDS)
-            assertTrue(supersessionFailure is VoiceAgentTelecomAttemptStartException)
-            assertSame(firstFailure, supersessionFailure?.cause)
+            assertSame(firstFailure, supersessionFailure)
             assertSame(firstFailure, leaseRetirement.get(1, TimeUnit.SECONDS))
             assertEquals(1, call.disconnectCalls)
             assertFalse(lease.isUsable)
             assertTrue(leaseRetirementInterrupted.get())
 
             retirementFailure.set(null)
-            val replacementAttempt = registry.beginAttempt()
+            lease.retire()
+            val replacementAttempt = registry.beginAttempt().requireAllocatedAttemptId()
             val replacementCall = RecordingTelecomCall()
             assertTrue(registry.activate(replacementAttempt, replacementCall))
 
-            lease.retire()
             assertEquals(2, call.disconnectCalls)
             assertEquals(0, replacementCall.disconnectCalls)
 
@@ -181,11 +184,11 @@ class VoiceAgentRouteLeaseTest {
     @Test
     fun `stale Telecom lease retirement leaves replacement attempt untouched`() {
         val registry = VoiceAgentTelecomCallRegistry()
-        val ownedAttempt = registry.beginAttempt()
+        val ownedAttempt = registry.beginAttempt().requireAllocatedAttemptId()
         val ownedCall = RecordingTelecomCall()
         assertTrue(registry.activate(ownedAttempt, ownedCall))
         val lease = registry.claimRouteLease(ownedAttempt)
-        val replacementAttempt = registry.beginAttempt()
+        val replacementAttempt = registry.beginAttempt().requireAllocatedAttemptId()
         val replacementCall = RecordingTelecomCall()
         assertTrue(registry.activate(replacementAttempt, replacementCall))
         assertEquals(1, ownedCall.disconnectCalls)
@@ -200,7 +203,7 @@ class VoiceAgentRouteLeaseTest {
     @Test
     fun `Telecom lease usability follows external connection retirement`() {
         val registry = VoiceAgentTelecomCallRegistry()
-        val attempt = registry.beginAttempt()
+        val attempt = registry.beginAttempt().requireAllocatedAttemptId()
         val call = RecordingTelecomCall()
         assertTrue(registry.activate(attempt, call))
         val lease = registry.claimRouteLease(attempt)
@@ -402,45 +405,40 @@ class VoiceAgentRouteLeaseTest {
         val drainFailure = UnsupportedOperationException("session drain failed")
         val closeFailure = IllegalArgumentException("session close failed")
         val registry = VoiceAgentTelecomCallRegistry()
-        val attempt = registry.beginAttempt()
+        val attempt = registry.beginAttempt().requireAllocatedAttemptId()
         val call = RecordingTelecomCall(events, routeFailure)
         assertTrue(registry.activate(attempt, call))
-        val replacementCall = RecordingTelecomCall()
-        var replacementAttempt: VoiceAgentTelecomAttemptId? = null
         val delegate = RecordingManagedSession(
             events = events,
             drainFailure = drainFailure,
             closeFailure = closeFailure,
             onDrain = {
-                replacementAttempt = registry.beginAttempt()
-                assertTrue(registry.activate(checkNotNull(replacementAttempt), replacementCall))
+                assertSame(
+                    routeFailure,
+                    runCatching { registry.beginAttempt().requireAllocatedAttemptId() }.exceptionOrNull(),
+                )
             },
         )
         val owned = RouteOwnedVoiceCallSession(
             delegate = delegate,
             routeLease = registry.claimRouteLease(attempt),
         )
-        try {
-            val thrown = captureFailure {
-                owned.endAndDrainWithin(timeoutMillis = 1_000)
-            }
-            assertSame(routeFailure, thrown)
-            assertEquals(2, thrown?.suppressed?.size)
-            val recoveredDrainFailure = thrown?.suppressed?.get(0)
-            assertEquals(drainFailure::class, recoveredDrainFailure?.javaClass?.kotlin)
-            assertEquals(drainFailure.message, recoveredDrainFailure?.message)
-            assertSame(drainFailure, recoveredDrainFailure?.cause)
-            assertSame(closeFailure, thrown?.suppressed?.get(1))
-            assertEquals(1, call.disconnectCalls)
-            assertEquals(1, delegate.closeNowCalls)
-            assertEquals(0, replacementCall.disconnectCalls)
-            assertEquals(
-                listOf("route-retire", "session-end-and-drain", "session-close-now"),
-                events,
-            )
-        } finally {
-            replacementAttempt?.let { registry.claimRouteLease(it).retire() }
+        val thrown = captureFailure {
+            owned.endAndDrainWithin(timeoutMillis = 1_000)
         }
+        assertSame(routeFailure, thrown)
+        assertEquals(2, thrown?.suppressed?.size)
+        val recoveredDrainFailure = thrown?.suppressed?.get(0)
+        assertEquals(drainFailure::class, recoveredDrainFailure?.javaClass?.kotlin)
+        assertEquals(drainFailure.message, recoveredDrainFailure?.message)
+        assertSame(drainFailure, recoveredDrainFailure?.cause)
+        assertSame(closeFailure, thrown?.suppressed?.get(1))
+        assertEquals(1, call.disconnectCalls)
+        assertEquals(1, delegate.closeNowCalls)
+        assertEquals(
+            listOf("route-retire", "session-end-and-drain", "session-close-now"),
+            events,
+        )
     }
 
     @Test
@@ -508,7 +506,7 @@ class VoiceAgentRouteLeaseTest {
         val drainStarted = CompletableDeferred<Unit>()
         val neverCompletes = CompletableDeferred<Unit>()
         val registry = VoiceAgentTelecomCallRegistry()
-        val attempt = registry.beginAttempt()
+        val attempt = registry.beginAttempt().requireAllocatedAttemptId()
         val call = RecordingTelecomCall(events, routeFailure)
         assertTrue(registry.activate(attempt, call))
         val delegate = RecordingManagedSession(
@@ -524,12 +522,12 @@ class VoiceAgentRouteLeaseTest {
             routeLease = registry.claimRouteLease(attempt),
         )
         val outcome = async { owned.endAndDrainWithin(timeoutMillis = 1_000) }
-        var replacementAttempt: VoiceAgentTelecomAttemptId? = null
         try {
             drainStarted.await()
-            val replacementCall = RecordingTelecomCall()
-            replacementAttempt = registry.beginAttempt()
-            assertTrue(registry.activate(replacementAttempt, replacementCall))
+            assertSame(
+                routeFailure,
+                runCatching { registry.beginAttempt().requireAllocatedAttemptId() }.exceptionOrNull(),
+            )
             outcome.cancel(callerCancellation)
 
             val thrown = runCatching { outcome.await() }.exceptionOrNull()
@@ -543,8 +541,6 @@ class VoiceAgentRouteLeaseTest {
             assertEquals(listOf(closeFailure), cleanupAggregate.suppressed.toList())
             assertEquals(1, call.disconnectCalls)
             assertEquals(1, delegate.closeNowCalls)
-            assertEquals(0, replacementCall.disconnectCalls)
-            assertTrue(registry.isOwnedAttemptActive(replacementAttempt))
             assertEquals(
                 listOf("route-retire", "session-end-and-drain", "session-close-now"),
                 events,
@@ -552,7 +548,6 @@ class VoiceAgentRouteLeaseTest {
         } finally {
             neverCompletes.complete(Unit)
             outcome.cancel()
-            replacementAttempt?.let { registry.claimRouteLease(it).retire() }
         }
     }
 
@@ -600,17 +595,17 @@ class VoiceAgentRouteLeaseTest {
         val closeFailure = IllegalArgumentException("session close failed")
         val neverCompletes = CompletableDeferred<Unit>()
         val registry = VoiceAgentTelecomCallRegistry()
-        val attempt = registry.beginAttempt()
+        val attempt = registry.beginAttempt().requireAllocatedAttemptId()
         val call = RecordingTelecomCall(events, routeFailure)
         assertTrue(registry.activate(attempt, call))
-        val replacementCall = RecordingTelecomCall()
-        var replacementAttempt: VoiceAgentTelecomAttemptId? = null
         val delegate = RecordingManagedSession(
             events = events,
             closeFailure = closeFailure,
             onDrain = {
-                replacementAttempt = registry.beginAttempt()
-                assertTrue(registry.activate(checkNotNull(replacementAttempt), replacementCall))
+                assertSame(
+                    routeFailure,
+                    runCatching { registry.beginAttempt().requireAllocatedAttemptId() }.exceptionOrNull(),
+                )
                 neverCompletes.await()
             },
         )
@@ -628,14 +623,12 @@ class VoiceAgentRouteLeaseTest {
             assertSame(closeFailure, thrown?.suppressed?.get(1))
             assertEquals(1, call.disconnectCalls)
             assertEquals(1, delegate.closeNowCalls)
-            assertEquals(0, replacementCall.disconnectCalls)
             assertEquals(
                 listOf("route-retire", "session-end-and-drain", "session-close-now"),
                 events,
             )
         } finally {
             neverCompletes.complete(Unit)
-            replacementAttempt?.let { registry.claimRouteLease(it).retire() }
         }
     }
 
@@ -657,7 +650,7 @@ class VoiceAgentRouteLeaseTest {
         retirementFailure: Throwable? = null,
     ): VoiceAgentRouteLease {
         val registry = VoiceAgentTelecomCallRegistry()
-        val attempt = registry.beginAttempt()
+        val attempt = registry.beginAttempt().requireAllocatedAttemptId()
         assertTrue(
             registry.activate(
                 attempt,

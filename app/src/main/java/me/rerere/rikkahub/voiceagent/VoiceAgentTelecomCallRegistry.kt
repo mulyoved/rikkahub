@@ -14,11 +14,15 @@ data class VoiceAgentTelecomFailure(
     val detail: String,
 )
 
-class VoiceAgentTelecomAttemptStartException(
-    val attemptId: VoiceAgentTelecomAttemptId,
-    val failure: VoiceAgentTelecomFailure,
-    cause: Throwable,
-) : IllegalStateException(failure.detail, cause)
+sealed interface VoiceAgentTelecomAttemptStartResult {
+    data class Allocated(
+        val attemptId: VoiceAgentTelecomAttemptId,
+    ) : VoiceAgentTelecomAttemptStartResult
+
+    data class CleanupFailed(
+        val error: Throwable,
+    ) : VoiceAgentTelecomAttemptStartResult
+}
 
 sealed interface VoiceAgentTelecomOutcome {
     data object Active : VoiceAgentTelecomOutcome
@@ -61,30 +65,22 @@ class VoiceAgentTelecomCallRegistry internal constructor(
     private var nextAttemptId = 0L
     private var currentAttemptId: VoiceAgentTelecomAttemptId? = null
 
-    fun beginAttempt(): VoiceAgentTelecomAttemptId {
+    fun beginAttempt(): VoiceAgentTelecomAttemptStartResult {
         while (true) {
             when (val decision = decideBeginAttempt()) {
                 is BeginAttemptDecision.Allocated -> {
-                    val retirement = decision.routeRetirement
-                    val cleanupError = retirement?.let { routeRetirement ->
-                        runCatching {
-                            routeRetirement.connection.disconnectFromApp()
-                        }.exceptionOrNull().also { error ->
-                            finishRetiring(
-                                id = routeRetirement.id,
-                                record = routeRetirement.record,
-                                connection = routeRetirement.connection,
-                                cleanupError = error,
-                            )
-                        }
-                    }
                     decision.supersededPublication?.publish()
-                    if (cleanupError != null) {
-                        failAllocatedAttemptAfterRouteCleanup(decision.id, cleanupError)
-                    }
-                    return decision.id
+                    return VoiceAgentTelecomAttemptStartResult.Allocated(decision.id)
                 }
-                is BeginAttemptDecision.Join -> decision.attempt.awaitResult().getOrThrow()
+                is BeginAttemptDecision.CleanupFailed -> {
+                    return VoiceAgentTelecomAttemptStartResult.CleanupFailed(decision.error)
+                }
+                is BeginAttemptDecision.Join -> {
+                    val cleanupError = decision.attempt.awaitResult().exceptionOrNull()
+                    if (cleanupError != null) {
+                        return VoiceAgentTelecomAttemptStartResult.CleanupFailed(cleanupError)
+                    }
+                }
                 is BeginAttemptDecision.Retry -> {
                     val result = runCatching { decision.connection.disconnectFromApp() }
                     finishRetiring(
@@ -93,7 +89,9 @@ class VoiceAgentTelecomCallRegistry internal constructor(
                         connection = decision.connection,
                         cleanupError = result.exceptionOrNull(),
                     )
-                    result.getOrThrow()
+                    result.exceptionOrNull()?.let { cleanupError ->
+                        return VoiceAgentTelecomAttemptStartResult.CleanupFailed(cleanupError)
+                    }
                 }
             }
         }
@@ -101,7 +99,7 @@ class VoiceAgentTelecomCallRegistry internal constructor(
 
     private fun decideBeginAttempt(): BeginAttemptDecision = synchronized(lock) {
         attempts.entries.firstNotNullOfOrNull { (id, record) ->
-            registryOwnedPredecessorDecisionLocked(id, record)
+            predecessorDecisionLocked(id, record)
         }?.let { return@synchronized it }
 
         check(nextAttemptId < Long.MAX_VALUE) { "Telecom attempt IDs exhausted" }
@@ -109,7 +107,6 @@ class VoiceAgentTelecomCallRegistry internal constructor(
         val previousId = currentAttemptId
         val previousRecord = previousId?.let(attempts::get)
         var supersededPublication: OutcomePublication? = null
-        var routeRetirement: AllocatedRouteRetirement? = null
         val supersededFailure = previousId?.let {
             VoiceAgentTelecomFailure(
                 diagnosticName = "telecom_attempt_superseded",
@@ -122,28 +119,11 @@ class VoiceAgentTelecomCallRegistry internal constructor(
                 previousRecord.phase = AttemptPhase.Failed(outcome.failure)
                 supersededPublication = selectOutcomeLocked(previousRecord, outcome)
             }
-            is AttemptPhase.Active -> {
-                check(phase.ownership == RetirementOwnership.RouteLease) {
-                    "Registry-owned Telecom active attempt escaped begin decision"
-                }
-                previousRecord.phase = AttemptPhase.Retiring(
-                    connection = phase.connection,
-                    failure = checkNotNull(supersededFailure),
-                    attempt = RetirementAttempt(),
-                    ownership = phase.ownership,
-                    execution = RetirementExecution.Synchronous,
-                )
-                routeRetirement = AllocatedRouteRetirement(
-                    id = checkNotNull(previousId),
-                    record = previousRecord,
-                    connection = phase.connection,
-                )
-            }
-            is AttemptPhase.Activating -> error(
-                "Registry-owned Telecom activation escaped begin decision",
-            )
+            is AttemptPhase.Active,
+            is AttemptPhase.Activating,
             is AttemptPhase.Retiring,
             is AttemptPhase.RetirementFailed,
+            -> error("Unfinished Telecom predecessor escaped begin admission")
             is AttemptPhase.Failed,
             null,
             -> Unit
@@ -151,38 +131,44 @@ class VoiceAgentTelecomCallRegistry internal constructor(
         nextAttemptId = id.value
         attempts[id] = AttemptRecord(id)
         currentAttemptId = id
-        BeginAttemptDecision.Allocated(id, supersededPublication, routeRetirement)
+        BeginAttemptDecision.Allocated(id, supersededPublication)
     }
 
-    private fun registryOwnedPredecessorDecisionLocked(
+    private fun predecessorDecisionLocked(
         id: VoiceAgentTelecomAttemptId,
         record: AttemptRecord,
     ): BeginAttemptDecision? = when (val phase = record.phase) {
         is AttemptPhase.RetirementFailed -> {
-            val ownership = phase.ownership as? RetirementOwnership.Registry ?: return null
-            requireExactClaim(id, ownership)
-            record.phase = AttemptPhase.Retiring(
-                connection = phase.connection,
-                failure = phase.outcomeFailure,
-                attempt = RetirementAttempt(),
-                ownership = ownership,
-                execution = RetirementExecution.Synchronous,
-            )
-            BeginAttemptDecision.Retry(id, record, phase.connection)
+            when (val ownership = phase.ownership) {
+                is RetirementOwnership.Registry -> {
+                    requireExactClaim(id, ownership)
+                    record.phase = AttemptPhase.Retiring(
+                        connection = phase.connection,
+                        failure = phase.outcomeFailure,
+                        attempt = RetirementAttempt(),
+                        ownership = ownership,
+                        execution = RetirementExecution.Synchronous,
+                    )
+                    BeginAttemptDecision.Retry(id, record, phase.connection)
+                }
+                RetirementOwnership.RouteLease -> BeginAttemptDecision.CleanupFailed(phase.cleanupError)
+            }
         }
         is AttemptPhase.Retiring -> {
-            val ownership = phase.ownership as? RetirementOwnership.Registry ?: return null
-            requireExactClaim(id, ownership)
+            (phase.ownership as? RetirementOwnership.Registry)?.let { ownership ->
+                requireExactClaim(id, ownership)
+            }
             BeginAttemptDecision.Join(phase.attempt)
         }
         is AttemptPhase.Active -> {
-            val ownership = phase.ownership as? RetirementOwnership.Registry ?: return null
-            requireExactClaim(id, ownership)
+            (phase.ownership as? RetirementOwnership.Registry)?.let { ownership ->
+                requireExactClaim(id, ownership)
+            }
             record.phase = AttemptPhase.Retiring(
                 connection = phase.connection,
                 failure = replacementRequestedFailure(id),
                 attempt = RetirementAttempt(),
-                ownership = ownership,
+                ownership = phase.ownership,
                 execution = RetirementExecution.Synchronous,
             )
             BeginAttemptDecision.Retry(id, record, phase.connection)
@@ -203,28 +189,6 @@ class VoiceAgentTelecomCallRegistry internal constructor(
         AttemptPhase.Pending,
         is AttemptPhase.Failed,
         -> null
-    }
-
-    private fun failAllocatedAttemptAfterRouteCleanup(
-        id: VoiceAgentTelecomAttemptId,
-        cleanupError: Throwable,
-    ): Nothing {
-        val failure = VoiceAgentTelecomFailure(
-            diagnosticName = "telecom_supersession_cleanup_failed",
-            detail = cleanupError.message ?: cleanupError.javaClass.simpleName,
-        )
-        var publication: OutcomePublication? = null
-        val outcome = VoiceAgentTelecomOutcome.Failed(failure)
-        synchronized(lock) {
-            attempts[id]?.takeIf { record ->
-                currentAttemptId == id && record.phase == AttemptPhase.Pending
-            }?.also { record ->
-                record.phase = AttemptPhase.Failed(failure)
-                publication = selectOutcomeLocked(record, outcome)
-            }
-        }
-        publication?.publish()
-        throw VoiceAgentTelecomAttemptStartException(id, failure, cleanupError)
     }
 
     fun activate(
@@ -828,8 +792,9 @@ class VoiceAgentTelecomCallRegistry internal constructor(
         data class Allocated(
             val id: VoiceAgentTelecomAttemptId,
             val supersededPublication: OutcomePublication?,
-            val routeRetirement: AllocatedRouteRetirement?,
         ) : BeginAttemptDecision
+
+        data class CleanupFailed(val error: Throwable) : BeginAttemptDecision
 
         data class Join(val attempt: RetirementAttempt) : BeginAttemptDecision
 
@@ -839,12 +804,6 @@ class VoiceAgentTelecomCallRegistry internal constructor(
             val connection: VoiceAgentTelecomCall,
         ) : BeginAttemptDecision
     }
-
-    private data class AllocatedRouteRetirement(
-        val id: VoiceAgentTelecomAttemptId,
-        val record: AttemptRecord,
-        val connection: VoiceAgentTelecomCall,
-    )
 
     private data class FailedRetirementPublication(
         val id: VoiceAgentTelecomAttemptId,

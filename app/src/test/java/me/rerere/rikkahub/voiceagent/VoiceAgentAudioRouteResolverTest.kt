@@ -69,7 +69,7 @@ class VoiceAgentAudioRouteResolverTest {
             registry,
             100,
         ).resolve()
-        val newerAttempt = registry.beginAttempt()
+        val newerAttempt = registry.beginAttempt().requireAllocatedAttemptId()
         val newerCall = ResolverFakeCall()
         assertTrue(registry.activate(newerAttempt, newerCall))
         val newerLease = registry.claimRouteLease(newerAttempt)
@@ -102,7 +102,7 @@ class VoiceAgentAudioRouteResolverTest {
             IllegalStateException("framework retirement failed"),
         )
         val registry = VoiceAgentTelecomCallRegistry()
-        val previous = registry.beginAttempt()
+        val previous = registry.beginAttempt().requireAllocatedAttemptId()
         val previousCall = CallbackFaithfulResolverCall(registry, cleanupFailure)
         registry.activate(previous, previousCall)
         registry.awaitOutcome(previous)
@@ -143,7 +143,7 @@ class VoiceAgentAudioRouteResolverTest {
         val cleanupEntered = CountDownLatch(1)
         val releaseCleanup = CountDownLatch(1)
         val registry = VoiceAgentTelecomCallRegistry()
-        val previous = registry.beginAttempt()
+        val previous = registry.beginAttempt().requireAllocatedAttemptId()
         val previousCall = CallbackFaithfulResolverCall(
             registry = registry,
             cleanupFailure = cleanupFailureRef,
@@ -176,7 +176,7 @@ class VoiceAgentAudioRouteResolverTest {
             val beginThread = AtomicReference<Thread>()
             val begin = executor.submit<Throwable?> {
                 beginThread.set(Thread.currentThread())
-                runCatching { registry.beginAttempt() }.exceptionOrNull()
+                runCatching { registry.beginAttempt().requireAllocatedAttemptId() }.exceptionOrNull()
             }
 
             val joinDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(1)
@@ -220,7 +220,7 @@ class VoiceAgentAudioRouteResolverTest {
         val cleanupEntered = CountDownLatch(1)
         val releaseCleanup = CountDownLatch(1)
         val registry = VoiceAgentTelecomCallRegistry()
-        val previous = registry.beginAttempt()
+        val previous = registry.beginAttempt().requireAllocatedAttemptId()
         val previousCall = CallbackFaithfulResolverCall(
             registry = registry,
             cleanupFailure = cleanupFailureRef,
@@ -281,7 +281,7 @@ class VoiceAgentAudioRouteResolverTest {
             assertEquals(0, gateway.startCalls)
 
             cleanupFailureRef.set(null)
-            val replacement = registry.beginAttempt()
+            val replacement = registry.beginAttempt().requireAllocatedAttemptId()
             assertEquals(previous.value + 1, replacement.value)
         } finally {
             releaseCleanup.countDown()
@@ -292,20 +292,20 @@ class VoiceAgentAudioRouteResolverTest {
     }
 
     @Test
-    fun `canceled allocated begin consumes terminal start failure attempt`() = runBlocking {
-        val cleanupFailure = IllegalStateException("allocated predecessor cleanup failed")
+    fun `canceled route cleanup keeps cancellation primary without allocating`() = runBlocking {
+        val cleanupFailure = IllegalStateException("route predecessor cleanup failed")
         val cleanupFailureRef = AtomicReference<Throwable?>(cleanupFailure)
         val cleanupEntered = CountDownLatch(1)
         val releaseCleanup = CountDownLatch(1)
         val registry = VoiceAgentTelecomCallRegistry()
-        val previous = registry.beginAttempt()
+        val previous = registry.beginAttempt().requireAllocatedAttemptId()
         val previousCall = CallbackFaithfulResolverCall(
             registry = registry,
             cleanupFailure = cleanupFailureRef,
             onCleanup = {
                 cleanupEntered.countDown()
                 check(releaseCleanup.await(5, TimeUnit.SECONDS)) {
-                    "allocated predecessor cleanup was not released"
+                    "route predecessor cleanup was not released"
                 }
             },
         )
@@ -330,9 +330,9 @@ class VoiceAgentAudioRouteResolverTest {
                 }
             }
             check(cleanupEntered.await(1, TimeUnit.SECONDS)) {
-                "allocated predecessor cleanup did not start"
+                "route predecessor cleanup did not start"
             }
-            val cancellation = CancellationException("cancel allocated begin")
+            val cancellation = CancellationException("cancel route cleanup")
 
             resolution.cancel(cancellation)
             releaseCleanup.countDown()
@@ -342,18 +342,19 @@ class VoiceAgentAudioRouteResolverTest {
             assertTrue(thrown is CancellationException)
             assertEquals(cancellation.message, thrown.message)
             assertEquals(1, thrown.suppressed.size)
-            val startFailure = thrown.suppressed.single()
-            assertTrue(startFailure is VoiceAgentTelecomAttemptStartException)
-            assertSame(cleanupFailure, startFailure.cause)
-            val allocatedAttempt = (startFailure as VoiceAgentTelecomAttemptStartException).attemptId
-            assertEquals(previous.value + 1, allocatedAttempt.value)
-            assertEquals(null, registry.awaitOutcomeIfPresent(allocatedAttempt))
+            assertSame(cleanupFailure, thrown.suppressed.single())
+            assertEquals(
+                null,
+                registry.awaitOutcomeIfPresent(VoiceAgentTelecomAttemptId(previous.value + 1)),
+            )
             assertEquals(1, previousCall.disconnectCalls.get())
             assertEquals(0, gateway.registerCalls)
             assertEquals(0, gateway.startCalls)
 
-            val next = registry.beginAttempt()
-            assertEquals(allocatedAttempt.value + 1, next.value)
+            cleanupFailureRef.set(null)
+            previousLease.retire()
+            val next = registry.beginAttempt().requireAllocatedAttemptId()
+            assertEquals(previous.value + 1, next.value)
             registry.retireAttempt(next, VoiceAgentTelecomFailure("test_cleanup", "test cleanup"))
             registry.awaitOutcome(next)
         } finally {

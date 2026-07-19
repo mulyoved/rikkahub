@@ -391,7 +391,7 @@ internal class CountingTelecomLease(
         disconnectEntered = disconnectEntered,
         releaseRetirement = releaseRetirement,
     )
-    private val attempt = registry.beginAttempt()
+    private val attempt = registry.beginAttempt().requireAllocatedAttemptId()
     val lease: VoiceAgentRouteLease
     val retireCalls: Int get() = call.disconnectCalls
 

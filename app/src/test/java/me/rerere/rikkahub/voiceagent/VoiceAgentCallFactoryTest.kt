@@ -77,7 +77,7 @@ class VoiceAgentCallFactoryTest {
                 },
             )
             val registry = VoiceAgentTelecomCallRegistry()
-            val attempt = registry.beginAttempt()
+            val attempt = registry.beginAttempt().requireAllocatedAttemptId()
             var disconnectCalls = 0
             val telecomCall = object : VoiceAgentTelecomCall {
                 override fun disconnectFromApp() {
@@ -146,7 +146,7 @@ class VoiceAgentCallFactoryTest {
             override fun getPackageName(): String = "me.rerere.rikkahub.factorytest"
         }
         val registry = VoiceAgentTelecomCallRegistry()
-        val attempt = registry.beginAttempt()
+        val attempt = registry.beginAttempt().requireAllocatedAttemptId()
         val telecomCall = object : VoiceAgentTelecomCall {
             override fun disconnectFromApp() {
                 throw retirementFailure

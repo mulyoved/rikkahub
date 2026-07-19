@@ -30,7 +30,7 @@ class VoiceAgentTelecomRetirementTest {
         val releaseRetry = CountDownLatch(1)
         val frameworkRetryJoinStarted = CountDownLatch(1)
         val registry = VoiceAgentTelecomCallRegistry()
-        val attempt = registry.beginAttempt()
+        val attempt = registry.beginAttempt().requireAllocatedAttemptId()
         lateinit var registeredCall: VoiceAgentTelecomCall
         val connection = VoiceAgentTelecomConnection(
             onCallEndRequested = { callEndRequests.incrementAndGet() },
@@ -71,14 +71,10 @@ class VoiceAgentTelecomRetirementTest {
         assertEquals(1, setDisconnectedCalls.get())
         assertEquals(1, destroyCalls.get())
 
-        val replacementAttempt = registry.beginAttempt()
-        val replacementDisconnects = AtomicInteger()
-        val replacement = object : VoiceAgentTelecomCall {
-            override fun disconnectFromApp() {
-                replacementDisconnects.incrementAndGet()
-            }
-        }
-        assertEquals(true, registry.activate(replacementAttempt, replacement))
+        assertSame(
+            firstFailure,
+            runCatching { registry.beginAttempt().requireAllocatedAttemptId() }.exceptionOrNull(),
+        )
         frameworkFailure.set(secondFailure)
 
         val executor = Executors.newFixedThreadPool(2)
@@ -104,7 +100,6 @@ class VoiceAgentTelecomRetirementTest {
             assertEquals(3, callEndRequests.get())
             assertEquals(2, setDisconnectedCalls.get())
             assertEquals(1, destroyCalls.get())
-            assertEquals(0, replacementDisconnects.get())
             assertFalse(lease.isUsable)
 
             releaseRetry.countDown()
@@ -113,14 +108,25 @@ class VoiceAgentTelecomRetirementTest {
             assertEquals(1, appDisconnectCalls.get())
             assertEquals(2, setDisconnectedCalls.get())
             assertEquals(2, destroyCalls.get())
-            assertEquals(0, replacementDisconnects.get())
             assertFalse(lease.isUsable)
 
+            assertSame(
+                secondFailure,
+                runCatching { registry.beginAttempt().requireAllocatedAttemptId() }.exceptionOrNull(),
+            )
             frameworkFailure.set(null)
             lease.retire()
             assertEquals(2, appDisconnectCalls.get())
             assertEquals(3, setDisconnectedCalls.get())
             assertEquals(3, destroyCalls.get())
+            val replacementAttempt = registry.beginAttempt().requireAllocatedAttemptId()
+            val replacementDisconnects = AtomicInteger()
+            val replacement = object : VoiceAgentTelecomCall {
+                override fun disconnectFromApp() {
+                    replacementDisconnects.incrementAndGet()
+                }
+            }
+            assertEquals(true, registry.activate(replacementAttempt, replacement))
             assertEquals(0, replacementDisconnects.get())
 
             lease.retire()
@@ -142,7 +148,7 @@ class VoiceAgentTelecomRetirementTest {
         val releaseCleanup = CountDownLatch(1)
         val joiningLeaseStarted = CountDownLatch(1)
         val registry = VoiceAgentTelecomCallRegistry()
-        val attempt = registry.beginAttempt()
+        val attempt = registry.beginAttempt().requireAllocatedAttemptId()
         val call = object : VoiceAgentTelecomCall {
             var disconnectCalls = 0
 
@@ -196,7 +202,15 @@ class VoiceAgentTelecomRetirementTest {
             assertEquals(1, call.disconnectCalls)
             assertFalse(lease.isUsable)
 
-            val replacementAttempt = registry.beginAttempt()
+            assertSame(
+                firstFailure,
+                runCatching { registry.beginAttempt().requireAllocatedAttemptId() }.exceptionOrNull(),
+            )
+            disconnectFailure.set(null)
+
+            lease.retire()
+            assertEquals(2, call.disconnectCalls)
+            val replacementAttempt = registry.beginAttempt().requireAllocatedAttemptId()
             val replacementCall = object : VoiceAgentTelecomCall {
                 var disconnectCalls = 0
 
@@ -205,10 +219,6 @@ class VoiceAgentTelecomRetirementTest {
                 }
             }
             assertEquals(true, registry.activate(replacementAttempt, replacementCall))
-            disconnectFailure.set(null)
-
-            lease.retire()
-            assertEquals(2, call.disconnectCalls)
             assertEquals(0, replacementCall.disconnectCalls)
 
             lease.retire()
@@ -290,7 +300,7 @@ class VoiceAgentTelecomRetirementTest {
     @Test
     fun `external retirement during activation completes failure after one framework retirement`() = runBlocking {
         val registry = VoiceAgentTelecomCallRegistry()
-        val attempt = registry.beginAttempt()
+        val attempt = registry.beginAttempt().requireAllocatedAttemptId()
         val events = Collections.synchronizedList(mutableListOf<String>())
         val appRetirementRequests = AtomicInteger()
         val appRetirementRequested = CountDownLatch(1)

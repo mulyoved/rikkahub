@@ -34,18 +34,7 @@ class VoiceAgentAudioRouteResolver internal constructor(
     ) : this(gateway, registry, timeoutMs, DefaultVoiceAgentTelecomOutcomeTimeout)
 
     suspend fun resolve(): VoiceAgentRouteLease {
-        val attempt = try {
-            beginAttemptRespectingCancellation()
-        } catch (error: VoiceAgentTelecomAttemptStartException) {
-            val outcome = withContext(NonCancellable) {
-                registry.awaitOutcome(error.attemptId)
-            }
-            return when (outcome) {
-                VoiceAgentTelecomOutcome.Active -> registry.claimRouteLease(error.attemptId)
-                is VoiceAgentTelecomOutcome.Failed -> DirectFallbackVoiceAgentRouteLease(outcome.failure)
-                is VoiceAgentTelecomOutcome.CleanupFailed -> throw outcome.cleanupError
-            }
-        }
+        val attempt = beginAttemptRespectingCancellation()
         try {
             gateway.register().exceptionOrNull()?.let {
                 return fallback(attempt, "telecom_register_failed", it)
@@ -85,19 +74,21 @@ class VoiceAgentAudioRouteResolver internal constructor(
         if (cancellation != null) {
             val beginFailure = result.exceptionOrNull()
             beginFailure?.let { cancellation.addSuppressedDistinct(it) }
-            result.getOrNull()?.let { attempt ->
-                cleanupCancelledAttempt(attempt, cancellation)
-            }
-            (beginFailure as? VoiceAgentTelecomAttemptStartException)?.let { startFailure ->
-                withContext(NonCancellable) {
-                    runCatching {
-                        registry.awaitOutcome(startFailure.attemptId)
-                    }.exceptionOrNull()?.let { cancellation.addSuppressedDistinct(it) }
+            when (val startResult = result.getOrNull()) {
+                is VoiceAgentTelecomAttemptStartResult.Allocated -> {
+                    cleanupCancelledAttempt(startResult.attemptId, cancellation)
                 }
+                is VoiceAgentTelecomAttemptStartResult.CleanupFailed -> {
+                    cancellation.addSuppressedDistinct(startResult.error)
+                }
+                null -> Unit
             }
             throw cancellation
         }
-        return result.getOrThrow()
+        return when (val startResult = result.getOrThrow()) {
+            is VoiceAgentTelecomAttemptStartResult.Allocated -> startResult.attemptId
+            is VoiceAgentTelecomAttemptStartResult.CleanupFailed -> throw startResult.error
+        }
     }
 
     private suspend fun cleanupCancelledAttempt(

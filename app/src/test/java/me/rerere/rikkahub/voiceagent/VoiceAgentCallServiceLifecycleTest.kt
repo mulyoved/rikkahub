@@ -240,7 +240,7 @@ class VoiceAgentCallServiceLifecycleTest {
     }
 
     @Test
-    fun `deadline after route failure closes delegate once and preserves replacement ownership and failure order`() =
+    fun `deadline after route failure blocks replacement and preserves failure order`() =
         runTest {
             val neverCompletes = CompletableDeferred<Unit>()
             val routeFailure = IllegalStateException("route retirement failed")
@@ -254,11 +254,13 @@ class VoiceAgentCallServiceLifecycleTest {
             val manager = VoiceAgentCallManager(LifecycleCallFactory(session))
             val host = RecordingLifecycleHost()
             val lifecycle = VoiceAgentCallServiceLifecycle(manager, scope, host, endDrainTimeoutMillis = 100)
-            var replacement: LifecycleTelecomReplacement? = null
             try {
                 manager.start(Uuid.random(), lifecycleLaunchConfig(), route.lease, scope)
                 assertTrue(lifecycle.endCall())
-                replacement = route.activateReplacement()
+                assertSame(
+                    routeFailure,
+                    runCatching(route::activateReplacement).exceptionOrNull(),
+                )
                 lifecycle.beginStart()
 
                 advanceTimeBy(100)
@@ -266,7 +268,6 @@ class VoiceAgentCallServiceLifecycleTest {
 
                 assertEquals(1, route.retireCalls)
                 assertEquals(1, session.closeNowCalls)
-                assertEquals(0, replacement.call.disconnectCalls)
                 val reported = host.reportedFailures.single()
                 assertEquals(routeFailure::class, reported::class)
                 assertEquals(routeFailure.message, reported.message)
@@ -276,7 +277,6 @@ class VoiceAgentCallServiceLifecycleTest {
                 assertEquals(closeFailure.message, reported.suppressed[1].message)
             } finally {
                 neverCompletes.complete(Unit)
-                replacement?.retire()
                 scope.cancel()
             }
         }
@@ -460,7 +460,7 @@ internal class LifecycleTelecomRoute(
 ) {
     private val registry = VoiceAgentTelecomCallRegistry()
     private val call = LifecycleTelecomCall(retireFailure)
-    val attempt = registry.beginAttempt()
+    val attempt = registry.beginAttempt().requireAllocatedAttemptId()
     val lease: VoiceAgentRouteLease
     val retireCalls: Int get() = call.disconnectCalls
 
@@ -472,7 +472,7 @@ internal class LifecycleTelecomRoute(
 
     fun activateReplacement(): LifecycleTelecomReplacement {
         val replacement = LifecycleTelecomCall()
-        val replacementAttempt = registry.beginAttempt()
+        val replacementAttempt = registry.beginAttempt().requireAllocatedAttemptId()
         check(registry.activate(replacementAttempt, replacement))
         registry.acknowledgeOutcome(replacementAttempt)
         return LifecycleTelecomReplacement(registry, replacementAttempt, replacement)
