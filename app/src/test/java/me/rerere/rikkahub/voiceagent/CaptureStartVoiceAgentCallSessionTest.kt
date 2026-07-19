@@ -169,7 +169,9 @@ class CaptureStartVoiceAgentCallSessionTest {
 
         fixture.session.setMuted(false)
         assertTrue(listenerEntered.await(TEST_TIMEOUT_MS, TimeUnit.MILLISECONDS))
-        yield()
+        withTimeout(TEST_TIMEOUT_MS) {
+            while (fixture.session.state.value.audio != VoiceAudioStatus.Muted) yield()
+        }
 
         assertEquals(VoiceAudioStatus.Muted, fixture.session.state.value.audio)
         removeListener()

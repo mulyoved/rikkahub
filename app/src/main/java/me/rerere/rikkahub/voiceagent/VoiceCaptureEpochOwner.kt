@@ -123,7 +123,20 @@ internal class VoiceCaptureEpochOwner(
                 epoch.deferredCleanups.clear()
             } else emptyList()
         }
-        deferred.forEach { cleanup -> cleanup.runDeferred() }
+        var primaryFailure: Throwable? = null
+        deferred.forEach { cleanup ->
+            try {
+                cleanup.runDeferred()
+            } catch (failure: Throwable) {
+                val primary = primaryFailure
+                if (primary == null) {
+                    primaryFailure = failure
+                } else if (primary !== failure) {
+                    primary.addSuppressed(failure)
+                }
+            }
+        }
+        primaryFailure?.let { throw it }
         publishRetirementIfEligible(epoch)
     }
 
