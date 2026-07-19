@@ -2,6 +2,7 @@ package me.rerere.rikkahub.voiceagent
 
 import java.util.Collections
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
@@ -159,6 +160,121 @@ class VoiceAgentTelecomCallRegistryTest {
         assertEquals(0, replacementCall.disconnectCalls)
         assertTrue(registry.isOwnedAttemptActive(allocatedAttempt))
         assertEquals(VoiceAgentTelecomOutcome.Active, registry.awaitOutcome(allocatedAttempt))
+    }
+
+    @Test
+    fun `begin joins synchronous failure while exact result publication is delayed`() {
+        val failure = IllegalStateException("synchronous publication failure")
+        val cleanupFailure = AtomicReference<Throwable?>(failure)
+        val publicationEntered = CountDownLatch(1)
+        val releasePublication = CountDownLatch(1)
+        val registry = VoiceAgentTelecomCallRegistry(
+            afterActivationOutcomeSelected = { _, _ -> },
+            beforeFailedRetirementResultPublished = {
+                publicationEntered.countDown()
+                check(releasePublication.await(5, TimeUnit.SECONDS)) {
+                    "synchronous failure publication was not released"
+                }
+            },
+        )
+        val previous = registry.beginAttempt()
+        val call = FakeTelecomCall {
+            cleanupFailure.get()?.let { throw it }
+        }
+        registry.activate(previous, call)
+        val executor = Executors.newFixedThreadPool(2)
+
+        try {
+            val owner = executor.submit<Throwable?> {
+                runCatching { registry.beginAttempt() }.exceptionOrNull()
+            }
+            check(publicationEntered.await(1, TimeUnit.SECONDS)) {
+                "synchronous failure publication did not start"
+            }
+            val joinerThread = AtomicReference<Thread>()
+            val joiner = executor.submit<Throwable?> {
+                joinerThread.set(Thread.currentThread())
+                runCatching { registry.beginAttempt() }.exceptionOrNull()
+            }
+
+            awaitBlocked(joinerThread)
+            assertEquals(1, call.disconnectCalls)
+            releasePublication.countDown()
+
+            assertSame(failure, owner.get(1, TimeUnit.SECONDS))
+            assertSame(failure, joiner.get(1, TimeUnit.SECONDS))
+            assertEquals(1, call.disconnectCalls)
+            assertFalse(registry.isOwnedAttemptActive(VoiceAgentTelecomAttemptId(previous.value + 1)))
+
+            cleanupFailure.set(null)
+            val replacement = registry.beginAttempt()
+            assertEquals(previous.value + 1, replacement.value)
+            assertEquals(2, call.disconnectCalls)
+        } finally {
+            releasePublication.countDown()
+            executor.shutdownNow()
+        }
+    }
+
+    @Test
+    fun `begin joins callback failure while exact result publication is delayed`() {
+        val failure = IllegalStateException("callback publication failure")
+        val cleanupFailure = AtomicReference<Throwable?>(failure)
+        val publicationEntered = CountDownLatch(1)
+        val releasePublication = CountDownLatch(1)
+        val registry = VoiceAgentTelecomCallRegistry(
+            afterActivationOutcomeSelected = { _, _ -> },
+            beforeFailedRetirementResultPublished = {
+                publicationEntered.countDown()
+                check(releasePublication.await(5, TimeUnit.SECONDS)) {
+                    "callback failure publication was not released"
+                }
+            },
+        )
+        val previous = registry.beginAttempt()
+        val call = FakeTelecomCall {
+            cleanupFailure.get()?.let { throw it }
+        }
+        registry.activate(previous, call)
+        registry.retiring(call)
+        val callbackFailure = AtomicReference<Throwable>()
+        val callback = thread {
+            runCatching {
+                registry.retired(call, Result.failure(failure))
+            }.onFailure(callbackFailure::set)
+        }
+
+        check(publicationEntered.await(1, TimeUnit.SECONDS)) {
+            "callback failure publication did not start"
+        }
+        val executor = Executors.newSingleThreadExecutor()
+        try {
+            val joinerThread = AtomicReference<Thread>()
+            val joiner = executor.submit<Throwable?> {
+                joinerThread.set(Thread.currentThread())
+                runCatching { registry.beginAttempt() }.exceptionOrNull()
+            }
+
+            awaitBlocked(joinerThread)
+            assertEquals(0, call.disconnectCalls)
+            releasePublication.countDown()
+
+            assertSame(failure, joiner.get(1, TimeUnit.SECONDS))
+            callback.join(1_000)
+            assertFalse(callback.isAlive)
+            throwWorkerFailure(callbackFailure, "Telecom callback")
+            assertEquals(0, call.disconnectCalls)
+            assertFalse(registry.isOwnedAttemptActive(VoiceAgentTelecomAttemptId(previous.value + 1)))
+
+            cleanupFailure.set(null)
+            val replacement = registry.beginAttempt()
+            assertEquals(previous.value + 1, replacement.value)
+            assertEquals(1, call.disconnectCalls)
+        } finally {
+            releasePublication.countDown()
+            executor.shutdownNow()
+            callback.join(1_000)
+        }
     }
 
     @Test
@@ -968,6 +1084,16 @@ class VoiceAgentTelecomCallRegistryTest {
         while (thread.get()?.state != Thread.State.WAITING) {
             check(System.nanoTime() < deadline) {
                 "begin caller did not wait for pre-lease retirement"
+            }
+            Thread.yield()
+        }
+    }
+
+    private fun awaitBlocked(thread: AtomicReference<Thread>) {
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(1)
+        while (thread.get()?.state !in setOf(Thread.State.WAITING, Thread.State.TIMED_WAITING)) {
+            check(System.nanoTime() < deadline) {
+                "begin caller did not block on pre-lease retirement publication"
             }
             Thread.yield()
         }

@@ -37,8 +37,19 @@ class VoiceAgentTelecomCallRegistry internal constructor(
         VoiceAgentTelecomAttemptId,
         VoiceAgentTelecomOutcome,
     ) -> Unit,
+    private val beforeFailedRetirementResultPublished: () -> Unit,
 ) {
-    constructor() : this(afterActivationOutcomeSelected = { _, _ -> })
+    internal constructor(
+        afterActivationOutcomeSelected: (
+            VoiceAgentTelecomAttemptId,
+            VoiceAgentTelecomOutcome,
+        ) -> Unit,
+    ) : this(afterActivationOutcomeSelected, beforeFailedRetirementResultPublished = {})
+
+    constructor() : this(
+        afterActivationOutcomeSelected = { _, _ -> },
+        beforeFailedRetirementResultPublished = {},
+    )
 
     private val lock = Any()
     private val attempts = mutableMapOf<VoiceAgentTelecomAttemptId, AttemptRecord>()
@@ -280,6 +291,7 @@ class VoiceAgentTelecomCallRegistry internal constructor(
                             }
                             RetirementExecution.Callback -> shouldDisconnect = true
                             RetirementExecution.Synchronous -> joinedAttempt = phase.attempt
+                            RetirementExecution.PublishingFailure -> joinedAttempt = phase.attempt
                         }
                     } else {
                         shouldDisconnect = true
@@ -537,12 +549,16 @@ class VoiceAgentTelecomCallRegistry internal constructor(
     fun retired(connection: VoiceAgentTelecomCall, result: Result<Unit>) {
         var publication: OutcomePublication? = null
         var retirementAttempt: RetirementAttempt? = null
+        var failedRetirementPublication: FailedRetirementPublication? = null
         synchronized(lock) {
             val (id, record) = attemptForConnectionLocked(connection) ?: return
             val currentPhase = record.phase
             if (
                 currentPhase is AttemptPhase.Retiring &&
-                currentPhase.execution == RetirementExecution.Synchronous
+                (
+                    currentPhase.execution == RetirementExecution.Synchronous ||
+                        currentPhase.execution == RetirementExecution.PublishingFailure
+                    )
             ) {
                 return@synchronized
             }
@@ -575,23 +591,38 @@ class VoiceAgentTelecomCallRegistry internal constructor(
             if (cleanupError == null) {
                 publication = terminalizeLocked(id, record, failure)
             } else {
-                record.phase = AttemptPhase.RetirementFailed(
-                    connection = connection,
-                    outcomeFailure = failure,
-                    cleanupError = cleanupError,
-                    ownership = ownership,
-                )
-                if (currentAttemptId == id) currentAttemptId = null
-                if (ownership is RetirementOwnership.Registry) {
-                    publication = selectOutcomeLocked(
-                        record,
-                        VoiceAgentTelecomOutcome.CleanupFailed(failure, cleanupError),
+                val retiringPhase = phase as? AttemptPhase.Retiring
+                if (retiringPhase != null) {
+                    failedRetirementPublication = stageFailedRetirementPublicationLocked(
+                        id = id,
+                        record = record,
+                        phase = retiringPhase,
+                        cleanupError = cleanupError,
                     )
+                } else {
+                    record.phase = AttemptPhase.RetirementFailed(
+                        connection = connection,
+                        outcomeFailure = failure,
+                        cleanupError = cleanupError,
+                        ownership = ownership,
+                    )
+                    if (currentAttemptId == id) currentAttemptId = null
+                    if (ownership is RetirementOwnership.Registry) {
+                        publication = selectOutcomeLocked(
+                            record,
+                            VoiceAgentTelecomOutcome.CleanupFailed(failure, cleanupError),
+                        )
+                    }
                 }
             }
         }
-        retirementAttempt?.publish(result)
-        publication?.publish()
+        val failedPublication = failedRetirementPublication
+        if (failedPublication != null) {
+            publishFailedRetirement(failedPublication)
+        } else {
+            retirementAttempt?.publish(result)
+            publication?.publish()
+        }
     }
 
     private fun finishRetiring(
@@ -602,33 +633,72 @@ class VoiceAgentTelecomCallRegistry internal constructor(
     ) {
         var publication: OutcomePublication? = null
         var retirementAttempt: RetirementAttempt? = null
+        var failedRetirementPublication: FailedRetirementPublication? = null
         synchronized(lock) {
             val phase = record.phase
             if (phase is AttemptPhase.Retiring && phase.connection === connection) {
-                retirementAttempt = phase.attempt
                 if (cleanupError == null) {
+                    retirementAttempt = phase.attempt
                     publication = terminalizeLocked(id, record, phase.failure)
-                } else {
-                    record.phase = AttemptPhase.RetirementFailed(
-                        connection = connection,
-                        outcomeFailure = phase.failure,
+                } else if (phase.execution != RetirementExecution.PublishingFailure) {
+                    failedRetirementPublication = stageFailedRetirementPublicationLocked(
+                        id = id,
+                        record = record,
+                        phase = phase,
                         cleanupError = cleanupError,
-                        ownership = phase.ownership,
                     )
-                    if (currentAttemptId == id) currentAttemptId = null
-                    if (phase.ownership is RetirementOwnership.Registry) {
-                        publication = selectOutcomeLocked(
-                            record,
-                            VoiceAgentTelecomOutcome.CleanupFailed(phase.failure, cleanupError),
-                        )
-                    }
                 }
             }
         }
-        retirementAttempt?.publish(
-            cleanupError?.let { Result.failure(it) } ?: Result.success(Unit),
+        val failedPublication = failedRetirementPublication
+        if (failedPublication != null) {
+            publishFailedRetirement(failedPublication)
+        } else {
+            retirementAttempt?.publish(Result.success(Unit))
+            publication?.publish()
+        }
+    }
+
+    private fun stageFailedRetirementPublicationLocked(
+        id: VoiceAgentTelecomAttemptId,
+        record: AttemptRecord,
+        phase: AttemptPhase.Retiring,
+        cleanupError: Throwable,
+    ): FailedRetirementPublication {
+        val publishingPhase = phase.copy(execution = RetirementExecution.PublishingFailure)
+        record.phase = publishingPhase
+        return FailedRetirementPublication(
+            id = id,
+            record = record,
+            phase = publishingPhase,
+            cleanupError = cleanupError,
         )
-        publication?.publish()
+    }
+
+    private fun publishFailedRetirement(failedPublication: FailedRetirementPublication) {
+        beforeFailedRetirementResultPublished()
+        failedPublication.phase.attempt.publish(Result.failure(failedPublication.cleanupError))
+
+        var outcomePublication: OutcomePublication? = null
+        synchronized(lock) {
+            val (id, record, phase, cleanupError) = failedPublication
+            if (attempts[id] !== record || record.phase !== phase) return@synchronized
+
+            record.phase = AttemptPhase.RetirementFailed(
+                connection = phase.connection,
+                outcomeFailure = phase.failure,
+                cleanupError = cleanupError,
+                ownership = phase.ownership,
+            )
+            if (currentAttemptId == id) currentAttemptId = null
+            if (phase.ownership is RetirementOwnership.Registry) {
+                outcomePublication = selectOutcomeLocked(
+                    record,
+                    VoiceAgentTelecomOutcome.CleanupFailed(phase.failure, cleanupError),
+                )
+            }
+        }
+        outcomePublication?.publish()
     }
 
     private fun terminalizeLocked(
@@ -769,6 +839,13 @@ class VoiceAgentTelecomCallRegistry internal constructor(
         val connection: VoiceAgentTelecomCall,
     )
 
+    private data class FailedRetirementPublication(
+        val id: VoiceAgentTelecomAttemptId,
+        val record: AttemptRecord,
+        val phase: AttemptPhase.Retiring,
+        val cleanupError: Throwable,
+    )
+
     private class RegistryCleanupClaim(
         val attemptId: VoiceAgentTelecomAttemptId,
     )
@@ -785,6 +862,8 @@ class VoiceAgentTelecomCallRegistry internal constructor(
         data object Callback : RetirementExecution
 
         data object Synchronous : RetirementExecution
+
+        data object PublishingFailure : RetirementExecution
     }
 
     private sealed interface RetirementCaller {
