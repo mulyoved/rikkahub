@@ -46,7 +46,9 @@ class VoiceAgentAudioRouteResolver internal constructor(
                 val startError = gateway.startCall(attempt).exceptionOrNull()
                 if (startError != null) {
                     fallback(attempt, "telecom_start_failed", startError)
-                } else when (val outcome = outcomeTimeout.awaitOutcome(timeoutMs) { registry.observeOutcome(attempt) }) {
+                } else when (
+                    val outcome = outcomeTimeout.awaitOutcome(timeoutMs) { registry.observeOutcome(attempt) }
+                ) {
                     VoiceAgentTelecomOutcome.Active -> {
                         registry.consumeActiveOutcome(attempt)
                     }
