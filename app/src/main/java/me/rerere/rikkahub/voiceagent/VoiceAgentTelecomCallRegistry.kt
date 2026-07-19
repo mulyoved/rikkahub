@@ -25,16 +25,6 @@ sealed interface VoiceAgentTelecomAttemptStartResult {
     ) : VoiceAgentTelecomAttemptStartResult
 }
 
-internal sealed interface VoiceAgentTelecomActiveConsumptionResult {
-    data class Claimed(
-        val lease: TelecomVoiceAgentRouteLease,
-    ) : VoiceAgentTelecomActiveConsumptionResult
-
-    data class Superseded(
-        val metadata: VoiceAgentRouteMetadata,
-    ) : VoiceAgentTelecomActiveConsumptionResult
-}
-
 sealed interface VoiceAgentTelecomOutcome {
     data object Active : VoiceAgentTelecomOutcome
 
@@ -53,6 +43,8 @@ class VoiceAgentTelecomCallRegistry internal constructor(
     ) -> Unit,
     private val beforeFailedRetirementResultPublished: () -> Unit,
     private val afterFailedRetirementResultPublished: () -> Unit = {},
+    private val beforeActiveOutcomeRetirementJoin: () -> Unit = {},
+    private val afterActiveOutcomeClaimed: () -> Unit = {},
 ) {
     internal constructor(
         afterActivationOutcomeSelected: (
@@ -376,34 +368,59 @@ class VoiceAgentTelecomCallRegistry internal constructor(
 
     internal fun consumeActiveOutcome(
         id: VoiceAgentTelecomAttemptId,
-    ): VoiceAgentTelecomActiveConsumptionResult = synchronized(lock) {
-        val record = attempts[id] ?: return@synchronized supersededActiveConsumption()
+    ): VoiceAgentRouteResolution {
+        while (true) {
+            when (val decision = decideActiveOutcomeConsumption(id)) {
+                is ActiveOutcomeConsumptionDecision.Return -> {
+                    if (decision.resolution is VoiceAgentRouteResolution.Resolved) {
+                        afterActiveOutcomeClaimed()
+                    }
+                    return decision.resolution
+                }
+                is ActiveOutcomeConsumptionDecision.Join -> {
+                    beforeActiveOutcomeRetirementJoin()
+                    decision.attempt.awaitResult()
+                }
+            }
+        }
+    }
+
+    private fun decideActiveOutcomeConsumption(
+        id: VoiceAgentTelecomAttemptId,
+    ): ActiveOutcomeConsumptionDecision = synchronized(lock) {
+        val record = attempts[id] ?: return@synchronized ActiveOutcomeConsumptionDecision.Return(
+            supersededActiveConsumption(),
+        )
         check(record.selectedOutcome == VoiceAgentTelecomOutcome.Active) {
             "Telecom attempt ${id.value} did not select an active outcome"
         }
         when (val phase = record.phase) {
             is AttemptPhase.Active -> {
                 val ownership = phase.ownership as? RetirementOwnership.Registry
-                    ?: return@synchronized supersededActiveConsumption()
+                    ?: return@synchronized ActiveOutcomeConsumptionDecision.Return(
+                        supersededActiveConsumption(),
+                    )
                 requireExactRegistryOwnership(id, ownership)
                 record.phase = phase.copy(ownership = RetirementOwnership.RouteLease)
                 record.outcomeAcknowledged = true
-                VoiceAgentTelecomActiveConsumptionResult.Claimed(
-                    TelecomVoiceAgentRouteLease(id, this),
+                ActiveOutcomeConsumptionDecision.Return(
+                    VoiceAgentRouteResolution.Resolved(TelecomVoiceAgentRouteLease(id, this)),
                 )
             }
             is AttemptPhase.Failed -> {
                 attempts.remove(id)
-                if (currentAttemptId == id) {
-                    currentAttemptId = null
-                }
-                supersededActiveConsumption()
+                if (currentAttemptId == id) currentAttemptId = null
+                ActiveOutcomeConsumptionDecision.Return(supersededActiveConsumption())
             }
-            is AttemptPhase.Retiring,
-            is AttemptPhase.RetirementFailed,
-            -> {
+            is AttemptPhase.Retiring -> {
                 record.outcomeAcknowledged = true
-                supersededActiveConsumption()
+                ActiveOutcomeConsumptionDecision.Join(phase.attempt)
+            }
+            is AttemptPhase.RetirementFailed -> {
+                record.outcomeAcknowledged = true
+                ActiveOutcomeConsumptionDecision.Return(
+                    VoiceAgentRouteResolution.CleanupFailed(phase.cleanupError),
+                )
             }
             AttemptPhase.Pending,
             is AttemptPhase.Activating,
@@ -411,7 +428,7 @@ class VoiceAgentTelecomCallRegistry internal constructor(
         }
     }
 
-    private fun supersededActiveConsumption() = VoiceAgentTelecomActiveConsumptionResult.Superseded(
+    private fun supersededActiveConsumption() = VoiceAgentRouteResolution.Superseded(
         VoiceAgentRouteMetadata(VoiceAudioRouteOwner.Telecom),
     )
 
@@ -823,6 +840,16 @@ class VoiceAgentTelecomCallRegistry internal constructor(
             val record: AttemptRecord,
             val connection: VoiceAgentTelecomCall,
         ) : BeginAttemptDecision
+    }
+
+    private sealed interface ActiveOutcomeConsumptionDecision {
+        data class Return(
+            val resolution: VoiceAgentRouteResolution,
+        ) : ActiveOutcomeConsumptionDecision
+
+        data class Join(
+            val attempt: SynchronousAttemptResult,
+        ) : ActiveOutcomeConsumptionDecision
     }
 
     private data class FailedRetirementPublication(

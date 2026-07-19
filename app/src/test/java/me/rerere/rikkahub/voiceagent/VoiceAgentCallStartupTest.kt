@@ -4,6 +4,7 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.CoroutineScope
@@ -262,6 +263,160 @@ class VoiceAgentCallStartupTest {
         )
         registry.awaitOutcome(replacementAttempt)
     }
+
+    @Test
+    fun `active supersession waits for blocked cleanup before returning stale`() {
+        val cleanupEntered = CountDownLatch(1)
+        val releaseCleanup = CountDownLatch(1)
+        val consumptionJoinEntered = CountDownLatch(1)
+        val registry = VoiceAgentTelecomCallRegistry(
+            afterActivationOutcomeSelected = { _, _ -> },
+            beforeFailedRetirementResultPublished = {},
+            beforeActiveOutcomeRetirementJoin = consumptionJoinEntered::countDown,
+        )
+        val previous = VoiceAgentTelecomAttemptId(1)
+        val previousCall = StartupBlockingTelecomCall(
+            cleanupFailure = AtomicReference(null),
+            cleanupEntered = cleanupEntered,
+            releaseCleanup = releaseCleanup,
+        )
+        val outcomeGate = StartupActiveOutcomeGate()
+        val resolver = VoiceAgentAudioRouteResolver(
+            gateway = StartupTelecomGateway { attempt ->
+                assertEquals(previous, attempt)
+                assertTrue(registry.activate(attempt, previousCall))
+            },
+            registry = registry,
+            timeoutMs = 1_000,
+            outcomeTimeout = outcomeGate,
+        )
+        val manager = VoiceAgentCallManager(StartupFakeCallFactory())
+        val startup = VoiceAgentCallStartup(manager, resolver)
+        val resolverExecutor = Executors.newSingleThreadExecutor()
+        val replacementExecutor = Executors.newSingleThreadExecutor()
+
+        try {
+            val olderStartup = resolverExecutor.submit<VoiceAgentCallStartupResult> {
+                runBlocking {
+                    startup.start(Uuid.random(), fakeStartupLaunchConfig(), this) { true }
+                }
+            }
+            runBlocking {
+                assertEquals(VoiceAgentTelecomOutcome.Active, outcomeGate.observed.await())
+            }
+            val replacement = replacementExecutor.submit<VoiceAgentTelecomAttemptStartResult> {
+                registry.beginAttempt()
+            }
+            assertTrue(cleanupEntered.await(1, TimeUnit.SECONDS))
+
+            outcomeGate.release.complete(Unit)
+            assertTrue(consumptionJoinEntered.await(1, TimeUnit.SECONDS))
+            assertFalse(olderStartup.isDone)
+            assertFalse(replacement.isDone)
+
+            releaseCleanup.countDown()
+            val replacementAttempt = replacement.get(1, TimeUnit.SECONDS).requireAllocatedAttemptId()
+            assertEquals(previous.value + 1, replacementAttempt.value)
+            assertEquals(
+                VoiceAgentCallStartupResult.Stale(VoiceAgentRouteMetadata(VoiceAudioRouteOwner.Telecom)),
+                olderStartup.get(1, TimeUnit.SECONDS),
+            )
+            assertEquals(1, previousCall.disconnectCalls.get())
+            assertEquals(null, manager.activeConversationId.value)
+            registry.retireAttempt(
+                replacementAttempt,
+                VoiceAgentTelecomFailure("test_cleanup", "test cleanup"),
+            )
+            runBlocking { registry.awaitOutcome(replacementAttempt) }
+        } finally {
+            outcomeGate.release.complete(Unit)
+            releaseCleanup.countDown()
+            resolverExecutor.shutdownNow()
+            replacementExecutor.shutdownNow()
+        }
+    }
+
+    @Test
+    fun `active supersession propagates exact blocked cleanup failure and retains retry ownership`() {
+        val cleanupFailure = IllegalStateException("blocked active supersession cleanup failed")
+        val cleanupFailureRef = AtomicReference<Throwable?>(cleanupFailure)
+        val cleanupEntered = CountDownLatch(1)
+        val releaseCleanup = CountDownLatch(1)
+        val consumptionJoinEntered = CountDownLatch(1)
+        val registry = VoiceAgentTelecomCallRegistry(
+            afterActivationOutcomeSelected = { _, _ -> },
+            beforeFailedRetirementResultPublished = {},
+            beforeActiveOutcomeRetirementJoin = consumptionJoinEntered::countDown,
+        )
+        val previous = VoiceAgentTelecomAttemptId(1)
+        val previousCall = StartupBlockingTelecomCall(
+            cleanupFailure = cleanupFailureRef,
+            cleanupEntered = cleanupEntered,
+            releaseCleanup = releaseCleanup,
+        )
+        val outcomeGate = StartupActiveOutcomeGate()
+        val resolver = VoiceAgentAudioRouteResolver(
+            gateway = StartupTelecomGateway { attempt ->
+                assertEquals(previous, attempt)
+                assertTrue(registry.activate(attempt, previousCall))
+            },
+            registry = registry,
+            timeoutMs = 1_000,
+            outcomeTimeout = outcomeGate,
+        )
+        val manager = VoiceAgentCallManager(StartupFakeCallFactory())
+        val startup = VoiceAgentCallStartup(manager, resolver)
+        val resolverExecutor = Executors.newSingleThreadExecutor()
+        val replacementExecutor = Executors.newSingleThreadExecutor()
+
+        try {
+            val olderStartup = resolverExecutor.submit<Throwable?> {
+                runBlocking {
+                    runCatching {
+                        startup.start(Uuid.random(), fakeStartupLaunchConfig(), this) { true }
+                    }.exceptionOrNull()
+                }
+            }
+            runBlocking {
+                assertEquals(VoiceAgentTelecomOutcome.Active, outcomeGate.observed.await())
+            }
+            val replacement = replacementExecutor.submit<VoiceAgentTelecomAttemptStartResult> {
+                registry.beginAttempt()
+            }
+            assertTrue(cleanupEntered.await(1, TimeUnit.SECONDS))
+
+            outcomeGate.release.complete(Unit)
+            assertTrue(consumptionJoinEntered.await(1, TimeUnit.SECONDS))
+            assertFalse(olderStartup.isDone)
+            assertFalse(replacement.isDone)
+
+            releaseCleanup.countDown()
+            val replacementResult = replacement.get(1, TimeUnit.SECONDS)
+            assertTrue(replacementResult is VoiceAgentTelecomAttemptStartResult.CleanupFailed)
+            assertSame(
+                cleanupFailure,
+                (replacementResult as VoiceAgentTelecomAttemptStartResult.CleanupFailed).error,
+            )
+            assertSame(cleanupFailure, olderStartup.get(1, TimeUnit.SECONDS))
+            assertEquals(1, previousCall.disconnectCalls.get())
+            assertEquals(null, manager.activeConversationId.value)
+
+            cleanupFailureRef.set(null)
+            val retryAttempt = registry.beginAttempt().requireAllocatedAttemptId()
+            assertEquals(previous.value + 1, retryAttempt.value)
+            assertEquals(2, previousCall.disconnectCalls.get())
+            registry.retireAttempt(
+                retryAttempt,
+                VoiceAgentTelecomFailure("test_cleanup", "test cleanup"),
+            )
+            runBlocking { registry.awaitOutcome(retryAttempt) }
+        } finally {
+            outcomeGate.release.complete(Unit)
+            releaseCleanup.countDown()
+            resolverExecutor.shutdownNow()
+            replacementExecutor.shutdownNow()
+        }
+    }
 }
 
 private class StartupActiveOutcomeGate : VoiceAgentTelecomOutcomeTimeout {
@@ -293,6 +448,21 @@ private class StartupTelecomCall : VoiceAgentTelecomCall {
 
     override fun disconnectFromApp() {
         disconnectCalls += 1
+    }
+}
+
+private class StartupBlockingTelecomCall(
+    private val cleanupFailure: AtomicReference<Throwable?>,
+    private val cleanupEntered: CountDownLatch,
+    private val releaseCleanup: CountDownLatch,
+) : VoiceAgentTelecomCall {
+    val disconnectCalls = AtomicInteger()
+
+    override fun disconnectFromApp() {
+        disconnectCalls.incrementAndGet()
+        cleanupEntered.countDown()
+        check(releaseCleanup.await(5, TimeUnit.SECONDS)) { "active supersession cleanup was not released" }
+        cleanupFailure.get()?.let { throw it }
     }
 }
 

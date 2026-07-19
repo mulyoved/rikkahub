@@ -58,7 +58,7 @@ class VoiceAgentTelecomRetirementTest {
         }
         assertEquals(true, registry.activate(attempt, registeredCall))
         assertEquals(VoiceAgentTelecomOutcome.Active, registry.awaitOutcome(attempt))
-        val lease = registry.consumeActiveOutcome(attempt).requireClaimedLease()
+        val lease = registry.consumeActiveOutcome(attempt).requireResolvedLease()
 
         assertSame(firstFailure, runCatching(connection::onDisconnect).exceptionOrNull())
         assertEquals(1, callEndRequests.get())
@@ -174,7 +174,7 @@ class VoiceAgentTelecomRetirementTest {
         }
         assertEquals(true, registry.activate(attempt, call))
         assertEquals(VoiceAgentTelecomOutcome.Active, registry.awaitOutcome(attempt))
-        val lease = registry.consumeActiveOutcome(attempt).requireClaimedLease()
+        val lease = registry.consumeActiveOutcome(attempt).requireResolvedLease()
         val executor = Executors.newFixedThreadPool(2)
         try {
             val ownerRetirement = executor.submit<Throwable?> {

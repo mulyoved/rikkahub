@@ -35,12 +35,12 @@ class VoiceAgentTelecomCallRegistryRetirementTest {
         val attempt = registry.beginAttempt().requireAllocatedAttemptId()
         val call = FakeTelecomCall()
         assertTrue(registry.activate(attempt, call))
-        val lease = registry.consumeActiveOutcome(attempt).requireClaimedLease()
+        val lease = registry.consumeActiveOutcome(attempt).requireResolvedLease()
 
         val duplicate = registry.consumeActiveOutcome(attempt)
 
         assertEquals(
-            VoiceAgentTelecomActiveConsumptionResult.Superseded(
+            VoiceAgentRouteResolution.Superseded(
                 VoiceAgentRouteMetadata(VoiceAudioRouteOwner.Telecom),
             ),
             duplicate,
@@ -55,7 +55,7 @@ class VoiceAgentTelecomCallRegistryRetirementTest {
         val attempt = registry.beginAttempt().requireAllocatedAttemptId()
         val call = FakeTelecomCall()
         assertTrue(registry.activate(attempt, call))
-        val lease = registry.consumeActiveOutcome(attempt).requireClaimedLease()
+        val lease = registry.consumeActiveOutcome(attempt).requireResolvedLease()
 
         val failure = runCatching {
             registry.retireAttempt(
@@ -79,7 +79,7 @@ class VoiceAgentTelecomCallRegistryRetirementTest {
         val previous = allocatedId(registry.beginAttempt())
         val previousCall = BlockingTelecomCall(cleanupFailureRef, cleanupEntered, releaseCleanup)
         assertTrue(registry.activate(previous, previousCall))
-        val lease = registry.consumeActiveOutcome(previous).requireClaimedLease()
+        val lease = registry.consumeActiveOutcome(previous).requireResolvedLease()
         val ownerGateway = CountingGateway()
         val joinerGateway = CountingGateway()
         val executor = Executors.newFixedThreadPool(2)
@@ -145,7 +145,7 @@ class VoiceAgentTelecomCallRegistryRetirementTest {
         val previous = allocatedId(registry.beginAttempt())
         val previousCall = ThrowingTelecomCall(cleanupFailureRef)
         assertTrue(registry.activate(previous, previousCall))
-        val lease = registry.consumeActiveOutcome(previous).requireClaimedLease()
+        val lease = registry.consumeActiveOutcome(previous).requireResolvedLease()
         val gateway = CountingGateway()
 
         val thrown = runCatching {

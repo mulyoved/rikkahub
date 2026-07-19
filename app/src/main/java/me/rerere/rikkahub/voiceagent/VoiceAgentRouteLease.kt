@@ -7,6 +7,20 @@ data class VoiceAgentRouteMetadata(
     val failure: VoiceAgentTelecomFailure? = null,
 )
 
+sealed interface VoiceAgentRouteResolution {
+    data class Resolved(
+        val lease: VoiceAgentRouteLease,
+    ) : VoiceAgentRouteResolution
+
+    data class Superseded(
+        val metadata: VoiceAgentRouteMetadata,
+    ) : VoiceAgentRouteResolution
+
+    data class CleanupFailed(
+        val error: Throwable,
+    ) : VoiceAgentRouteResolution
+}
+
 sealed interface VoiceAgentRouteLease {
     val metadata: VoiceAgentRouteMetadata
     val isUsable: Boolean

@@ -467,7 +467,7 @@ internal class LifecycleTelecomRoute(
     init {
         check(registry.activate(attempt, call))
         registry.acknowledgeOutcome(attempt)
-        lease = registry.consumeActiveOutcome(attempt).requireClaimedLease()
+        lease = registry.consumeActiveOutcome(attempt).requireResolvedLease()
     }
 
     fun activateReplacement(): LifecycleTelecomReplacement {

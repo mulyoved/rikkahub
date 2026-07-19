@@ -7,16 +7,6 @@ import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 
-sealed interface VoiceAgentRouteResolution {
-    data class Resolved(
-        val lease: VoiceAgentRouteLease,
-    ) : VoiceAgentRouteResolution
-
-    data class Superseded(
-        val metadata: VoiceAgentRouteMetadata,
-    ) : VoiceAgentRouteResolution
-}
-
 internal fun interface VoiceAgentTelecomOutcomeTimeout {
     suspend fun awaitOutcome(
         timeoutMs: Long,
@@ -45,35 +35,44 @@ class VoiceAgentAudioRouteResolver internal constructor(
 
     suspend fun resolve(): VoiceAgentRouteResolution {
         val attempt = beginAttemptRespectingCancellation()
+        var cleanupOnCancellation: suspend (CancellationException) -> Unit = { cancellation ->
+            cleanupCancelledAttempt(attempt, cancellation)
+        }
         try {
-            gateway.register().exceptionOrNull()?.let {
-                return fallback(attempt, "telecom_register_failed", it)
-            }
-            gateway.startCall(attempt).exceptionOrNull()?.let {
-                return fallback(attempt, "telecom_start_failed", it)
-            }
-            return when (val outcome = outcomeTimeout.awaitOutcome(timeoutMs) { registry.observeOutcome(attempt) }) {
-                VoiceAgentTelecomOutcome.Active -> {
-                    consumeActiveOutcome(attempt)
-                }
-                is VoiceAgentTelecomOutcome.Failed -> {
-                    registry.acknowledgeOutcome(attempt)
-                    VoiceAgentRouteResolution.Resolved(
-                        DirectFallbackVoiceAgentRouteLease(outcome.failure),
+            val registrationError = gateway.register().exceptionOrNull()
+            val resolution = if (registrationError != null) {
+                fallback(attempt, "telecom_register_failed", registrationError)
+            } else {
+                val startError = gateway.startCall(attempt).exceptionOrNull()
+                if (startError != null) {
+                    fallback(attempt, "telecom_start_failed", startError)
+                } else when (val outcome = outcomeTimeout.awaitOutcome(timeoutMs) { registry.observeOutcome(attempt) }) {
+                    VoiceAgentTelecomOutcome.Active -> {
+                        registry.consumeActiveOutcome(attempt)
+                    }
+                    is VoiceAgentTelecomOutcome.Failed -> {
+                        registry.acknowledgeOutcome(attempt)
+                        VoiceAgentRouteResolution.Resolved(
+                            DirectFallbackVoiceAgentRouteLease(outcome.failure),
+                        )
+                    }
+                    is VoiceAgentTelecomOutcome.CleanupFailed -> {
+                        registry.acknowledgeOutcome(attempt)
+                        throw outcome.cleanupError
+                    }
+                    null -> fallback(
+                        attempt,
+                        "telecom_connection_timeout",
+                        IllegalStateException("Android Telecom did not become active within ${timeoutMs}ms"),
                     )
                 }
-                is VoiceAgentTelecomOutcome.CleanupFailed -> {
-                    registry.acknowledgeOutcome(attempt)
-                    throw outcome.cleanupError
-                }
-                null -> fallback(
-                    attempt,
-                    "telecom_connection_timeout",
-                    IllegalStateException("Android Telecom did not become active within ${timeoutMs}ms"),
-                )
             }
+            cleanupOnCancellation = cancellationCleanupFor(resolution)
+            currentCoroutineContext().ensureActive()
+            cleanupOnCancellation = {}
+            return resolution
         } catch (cancellation: CancellationException) {
-            cleanupCancelledAttempt(attempt, cancellation)
+            cleanupOnCancellation(cancellation)
             throw cancellation
         }
     }
@@ -136,7 +135,7 @@ class VoiceAgentAudioRouteResolver internal constructor(
             registry.awaitOutcome(attempt)
         }
         return when (retired) {
-            VoiceAgentTelecomOutcome.Active -> consumeActiveOutcome(attempt)
+            VoiceAgentTelecomOutcome.Active -> registry.consumeActiveOutcome(attempt)
             is VoiceAgentTelecomOutcome.Failed -> VoiceAgentRouteResolution.Resolved(
                 DirectFallbackVoiceAgentRouteLease(retired.failure),
             )
@@ -144,14 +143,26 @@ class VoiceAgentAudioRouteResolver internal constructor(
         }
     }
 
-    private fun consumeActiveOutcome(
-        attempt: VoiceAgentTelecomAttemptId,
-    ): VoiceAgentRouteResolution = when (val result = registry.consumeActiveOutcome(attempt)) {
-        is VoiceAgentTelecomActiveConsumptionResult.Claimed -> {
-            VoiceAgentRouteResolution.Resolved(result.lease)
+    private fun cancellationCleanupFor(
+        resolution: VoiceAgentRouteResolution,
+    ): suspend (CancellationException) -> Unit = when (resolution) {
+        is VoiceAgentRouteResolution.Resolved -> { cancellation ->
+            cleanupCancelledLease(resolution.lease, cancellation)
         }
-        is VoiceAgentTelecomActiveConsumptionResult.Superseded -> {
-            VoiceAgentRouteResolution.Superseded(result.metadata)
+        is VoiceAgentRouteResolution.CleanupFailed -> { cancellation ->
+            cancellation.addSuppressedDistinct(resolution.error)
+        }
+        is VoiceAgentRouteResolution.Superseded -> { _ -> }
+    }
+
+    private suspend fun cleanupCancelledLease(
+        lease: VoiceAgentRouteLease,
+        cancellation: CancellationException,
+    ) {
+        withContext(NonCancellable) {
+            runCatching(lease::retire).exceptionOrNull()?.let { error ->
+                cancellation.addSuppressedDistinct(error)
+            }
         }
     }
 

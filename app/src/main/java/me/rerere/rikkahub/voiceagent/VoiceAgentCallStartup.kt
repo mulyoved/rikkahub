@@ -46,6 +46,7 @@ class VoiceAgentCallStartup internal constructor(
             is VoiceAgentRouteResolution.Superseded -> {
                 return VoiceAgentCallStartupResult.Stale(resolution.metadata)
             }
+            is VoiceAgentRouteResolution.CleanupFailed -> throw resolution.error
         }
         val route = routeLease.metadata
         if (!isCurrent()) {
