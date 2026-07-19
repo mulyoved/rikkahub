@@ -19,16 +19,23 @@ import org.junit.Test
 
 class VoiceAgentTelecomRetirementTest {
     @Test
-    fun `framework onDisconnect retains captured failure for later exact lease retry`() = runBlocking {
+    fun `framework onDisconnect fail once can succeed on later exact lease retry`() = runBlocking {
         val firstFailure = IllegalStateException("framework disconnect failed")
+        val frameworkFailure = AtomicReference<Throwable?>(firstFailure)
+        val callEndRequests = AtomicInteger()
+        val setDisconnectedCalls = AtomicInteger()
+        val destroyCalls = AtomicInteger()
         val registry = VoiceAgentTelecomCallRegistry()
         val attempt = registry.beginAttempt()
         lateinit var registeredCall: VoiceAgentTelecomCall
         val connection = VoiceAgentTelecomConnection(
-            onCallEndRequested = {},
+            onCallEndRequested = { callEndRequests.incrementAndGet() },
             onRetiring = { registry.retiring(registeredCall) },
-            setDisconnected = { throw firstFailure },
-            destroy = {},
+            setDisconnected = {
+                setDisconnectedCalls.incrementAndGet()
+                frameworkFailure.getAndSet(null)?.let { throw it }
+            },
+            destroy = { destroyCalls.incrementAndGet() },
             onRetired = { result -> registry.retired(registeredCall, result) },
         )
         val appDisconnectCalls = AtomicInteger()
@@ -43,6 +50,9 @@ class VoiceAgentTelecomRetirementTest {
         val lease = TelecomVoiceAgentRouteLease(attempt, registry)
 
         assertSame(firstFailure, runCatching(connection::onDisconnect).exceptionOrNull())
+        assertEquals(1, callEndRequests.get())
+        assertEquals(1, setDisconnectedCalls.get())
+        assertEquals(1, destroyCalls.get())
         assertFalse(lease.isUsable)
 
         val replacementAttempt = registry.beginAttempt()
@@ -54,10 +64,18 @@ class VoiceAgentTelecomRetirementTest {
         }
         assertEquals(true, registry.activate(replacementAttempt, replacement))
 
-        assertSame(firstFailure, runCatching(lease::retire).exceptionOrNull())
+        lease.retire()
         assertEquals(1, appDisconnectCalls.get())
+        assertEquals(2, setDisconnectedCalls.get())
+        assertEquals(2, destroyCalls.get())
         assertEquals(0, replacementDisconnects.get())
         assertFalse(lease.isUsable)
+
+        lease.retire()
+        assertEquals(1, appDisconnectCalls.get())
+        assertEquals(2, setDisconnectedCalls.get())
+        assertEquals(2, destroyCalls.get())
+        assertEquals(0, replacementDisconnects.get())
     }
 
     @Test
@@ -172,13 +190,12 @@ class VoiceAgentTelecomRetirementTest {
         )
 
         runCatching { retirement.retire(Unit) }
-        runCatching { retirement.retire(Unit) }
 
         assertEquals(listOf("retiring", "setDisconnected", "destroy", "callback"), events)
     }
 
     @Test
-    fun `retirement preserves first cleanup failure and replays aggregate`() {
+    fun `retirement preserves first cleanup failure and aggregates stages`() {
         val events = mutableListOf<String>()
         val retiringFailure = IllegalStateException("retiring failed")
         val disconnectFailure = IllegalArgumentException("disconnect failed")
@@ -204,12 +221,10 @@ class VoiceAgentTelecomRetirementTest {
         )
 
         val first = runCatching { retirement.retire(Unit) }.exceptionOrNull()
-        val later = runCatching { retirement.retire(Unit) }.exceptionOrNull()
 
         assertEquals(listOf("retiring", "setDisconnected", "destroy", "retired"), events)
         assertSame(retiringFailure, first)
         assertEquals(listOf(disconnectFailure, destroyFailure, retiredFailure), first?.suppressed?.toList())
-        assertSame(first, later)
     }
 
     @Test
