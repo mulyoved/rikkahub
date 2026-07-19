@@ -19,8 +19,9 @@ import org.junit.Test
 
 class VoiceAgentTelecomRetirementTest {
     @Test
-    fun `framework onDisconnect joins active exact lease retry without reopening failure`() = runBlocking {
+    fun `framework onDisconnect joins failed exact lease retry and later route retry succeeds`() = runBlocking {
         val firstFailure = IllegalStateException("framework disconnect failed")
+        val secondFailure = IllegalArgumentException("route retry failed")
         val frameworkFailure = AtomicReference<Throwable?>(firstFailure)
         val callEndRequests = AtomicInteger()
         val setDisconnectedCalls = AtomicInteger()
@@ -36,13 +37,14 @@ class VoiceAgentTelecomRetirementTest {
             onRetiring = { registry.retiring(registeredCall) },
             setDisconnected = {
                 val call = setDisconnectedCalls.incrementAndGet()
-                frameworkFailure.getAndSet(null)?.let { throw it }
+                val failure = frameworkFailure.get()
                 if (call == 2) {
                     retryEntered.countDown()
                     check(releaseRetry.await(1, TimeUnit.SECONDS)) {
                         "exact route retry was not released"
                     }
                 }
+                failure?.let { throw it }
             },
             destroy = { destroyCalls.incrementAndGet() },
             onRetired = { result -> registry.retired(registeredCall, result) },
@@ -77,6 +79,7 @@ class VoiceAgentTelecomRetirementTest {
             }
         }
         assertEquals(true, registry.activate(replacementAttempt, replacement))
+        frameworkFailure.set(secondFailure)
 
         val executor = Executors.newFixedThreadPool(2)
         try {
@@ -105,18 +108,25 @@ class VoiceAgentTelecomRetirementTest {
             assertFalse(lease.isUsable)
 
             releaseRetry.countDown()
-            assertEquals(null, retry.get(1, TimeUnit.SECONDS))
-            assertEquals(null, frameworkJoin.get(1, TimeUnit.SECONDS))
+            assertSame(secondFailure, retry.get(1, TimeUnit.SECONDS))
+            assertSame(secondFailure, frameworkJoin.get(1, TimeUnit.SECONDS))
             assertEquals(1, appDisconnectCalls.get())
             assertEquals(2, setDisconnectedCalls.get())
             assertEquals(2, destroyCalls.get())
             assertEquals(0, replacementDisconnects.get())
             assertFalse(lease.isUsable)
 
+            frameworkFailure.set(null)
             lease.retire()
-            assertEquals(1, appDisconnectCalls.get())
-            assertEquals(2, setDisconnectedCalls.get())
-            assertEquals(2, destroyCalls.get())
+            assertEquals(2, appDisconnectCalls.get())
+            assertEquals(3, setDisconnectedCalls.get())
+            assertEquals(3, destroyCalls.get())
+            assertEquals(0, replacementDisconnects.get())
+
+            lease.retire()
+            assertEquals(2, appDisconnectCalls.get())
+            assertEquals(3, setDisconnectedCalls.get())
+            assertEquals(3, destroyCalls.get())
             assertEquals(0, replacementDisconnects.get())
         } finally {
             releaseRetry.countDown()
@@ -138,16 +148,21 @@ class VoiceAgentTelecomRetirementTest {
 
             override fun disconnectFromApp() {
                 disconnectCalls += 1
+                val cleanupResult = runCatching {
+                    runVoiceAgentCleanupStages(
+                        { registry.retiring(this) },
+                        { disconnectFailure.get()?.let { throw it } },
+                        {
+                            cleanupReached.countDown()
+                            check(releaseCleanup.await(1, TimeUnit.SECONDS)) {
+                                "production cleanup callback was not released"
+                            }
+                        },
+                    )
+                }
                 runVoiceAgentCleanupStages(
-                    { registry.retiring(this) },
-                    { disconnectFailure.get()?.let { throw it } },
-                    {
-                        cleanupReached.countDown()
-                        check(releaseCleanup.await(1, TimeUnit.SECONDS)) {
-                            "production cleanup callback was not released"
-                        }
-                    },
-                    { registry.clear(this) },
+                    { cleanupResult.getOrThrow() },
+                    { registry.retired(this, cleanupResult) },
                 )
             }
         }

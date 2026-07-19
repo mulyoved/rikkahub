@@ -377,10 +377,6 @@ class VoiceAgentTelecomCallRegistry internal constructor(
         }
     }
 
-    fun clear(connection: VoiceAgentTelecomCall) {
-        retired(connection, Result.success(Unit))
-    }
-
     fun retired(connection: VoiceAgentTelecomCall, result: Result<Unit>) {
         var publication: OutcomePublication? = null
         var retirementAttempt: RetirementAttempt? = null
