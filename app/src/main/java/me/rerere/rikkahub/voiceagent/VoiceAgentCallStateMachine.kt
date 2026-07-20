@@ -10,6 +10,7 @@ import kotlin.uuid.Uuid
 internal data class VoiceAgentCallRequest(
     val conversationId: Uuid,
     val config: VoiceAgentLaunchConfig,
+    val transport: VoiceAgentTransport,
 )
 
 internal sealed interface VoiceAgentCallStartResult {

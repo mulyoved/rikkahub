@@ -112,7 +112,19 @@ internal class DefaultVoiceAgentCallFactory internal constructor(
         val cleanup = voiceAgentRouteCleanupOperation(routeLease)
         return try {
             VoiceAgentSessionCreationResult.Created(
-                createSession(request.conversationId, request.config, routeLease, scope),
+                when (request.transport) {
+                    VoiceAgentTransport.DirectGemini -> createSession(
+                        request.conversationId,
+                        request.config,
+                        routeLease,
+                        scope,
+                    )
+                    VoiceAgentTransport.LiveKitExperimental -> {
+                        throw VoiceAgentCallConfigurationException(
+                            "LiveKit experimental voice transport is unavailable",
+                        )
+                    }
+                },
             )
         } catch (creationError: Throwable) {
             finishFailedOwnedCreation(creationError, cleanup)

@@ -73,7 +73,8 @@ class VoiceAgentCallService : Service() {
     private fun destroyBaseService() = super.onDestroy()
 
     private fun startCall(intent: Intent) {
-        val conversationId = parseConversationId(intent) ?: return
+        val fields = parseStartFields(intent) ?: return
+        val conversationId = fields.conversationId
         VoiceAgentLog.d(TAG, "start requested conversationId=$conversationId")
         val generation = lifecycle.beginStart(conversationId)
         lifecycle.launchStartConfiguration(generation, conversationId) {
@@ -83,7 +84,11 @@ class VoiceAgentCallService : Service() {
             when (val result = VoiceAgentConfigResolver().resolve(settings, conversation)) {
                 is VoiceAgentConfigResult.Available -> {
                     VoiceAgentLog.d(TAG, "config available voiceModelId=${result.config.voiceModelId}")
-                    VoiceAgentCallRequest(conversationId, result.config)
+                    VoiceAgentCallRequest(
+                        conversationId = conversationId,
+                        config = result.config,
+                        transport = fields.transport,
+                    )
                 }
                 is VoiceAgentConfigResult.Unavailable -> {
                     val safeMessage = result.message.redactForVoiceAgentLog()
@@ -94,16 +99,18 @@ class VoiceAgentCallService : Service() {
         }
     }
 
-    private fun parseConversationId(intent: Intent): Uuid? {
-        val conversationId = intent.getStringExtra(VoiceAgentCallContract.EXTRA_CONVERSATION_ID)
-            ?.let { runCatching { Uuid.parse(it) }.getOrNull() }
-        if (conversationId == null) {
-            VoiceAgentLog.w(TAG, "start ignored: missing or invalid conversation id")
+    private fun parseStartFields(intent: Intent): VoiceAgentCallStartFields? {
+        val fields = decodeVoiceAgentCallStartFields(
+            conversationId = intent.getStringExtra(VoiceAgentCallContract.EXTRA_CONVERSATION_ID),
+            transportWireName = intent.getStringExtra(VoiceAgentCallContract.EXTRA_TRANSPORT),
+        )
+        if (fields == null) {
+            VoiceAgentLog.w(TAG, "start ignored: missing or invalid start fields")
             lifecycle.rejectInvalidStart(
-                VoiceAgentCallConfigurationException("Missing or invalid conversation id"),
+                VoiceAgentCallConfigurationException("Missing or invalid voice call start fields"),
             )
         }
-        return conversationId
+        return fields
     }
 
     private fun startForegroundFor(conversationId: String, state: VoiceAgentUiState) {

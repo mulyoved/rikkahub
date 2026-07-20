@@ -972,6 +972,7 @@ private fun completedJob(): Job = CompletableDeferred<Unit>().apply { complete(U
 
 private fun request(label: String): VoiceAgentCallRequest = VoiceAgentCallRequest(
     conversationId = Uuid.random(),
+    transport = VoiceAgentTransport.DirectGemini,
     config = VoiceAgentLaunchConfig(
         hermesVoiceBaseUrl = "https://$label.voice.test",
         credentials = HermesVoiceCredentials(deviceApiKey = "test-key"),

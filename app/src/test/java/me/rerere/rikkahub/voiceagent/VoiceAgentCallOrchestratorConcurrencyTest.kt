@@ -19,6 +19,97 @@ import org.junit.Test
 
 class VoiceAgentCallOrchestratorConcurrencyTest {
     @Test
+    fun `matching livekit transport reuses active call`() = runTest {
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val appJob = SupervisorJob()
+        val route = OrchestratorFakeRoute()
+        val session = OrchestratorFakeSession(routeMetadata = route.lease.metadata)
+        val factory = OrchestratorFakeFactory { _, _, _ ->
+            VoiceAgentSessionCreationResult.Created(session)
+        }
+        var routeCalls = 0
+        val orchestrator = VoiceAgentCallOrchestrator(
+            factory = factory,
+            resolveRoute = {
+                routeCalls += 1
+                route.lease
+            },
+            appScope = CoroutineScope(appJob + dispatcher),
+        )
+        val request = orchestratorRequest("livekit-reuse").copy(
+            transport = VoiceAgentTransport.LiveKitExperimental,
+        )
+
+        assertTrue(
+            async { orchestrator.start(request) }.also { runCurrent() }.await() is VoiceAgentCallStartResult.Active,
+        )
+        assertTrue(
+            async { orchestrator.start(request) }.also { runCurrent() }.await() is VoiceAgentCallStartResult.Active,
+        )
+
+        assertEquals(listOf(request), factory.requests)
+        assertEquals(1, routeCalls)
+        assertEquals(0, session.reconnectCalls)
+        appJob.cancel()
+    }
+
+    @Test
+    fun `different transport replaces matching conversation and config and rejects stale direct state`() = runTest {
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val appJob = SupervisorJob()
+        val cleanupEntered = CompletableDeferred<Unit>()
+        val releaseCleanup = CompletableDeferred<Unit>()
+        val directCleanup = OrchestratorFakeCleanupOperation {
+            cleanupEntered.complete(Unit)
+            releaseCleanup.await()
+            VoiceAgentCleanupResult.Completed
+        }
+        val routes = listOf(OrchestratorFakeRoute(), OrchestratorFakeRoute())
+        val directSession = OrchestratorFakeSession(
+            routeMetadata = routes[0].lease.metadata,
+            cleanupOperation = directCleanup,
+        )
+        val liveKitSession = OrchestratorFakeSession(routeMetadata = routes[1].lease.metadata)
+        val sessions = listOf(directSession, liveKitSession)
+        var routeIndex = 0
+        var sessionIndex = 0
+        val factory = OrchestratorFakeFactory { _, _, _ ->
+            VoiceAgentSessionCreationResult.Created(sessions[sessionIndex++])
+        }
+        val orchestrator = VoiceAgentCallOrchestrator(
+            factory = factory,
+            resolveRoute = { routes[routeIndex++].lease },
+            appScope = CoroutineScope(appJob + dispatcher),
+        )
+        val direct = orchestratorRequest("same").copy(transport = VoiceAgentTransport.DirectGemini)
+        val liveKit = direct.copy(transport = VoiceAgentTransport.LiveKitExperimental)
+
+        assertTrue(
+            async { orchestrator.start(direct) }.also { runCurrent() }.await() is VoiceAgentCallStartResult.Active,
+        )
+        val replacement = async { orchestrator.start(liveKit) }
+        runCurrent()
+        cleanupEntered.await()
+
+        assertFalse(replacement.isCompleted)
+        assertEquals(listOf(direct), factory.requests)
+
+        releaseCleanup.complete(Unit)
+        runCurrent()
+
+        assertTrue(replacement.await() is VoiceAgentCallStartResult.Active)
+        assertEquals(listOf(direct, liveKit), factory.requests)
+        assertEquals(listOf(VoiceAgentCleanupMode.Replacement), directCleanup.modes)
+        val liveKitState = orchestrator.state.value
+
+        directSession.emit(VoiceAgentUiState(session = VoiceSessionStatus.Error("stale direct callback")))
+        runCurrent()
+
+        assertEquals(liveKitState, orchestrator.state.value)
+        appJob.cancel()
+    }
+
+    @Test
     fun `A B C replacement cleans A once and admits only C after cleanup`() = runTest {
         val dispatcher = StandardTestDispatcher(testScheduler)
         val appJob = SupervisorJob()

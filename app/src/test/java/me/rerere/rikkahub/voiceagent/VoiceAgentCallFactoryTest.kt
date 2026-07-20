@@ -34,6 +34,40 @@ import kotlin.uuid.Uuid
 
 class VoiceAgentCallFactoryTest {
     @Test
+    fun `livekit request never falls back to direct session creation`() = runTest {
+        val root = Files.createTempDirectory("voice-factory-livekit-unavailable").toFile()
+        val conversationId = Uuid.random()
+        var directSessionCreations = 0
+        val factory = ownedCreationFactory(root, conversationId) {
+            directSessionCreations += 1
+            FakeVoiceSessionApi()
+        }
+        val registry = VoiceAgentTelecomCallRegistry()
+        val attempt = registry.beginAttempt().requireAllocatedAttemptId()
+        val telecomCall = RecordingFactoryTelecomCall()
+        assertTrue(registry.activate(attempt, telecomCall))
+        registry.acknowledgeOutcome(attempt)
+        try {
+            val result = factory.createOwned(
+                request = VoiceAgentCallRequest(
+                    conversationId = conversationId,
+                    config = factoryLaunchConfig(),
+                    transport = VoiceAgentTransport.LiveKitExperimental,
+                ),
+                routeLease = registry.consumeActiveOutcome(attempt).requireResolvedLease(),
+                scope = this,
+            )
+
+            assertTrue(result is VoiceAgentSessionCreationResult.FailedClean)
+            assertEquals(0, directSessionCreations)
+            assertEquals(1, telecomCall.disconnectCalls)
+            assertFalse(registry.isOwnedAttemptActive(attempt))
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
     fun `successful owned creation returns Created and leaves route live`() = runTest {
         val root = Files.createTempDirectory("voice-factory-owned-success").toFile()
         val sessionScope = CoroutineScope(coroutineContext + SupervisorJob())
@@ -47,7 +81,11 @@ class VoiceAgentCallFactoryTest {
         val factory = ownedCreationFactory(root, conversationId)
         try {
             val result = factory.createOwned(
-                request = VoiceAgentCallRequest(conversationId, factoryLaunchConfig()),
+                request = VoiceAgentCallRequest(
+                    conversationId,
+                    factoryLaunchConfig(),
+                    VoiceAgentTransport.DirectGemini,
+                ),
                 routeLease = lease,
                 scope = sessionScope,
             )
@@ -80,7 +118,11 @@ class VoiceAgentCallFactoryTest {
         val factory = ownedCreationFactory(root, conversationId) { throw creationFailure }
         try {
             val result = factory.createOwned(
-                request = VoiceAgentCallRequest(conversationId, factoryLaunchConfig()),
+                request = VoiceAgentCallRequest(
+                    conversationId,
+                    factoryLaunchConfig(),
+                    VoiceAgentTransport.DirectGemini,
+                ),
                 routeLease = registry.consumeActiveOutcome(attempt).requireResolvedLease(),
                 scope = this,
             )
@@ -109,7 +151,11 @@ class VoiceAgentCallFactoryTest {
         val factory = ownedCreationFactory(root, conversationId) { throw creationFailure }
         try {
             val result = factory.createOwned(
-                request = VoiceAgentCallRequest(conversationId, factoryLaunchConfig()),
+                request = VoiceAgentCallRequest(
+                    conversationId,
+                    factoryLaunchConfig(),
+                    VoiceAgentTransport.DirectGemini,
+                ),
                 routeLease = registry.consumeActiveOutcome(attempt).requireResolvedLease(),
                 scope = this,
             )
@@ -142,7 +188,11 @@ class VoiceAgentCallFactoryTest {
         try {
             val thrown = runCatching {
                 factory.createOwned(
-                    request = VoiceAgentCallRequest(conversationId, factoryLaunchConfig()),
+                    request = VoiceAgentCallRequest(
+                        conversationId,
+                        factoryLaunchConfig(),
+                        VoiceAgentTransport.DirectGemini,
+                    ),
                     routeLease = registry.consumeActiveOutcome(attempt).requireResolvedLease(),
                     scope = this,
                 )
@@ -171,7 +221,11 @@ class VoiceAgentCallFactoryTest {
         try {
             val thrown = runCatching {
                 factory.createOwned(
-                    request = VoiceAgentCallRequest(conversationId, factoryLaunchConfig()),
+                    request = VoiceAgentCallRequest(
+                        conversationId,
+                        factoryLaunchConfig(),
+                        VoiceAgentTransport.DirectGemini,
+                    ),
                     routeLease = registry.consumeActiveOutcome(attempt).requireResolvedLease(),
                     scope = this,
                 )
@@ -243,6 +297,7 @@ class VoiceAgentCallFactoryTest {
                 request = VoiceAgentCallRequest(
                     conversationId = conversationId,
                     config = factoryLaunchConfig(voiceModelId = "factory-gemini"),
+                    transport = VoiceAgentTransport.DirectGemini,
                 ),
                 routeLease = registry.consumeActiveOutcome(attempt).requireResolvedLease(),
                 scope = sessionScope,

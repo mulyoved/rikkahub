@@ -11,6 +11,7 @@ class VoiceAgentCallContractTest {
         assertEquals("me.rerere.rikkahub.voiceagent.action.START", VoiceAgentCallContract.ACTION_START)
         assertEquals("me.rerere.rikkahub.voiceagent.action.END", VoiceAgentCallContract.ACTION_END)
         assertEquals("conversationId", VoiceAgentCallContract.EXTRA_CONVERSATION_ID)
+        assertEquals("transport", VoiceAgentCallContract.EXTRA_TRANSPORT)
         assertEquals(2401, VoiceAgentCallContract.NOTIFICATION_ID)
     }
 

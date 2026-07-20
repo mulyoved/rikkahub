@@ -167,6 +167,7 @@ internal class OrchestratorFakeFactory(
 
 internal fun orchestratorRequest(label: String): VoiceAgentCallRequest = VoiceAgentCallRequest(
     conversationId = Uuid.random(),
+    transport = VoiceAgentTransport.DirectGemini,
     config = VoiceAgentLaunchConfig(
         hermesVoiceBaseUrl = "https://$label.voice.test",
         credentials = HermesVoiceCredentials(deviceApiKey = "test-key"),

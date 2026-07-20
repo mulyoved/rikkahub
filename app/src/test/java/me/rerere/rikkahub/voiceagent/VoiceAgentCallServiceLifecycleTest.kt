@@ -646,6 +646,7 @@ internal fun serviceRequest(
     voiceModelId: String = "gemini-flash",
 ) = VoiceAgentCallRequest(
     conversationId = conversationId,
+    transport = VoiceAgentTransport.DirectGemini,
     config = VoiceAgentLaunchConfig(
         hermesVoiceBaseUrl = "https://voice.test",
         credentials = me.rerere.rikkahub.voiceagent.hermesvoice.HermesVoiceCredentials(

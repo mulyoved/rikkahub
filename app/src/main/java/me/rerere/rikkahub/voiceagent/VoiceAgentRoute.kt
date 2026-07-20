@@ -86,7 +86,11 @@ fun VoiceAgentRoute(conversationId: Uuid) {
                 onStart = {
                     ContextCompat.startForegroundService(
                         context,
-                        voiceAgentCallStartIntent(context, conversationId.toString()),
+                        voiceAgentCallStartIntent(
+                            context,
+                            conversationId.toString(),
+                            VoiceAgentTransport.DirectGemini,
+                        ),
                     )
                 },
                 onBack = { navController.popBackStack() },
