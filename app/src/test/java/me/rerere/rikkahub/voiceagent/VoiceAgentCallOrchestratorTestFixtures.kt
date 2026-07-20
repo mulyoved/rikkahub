@@ -1,5 +1,6 @@
 package me.rerere.rikkahub.voiceagent
 
+import java.util.Collections
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -103,7 +104,7 @@ internal class OrchestratorFakeCleanupOperation(
     },
 ) : VoiceAgentCleanupOperation {
     override val token: Any = Any()
-    val modes = mutableListOf<VoiceAgentCleanupMode>()
+    val modes: MutableList<VoiceAgentCleanupMode> = Collections.synchronizedList(mutableListOf())
 
     override suspend fun run(mode: VoiceAgentCleanupMode): VoiceAgentCleanupResult {
         modes += mode

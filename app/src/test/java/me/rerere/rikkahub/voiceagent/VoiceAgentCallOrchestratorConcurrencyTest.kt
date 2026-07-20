@@ -50,16 +50,19 @@ class VoiceAgentCallOrchestratorConcurrencyTest {
         assertTrue(
             async { orchestrator.start(requestA) }.also { runCurrent() }.await() is VoiceAgentCallStartResult.Active,
         )
+        val childrenBeforeB = appJob.children.count()
         val startB = async { orchestrator.start(requestB) }
         runCurrent()
         cleanupEntered.await()
-        val childrenBeforeC = appJob.children.count()
+        val childrenAfterB = appJob.children.count()
         val startC = async { orchestrator.start(requestC) }
         runCurrent()
+        val childrenAfterC = appJob.children.count()
 
         assertFalse(startB.isCompleted)
         assertFalse(startC.isCompleted)
-        assertEquals(childrenBeforeC, appJob.children.count())
+        assertEquals(childrenBeforeB + 1, childrenAfterB)
+        assertEquals(childrenAfterB, childrenAfterC)
         assertEquals(1, routeCalls)
         assertEquals(1, created)
 
@@ -72,6 +75,12 @@ class VoiceAgentCallOrchestratorConcurrencyTest {
         assertEquals(2, routeCalls)
         assertEquals(2, created)
         assertEquals(requestC.conversationId, orchestrator.activeConversationId.value)
+
+        val currentState = orchestrator.state.value
+        sessions[0].emit(VoiceAgentUiState(session = VoiceSessionStatus.Error("stale A")))
+        runCurrent()
+        assertEquals(requestC.conversationId, orchestrator.activeConversationId.value)
+        assertEquals(currentState, orchestrator.state.value)
         appJob.cancel()
     }
 
@@ -80,9 +89,17 @@ class VoiceAgentCallOrchestratorConcurrencyTest {
         val dispatcher = StandardTestDispatcher(testScheduler)
         val appJob = SupervisorJob()
         val failure = IllegalStateException("route retirement failed")
+        val cleanupEntered = CompletableDeferred<Unit>()
+        val releaseCleanup = CompletableDeferred<Unit>()
         var failCleanup = true
         val cleanup = OrchestratorFakeCleanupOperation {
-            if (failCleanup) VoiceAgentCleanupResult.Failed(failure) else VoiceAgentCleanupResult.Completed
+            if (failCleanup) {
+                cleanupEntered.complete(Unit)
+                releaseCleanup.await()
+                VoiceAgentCleanupResult.Failed(failure)
+            } else {
+                VoiceAgentCleanupResult.Completed
+            }
         }
         val routes = listOf(OrchestratorFakeRoute(), OrchestratorFakeRoute())
         val sessions = listOf(
@@ -104,9 +121,22 @@ class VoiceAgentCallOrchestratorConcurrencyTest {
                 .await() is VoiceAgentCallStartResult.Active,
         )
 
+        val displaced = async { orchestrator.start(orchestratorRequest("displaced")) }
+        runCurrent()
+        cleanupEntered.await()
+        val childrenAfterDisplaced = appJob.children.count()
         val rejected = async { orchestrator.start(orchestratorRequest("rejected")) }
         runCurrent()
 
+        assertFalse(displaced.isCompleted)
+        assertFalse(rejected.isCompleted)
+        assertEquals(childrenAfterDisplaced, appJob.children.count())
+        assertEquals(1, routeCalls)
+        assertEquals(1, created)
+
+        releaseCleanup.complete(Unit)
+
+        assertEquals(VoiceAgentCallStartResult.Superseded, displaced.await())
         assertSame(failure, (rejected.await() as VoiceAgentCallStartResult.Failed).error)
         assertEquals(VoiceAgentCallLifecycle.CleanupFailed(failure), orchestrator.lifecycle.value)
         assertNull(orchestrator.activeConversationId.value)
@@ -336,6 +366,73 @@ class VoiceAgentCallOrchestratorConcurrencyTest {
     }
 
     @Test
+    fun `end from idle completes without allocating route factory or app child`() = runTest {
+        val appJob = SupervisorJob()
+        val factory = OrchestratorFakeFactory { _, _, _ -> error("factory must not run") }
+        var routeCalls = 0
+        val orchestrator = VoiceAgentCallOrchestrator(
+            factory = factory,
+            resolveRoute = {
+                routeCalls += 1
+                error("route must not resolve")
+            },
+            appScope = CoroutineScope(appJob + StandardTestDispatcher(testScheduler)),
+        )
+
+        assertEquals(VoiceAgentCallEndResult.Completed, orchestrator.end())
+        assertEquals(VoiceAgentCallLifecycle.Idle, orchestrator.lifecycle.value)
+        assertEquals(0, routeCalls)
+        assertEquals(0, factory.calls)
+        assertEquals(0, appJob.children.count())
+    }
+
+    @Test
+    fun `end during replacement cleanup retires pending start and joins exact cleanup`() = runTest {
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val appJob = SupervisorJob()
+        val cleanupEntered = CompletableDeferred<Unit>()
+        val releaseCleanup = CompletableDeferred<Unit>()
+        val cleanup = OrchestratorFakeCleanupOperation {
+            cleanupEntered.complete(Unit)
+            releaseCleanup.await()
+            VoiceAgentCleanupResult.Completed
+        }
+        val route = OrchestratorFakeRoute()
+        val session = OrchestratorFakeSession(routeMetadata = route.lease.metadata, cleanupOperation = cleanup)
+        var routeCalls = 0
+        val factory = OrchestratorFakeFactory { _, _, _ -> VoiceAgentSessionCreationResult.Created(session) }
+        val orchestrator = VoiceAgentCallOrchestrator(
+            factory = factory,
+            resolveRoute = {
+                routeCalls += 1
+                route.lease
+            },
+            appScope = CoroutineScope(appJob + dispatcher),
+        )
+        async { orchestrator.start(orchestratorRequest("active-before-end")) }.also { runCurrent() }.await()
+        val replacement = async { orchestrator.start(orchestratorRequest("pending-before-end")) }
+        runCurrent()
+        cleanupEntered.await()
+
+        val end = async { orchestrator.end() }
+        runCurrent()
+
+        assertFalse(replacement.isCompleted)
+        assertFalse(end.isCompleted)
+        assertEquals(1, routeCalls)
+        assertEquals(1, factory.calls)
+        releaseCleanup.complete(Unit)
+
+        assertEquals(VoiceAgentCallStartResult.Superseded, replacement.await())
+        assertEquals(VoiceAgentCallEndResult.Completed, end.await())
+        assertEquals(VoiceAgentCallLifecycle.Idle, orchestrator.lifecycle.value)
+        assertEquals(listOf(VoiceAgentCleanupMode.Replacement), cleanup.modes)
+        assertEquals(1, routeCalls)
+        assertEquals(1, factory.calls)
+        appJob.cancel()
+    }
+
+    @Test
     fun `repeated end callers join one graceful cleanup result`() = runTest {
         val dispatcher = StandardTestDispatcher(testScheduler)
         val appJob = SupervisorJob()
@@ -444,14 +541,19 @@ class VoiceAgentCallOrchestratorConcurrencyTest {
         )
         async { orchestrator.start(orchestratorRequest("close")) }.also { runCurrent() }.await()
 
-        orchestrator.closeNow()
+        val closeReturned = CompletableDeferred<Unit>()
+        val close = async(Dispatchers.Default) {
+            orchestrator.closeNow()
+            closeReturned.complete(Unit)
+        }
+        entered.await()
+        closeReturned.await()
 
         assertEquals(VoiceAgentCallLifecycle.Stopping(null), orchestrator.lifecycle.value)
-        assertTrue(cleanup.modes.isEmpty())
-        runCurrent()
-        entered.await()
+        assertFalse(release.isCompleted)
         assertEquals(listOf(VoiceAgentCleanupMode.Immediate), cleanup.modes)
         release.complete(Unit)
+        close.await()
         assertEquals(
             VoiceAgentCallLifecycle.Idle,
             orchestrator.lifecycle.first { it == VoiceAgentCallLifecycle.Idle },
@@ -481,13 +583,22 @@ class VoiceAgentCallOrchestratorConcurrencyTest {
         )
         assertTrue(orchestrator.start(orchestratorRequest("unconfined")) is VoiceAgentCallStartResult.Active)
 
-        val close = async(Dispatchers.Default) { orchestrator.closeNow() }
+        val closeReturned = CompletableDeferred<Unit>()
+        val close = async(Dispatchers.Default) {
+            orchestrator.closeNow()
+            closeReturned.complete(Unit)
+        }
         cleanupEntered.await()
-        val returnedBeforeRelease = close.isCompleted
+        closeReturned.await()
+
+        assertEquals(1L, releaseCleanup.count)
+        assertEquals(listOf(VoiceAgentCleanupMode.Immediate), cleanup.modes)
         releaseCleanup.countDown()
         close.await()
-
-        assertTrue("closeNow must return before external cleanup is released", returnedBeforeRelease)
+        assertEquals(
+            VoiceAgentCallLifecycle.Idle,
+            orchestrator.lifecycle.first { it == VoiceAgentCallLifecycle.Idle },
+        )
         appJob.cancel()
     }
 }

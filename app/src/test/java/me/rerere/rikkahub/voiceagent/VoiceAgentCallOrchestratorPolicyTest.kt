@@ -19,6 +19,109 @@ import org.junit.Test
 
 class VoiceAgentCallOrchestratorPolicyTest {
     @Test
+    fun `initial Ended state is processed after publication and cleans immediately`() = runTest {
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val appJob = SupervisorJob()
+        val cleanupEntered = CompletableDeferred<Unit>()
+        val cleanup = OrchestratorFakeCleanupOperation {
+            cleanupEntered.complete(Unit)
+            VoiceAgentCleanupResult.Completed
+        }
+        val route = OrchestratorFakeRoute()
+        val session = OrchestratorFakeSession(
+            initialState = VoiceAgentUiState(session = VoiceSessionStatus.Ended),
+            routeMetadata = route.lease.metadata,
+            cleanupOperation = cleanup,
+        )
+        val orchestrator = VoiceAgentCallOrchestrator(
+            factory = OrchestratorFakeFactory { _, _, _ -> VoiceAgentSessionCreationResult.Created(session) },
+            resolveRoute = { route.lease },
+            appScope = CoroutineScope(appJob + dispatcher),
+        )
+
+        val result = async { orchestrator.start(orchestratorRequest("initial-ended")) }
+        runCurrent()
+
+        assertTrue(result.await() is VoiceAgentCallStartResult.Active)
+        cleanupEntered.await()
+        assertEquals(
+            VoiceAgentCallLifecycle.Idle,
+            orchestrator.lifecycle.first { it == VoiceAgentCallLifecycle.Idle },
+        )
+        assertNull(orchestrator.activeConversationId.value)
+        assertEquals(listOf(VoiceAgentCleanupMode.Immediate), cleanup.modes)
+        appJob.cancel()
+    }
+
+    @Test
+    fun `initial Error with unusable route is processed and cleans immediately`() = runTest {
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val appJob = SupervisorJob()
+        val cleanupEntered = CompletableDeferred<Unit>()
+        val cleanup = OrchestratorFakeCleanupOperation {
+            cleanupEntered.complete(Unit)
+            VoiceAgentCleanupResult.Completed
+        }
+        val route = OrchestratorFakeRoute()
+        val session = OrchestratorFakeSession(
+            initialState = VoiceAgentUiState(session = VoiceSessionStatus.Error("initial route failure")),
+            routeMetadata = route.lease.metadata,
+            cleanupOperation = cleanup,
+        ).apply { isRouteUsable = false }
+        val orchestrator = VoiceAgentCallOrchestrator(
+            factory = OrchestratorFakeFactory { _, _, _ -> VoiceAgentSessionCreationResult.Created(session) },
+            resolveRoute = { route.lease },
+            appScope = CoroutineScope(appJob + dispatcher),
+        )
+
+        val result = async { orchestrator.start(orchestratorRequest("initial-unusable-error")) }
+        runCurrent()
+
+        assertTrue(result.await() is VoiceAgentCallStartResult.Active)
+        cleanupEntered.await()
+        assertEquals(
+            VoiceAgentCallLifecycle.Idle,
+            orchestrator.lifecycle.first { it == VoiceAgentCallLifecycle.Idle },
+        )
+        assertNull(orchestrator.activeConversationId.value)
+        assertEquals(listOf(VoiceAgentCleanupMode.Immediate), cleanup.modes)
+        appJob.cancel()
+    }
+
+    @Test
+    fun `initial usable Error stays active degraded and matching start reconnects`() = runTest {
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val appJob = SupervisorJob()
+        val route = OrchestratorFakeRoute()
+        val session = OrchestratorFakeSession(
+            initialState = VoiceAgentUiState(session = VoiceSessionStatus.Error("initial connection failure")),
+            routeMetadata = route.lease.metadata,
+        )
+        val request = orchestratorRequest("initial-usable-error")
+        val orchestrator = VoiceAgentCallOrchestrator(
+            factory = OrchestratorFakeFactory { _, _, _ -> VoiceAgentSessionCreationResult.Created(session) },
+            resolveRoute = { route.lease },
+            appScope = CoroutineScope(appJob + dispatcher),
+        )
+
+        val first = async { orchestrator.start(request) }
+        runCurrent()
+
+        assertTrue(first.await() is VoiceAgentCallStartResult.Active)
+        assertEquals(request.conversationId, orchestrator.activeConversationId.value)
+        assertEquals(VoiceCallStatus.Degraded("initial connection failure"), orchestrator.state.value.call)
+        assertEquals(
+            listOf("voice_call_start_failed" to "initial connection failure"),
+            session.diagnostics,
+        )
+        assertTrue(
+            async { orchestrator.start(request) }.also { runCurrent() }.await() is VoiceAgentCallStartResult.Active,
+        )
+        assertEquals(1, session.reconnectCalls)
+        appJob.cancel()
+    }
+
+    @Test
     fun `usable session Error stays active degraded and matching start reconnects once`() = runTest {
         val dispatcher = StandardTestDispatcher(testScheduler)
         val appJob = SupervisorJob()
@@ -156,6 +259,44 @@ class VoiceAgentCallOrchestratorPolicyTest {
         assertNull(orchestrator.activeConversationId.value)
         assertEquals(VoiceAgentUiState(), orchestrator.state.value)
         assertFalse(orchestrator.state.value.call is VoiceCallStatus.Degraded)
+        assertEquals(
+            VoiceAgentCallLifecycle.Idle,
+            orchestrator.lifecycle.first { it == VoiceAgentCallLifecycle.Idle },
+        )
+        appJob.cancel()
+    }
+
+    @Test
+    fun `reentrant route diagnostic close rejects stale route call-status projection`() = runTest {
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val appJob = SupervisorJob()
+        val failure = VoiceAgentTelecomFailure("fallback", "Telecom route failed")
+        val route = DirectFallbackVoiceAgentRouteLease(failure)
+        val cleanupEntered = CompletableDeferred<Unit>()
+        val cleanup = OrchestratorFakeCleanupOperation {
+            cleanupEntered.complete(Unit)
+            VoiceAgentCleanupResult.Completed
+        }
+        lateinit var orchestrator: VoiceAgentCallOrchestrator
+        val session = OrchestratorFakeSession(
+            routeMetadata = route.metadata,
+            cleanupOperation = cleanup,
+            onDiagnostic = { _, _ -> orchestrator.closeNow() },
+        )
+        orchestrator = VoiceAgentCallOrchestrator(
+            factory = OrchestratorFakeFactory { _, _, _ -> VoiceAgentSessionCreationResult.Created(session) },
+            resolveRoute = { route },
+            appScope = CoroutineScope(appJob + dispatcher),
+        )
+
+        val result = async { orchestrator.start(orchestratorRequest("stale-route-status")) }
+        runCurrent()
+
+        assertTrue(result.await() is VoiceAgentCallStartResult.Active)
+        assertNull(orchestrator.activeConversationId.value)
+        assertEquals(VoiceAgentUiState(), orchestrator.state.value)
+        assertFalse(orchestrator.state.value.call is VoiceCallStatus.Degraded)
+        cleanupEntered.await()
         assertEquals(
             VoiceAgentCallLifecycle.Idle,
             orchestrator.lifecycle.first { it == VoiceAgentCallLifecycle.Idle },
