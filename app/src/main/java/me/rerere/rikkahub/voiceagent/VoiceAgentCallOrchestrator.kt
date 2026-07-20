@@ -6,13 +6,11 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
-import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import kotlin.coroutines.CoroutineContext
 import kotlin.uuid.Uuid
 
 internal interface VoiceAgentCallServiceController {
@@ -109,8 +107,11 @@ internal class VoiceAgentCallOrchestrator(
         val execution = synchronized(lock) {
             reduceAndDrainAdmissionsLocked(event)
         }
-        execution.effects.forEach(::runEffect)
-        execution.collectorToStart?.start()
+        try {
+            execution.effects.forEach(::runEffect)
+        } finally {
+            execution.collectorToStart?.start()
+        }
     }
 
     private fun reduceAndDrainAdmissionsLocked(event: VoiceAgentCallEvent): EventExecution {
@@ -144,12 +145,9 @@ internal class VoiceAgentCallOrchestrator(
     }
 
     private fun createUnstartedOperationLocked(pending: PendingVoiceAgentStart): VoiceAgentStartOperation {
-        val callJob = SupervisorJob(appScope.coroutineContext[Job])
-        val callScope = CoroutineScope(appScope.coroutineContext.withJob(callJob))
         return voiceAgentStartOperation(
             request = pending.request,
-            callScope = callScope,
-            callJob = callJob,
+            appScope = appScope,
             factory = factory,
             resolveRoute = resolveRoute,
             onFinished = { operation, outcome ->
@@ -180,7 +178,10 @@ internal class VoiceAgentCallOrchestrator(
     private fun runEffect(effect: VoiceAgentCallEffect) {
         when (effect) {
             is VoiceAgentCallEffect.AdmitStart -> error("Admissions must be drained under the orchestrator lock")
-            is VoiceAgentCallEffect.LaunchStart -> effect.operation.start()
+            is VoiceAgentCallEffect.LaunchStart -> {
+                check(!Thread.holdsLock(lock)) { "Voice Agent startup launch must run outside the orchestrator lock" }
+                effect.operation.start()
+            }
             is VoiceAgentCallEffect.CancelStart -> effect.operation.cancel()
             is VoiceAgentCallEffect.RunCleanup -> appScope.launch(Dispatchers.Default) {
                 val result = try {
@@ -195,12 +196,24 @@ internal class VoiceAgentCallOrchestrator(
             is VoiceAgentCallEffect.CompleteCancellations -> effect.cancellations.forEach {
                 it.completion.complete(effect.cleanupFailure)
             }
-            is VoiceAgentCallEffect.Reconnect -> withCurrentActive(effect.call) { it.session.reconnect() }
+            is VoiceAgentCallEffect.Reconnect -> runAncillaryPolicyEffect {
+                withCurrentActive(effect.call) { it.session.reconnect() }
+            }
             is VoiceAgentCallEffect.ApplySessionState -> applySessionState(effect.call, effect.state)
-            is VoiceAgentCallEffect.RecordDiagnostic -> withCurrentActive(effect.call) {
-                it.session.recordDiagnostic(effect.name, effect.detail)
+            is VoiceAgentCallEffect.RecordDiagnostic -> runAncillaryPolicyEffect {
+                withCurrentActive(effect.call) {
+                    it.session.recordDiagnostic(effect.name, effect.detail)
+                }
             }
             is VoiceAgentCallEffect.ApplyCallStatus -> applyCallStatus(effect.call, effect.status)
+        }
+    }
+
+    private inline fun runAncillaryPolicyEffect(block: () -> Unit) {
+        try {
+            block()
+        } catch (_: Throwable) {
+            // Diagnostics and reconnect policy cannot prevent required state publication or collector startup.
         }
     }
 
@@ -237,5 +250,3 @@ internal class VoiceAgentCallOrchestrator(
         val collectorToStart: Job?,
     )
 }
-
-private fun CoroutineContext.withJob(job: Job): CoroutineContext = minusKey(Job) + job

@@ -7,25 +7,25 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.yield
+import kotlin.coroutines.CoroutineContext
 
 internal fun voiceAgentStartOperation(
     request: VoiceAgentCallRequest,
-    callScope: CoroutineScope,
-    callJob: CompletableJob,
+    appScope: CoroutineScope,
     factory: VoiceAgentCallFactory,
     resolveRoute: suspend () -> VoiceAgentRouteLease,
     onFinished: (VoiceAgentStartOperation, VoiceAgentStartOutcome) -> Unit,
     onSessionState: (ActiveVoiceAgentCall, VoiceAgentUiState, Boolean) -> Unit,
 ): VoiceAgentStartOperation = DefaultVoiceAgentStartOperation(
     request = request,
-    callScope = callScope,
-    callJob = callJob,
+    appScope = appScope,
     factory = factory,
     resolveRoute = resolveRoute,
     onFinished = onFinished,
@@ -34,8 +34,7 @@ internal fun voiceAgentStartOperation(
 
 private class DefaultVoiceAgentStartOperation(
     override val request: VoiceAgentCallRequest,
-    private val callScope: CoroutineScope,
-    private val callJob: CompletableJob,
+    private val appScope: CoroutineScope,
     private val factory: VoiceAgentCallFactory,
     private val resolveRoute: suspend () -> VoiceAgentRouteLease,
     private val onFinished: (VoiceAgentStartOperation, VoiceAgentStartOutcome) -> Unit,
@@ -43,20 +42,8 @@ private class DefaultVoiceAgentStartOperation(
 ) : VoiceAgentStartOperation {
     override val token: Any = Any()
     private val phaseLock = Any()
-    private var currentPhase: VoiceAgentStartPhase = VoiceAgentStartPhase.PreparingRoute(
-        request = request,
-        callScope = callScope,
-        callJob = callJob,
-    )
-    private val startupCleanup = StartupCleanupOperation(callJob)
-    private val worker = callScope.launch(start = CoroutineStart.LAZY) {
-        val outcome = runStartup()
-        onFinished(this@DefaultVoiceAgentStartOperation, outcome)
-        startupCleanup.releaseLocalCleanupAfterPublication()
-        if (outcome !is VoiceAgentStartOutcome.Ready) {
-            callJob.complete()
-        }
-    }.also(startupCleanup::attachWorker)
+    private var currentPhase: VoiceAgentStartPhase = VoiceAgentStartPhase.Admitted(request)
+    private val startupCleanup = StartupCleanupOperation()
 
     override val phase: VoiceAgentStartPhase
         get() = synchronized(phaseLock) { currentPhase }
@@ -65,14 +52,30 @@ private class DefaultVoiceAgentStartOperation(
         get() = startupCleanup
 
     override fun start() {
-        worker.start()
+        val reservation = startupCleanup.reserveWorkerCreation() ?: return
+        val callJob = SupervisorJob(appScope.coroutineContext[Job])
+        val callScope = CoroutineScope(appScope.coroutineContext.withJob(callJob))
+        updatePhase(VoiceAgentStartPhase.PreparingRoute(request, callScope, callJob))
+        val worker = callScope.launch(start = CoroutineStart.LAZY) {
+            val outcome = runStartup(callScope, callJob)
+            onFinished(this@DefaultVoiceAgentStartOperation, outcome)
+            startupCleanup.releaseLocalCleanupAfterPublication()
+            if (outcome !is VoiceAgentStartOutcome.Ready) {
+                callJob.complete()
+            }
+        }
+        val shouldStart = startupCleanup.attachWorker(reservation, StartupWorker(worker, callJob))
+        if (shouldStart) worker.start() else worker.cancel()
     }
 
     override fun cancel() {
         startupCleanup.cancelWorker()
     }
 
-    private suspend fun runStartup(): VoiceAgentStartOutcome {
+    private suspend fun runStartup(
+        callScope: CoroutineScope,
+        callJob: CompletableJob,
+    ): VoiceAgentStartOutcome {
         return try {
             val routeLease = resolveRoute()
             startupCleanup.installDelegate(voiceAgentRouteCleanupOperation(routeLease))
@@ -80,7 +83,7 @@ private class DefaultVoiceAgentStartOperation(
             yield()
             currentCoroutineContext().ensureActive()
             when (val creation = factory.createOwned(request, routeLease, callScope)) {
-                is VoiceAgentSessionCreationResult.Created -> startSession(creation.session)
+                is VoiceAgentSessionCreationResult.Created -> startSession(creation.session, callScope, callJob)
                 is VoiceAgentSessionCreationResult.FailedClean -> {
                     startupCleanup.clearDelegate()
                     VoiceAgentStartOutcome.FailedClean(creation.error)
@@ -98,7 +101,11 @@ private class DefaultVoiceAgentStartOperation(
         }
     }
 
-    private suspend fun startSession(session: RouteOwnedManagedVoiceCallSession): VoiceAgentStartOutcome {
+    private suspend fun startSession(
+        session: RouteOwnedManagedVoiceCallSession,
+        callScope: CoroutineScope,
+        callJob: CompletableJob,
+    ): VoiceAgentStartOutcome {
         startupCleanup.installDelegate(session.cleanupOperation)
         updatePhase(VoiceAgentStartPhase.StartingSession(request, callScope, callJob, session))
         return try {
@@ -219,21 +226,64 @@ private enum class StartupCancellationState {
     CleanupRequested,
 }
 
-private class StartupCleanupOperation(
-    private val callJob: Job,
-) : VoiceAgentCleanupOperation {
+private data class StartupWorker(
+    val job: Job,
+    val callJob: CompletableJob,
+)
+
+private sealed interface StartupWorkerState {
+    data object Admitted : StartupWorkerState
+
+    data class Creating(
+        val completion: CompletableDeferred<StartupWorker>,
+    ) : StartupWorkerState
+
+    data class Attached(
+        val worker: StartupWorker,
+    ) : StartupWorkerState
+
+    data object CancelledBeforeStart : StartupWorkerState
+}
+
+private sealed interface StartupWorkerAccess {
+    data object None : StartupWorkerAccess
+    data class Ready(val worker: StartupWorker) : StartupWorkerAccess
+    data class Await(val completion: CompletableDeferred<StartupWorker>) : StartupWorkerAccess
+}
+
+private class StartupCleanupOperation : VoiceAgentCleanupOperation {
     override val token: Any = Any()
     private val lock = Any()
-    private lateinit var worker: Job
+    private var workerState: StartupWorkerState = StartupWorkerState.Admitted
     private var target: StartupCleanupTarget = StartupCleanupTarget.None
     private var attempt: StartupCleanupAttempt = StartupCleanupAttempt.Ready
     private var callJobProgress = StartupCallJobProgress.Pending
     private var cancellationState = StartupCancellationState.Running
 
-    fun attachWorker(value: Job) {
-        synchronized(lock) {
-            worker = value
+    fun reserveWorkerCreation(): CompletableDeferred<StartupWorker>? = synchronized(lock) {
+        if (
+            cancellationState == StartupCancellationState.CleanupRequested ||
+            workerState != StartupWorkerState.Admitted
+        ) {
+            return@synchronized null
         }
+        CompletableDeferred<StartupWorker>().also { completion ->
+            workerState = StartupWorkerState.Creating(completion)
+        }
+    }
+
+    fun attachWorker(
+        reservation: CompletableDeferred<StartupWorker>,
+        worker: StartupWorker,
+    ): Boolean {
+        val shouldStart = synchronized(lock) {
+            val creating = workerState as? StartupWorkerState.Creating
+            check(creating?.completion === reservation) { "Startup worker reservation is no longer current" }
+            workerState = StartupWorkerState.Attached(worker)
+            cancellationState == StartupCancellationState.Running
+        }
+        check(reservation.complete(worker)) { "Startup worker reservation was already completed" }
+        return shouldStart
     }
 
     fun installDelegate(value: VoiceAgentCleanupOperation) {
@@ -245,10 +295,19 @@ private class StartupCleanupOperation(
     fun currentTarget(): StartupCleanupTarget = synchronized(lock) { target }
 
     fun cancelWorker() {
-        synchronized(lock) {
+        val worker = synchronized(lock) {
             cancellationState = StartupCancellationState.CleanupRequested
+            when (val current = workerState) {
+                StartupWorkerState.Admitted -> {
+                    workerState = StartupWorkerState.CancelledBeforeStart
+                    null
+                }
+                is StartupWorkerState.Creating -> null
+                is StartupWorkerState.Attached -> current.worker.job
+                StartupWorkerState.CancelledBeforeStart -> null
+            }
         }
-        worker.cancel()
+        worker?.cancel()
     }
 
     fun clearDelegate(expected: VoiceAgentCleanupOperation? = null) {
@@ -300,6 +359,7 @@ private class StartupCleanupOperation(
     }
 
     override suspend fun run(mode: VoiceAgentCleanupMode): VoiceAgentCleanupResult {
+        cancelWorker()
         val decision = synchronized(lock) {
             when (val current = attempt) {
                 StartupCleanupAttempt.Completed -> StartupCleanupDecision.Completed
@@ -320,7 +380,6 @@ private class StartupCleanupOperation(
                 is StartupCleanupAttempt.Running -> StartupCleanupDecision.Join(current.completion)
             }
         }
-        worker.cancel()
         return when (decision) {
             StartupCleanupDecision.Completed -> VoiceAgentCleanupResult.Completed
             is StartupCleanupDecision.Join -> decision.completion.await()
@@ -360,11 +419,14 @@ private class StartupCleanupOperation(
         localResult: VoiceAgentCleanupResult?,
     ): VoiceAgentCleanupResult {
         var failure = (localResult as? VoiceAgentCleanupResult.Failed)?.error
-        worker.cancel()
-        try {
-            worker.join()
-        } catch (error: Throwable) {
-            failure = failure.appendStartupFailure(error)
+        val worker = awaitWorker()
+        if (worker != null) {
+            worker.job.cancel()
+            try {
+                worker.job.join()
+            } catch (error: Throwable) {
+                failure = failure.appendStartupFailure(error)
+            }
         }
         val current = currentTarget()
         if (localResult == null && current is StartupCleanupTarget.Owned) {
@@ -378,18 +440,39 @@ private class StartupCleanupOperation(
             }
         }
         if (callJobProgress == StartupCallJobProgress.Pending) {
-            try {
-                callJob.cancel()
-                callJob.join()
+            if (worker == null) {
                 callJobProgress = StartupCallJobProgress.Completed
-            } catch (error: Throwable) {
-                failure = failure.appendStartupFailure(error)
+            } else {
+                try {
+                    worker.callJob.cancel()
+                    worker.callJob.join()
+                    callJobProgress = StartupCallJobProgress.Completed
+                } catch (error: Throwable) {
+                    failure = failure.appendStartupFailure(error)
+                }
             }
         }
         return when {
             failure == null -> VoiceAgentCleanupResult.Completed
             localResult is VoiceAgentCleanupResult.Failed && failure === localResult.error -> localResult
             else -> VoiceAgentCleanupResult.Failed(failure)
+        }
+    }
+
+    private suspend fun awaitWorker(): StartupWorker? {
+        val access = synchronized(lock) {
+            when (val current = workerState) {
+                StartupWorkerState.Admitted,
+                StartupWorkerState.CancelledBeforeStart,
+                -> StartupWorkerAccess.None
+                is StartupWorkerState.Creating -> StartupWorkerAccess.Await(current.completion)
+                is StartupWorkerState.Attached -> StartupWorkerAccess.Ready(current.worker)
+            }
+        }
+        return when (access) {
+            StartupWorkerAccess.None -> null
+            is StartupWorkerAccess.Ready -> access.worker
+            is StartupWorkerAccess.Await -> access.completion.await()
         }
     }
 }
@@ -399,3 +482,5 @@ private fun Throwable?.appendStartupFailure(error: Throwable): Throwable = when 
     this !== error && error !in suppressed -> apply { addSuppressed(error) }
     else -> this
 }
+
+private fun CoroutineContext.withJob(job: Job): CoroutineContext = minusKey(Job) + job

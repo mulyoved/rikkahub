@@ -598,6 +598,7 @@ class VoiceAgentCallStateMachineTest {
             CoroutineScope,
             Job,
         ) -> VoiceAgentStartPhase>(
+            { value, _, _ -> VoiceAgentStartPhase.Admitted(value) },
             { value, scope, job -> VoiceAgentStartPhase.PreparingRoute(value, scope, job) },
             { value, scope, job -> VoiceAgentStartPhase.CreatingSession(value, scope, job) },
             { value, scope, job ->
@@ -618,7 +619,11 @@ class VoiceAgentCallStateMachineTest {
             )
             val running = assertType<VoiceAgentCallState.Starting.Running>(admitted.state)
             assertSame(operation, running.operation)
-            assertSame(operation.phase.callJob, running.operation.phase.callJob)
+            if (operation.phase is VoiceAgentStartPhase.Admitted) {
+                assertSame(operation.phase, running.operation.phase)
+            } else {
+                assertSame(operation.phase.callJob, running.operation.phase.callJob)
+            }
 
             val failed = reduceVoiceAgentCallState(
                 running,

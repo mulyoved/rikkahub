@@ -3,6 +3,7 @@ package me.rerere.rikkahub.voiceagent
 import java.util.Collections
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
+import java.util.concurrent.Future
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
@@ -743,15 +744,15 @@ class VoiceAgentTelecomCallRegistryTest {
         val oldActivationFailure = AtomicReference<Throwable>()
         var primaryFailure: Throwable? = null
         var replacementAttempt: VoiceAgentTelecomAttemptId? = null
+        var replacementWorker: Future<VoiceAgentTelecomAttemptId>? = null
         val replacementCall = FakeTelecomCall()
-        val oldActivation = thread {
+        val activationExecutor = Executors.newFixedThreadPool(2)
+        val oldActivation = activationExecutor.submit {
             runCatching {
                 oldAccepted.set(
                     registry.activate(oldAttempt, oldCall) {
                         activationEntered.countDown()
-                        check(releaseActivation.await(1, TimeUnit.SECONDS)) {
-                            "old activation was not released"
-                        }
+                        releaseActivation.await()
                     },
                 )
             }.onFailure(oldActivationFailure::set)
@@ -759,23 +760,34 @@ class VoiceAgentTelecomCallRegistryTest {
 
         try {
             assertTrue(activationEntered.await(1, TimeUnit.SECONDS))
-            replacementAttempt = registry.beginAttempt().requireAllocatedAttemptId()
-            assertTrue(registry.activate(requireNotNull(replacementAttempt), replacementCall))
+            val replacementThread = AtomicReference<Thread>()
+            val replacement = activationExecutor.submit<VoiceAgentTelecomAttemptId> {
+                replacementThread.set(Thread.currentThread())
+                registry.beginAttempt().requireAllocatedAttemptId()
+            }
+            replacementWorker = replacement
+            awaitWaiting(replacementThread)
             assertFalse(oldOutcome.isCompleted)
+            releaseActivation.countDown()
+            replacementAttempt = replacement.get(1, TimeUnit.SECONDS)
+            assertTrue(registry.activate(requireNotNull(replacementAttempt), replacementCall))
         } catch (failure: Throwable) {
             primaryFailure = failure
             throw failure
         } finally {
             releaseActivation.countDown()
             if (primaryFailure != null) oldOutcome.cancel()
-            runCatching {
-                finishWorker(
-                    worker = oldActivation,
-                    workerFailure = oldActivationFailure,
-                    description = "old activation",
-                    primaryFailure = primaryFailure,
-                )
-            }.onFailure { oldOutcome.cancel() }.getOrThrow()
+            val cleanupFailure = runCatching {
+                oldActivation.get(1, TimeUnit.SECONDS)
+                replacementWorker?.get(1, TimeUnit.SECONDS)
+                throwWorkerFailure(oldActivationFailure, "old activation")
+            }.exceptionOrNull()
+            activationExecutor.shutdownNow()
+            if (primaryFailure != null) {
+                cleanupFailure?.let(primaryFailure::addSuppressed)
+            } else {
+                cleanupFailure?.let { throw it }
+            }
         }
 
         assertFalse(oldAccepted.get())

@@ -19,6 +19,86 @@ import org.junit.Test
 
 class VoiceAgentCallOrchestratorStartupTest {
     @Test
+    fun `operation admission creates no child and repeated start attaches one worker outside admission`() = runTest {
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val appJob = SupervisorJob()
+        val appScope = CoroutineScope(appJob + dispatcher)
+        val resolverEntered = CompletableDeferred<Unit>()
+        val factory = OrchestratorFakeFactory { _, _, _ -> error("factory must not run") }
+        val outcomes = mutableListOf<VoiceAgentStartOutcome>()
+
+        val operation = voiceAgentStartOperation(
+            request = orchestratorRequest("operation-admission"),
+            appScope = appScope,
+            factory = factory,
+            resolveRoute = {
+                resolverEntered.complete(Unit)
+                awaitCancellation()
+            },
+            onFinished = { _, outcome -> outcomes += outcome },
+            onSessionState = { _, _, _ -> },
+        )
+
+        assertTrue(operation.phase is VoiceAgentStartPhase.Admitted)
+        assertEquals(0, appJob.children.count())
+
+        operation.start()
+        operation.start()
+
+        assertEquals(1, appJob.children.count())
+        assertFalse(resolverEntered.isCompleted)
+        runCurrent()
+        assertTrue(resolverEntered.isCompleted)
+
+        operation.cancel()
+        assertEquals(VoiceAgentCleanupResult.Completed, operation.cleanup.run(VoiceAgentCleanupMode.Immediate))
+        runCurrent()
+        assertEquals(listOf(VoiceAgentStartOutcome.Cancelled), outcomes)
+        assertEquals(0, factory.calls)
+        assertEquals(0, appJob.children.count())
+    }
+
+    @Test
+    fun `stale admitted cancellation before start allocates no job and performs no startup work`() = runTest {
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val appJob = SupervisorJob()
+        var routeCalls = 0
+        val factory = OrchestratorFakeFactory { _, _, _ -> error("factory must not run") }
+        val operation = voiceAgentStartOperation(
+            request = orchestratorRequest("stale-admitted"),
+            appScope = CoroutineScope(appJob + dispatcher),
+            factory = factory,
+            resolveRoute = {
+                routeCalls += 1
+                error("route must not resolve")
+            },
+            onFinished = { _, _ -> error("cancel-before-start must not finish startup") },
+            onSessionState = { _, _, _ -> },
+        )
+        val stale = reduceVoiceAgentCallState(
+            VoiceAgentCallState.Idle,
+            VoiceAgentCallEvent.StartAdmitted(Any(), operation),
+        )
+
+        assertEquals(
+            listOf(
+                VoiceAgentCallEffect.CancelStart(operation),
+                VoiceAgentCallEffect.RunCleanup(operation.cleanup, VoiceAgentCleanupMode.Immediate),
+            ),
+            stale.effects,
+        )
+        (stale.effects[0] as VoiceAgentCallEffect.CancelStart).operation.cancel()
+        val cleanup = stale.effects[1] as VoiceAgentCallEffect.RunCleanup
+        assertEquals(VoiceAgentCleanupResult.Completed, cleanup.cleanup.run(cleanup.mode))
+        operation.start()
+        runCurrent()
+
+        assertEquals(0, routeCalls)
+        assertEquals(0, factory.calls)
+        assertEquals(0, appJob.children.count())
+    }
+
+    @Test
     fun `idle start publishes one complete active call after route factory and session start`() = runTest {
         val dispatcher = StandardTestDispatcher(testScheduler)
         val appJob = SupervisorJob()

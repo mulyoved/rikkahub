@@ -45,6 +45,15 @@ internal sealed interface VoiceAgentStartPhase {
     val callScope: CoroutineScope
     val callJob: Job
 
+    data class Admitted(
+        override val request: VoiceAgentCallRequest,
+    ) : VoiceAgentStartPhase {
+        override val callScope: CoroutineScope
+            get() = error("Admitted startup has no call scope")
+        override val callJob: Job
+            get() = error("Admitted startup has no call job")
+    }
+
     data class PreparingRoute(
         override val request: VoiceAgentCallRequest,
         override val callScope: CoroutineScope,

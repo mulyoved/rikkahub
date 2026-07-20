@@ -19,6 +19,85 @@ import org.junit.Test
 
 class VoiceAgentCallOrchestratorPolicyTest {
     @Test
+    fun `throwing fallback diagnostic still publishes degraded status and starts collector`() = runTest {
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val appJob = SupervisorJob()
+        val failure = VoiceAgentTelecomFailure("telecom_unavailable", "Telecom unavailable")
+        val route = DirectFallbackVoiceAgentRouteLease(failure)
+        val session = OrchestratorFakeSession(
+            routeMetadata = route.metadata,
+            onDiagnostic = { _, _ -> throw IllegalStateException("diagnostic callback failed") },
+        )
+        val orchestrator = VoiceAgentCallOrchestrator(
+            factory = OrchestratorFakeFactory { _, _, _ -> VoiceAgentSessionCreationResult.Created(session) },
+            resolveRoute = { route },
+            appScope = CoroutineScope(appJob + dispatcher),
+        )
+
+        val result = async { orchestrator.start(orchestratorRequest("throwing-fallback-diagnostic")) }
+        runCurrent()
+
+        assertTrue(result.await() is VoiceAgentCallStartResult.Active)
+        assertEquals(VoiceCallStatus.Degraded(failure.detail), orchestrator.state.value.call)
+        assertEquals(1, session.collectorCount())
+        appJob.cancel()
+    }
+
+    @Test
+    fun `throwing session error diagnostic still publishes degraded session state`() = runTest {
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val appJob = SupervisorJob()
+        val route = OrchestratorFakeRoute()
+        val session = OrchestratorFakeSession(
+            routeMetadata = route.lease.metadata,
+            onDiagnostic = { _, _ -> throw IllegalStateException("diagnostic callback failed") },
+        )
+        val orchestrator = VoiceAgentCallOrchestrator(
+            factory = OrchestratorFakeFactory { _, _, _ -> VoiceAgentSessionCreationResult.Created(session) },
+            resolveRoute = { route.lease },
+            appScope = CoroutineScope(appJob + dispatcher),
+        )
+        async { orchestrator.start(orchestratorRequest("throwing-error-diagnostic")) }
+            .also { runCurrent() }
+            .await()
+
+        session.emit(VoiceAgentUiState(session = VoiceSessionStatus.Error("connection lost")))
+        runCurrent()
+
+        assertEquals(VoiceSessionStatus.Error("connection lost"), orchestrator.state.value.session)
+        assertEquals(VoiceCallStatus.Degraded("connection lost"), orchestrator.state.value.call)
+        assertEquals(1, session.collectorCount())
+        appJob.cancel()
+    }
+
+    @Test
+    fun `throwing matching reconnect does not escape active start result`() = runTest {
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val appJob = SupervisorJob()
+        val route = OrchestratorFakeRoute()
+        val session = OrchestratorFakeSession(
+            initialState = VoiceAgentUiState(session = VoiceSessionStatus.Error("connection lost")),
+            routeMetadata = route.lease.metadata,
+            onReconnect = { throw IllegalStateException("reconnect callback failed") },
+        )
+        val request = orchestratorRequest("throwing-reconnect")
+        val orchestrator = VoiceAgentCallOrchestrator(
+            factory = OrchestratorFakeFactory { _, _, _ -> VoiceAgentSessionCreationResult.Created(session) },
+            resolveRoute = { route.lease },
+            appScope = CoroutineScope(appJob + dispatcher),
+        )
+        async { orchestrator.start(request) }.also { runCurrent() }.await()
+
+        val matching = async { orchestrator.start(request) }
+        runCurrent()
+
+        assertTrue(matching.await() is VoiceAgentCallStartResult.Active)
+        assertEquals(1, session.reconnectCalls)
+        assertEquals(request.conversationId, orchestrator.activeConversationId.value)
+        appJob.cancel()
+    }
+
+    @Test
     fun `initial Ended state is processed after publication and cleans immediately`() = runTest {
         val dispatcher = StandardTestDispatcher(testScheduler)
         val appJob = SupervisorJob()
