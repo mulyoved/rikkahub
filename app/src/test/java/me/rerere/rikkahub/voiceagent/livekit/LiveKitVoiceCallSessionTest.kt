@@ -2,13 +2,19 @@ package me.rerere.rikkahub.voiceagent.livekit
 
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.withContext
 import me.rerere.rikkahub.voiceagent.OrchestratorFakeRoute
 import me.rerere.rikkahub.voiceagent.VoiceAgentCleanupMode
 import me.rerere.rikkahub.voiceagent.VoiceAgentCleanupResult
@@ -263,6 +269,138 @@ class LiveKitVoiceCallSessionTest {
     }
 
     @Test
+    fun `cleanup joins an admitted interrupt before disconnect and release`() = runTest {
+        val fixture = fixture()
+        val rpcGate = CompletableDeferred<Unit>()
+        val rpcTerminationGate = CompletableDeferred<Unit>()
+        fixture.room.performRpcGate = rpcGate
+        fixture.room.performRpcTerminationGate = rpcTerminationGate
+        fixture.session.start()
+        runCurrent()
+
+        fixture.session.interrupt()
+        runCurrent()
+        assertTrue("perform-rpc-started" in fixture.room.lifecycle)
+
+        val cleanup = async {
+            fixture.session.cleanupOperation.run(VoiceAgentCleanupMode.Immediate)
+        }
+        runCurrent()
+        val completedBeforeRpcTermination = cleanup.isCompleted
+        val disconnectsBeforeRpcTermination = fixture.room.disconnectCalls
+
+        rpcGate.complete(Unit)
+        rpcTerminationGate.complete(Unit)
+        runCurrent()
+
+        assertFalse(completedBeforeRpcTermination)
+        assertEquals(0, disconnectsBeforeRpcTermination)
+        assertEquals(VoiceAgentCleanupResult.Completed, cleanup.await())
+        assertTrue(
+            fixture.room.lifecycle.indexOf("perform-rpc-finished") <
+                fixture.room.lifecycle.indexOf("disconnect"),
+        )
+        assertTrue(
+            fixture.room.lifecycle.indexOf("disconnect") < fixture.room.lifecycle.indexOf("close"),
+        )
+    }
+
+    @Test
+    fun `interrupt queued before cleanup cannot start after RPC admission closes`() = runTest {
+        val queuedScope = CoroutineScope(SupervisorJob() + StandardTestDispatcher(testScheduler))
+        try {
+            val fixture = fixture(sessionScope = queuedScope)
+            fixture.session.start()
+            runCurrent()
+
+            fixture.session.interrupt()
+            assertEquals(
+                VoiceAgentCleanupResult.Completed,
+                fixture.session.cleanupOperation.run(VoiceAgentCleanupMode.Immediate),
+            )
+            runCurrent()
+
+            assertTrue(fixture.room.rpcCalls.isEmpty())
+            assertFalse("perform-rpc-started" in fixture.room.lifecycle)
+        } finally {
+            queuedScope.cancel()
+        }
+    }
+
+    @Test
+    fun `cleanup drains an admitted inbound RPC before disconnect and release`() = runTest {
+        val handlerStarted = CompletableDeferred<Unit>()
+        val handlerGate = CompletableDeferred<Unit>()
+        var handlerCompleted = false
+        lateinit var fixture: SessionFixture
+        fixture = fixture(
+            rpcMethods = mapOf(
+                "hermes.job.accepted" to {
+                    handlerStarted.complete(Unit)
+                    handlerGate.await()
+                    assertTrue("unregister:hermes.job.accepted" in fixture.room.lifecycle)
+                    handlerCompleted = true
+                    "persisted"
+                },
+            ),
+        )
+        fixture.session.start()
+        runCurrent()
+
+        val invocation = async {
+            fixture.room.invoke("hermes.job.accepted", AGENT_IDENTITY, "payload")
+        }
+        runCurrent()
+        assertTrue(handlerStarted.isCompleted)
+
+        val cleanup = async {
+            fixture.session.cleanupOperation.run(VoiceAgentCleanupMode.Immediate)
+        }
+        runCurrent()
+        val completedBeforeHandler = cleanup.isCompleted
+        val disconnectsBeforeHandler = fixture.room.disconnectCalls
+
+        handlerGate.complete(Unit)
+        runCurrent()
+
+        assertFalse(completedBeforeHandler)
+        assertEquals(0, disconnectsBeforeHandler)
+        assertEquals("persisted", invocation.await())
+        assertTrue(handlerCompleted)
+        assertEquals(VoiceAgentCleanupResult.Completed, cleanup.await())
+        assertEquals(1, fixture.room.disconnectCalls)
+        assertEquals(1, fixture.room.closeCalls)
+    }
+
+    @Test
+    fun `captured inbound RPC handler rejects invocation after admission closes`() = runTest {
+        var underlyingCalls = 0
+        val fixture = fixture(
+            rpcMethods = mapOf(
+                "hermes.job.accepted" to {
+                    underlyingCalls += 1
+                    "persisted"
+                },
+            ),
+        )
+        fixture.session.start()
+        runCurrent()
+        val capturedHandler = fixture.room.captureHandler("hermes.job.accepted")
+
+        assertEquals(
+            VoiceAgentCleanupResult.Completed,
+            fixture.session.cleanupOperation.run(VoiceAgentCleanupMode.Immediate),
+        )
+        val error = runCatching {
+            capturedHandler(LiveKitRpcInvocation(AGENT_IDENTITY, "payload"))
+        }.exceptionOrNull()
+
+        assertTrue(error is IllegalStateException)
+        assertTrue(error?.message.orEmpty().contains("closed", ignoreCase = true))
+        assertEquals(0, underlyingCalls)
+    }
+
+    @Test
     fun `reconnect events preserve readiness and remote disconnect ends experimental path`() = runTest {
         val fixture = fixture()
         fixture.session.start()
@@ -327,6 +465,7 @@ class LiveKitVoiceCallSessionTest {
         connectFailure: Throwable? = null,
         readyTimeoutMillis: Long = 30_000,
         route: OrchestratorFakeRoute = OrchestratorFakeRoute(),
+        sessionScope: CoroutineScope = backgroundScope,
     ): SessionFixture {
         val room = FakeLiveKitRoomFacade(connectFailure)
         return SessionFixture(
@@ -334,7 +473,7 @@ class LiveKitVoiceCallSessionTest {
                 details = details(),
                 room = room,
                 routeLease = route.lease,
-                scope = backgroundScope,
+                scope = sessionScope,
                 rpcMethods = rpcMethods,
                 connectTimeoutMillis = 10_000,
                 readyTimeoutMillis = readyTimeoutMillis,
@@ -378,6 +517,8 @@ private class FakeLiveKitRoomFacade(
     var disconnectFailure: Throwable? = null
     var closeFailure: Throwable? = null
     var microphoneGate: CompletableDeferred<Unit>? = null
+    var performRpcGate: CompletableDeferred<Unit>? = null
+    var performRpcTerminationGate: CompletableDeferred<Unit>? = null
     var sdkMicrophoneEnabled = false
 
     suspend fun emit(event: LiveKitRoomEvent) {
@@ -386,6 +527,9 @@ private class FakeLiveKitRoomFacade(
 
     suspend fun invoke(method: String, caller: String, payload: String): String =
         requireNotNull(handlers[method])(LiveKitRpcInvocation(caller, payload))
+
+    fun captureHandler(method: String): suspend (LiveKitRpcInvocation) -> String =
+        requireNotNull(handlers[method])
 
     override suspend fun connect(url: String, token: String) {
         connectAttempts += 1
@@ -409,8 +553,17 @@ private class FakeLiveKitRoomFacade(
     }
 
     override suspend fun performRpc(destination: String, method: String, payload: String): String {
+        lifecycle += "perform-rpc-started"
         rpcCalls += Triple(destination, method, payload)
-        return "ok"
+        return try {
+            performRpcGate?.await()
+            "ok"
+        } finally {
+            withContext(NonCancellable) {
+                performRpcTerminationGate?.await()
+            }
+            lifecycle += "perform-rpc-finished"
+        }
     }
 
     override fun registerRpcMethod(method: String, handler: suspend (LiveKitRpcInvocation) -> String) {

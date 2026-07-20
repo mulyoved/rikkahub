@@ -51,6 +51,7 @@ internal class LiveKitVoiceCallSession(
     private val closed = AtomicBoolean(false)
     private val lifecycleLock = Any()
     private val microphoneStateLock = Any()
+    private val rpcAdmission = LiveKitRpcAdmission()
     private val ready = CompletableDeferred<Unit>()
     private val roomConnected = CompletableDeferred<Unit>()
     private val microphoneCommands = Channel<Unit>(capacity = Channel.CONFLATED)
@@ -75,6 +76,7 @@ internal class LiveKitVoiceCallSession(
         connectionJob = { connectionJob },
         eventJob = { eventJob },
         microphoneJob = { microphoneJob },
+        rpcAdmission = rpcAdmission,
         rpcMethods = rpcMethods.keys,
         room = room,
     )
@@ -82,7 +84,11 @@ internal class LiveKitVoiceCallSession(
     override fun start() {
         synchronized(lifecycleLock) {
             if (!started.compareAndSet(false, true) || closed.get()) return
-            rpcMethods.forEach(room::registerRpcMethod)
+            rpcMethods.forEach { (method, handler) ->
+                room.registerRpcMethod(method) { invocation ->
+                    rpcAdmission.runInbound { handler(invocation) }
+                }
+            }
             eventJob = scope.launch(start = CoroutineStart.UNDISPATCHED) {
                 room.events.collect(::handleRoomEvent)
             }
@@ -95,18 +101,17 @@ internal class LiveKitVoiceCallSession(
     }
 
     override fun interrupt() {
-        if (closed.get()) return
-        scope.launch {
-            runCatching {
+        rpcAdmission.launchOutbound(scope) {
+            try {
                 room.performRpc(
                     destination = details.agentParticipantIdentity,
                     method = LIVEKIT_INTERRUPT_RPC,
                     payload = "",
                 )
-            }.onFailure { error ->
-                if (error !is CancellationException) {
-                    appendDiagnostic("livekit_interrupt_failed", error::class.simpleName ?: "unknown")
-                }
+            } catch (cancellation: CancellationException) {
+                throw cancellation
+            } catch (error: Throwable) {
+                appendDiagnostic("livekit_interrupt_failed", error::class.simpleName ?: "unknown")
             }
         }
     }
@@ -248,6 +253,7 @@ internal class LiveKitVoiceCallSession(
     private fun requestCloseForCleanup(): Boolean {
         return synchronized(lifecycleLock) {
             synchronized(microphoneStateLock) {
+                rpcAdmission.close()
                 closed.compareAndSet(false, true)
             }
         }
@@ -265,6 +271,7 @@ private class LiveKitCleanupOperation(
     private val connectionJob: () -> Job?,
     private val eventJob: () -> Job?,
     private val microphoneJob: () -> Job?,
+    private val rpcAdmission: LiveKitRpcAdmission,
     rpcMethods: Set<String>,
     private val room: LiveKitRoomFacade,
 ) : VoiceAgentCleanupOperation {
@@ -276,6 +283,7 @@ private class LiveKitCleanupOperation(
     private var connectionJobCompleted = false
     private var eventJobCompleted = false
     private var microphoneJobCompleted = false
+    private var rpcWorkCompleted = false
     private val pendingRpcMethods = rpcMethods.toMutableSet()
     private var disconnectCompleted = false
     private var closeCompleted = false
@@ -326,14 +334,15 @@ private class LiveKitCleanupOperation(
     private suspend fun executeAttempt(): LiveKitCleanupAttemptOutcome {
         val failures = LiveKitCleanupFailures()
         failures.captureCallerCancellation()
+        requestClose()
         try {
             withContext(NonCancellable) {
-                requestClose()
                 retireRoute(failures)
+                unregisterRpcMethods(failures)
                 connectionJobCompleted = cleanJob(connectionJob(), connectionJobCompleted, failures)
                 eventJobCompleted = cleanJob(eventJob(), eventJobCompleted, failures)
                 microphoneJobCompleted = cleanJob(microphoneJob(), microphoneJobCompleted, failures)
-                unregisterRpcMethods(failures)
+                rpcWorkCompleted = cleanRpcWork(rpcWorkCompleted, failures)
                 disconnectRoom(failures)
                 closeRoom(failures)
             }
@@ -370,7 +379,6 @@ private class LiveKitCleanupOperation(
     }
 
     private fun unregisterRpcMethods(failures: LiveKitCleanupFailures) {
-        if (!jobsCompleted()) return
         pendingRpcMethods.toList().forEach { method ->
             try {
                 room.unregisterRpcMethod(method)
@@ -381,8 +389,27 @@ private class LiveKitCleanupOperation(
         }
     }
 
+    private suspend fun cleanRpcWork(
+        completed: Boolean,
+        failures: LiveKitCleanupFailures,
+    ): Boolean {
+        if (completed) return true
+        return try {
+            rpcAdmission.quiesce()
+            true
+        } catch (error: Throwable) {
+            failures.add(error)
+            false
+        }
+    }
+
     private fun disconnectRoom(failures: LiveKitCleanupFailures) {
-        if (disconnectCompleted || !jobsCompleted() || pendingRpcMethods.isNotEmpty()) return
+        if (
+            disconnectCompleted ||
+            !jobsCompleted() ||
+            !rpcWorkCompleted ||
+            pendingRpcMethods.isNotEmpty()
+        ) return
         try {
             room.disconnect()
             disconnectCompleted = true
@@ -407,10 +434,98 @@ private class LiveKitCleanupOperation(
     private fun hasUnfinishedStages(): Boolean =
         !routeCompleted ||
             !jobsCompleted() ||
+            !rpcWorkCompleted ||
             pendingRpcMethods.isNotEmpty() ||
             !disconnectCompleted ||
             !closeCompleted
 }
+
+private class LiveKitRpcAdmission {
+    private val lock = Any()
+    private var accepting = true
+    private val activeWork = mutableSetOf<LiveKitRpcWork>()
+
+    fun close() {
+        synchronized(lock) {
+            accepting = false
+        }
+    }
+
+    fun launchOutbound(
+        scope: CoroutineScope,
+        block: suspend () -> Unit,
+    ): Boolean {
+        lateinit var work: LiveKitRpcWork.Outbound
+        val job = scope.launch(start = CoroutineStart.LAZY) {
+            if (beginOutbound(work)) block()
+        }
+        work = LiveKitRpcWork.Outbound(job)
+        job.invokeOnCompletion { complete(work) }
+        val admitted = synchronized(lock) {
+            if (!accepting) {
+                false
+            } else {
+                activeWork += work
+                if (job.isCompleted) activeWork.remove(work)
+                true
+            }
+        }
+        if (admitted) {
+            job.start()
+        } else {
+            job.cancel()
+        }
+        return admitted
+    }
+
+    private fun beginOutbound(work: LiveKitRpcWork.Outbound): Boolean = synchronized(lock) {
+        accepting && work in activeWork
+    }
+
+    suspend fun <T> runInbound(block: suspend () -> T): T {
+        val work = LiveKitRpcWork.Inbound(CompletableDeferred())
+        synchronized(lock) {
+            if (!accepting) throw LiveKitRpcAdmissionClosedException()
+            activeWork += work
+        }
+        return try {
+            block()
+        } finally {
+            check(work.completion.complete(Unit)) { "Inbound LiveKit RPC work completed twice" }
+            complete(work)
+        }
+    }
+
+    suspend fun quiesce() {
+        val admittedWork = synchronized(lock) {
+            check(!accepting) { "LiveKit RPC work cannot quiesce while admission is open" }
+            activeWork.toList()
+        }
+        admittedWork.forEach { work ->
+            when (work) {
+                is LiveKitRpcWork.Outbound -> {
+                    work.job.cancel()
+                    work.job.join()
+                }
+                is LiveKitRpcWork.Inbound -> work.completion.await()
+            }
+        }
+    }
+
+    private fun complete(work: LiveKitRpcWork) {
+        synchronized(lock) {
+            activeWork.remove(work)
+        }
+    }
+}
+
+private sealed interface LiveKitRpcWork {
+    class Outbound(val job: Job) : LiveKitRpcWork
+    class Inbound(val completion: CompletableDeferred<Unit>) : LiveKitRpcWork
+}
+
+private class LiveKitRpcAdmissionClosedException :
+    IllegalStateException("LiveKit RPC admission is closed")
 
 private sealed interface LiveKitCleanupAttemptState {
     data object Ready : LiveKitCleanupAttemptState
