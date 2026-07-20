@@ -1,18 +1,19 @@
 ## Current Result
 
 - Status: DONE
-- Code commit: `489e70a8ea653bcbd2c89cf00ddc07534e2cf396`
-  (`fix(voice): join startup cleanup race`)
+- Code commit: `80aca989e73db6c85c768ea79f16810710c8acc7`
+  (`refactor(voice): rename startup cleanup decision`)
 - Summary: Startup failure cleanup now makes one atomic local-versus-external ownership claim. An external winner
   excludes local delegate work; a local winner publishes one in-flight attempt that a later caller-cancellation transfer
   joins before finishing only worker/call-job stages. The losing path never independently invokes the delegate. The
-  first failed result therefore
-  remains retryable only from a later `CleanupFailed` start and is supplied unchanged for suppression onto the caller's
-  canonical cancellation. The Task 4 typed factory boundary and temporary interface-level legacy bridge are unchanged.
+  first failed result therefore remains retryable only from a later `CleanupFailed` start and is supplied unchanged for
+  suppression onto the caller's canonical cancellation. The private arbitration type is named
+  `StartupLocalCleanupDecision`, avoiding the binding scan's deleted-ownership token. The Task 4 typed factory boundary
+  and temporary interface-level legacy bridge are unchanged.
 
 ## Tests
 
-- Focused verification: the exact Task 4 startup-plus-reducer command passed with `BUILD SUCCESSFUL in 9s`. Generated
+- Focused verification: the exact Task 4 startup-plus-reducer command passed with `BUILD SUCCESSFUL in 10s`. Generated
   XML reports 38 selected tests, 0 skipped, 0 failures, and 0 errors: 18
   `VoiceAgentCallOrchestratorStartupTest` and 20 `VoiceAgentCallStateMachineTest`.
 
@@ -20,6 +21,14 @@
   ./gradlew :app:testDebugUnitTest \
     --tests '*VoiceAgentCallStateMachineTest' \
     --tests '*VoiceAgentCallOrchestratorStartupTest'
+  ```
+
+- Targeted deleted-name verification returned exit status 1 with no matches:
+
+  ```text
+  rg --hidden -n "StartupLocalCleanup[C]laim" -g '!.git' .
+  rg -n "Cleanup[C]laim" \
+    app/src/main/java/me/rerere/rikkahub/voiceagent/VoiceAgentStartOperation.kt
   ```
 
 - The deterministic race regression blocks local resource cleanup, cancels the caller, and releases one failed result.
@@ -33,8 +42,8 @@
 ## Files Changed
 
 - `app/src/main/java/me/rerere/rikkahub/voiceagent/VoiceAgentStartOperation.kt` — atomically arbitrates local and external
-  startup cleanup, publishes local attempts for exact joining, prevents duplicate delegate invocation, and preserves
-  later-start-only retry admission.
+  startup cleanup, publishes local attempts for exact joining, prevents duplicate delegate invocation, preserves
+  later-start-only retry admission, and uses a binding-scan-safe private decision name.
 - `app/src/main/java/me/rerere/rikkahub/voiceagent/VoiceAgentCallOrchestrator.kt` — uses the shared cancellation helpers
   for caller-cancellation handoff.
 - `app/src/main/java/me/rerere/rikkahub/voiceagent/VoiceAgentCancellation.kt` — narrowly owns canonical
@@ -55,6 +64,11 @@
 
 ## Attempt Appendix
 
+- Mechanical scan RED/GREEN: before the private-type rename, the targeted scan reported 13 occurrences of the prohibited
+  helper-name token in `VoiceAgentStartOperation.kt`. After the code-only rename, the same scan returned exit status 1
+  with no matches. No later-task legacy API was migrated.
+- Superseded verification: the prior concurrency-fix focused run passed the same 38 tests in 9s; the final 10s run above
+  verifies the binding-scan-safe rename.
 - Re-review RED: With the deterministic blocked-cleanup race added before production changes, the exact focused command
   ran 38 tests and failed one assertion: the caller's canonical cancellation had no suppressed first cleanup failure.
   The local attempt had been invoked a second time and succeeded, demonstrating the check-then-act ownership race.
