@@ -42,6 +42,7 @@ class VoiceAgentAudioRouteResolver internal constructor(
     private val registry: VoiceAgentTelecomCallRegistry,
     private val timeoutMs: Long,
     private val outcomeTimeout: VoiceAgentTelecomOutcomeTimeout,
+    private val blockingDispatcher: CoroutineDispatcher,
     private val cleanupScope: CoroutineScope,
     private val cleanupDispatcher: CoroutineDispatcher,
     private val deliveryProbe: VoiceAgentRouteDeliveryProbe,
@@ -51,11 +52,13 @@ class VoiceAgentAudioRouteResolver internal constructor(
         registry: VoiceAgentTelecomCallRegistry,
         timeoutMs: Long = 3_000L,
         outcomeTimeout: VoiceAgentTelecomOutcomeTimeout,
+        blockingDispatcher: CoroutineDispatcher = DefaultVoiceAgentRouteBlockingDispatcher,
     ) : this(
         gateway,
         registry,
         timeoutMs,
         outcomeTimeout,
+        blockingDispatcher,
         DefaultVoiceAgentRouteCleanupScope,
         Dispatchers.IO,
         NoOpVoiceAgentRouteDeliveryProbe,
@@ -70,6 +73,7 @@ class VoiceAgentAudioRouteResolver internal constructor(
         registry,
         timeoutMs,
         DefaultVoiceAgentTelecomOutcomeTimeout,
+        DefaultVoiceAgentRouteBlockingDispatcher,
         DefaultVoiceAgentRouteCleanupScope,
         Dispatchers.IO,
         NoOpVoiceAgentRouteDeliveryProbe,
@@ -79,6 +83,7 @@ class VoiceAgentAudioRouteResolver internal constructor(
         gateway: VoiceAgentTelecomGateway,
         registry: VoiceAgentTelecomCallRegistry,
         timeoutMs: Long = 3_000L,
+        blockingDispatcher: CoroutineDispatcher = DefaultVoiceAgentRouteBlockingDispatcher,
         cleanupScope: CoroutineScope = DefaultVoiceAgentRouteCleanupScope,
         cleanupDispatcher: CoroutineDispatcher = Dispatchers.IO,
         deliveryProbe: VoiceAgentRouteDeliveryProbe = NoOpVoiceAgentRouteDeliveryProbe,
@@ -87,6 +92,7 @@ class VoiceAgentAudioRouteResolver internal constructor(
         registry,
         timeoutMs,
         DefaultVoiceAgentTelecomOutcomeTimeout,
+        blockingDispatcher,
         cleanupScope,
         cleanupDispatcher,
         deliveryProbe,
@@ -147,9 +153,14 @@ class VoiceAgentAudioRouteResolver internal constructor(
     }
 
     private suspend fun beginAttemptRespectingCancellation(): VoiceAgentTelecomAttemptId {
-        val result = runCatching(registry::beginAttempt)
+        val callerContext = currentCoroutineContext()
+        val result = withContext(NonCancellable) {
+            withContext(blockingDispatcher) {
+                runCatching(registry::beginAttempt)
+            }
+        }
         val cancellation = runCatching {
-            currentCoroutineContext().ensureActive()
+            callerContext.ensureActive()
         }.exceptionOrNull() as? CancellationException
         if (cancellation != null) {
             val beginFailure = result.exceptionOrNull()
@@ -175,7 +186,7 @@ class VoiceAgentAudioRouteResolver internal constructor(
         attempt: VoiceAgentTelecomAttemptId,
         cancellation: CancellationException,
     ) {
-        withContext(NonCancellable) {
+        withContext(NonCancellable + cleanupDispatcher) {
             val retirementError = runCatching {
                 registry.retireAttempt(
                     attempt,
@@ -348,6 +359,8 @@ private class CompletedFinalDeliveryCleanup(
 private object DefaultVoiceAgentRouteCleanupScope : CoroutineScope by CoroutineScope(
     SupervisorJob() + Dispatchers.IO,
 )
+
+private val DefaultVoiceAgentRouteBlockingDispatcher = Dispatchers.IO
 
 private fun Throwable.addSuppressedDistinct(error: Throwable) {
     if (error !== this && suppressed.none { it === error }) addSuppressed(error)

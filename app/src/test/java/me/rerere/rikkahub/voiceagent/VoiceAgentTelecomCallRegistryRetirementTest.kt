@@ -224,6 +224,133 @@ class VoiceAgentTelecomCallRegistryRetirementTest {
     }
 
     @Test
+    fun `rejected JoinRetirement claim lets external success terminalize exact lease`() = runBlocking {
+        val schedulingFailure = IllegalStateException("joined cleanup scheduling rejected")
+        val cleanupEntered = CountDownLatch(1)
+        val releaseCleanup = CountDownLatch(1)
+        val replacementJoinEntered = CountDownLatch(1)
+        val registry = VoiceAgentTelecomCallRegistry(
+            probe = VoiceAgentTelecomRegistryProbe { event ->
+                if (event is VoiceAgentTelecomRegistryProbeEvent.RouteRetirementJoining) {
+                    replacementJoinEntered.countDown()
+                }
+            },
+        )
+        val previous = registry.beginAttempt().requireAllocatedAttemptId()
+        val call = BlockingTelecomCall(AtomicReference(null), cleanupEntered, releaseCleanup)
+        assertTrue(registry.activate(previous, call))
+        val lease = registry.consumeActiveOutcome(previous).requireResolvedLease() as
+            TelecomVoiceAgentRouteLease
+        val executor = Executors.newFixedThreadPool(2)
+        val externalRetirement = executor.submit(lease::retire)
+
+        try {
+            assertTrue(cleanupEntered.await(1, TimeUnit.SECONDS))
+            val acquisition = lease.claimUndeliveredCleanup()
+            assertTrue(acquisition.step is UndeliveredRouteCleanupStep.JoinRetirement)
+            val blockedReplacement = executor.submit<VoiceAgentTelecomAttemptStartResult> {
+                registry.beginAttempt()
+            }
+            assertTrue(replacementJoinEntered.await(1, TimeUnit.SECONDS))
+            assertFalse(blockedReplacement.isDone)
+
+            lease.rejectUndeliveredCleanupScheduling(acquisition.claim, schedulingFailure)
+
+            assertSame(schedulingFailure, acquisition.claim.awaitResult().exceptionOrNull())
+            assertCleanupFailure(blockedReplacement.get(1, TimeUnit.SECONDS), schedulingFailure)
+            assertEquals(1, call.disconnectCalls)
+            assertEquals(
+                null,
+                registry.awaitOutcomeIfPresent(VoiceAgentTelecomAttemptId(previous.value + 1)),
+            )
+
+            releaseCleanup.countDown()
+            externalRetirement.get(1, TimeUnit.SECONDS)
+            assertEquals(1, call.disconnectCalls)
+            val replacement = registry.beginAttempt().requireAllocatedAttemptId()
+            assertEquals(previous.value + 1, replacement.value)
+        } finally {
+            releaseCleanup.countDown()
+            executor.shutdownNow()
+        }
+    }
+
+    @Test
+    fun `rejected JoinFailurePublication claim retains exact lease for later successful retry`() = runBlocking {
+        val cleanupFailure = IllegalStateException("external route cleanup failed")
+        val schedulingFailure = IllegalStateException("publishing cleanup scheduling rejected")
+        val cleanupFailureRef = AtomicReference<Throwable?>(cleanupFailure)
+        val cleanupEntered = CountDownLatch(1)
+        val releaseCleanup = CountDownLatch(1)
+        val publicationEntered = CountDownLatch(1)
+        val releasePublication = CountDownLatch(1)
+        val replacementJoinEntered = CountDownLatch(1)
+        val registry = VoiceAgentTelecomCallRegistry(
+            probe = VoiceAgentTelecomRegistryProbe { event ->
+                when (event) {
+                    VoiceAgentTelecomRegistryProbeEvent.FailedRetirementResultPublishing -> {
+                        publicationEntered.countDown()
+                        check(releasePublication.await(5, TimeUnit.SECONDS)) {
+                            "external cleanup failure publication was not released"
+                        }
+                    }
+                    VoiceAgentTelecomRegistryProbeEvent.RouteRetirementJoining -> {
+                        replacementJoinEntered.countDown()
+                    }
+                    else -> Unit
+                }
+            },
+        )
+        val previous = registry.beginAttempt().requireAllocatedAttemptId()
+        val call = BlockingTelecomCall(cleanupFailureRef, cleanupEntered, releaseCleanup)
+        assertTrue(registry.activate(previous, call))
+        val lease = registry.consumeActiveOutcome(previous).requireResolvedLease() as
+            TelecomVoiceAgentRouteLease
+        val executor = Executors.newFixedThreadPool(2)
+        val externalRetirement = executor.submit<Throwable?> {
+            runCatching(lease::retire).exceptionOrNull()
+        }
+
+        try {
+            assertTrue(cleanupEntered.await(1, TimeUnit.SECONDS))
+            releaseCleanup.countDown()
+            assertTrue(publicationEntered.await(1, TimeUnit.SECONDS))
+            val acquisition = lease.claimUndeliveredCleanup()
+            assertTrue(acquisition.step is UndeliveredRouteCleanupStep.JoinFailurePublication)
+            val blockedReplacement = executor.submit<VoiceAgentTelecomAttemptStartResult> {
+                registry.beginAttempt()
+            }
+            assertTrue(replacementJoinEntered.await(1, TimeUnit.SECONDS))
+            assertFalse(blockedReplacement.isDone)
+
+            lease.rejectUndeliveredCleanupScheduling(acquisition.claim, schedulingFailure)
+
+            assertSame(schedulingFailure, acquisition.claim.awaitResult().exceptionOrNull())
+            assertCleanupFailure(blockedReplacement.get(1, TimeUnit.SECONDS), schedulingFailure)
+            assertEquals(1, call.disconnectCalls)
+            assertEquals(
+                null,
+                registry.awaitOutcomeIfPresent(VoiceAgentTelecomAttemptId(previous.value + 1)),
+            )
+
+            releasePublication.countDown()
+            assertSame(cleanupFailure, externalRetirement.get(1, TimeUnit.SECONDS))
+            assertEquals(1, call.disconnectCalls)
+
+            cleanupFailureRef.set(null)
+            lease.retire()
+            assertEquals(2, call.disconnectCalls)
+            val replacement = registry.beginAttempt().requireAllocatedAttemptId()
+            assertEquals(previous.value + 1, replacement.value)
+        } finally {
+            releaseCleanup.countDown()
+            releasePublication.countDown()
+            cleanupFailureRef.set(null)
+            executor.shutdownNow()
+        }
+    }
+
+    @Test
     fun `failed retirement result publication does not hold registry lock`() {
         val cleanupFailure = IllegalStateException("failed retirement publication")
         val publicationObserved = CountDownLatch(1)

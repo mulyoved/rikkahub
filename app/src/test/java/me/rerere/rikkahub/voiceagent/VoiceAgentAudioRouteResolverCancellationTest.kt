@@ -12,6 +12,7 @@ import kotlin.concurrent.thread
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.asCoroutineDispatcher
@@ -45,6 +46,7 @@ class VoiceAgentAudioRouteResolverCancellationTest {
                     gateway = gateway,
                     registry = registry,
                     timeoutMs = 1_000,
+                    blockingDispatcher = Dispatchers.Unconfined,
                     deliveryProbe = VoiceAgentRouteDeliveryProbe { job -> job.cancel(cancellation) },
                 ).resolve()
             } catch (error: Throwable) {
@@ -222,6 +224,7 @@ class VoiceAgentAudioRouteResolverCancellationTest {
                         gateway = gateway,
                         registry = registry,
                         timeoutMs = 1_000,
+                        blockingDispatcher = Dispatchers.Unconfined,
                         deliveryProbe = VoiceAgentRouteDeliveryProbe { job -> job.cancel(cancellation) },
                     ).resolve()
                 } catch (error: Throwable) {
@@ -710,7 +713,12 @@ class VoiceAgentAudioRouteResolverCancellationTest {
         }
 
         val thrown = runCatching {
-            VoiceAgentAudioRouteResolver(initialGateway, registry, 1_000).resolve()
+            VoiceAgentAudioRouteResolver(
+                gateway = initialGateway,
+                registry = registry,
+                timeoutMs = 1_000,
+                blockingDispatcher = Dispatchers.Unconfined,
+            ).resolve()
         }.exceptionOrNull()
 
         assertSame(cancellation, thrown)
@@ -803,6 +811,8 @@ class VoiceAgentAudioRouteResolverCancellationTest {
             }),
             registry,
             1_000,
+            blockingDispatcher = Dispatchers.Unconfined,
+            cleanupDispatcher = Dispatchers.Unconfined,
         )
         val resolution = async(start = CoroutineStart.UNDISPATCHED) { resolver.resolve() }
         val cancellation = CancellationException("caller cancelled during activation")

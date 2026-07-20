@@ -16,6 +16,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.supervisorScope
 import kotlinx.coroutines.withTimeoutOrNull
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -24,6 +25,104 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class VoiceAgentAudioRouteResolverDeliveryTest {
+    @Test
+    fun `blocked replacement join leaves Main responsive to cancellation`() = runBlocking {
+        supervisorScope {
+            val cleanupFailure = IllegalStateException("blocked predecessor cleanup failed")
+            val currentFailure = AtomicReference<Throwable?>(cleanupFailure)
+            val cleanupEntered = CountDownLatch(1)
+            val releaseCleanup = CountDownLatch(1)
+            val joinEntered = CountDownLatch(1)
+            val registry = VoiceAgentTelecomCallRegistry(
+                probe = VoiceAgentTelecomRegistryProbe { event ->
+                    if (event is VoiceAgentTelecomRegistryProbeEvent.RouteRetirementJoining) {
+                        joinEntered.countDown()
+                    }
+                },
+            )
+            val previous = registry.beginAttempt().requireAllocatedAttemptId()
+            val previousCall = CallbackFaithfulResolverCall(
+                registry = registry,
+                cleanupFailure = currentFailure,
+                onCleanup = {
+                    cleanupEntered.countDown()
+                    check(releaseCleanup.await(5, TimeUnit.SECONDS)) {
+                        "predecessor cleanup was not released"
+                    }
+                },
+            )
+            assertTrue(registry.activate(previous, previousCall))
+            assertEquals(VoiceAgentTelecomOutcome.Active, registry.awaitOutcome(previous))
+            val previousLease = registry.consumeActiveOutcome(previous).requireResolvedLease() as
+                TelecomVoiceAgentRouteLease
+            val cleanupAcquisition = previousLease.claimUndeliveredCleanup()
+            val retirementExecutor = Executors.newSingleThreadExecutor()
+            val retirement = retirementExecutor.submit {
+                previousLease.executeUndeliveredCleanup(cleanupAcquisition)
+            }
+            val main = MainDeliveryGateDispatcher()
+            val blockingExecutor = Executors.newSingleThreadExecutor()
+            val blockingDispatcher = blockingExecutor.asCoroutineDispatcher()
+            val observed = AtomicReference<Throwable>()
+            val resolutionReturned = CountDownLatch(1)
+            val sentinelRan = CountDownLatch(1)
+            val cancellation = CancellationException("cancel blocked Main replacement")
+            var resolution: Deferred<VoiceAgentRouteResolution>? = null
+
+            try {
+                assertTrue(cleanupEntered.await(1, TimeUnit.SECONDS))
+                resolution = async(main) {
+                    try {
+                        VoiceAgentAudioRouteResolver(
+                            gateway = DeliveryTestGateway { error("gateway must not run") },
+                            registry = registry,
+                            timeoutMs = 1_000,
+                            blockingDispatcher = blockingDispatcher,
+                        ).resolve()
+                    } catch (error: Throwable) {
+                        observed.set(error)
+                        throw error
+                    } finally {
+                        resolutionReturned.countDown()
+                    }
+                }
+                assertTrue(joinEntered.await(1, TimeUnit.SECONDS))
+                main.execute {
+                    checkNotNull(resolution).cancel(cancellation)
+                    sentinelRan.countDown()
+                }
+
+                assertTrue(sentinelRan.await(1, TimeUnit.SECONDS))
+                assertTrue(checkNotNull(resolution).isCancelled)
+                assertFalse(checkNotNull(resolution).isCompleted)
+                releaseCleanup.countDown()
+
+                retirement.get(1, TimeUnit.SECONDS)
+                assertTrue(resolutionReturned.await(1, TimeUnit.SECONDS))
+                val thrown = observed.get()
+                assertTrue(thrown is CancellationException)
+                assertEquals(cancellation.message, thrown.message)
+                assertEquals(1, thrown.suppressed.size)
+                assertSame(cleanupFailure, thrown.suppressed.single())
+                assertEquals(1, previousCall.disconnectCalls.get())
+
+                currentFailure.set(null)
+                previousLease.retire()
+                val next = registry.beginAttempt().requireAllocatedAttemptId()
+                assertEquals(2L, next.value)
+            } finally {
+                releaseCleanup.countDown()
+                withTimeoutOrNull(1_000) { resolution?.join() }
+                currentFailure.set(null)
+                previousLease.retire()
+                main.close()
+                blockingDispatcher.close()
+                blockingExecutor.shutdownNow()
+                retirementExecutor.shutdownNow()
+            }
+        }
+    }
+
     @Test
     fun `delivery cancellation joins framework failure publication before exact retry`() = runBlocking {
         verifyFrameworkFailureDuringFinalDelivery(pauseFailurePublication = true)
@@ -229,6 +328,7 @@ class VoiceAgentAudioRouteResolverDeliveryTest {
         val releasePublication = CountDownLatch(if (pauseFailurePublication) 1 else 0)
         val retryEntered = CountDownLatch(1)
         val releaseRetry = CountDownLatch(1)
+        val replacementJoinEntered = CountDownLatch(1)
         val registry = VoiceAgentTelecomCallRegistry(
             probe = VoiceAgentTelecomRegistryProbe { event ->
                 when (event) {
@@ -240,6 +340,9 @@ class VoiceAgentAudioRouteResolverDeliveryTest {
                         check(releasePublication.await(5, TimeUnit.SECONDS)) {
                             "framework failure publication was not released"
                         }
+                    }
+                    VoiceAgentTelecomRegistryProbeEvent.RouteRetirementJoining -> {
+                        replacementJoinEntered.countDown()
                     }
                     else -> Unit
                 }
@@ -309,6 +412,7 @@ class VoiceAgentAudioRouteResolverDeliveryTest {
             val replacement = replacementExecutor.submit<VoiceAgentTelecomAttemptStartResult> {
                 registry.beginAttempt()
             }
+            assertTrue(replacementJoinEntered.await(1, TimeUnit.SECONDS))
             assertFutureBlocked(replacement)
             assertFalse(checkNotNull(resolution).isCompleted)
             assertFalse(resolverReturned.await(100, TimeUnit.MILLISECONDS))
@@ -373,6 +477,10 @@ private class MainDeliveryGateDispatcher : CoroutineDispatcher(), AutoCloseable 
 
     fun awaitIdle(): Boolean = executor.submit {}.run {
         runCatching { get(1, TimeUnit.SECONDS) }.isSuccess
+    }
+
+    fun execute(block: () -> Unit) {
+        executor.execute(block)
     }
 
     override fun close() {
