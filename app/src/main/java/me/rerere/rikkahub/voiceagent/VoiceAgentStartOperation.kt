@@ -52,6 +52,7 @@ private class DefaultVoiceAgentStartOperation(
     private val worker = callScope.launch(start = CoroutineStart.LAZY) {
         val outcome = runStartup()
         onFinished(this@DefaultVoiceAgentStartOperation, outcome)
+        startupCleanup.releaseLocalCleanupAfterPublication()
         if (outcome !is VoiceAgentStartOutcome.Ready) {
             callJob.complete()
         }
@@ -90,11 +91,8 @@ private class DefaultVoiceAgentStartOperation(
                 }
             }
         } catch (cancellation: CancellationException) {
-            if (startupCleanup.wasCleanupRequested()) {
-                VoiceAgentStartOutcome.Cancelled
-            } else {
-                finishResourceCancellation(cancellation)
-            }
+            val canonical = cancellation.canonicalVoiceAgentCancellation()
+            finishFailure(canonical)
         } catch (error: Throwable) {
             finishFailure(error)
         }
@@ -143,45 +141,32 @@ private class DefaultVoiceAgentStartOperation(
     }
 
     private suspend fun finishFailure(error: Throwable): VoiceAgentStartOutcome {
-        val cleanup = when (val target = startupCleanup.currentTarget()) {
-            StartupCleanupTarget.None -> return VoiceAgentStartOutcome.FailedClean(error)
-            is StartupCleanupTarget.Owned -> target.cleanup
-        }
-        return when (val result = cleanup.run(VoiceAgentCleanupMode.Immediate)) {
-            VoiceAgentCleanupResult.Completed -> {
-                startupCleanup.clearDelegate(cleanup)
-                VoiceAgentStartOutcome.FailedClean(error)
-            }
-            is VoiceAgentCleanupResult.Failed -> {
-                error.addVoiceAgentSuppressedDistinct(result.error)
-                VoiceAgentStartOutcome.FailedDirty(error, startupCleanup)
-            }
+        return when (val claim = startupCleanup.claimLocalCleanup()) {
+            StartupLocalCleanupClaim.Clean -> VoiceAgentStartOutcome.FailedClean(error)
+            StartupLocalCleanupClaim.External -> VoiceAgentStartOutcome.Cancelled
+            is StartupLocalCleanupClaim.Execute -> finishClaimedFailure(error, claim)
         }
     }
 
-    private suspend fun finishResourceCancellation(
-        cancellation: CancellationException,
+    private suspend fun finishClaimedFailure(
+        error: Throwable,
+        claim: StartupLocalCleanupClaim.Execute,
     ): VoiceAgentStartOutcome {
-        val canonical = cancellation.canonicalVoiceAgentCancellation()
-        val cleanup = when (val target = startupCleanup.currentTarget()) {
-            StartupCleanupTarget.None -> return VoiceAgentStartOutcome.FailedClean(canonical)
-            is StartupCleanupTarget.Owned -> target.cleanup
-        }
-        return withContext(NonCancellable) {
-            val result = try {
-                cleanup.run(VoiceAgentCleanupMode.Immediate)
+        val result = withContext(NonCancellable) {
+            try {
+                claim.cleanup.run(VoiceAgentCleanupMode.Immediate)
             } catch (cleanupError: Throwable) {
                 VoiceAgentCleanupResult.Failed(cleanupError)
             }
-            when (result) {
-                VoiceAgentCleanupResult.Completed -> {
-                    startupCleanup.clearDelegate(cleanup)
-                    VoiceAgentStartOutcome.FailedClean(canonical)
-                }
-                is VoiceAgentCleanupResult.Failed -> {
-                    canonical.addVoiceAgentSuppressedDistinct(result.error)
-                    VoiceAgentStartOutcome.FailedDirty(canonical, startupCleanup)
-                }
+        }
+        if (startupCleanup.completeLocalCleanup(claim, result)) {
+            return VoiceAgentStartOutcome.Cancelled
+        }
+        return when (result) {
+            VoiceAgentCleanupResult.Completed -> VoiceAgentStartOutcome.FailedClean(error)
+            is VoiceAgentCleanupResult.Failed -> {
+                error.addVoiceAgentSuppressedDistinct(result.error)
+                VoiceAgentStartOutcome.FailedDirty(error, startupCleanup)
             }
         }
     }
@@ -195,14 +180,28 @@ private class DefaultVoiceAgentStartOperation(
 
 private sealed interface StartupCleanupAttempt {
     data object Ready : StartupCleanupAttempt
+    data class Local(val completion: CompletableDeferred<VoiceAgentCleanupResult>) : StartupCleanupAttempt
     data class Running(val completion: CompletableDeferred<VoiceAgentCleanupResult>) : StartupCleanupAttempt
     data object Completed : StartupCleanupAttempt
 }
 
 private sealed interface StartupCleanupDecision {
     data object Completed : StartupCleanupDecision
-    data class Execute(val completion: CompletableDeferred<VoiceAgentCleanupResult>) : StartupCleanupDecision
+    data class Execute(
+        val completion: CompletableDeferred<VoiceAgentCleanupResult>,
+        val localCompletion: CompletableDeferred<VoiceAgentCleanupResult>?,
+    ) : StartupCleanupDecision
     data class Join(val completion: CompletableDeferred<VoiceAgentCleanupResult>) : StartupCleanupDecision
+}
+
+private sealed interface StartupLocalCleanupClaim {
+    data object Clean : StartupLocalCleanupClaim
+    data object External : StartupLocalCleanupClaim
+
+    data class Execute(
+        val cleanup: VoiceAgentCleanupOperation,
+        val completion: CompletableDeferred<VoiceAgentCleanupResult>,
+    ) : StartupLocalCleanupClaim
 }
 
 private sealed interface StartupCleanupTarget {
@@ -252,14 +251,51 @@ private class StartupCleanupOperation(
         worker.cancel()
     }
 
-    fun wasCleanupRequested(): Boolean = synchronized(lock) {
-        cancellationState == StartupCancellationState.CleanupRequested
-    }
-
     fun clearDelegate(expected: VoiceAgentCleanupOperation? = null) {
         synchronized(lock) {
             val current = target as? StartupCleanupTarget.Owned
             if (expected == null || current?.cleanup === expected) target = StartupCleanupTarget.None
+        }
+    }
+
+    fun claimLocalCleanup(): StartupLocalCleanupClaim = synchronized(lock) {
+        if (
+            cancellationState == StartupCancellationState.CleanupRequested ||
+            attempt != StartupCleanupAttempt.Ready
+        ) {
+            return@synchronized StartupLocalCleanupClaim.External
+        }
+        val cleanup = when (val current = target) {
+            StartupCleanupTarget.None -> return@synchronized StartupLocalCleanupClaim.Clean
+            is StartupCleanupTarget.Owned -> current.cleanup
+        }
+        val completion = CompletableDeferred<VoiceAgentCleanupResult>()
+        attempt = StartupCleanupAttempt.Local(completion)
+        StartupLocalCleanupClaim.Execute(cleanup, completion)
+    }
+
+    fun completeLocalCleanup(
+        claim: StartupLocalCleanupClaim.Execute,
+        result: VoiceAgentCleanupResult,
+    ): Boolean = synchronized(lock) {
+        if (result == VoiceAgentCleanupResult.Completed) {
+            val current = target as? StartupCleanupTarget.Owned
+            if (current?.cleanup === claim.cleanup) target = StartupCleanupTarget.None
+        }
+        check(claim.completion.complete(result)) { "Local startup cleanup was already completed" }
+        cancellationState == StartupCancellationState.CleanupRequested ||
+            (attempt as? StartupCleanupAttempt.Local)?.completion !== claim.completion
+    }
+
+    fun releaseLocalCleanupAfterPublication() {
+        synchronized(lock) {
+            val local = attempt as? StartupCleanupAttempt.Local ?: return
+            if (
+                local.completion.isCompleted &&
+                cancellationState == StartupCancellationState.Running
+            ) {
+                attempt = StartupCleanupAttempt.Ready
+            }
         }
     }
 
@@ -269,23 +305,40 @@ private class StartupCleanupOperation(
                 StartupCleanupAttempt.Completed -> StartupCleanupDecision.Completed
                 StartupCleanupAttempt.Ready -> CompletableDeferred<VoiceAgentCleanupResult>().also {
                     attempt = StartupCleanupAttempt.Running(it)
-                }.let(StartupCleanupDecision::Execute)
+                }.let { StartupCleanupDecision.Execute(it, null) }
+                is StartupCleanupAttempt.Local -> CompletableDeferred<VoiceAgentCleanupResult>().also {
+                    attempt = StartupCleanupAttempt.Running(it)
+                }.let { externalCompletion ->
+                    val joinsLocalAttempt =
+                        cancellationState == StartupCancellationState.CleanupRequested ||
+                            !current.completion.isCompleted
+                    StartupCleanupDecision.Execute(
+                        completion = externalCompletion,
+                        localCompletion = current.completion.takeIf { joinsLocalAttempt },
+                    )
+                }
                 is StartupCleanupAttempt.Running -> StartupCleanupDecision.Join(current.completion)
             }
         }
+        worker.cancel()
         return when (decision) {
             StartupCleanupDecision.Completed -> VoiceAgentCleanupResult.Completed
             is StartupCleanupDecision.Join -> decision.completion.await()
-            is StartupCleanupDecision.Execute -> executeAndPublish(mode, decision.completion)
+            is StartupCleanupDecision.Execute -> executeAndPublish(
+                mode = mode,
+                completion = decision.completion,
+                localCompletion = decision.localCompletion,
+            )
         }
     }
 
     private suspend fun executeAndPublish(
         mode: VoiceAgentCleanupMode,
         completion: CompletableDeferred<VoiceAgentCleanupResult>,
+        localCompletion: CompletableDeferred<VoiceAgentCleanupResult>?,
     ): VoiceAgentCleanupResult {
-        cancelWorker()
-        val result = executeAttempt(mode)
+        val localResult = localCompletion?.await()
+        val result = executeAttempt(mode, localResult)
         synchronized(lock) {
             if ((attempt as? StartupCleanupAttempt.Running)?.completion === completion) {
                 attempt = if (
@@ -302,8 +355,11 @@ private class StartupCleanupOperation(
         return result
     }
 
-    private suspend fun executeAttempt(mode: VoiceAgentCleanupMode): VoiceAgentCleanupResult {
-        var failure: Throwable? = null
+    private suspend fun executeAttempt(
+        mode: VoiceAgentCleanupMode,
+        localResult: VoiceAgentCleanupResult?,
+    ): VoiceAgentCleanupResult {
+        var failure = (localResult as? VoiceAgentCleanupResult.Failed)?.error
         worker.cancel()
         try {
             worker.join()
@@ -311,7 +367,7 @@ private class StartupCleanupOperation(
             failure = failure.appendStartupFailure(error)
         }
         val current = currentTarget()
-        if (current is StartupCleanupTarget.Owned) {
+        if (localResult == null && current is StartupCleanupTarget.Owned) {
             try {
                 when (val result = current.cleanup.run(mode)) {
                     VoiceAgentCleanupResult.Completed -> clearDelegate(current.cleanup)
@@ -330,7 +386,11 @@ private class StartupCleanupOperation(
                 failure = failure.appendStartupFailure(error)
             }
         }
-        return failure?.let(VoiceAgentCleanupResult::Failed) ?: VoiceAgentCleanupResult.Completed
+        return when {
+            failure == null -> VoiceAgentCleanupResult.Completed
+            localResult is VoiceAgentCleanupResult.Failed && failure === localResult.error -> localResult
+            else -> VoiceAgentCleanupResult.Failed(failure)
+        }
     }
 }
 

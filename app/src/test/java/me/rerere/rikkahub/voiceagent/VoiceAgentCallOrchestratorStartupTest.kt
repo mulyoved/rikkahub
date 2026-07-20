@@ -261,6 +261,67 @@ class VoiceAgentCallOrchestratorStartupTest {
     }
 
     @Test
+    fun `caller cancellation joins blocked resource cleanup failure without retrying it`() = runTest {
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val appJob = SupervisorJob()
+        val route = OrchestratorFakeRoute()
+        val resourceCancellation = CancellationException("session resource cancelled")
+        val callerCancellation = CancellationException("caller cancelled during resource cleanup")
+        val cleanupError = IllegalStateException("first resource cleanup failed")
+        val cleanupEntered = CompletableDeferred<Unit>()
+        val releaseCleanup = CompletableDeferred<Unit>()
+        var cleanupAttempt = 0
+        val cleanup = OrchestratorFakeCleanupOperation {
+            cleanupAttempt += 1
+            if (cleanupAttempt == 1) {
+                cleanupEntered.complete(Unit)
+                releaseCleanup.await()
+                VoiceAgentCleanupResult.Failed(cleanupError)
+            } else {
+                VoiceAgentCleanupResult.Completed
+            }
+        }
+        val session = OrchestratorFakeSession(
+            routeMetadata = route.lease.metadata,
+            cleanupOperation = cleanup,
+            onStart = { throw resourceCancellation },
+        )
+        val orchestrator = VoiceAgentCallOrchestrator(
+            factory = OrchestratorFakeFactory { _, _, _ ->
+                VoiceAgentSessionCreationResult.Created(session)
+            },
+            resolveRoute = { route.lease },
+            appScope = CoroutineScope(appJob + dispatcher),
+        )
+        val failure = CompletableDeferred<Throwable>()
+        val caller = launch {
+            try {
+                orchestrator.start(orchestratorRequest("cancel-during-resource-cleanup"))
+            } catch (error: Throwable) {
+                failure.complete(error)
+            }
+        }
+
+        runCurrent()
+        cleanupEntered.await()
+        caller.cancel(callerCancellation)
+        runCurrent()
+
+        assertEquals(listOf(VoiceAgentCleanupMode.Immediate), cleanup.modes)
+        assertEquals(VoiceAgentCallLifecycle.Stopping(null), orchestrator.lifecycle.value)
+
+        releaseCleanup.complete(Unit)
+        runCurrent()
+
+        val thrown = failure.await()
+        assertSame(callerCancellation, thrown)
+        assertEquals(listOf(cleanupError), thrown.suppressed.toList())
+        assertEquals(VoiceAgentCallLifecycle.CleanupFailed(cleanupError), orchestrator.lifecycle.value)
+        assertEquals(listOf(VoiceAgentCleanupMode.Immediate), cleanup.modes)
+        assertEquals(0, appJob.children.count())
+    }
+
+    @Test
     fun `final pre-collector resource cancellation cleans once without starting collector or leaking job`() = runTest {
         val dispatcher = StandardTestDispatcher(testScheduler)
         val appJob = SupervisorJob()
