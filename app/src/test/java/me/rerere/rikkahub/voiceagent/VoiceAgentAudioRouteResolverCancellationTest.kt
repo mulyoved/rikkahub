@@ -36,42 +36,57 @@ class VoiceAgentAudioRouteResolverCancellationTest {
         val gateway = DeliveryGateTelecomGateway { attempt ->
             assertTrue(registry.activate(attempt, call))
         }
+        val cleanupExecutor = Executors.newSingleThreadExecutor()
+        val cleanupDispatcher = cleanupExecutor.asCoroutineDispatcher()
+        val cleanupScope = CoroutineScope(SupervisorJob() + cleanupDispatcher)
         val observedFailure = AtomicReference<Throwable>()
-        val resolutionReturned = CountDownLatch(1)
         val cancellation = CancellationException("cancel armed resolved delivery")
 
-        val resolution = async(start = CoroutineStart.UNDISPATCHED) {
-            try {
-                VoiceAgentAudioRouteResolver(
-                    gateway = gateway,
-                    registry = registry,
-                    timeoutMs = 1_000,
-                    executionDispatchers = DefaultVoiceAgentRouteExecutionDispatchers.copy(
-                        acquisition = Dispatchers.Unconfined,
-                    ),
-                    deliveryProbe = VoiceAgentRouteDeliveryProbe { job -> job.cancel(cancellation) },
-                ).resolve()
-            } catch (error: Throwable) {
-                observedFailure.set(error)
-                throw error
-            } finally {
-                resolutionReturned.countDown()
+        try {
+            val resolution = async(start = CoroutineStart.UNDISPATCHED) {
+                try {
+                    VoiceAgentAudioRouteResolver(
+                        gateway = gateway,
+                        registry = registry,
+                        timeoutMs = 1_000,
+                        cleanupScope = cleanupScope,
+                        executionDispatchers = DefaultVoiceAgentRouteExecutionDispatchers.copy(
+                            acquisition = Dispatchers.Unconfined,
+                            cleanup = cleanupDispatcher,
+                        ),
+                        deliveryProbe = VoiceAgentRouteDeliveryProbe { job -> job.cancel(cancellation) },
+                    ).resolve()
+                } catch (error: Throwable) {
+                    observedFailure.set(error)
+                    throw error
+                }
             }
-        }
-        assertTrue(resolutionReturned.await(1, TimeUnit.SECONDS))
-        val thrown = observedFailure.get()
-        assertTrue(thrown is CancellationException)
-        assertEquals(cancellation.message, thrown.message)
-        assertEquals(0, thrown.suppressed.size)
-        assertEquals(1, call.disconnectCalls.get())
-        withTimeout(1_000) {
-            assertAttemptWasConsumed(registry, VoiceAgentTelecomAttemptId(1))
-        }
+            withTimeout(5_000) {
+                runCatching { resolution.await() }.exceptionOrNull()
+            }
+            val thrown = observedFailure.get()
+            assertTrue(thrown is CancellationException)
+            val thrownCancellation = thrown as CancellationException
+            assertEquals(cancellation.message, thrownCancellation.message)
+            assertEquals(0, thrownCancellation.suppressed.size)
+            val canonicalCancellation = thrownCancellation.canonicalVoiceAgentCancellation()
+            assertSame(cancellation, canonicalCancellation)
+            assertEquals(cancellation.message, canonicalCancellation.message)
+            assertEquals(0, canonicalCancellation.suppressed.size)
+            assertEquals(1, call.disconnectCalls.get())
+            withTimeout(1_000) {
+                assertAttemptWasConsumed(registry, VoiceAgentTelecomAttemptId(1))
+            }
 
-        val next = registry.beginAttempt().requireAllocatedAttemptId()
-        assertEquals(2L, next.value)
-        registry.retireAttempt(next, VoiceAgentTelecomFailure("test_cleanup", "test cleanup"))
-        registry.awaitOutcome(next)
+            val next = registry.beginAttempt().requireAllocatedAttemptId()
+            assertEquals(2L, next.value)
+            registry.retireAttempt(next, VoiceAgentTelecomFailure("test_cleanup", "test cleanup"))
+            registry.awaitOutcome(next)
+        } finally {
+            cleanupScope.cancel()
+            cleanupDispatcher.close()
+            cleanupExecutor.shutdownNow()
+        }
         Unit
     }
 
