@@ -107,6 +107,10 @@ internal class VoiceAgentCallServiceLifecycle(
         if (hasHostedCall()) {
             reportFailureSafely(error)
         } else {
+            currentGeneration += 1
+            configurationJob?.cancel()
+            configurationJob = null
+            configurationToken = null
             closeControllerOnDestroy = false
             runCatching {
                 runVoiceAgentCleanupStages(

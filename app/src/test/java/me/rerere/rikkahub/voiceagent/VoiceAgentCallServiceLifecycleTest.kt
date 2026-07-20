@@ -266,6 +266,40 @@ class VoiceAgentCallServiceLifecycleTest {
     }
 
     @Test
+    fun `idle malformed intent invalidates blocked preflight before host stop`() = runTest {
+        val controller = RecordingServiceController()
+        val host = RecordingLifecycleHost()
+        val scope = CoroutineScope(coroutineContext + SupervisorJob())
+        val lifecycle = VoiceAgentCallServiceLifecycle(controller, scope, host)
+        val request = serviceRequest()
+        val releasePreflight = CompletableDeferred<Unit>()
+        try {
+            val startGeneration = lifecycle.beginStart(request.conversationId)
+            lifecycle.launchStartConfiguration(startGeneration, request.conversationId) {
+                releasePreflight.await()
+                request
+            }
+            runCurrent()
+
+            lifecycle.rejectInvalidStart(VoiceAgentCallConfigurationException("invalid conversation id"))
+            releasePreflight.complete(Unit)
+            runCurrent()
+
+            assertEquals(startGeneration + 1, lifecycle.currentGeneration)
+            assertTrue(controller.requests.isEmpty())
+            assertTrue(controller.statuses.isEmpty())
+            assertEquals(
+                listOf("cancelNotification", "startForeground", "reportFailure", "stopSelf"),
+                host.events,
+            )
+        } finally {
+            releasePreflight.complete(Unit)
+            lifecycle.destroy()
+        }
+        assertEquals(0, controller.closeNowCalls)
+    }
+
+    @Test
     fun `failed start reports exact error and stops only matching generation`() = runTest {
         val failure = IllegalStateException("token=private")
         val controller = RecordingServiceController(
