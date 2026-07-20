@@ -20,8 +20,9 @@ import me.rerere.rikkahub.utils.UpdateChecker
 import me.rerere.rikkahub.voiceagent.DefaultVoiceAgentCallFactory
 import me.rerere.rikkahub.voiceagent.VoiceAgentAudioRouteResolver
 import me.rerere.rikkahub.voiceagent.VoiceAgentCallFactory
-import me.rerere.rikkahub.voiceagent.VoiceAgentCallManager
-import me.rerere.rikkahub.voiceagent.VoiceAgentCallStartup
+import me.rerere.rikkahub.voiceagent.VoiceAgentCallOrchestrator
+import me.rerere.rikkahub.voiceagent.VoiceAgentCallServiceController
+import me.rerere.rikkahub.voiceagent.VoiceAgentRouteResolution
 import me.rerere.rikkahub.voiceagent.VoiceAgentNotificationFactory
 import me.rerere.rikkahub.voiceagent.VoiceSessionMetadataStore
 import me.rerere.rikkahub.voiceagent.VoiceAgentTelecomAdapter
@@ -138,10 +139,6 @@ val appModule = module {
     }
 
     single {
-        VoiceAgentCallManager(factory = get())
-    }
-
-    single {
         VoiceSessionMetadataStore(rootDirectory = get<android.content.Context>().noBackupFilesDir)
     }
 
@@ -170,7 +167,24 @@ val appModule = module {
     }
 
     single {
-        VoiceAgentCallStartup(manager = get(), routeResolver = get())
+        val routeResolver = get<VoiceAgentAudioRouteResolver>()
+        VoiceAgentCallOrchestrator(
+            factory = get(),
+            resolveRoute = {
+                when (val resolution = routeResolver.resolve()) {
+                    is VoiceAgentRouteResolution.Resolved -> resolution.lease
+                    is VoiceAgentRouteResolution.CleanupFailed -> throw resolution.error
+                    is VoiceAgentRouteResolution.Superseded -> error(
+                        "Voice route resolution was superseded by another Telecom attempt",
+                    )
+                }
+            },
+            appScope = get<AppScope>(),
+        )
+    }
+
+    single<VoiceAgentCallServiceController> {
+        get<VoiceAgentCallOrchestrator>()
     }
 
     single {

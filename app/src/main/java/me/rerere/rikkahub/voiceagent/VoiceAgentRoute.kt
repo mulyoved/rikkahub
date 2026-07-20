@@ -79,9 +79,9 @@ fun VoiceAgentRoute(conversationId: Uuid) {
     when (val result = configResult) {
         is VoiceAgentConfigResult.Available -> {
             val context = LocalContext.current
-            val callManager = koinInject<VoiceAgentCallManager>()
+            val callOrchestrator = koinInject<VoiceAgentCallOrchestrator>()
             VoiceAgentScreen(
-                stateProvider = { callManager.state },
+                stateProvider = { callOrchestrator.state },
                 title = result.config.assistantName,
                 onStart = {
                     ContextCompat.startForegroundService(
@@ -90,9 +90,9 @@ fun VoiceAgentRoute(conversationId: Uuid) {
                     )
                 },
                 onBack = { navController.popBackStack() },
-                onMuteToggle = { muted -> callManager.setMuted(!muted) },
-                onInterrupt = callManager::interrupt,
-                onReconnect = callManager::reconnect,
+                onMuteToggle = { muted -> callOrchestrator.setMuted(!muted) },
+                onInterrupt = callOrchestrator::interrupt,
+                onReconnect = callOrchestrator::reconnect,
                 onEnd = {
                     context.startService(voiceAgentCallEndIntent(context))
                     navController.popBackStack()

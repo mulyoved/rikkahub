@@ -1,10 +1,13 @@
 package me.rerere.rikkahub.voiceagent
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlin.uuid.Uuid
@@ -17,101 +20,104 @@ internal interface VoiceAgentCallServiceLifecycleHost {
     fun endCompleted(conversationId: Uuid?)
     fun stopForeground()
     fun stopSelf()
-    fun reportCleanupFailure(error: Throwable)
+    fun reportFailure(error: Throwable)
     fun destroyBaseService()
 }
 
 internal class VoiceAgentCallServiceLifecycle(
-    private val manager: VoiceAgentCallManager,
+    private val controller: VoiceAgentCallServiceController,
     private val serviceScope: CoroutineScope,
     private val host: VoiceAgentCallServiceLifecycleHost,
-    private val endDrainTimeoutMillis: Long = VOICE_AGENT_END_DRAIN_TIMEOUT_MS,
 ) {
     private val endJobTracker = VoiceAgentEndJobTracker()
+    private var configurationJob: Job? = null
+    private var notificationJob: Job? = null
+
     var currentGeneration: Long = 0L
         private set
 
-    init {
-        require(endDrainTimeoutMillis > 0) { "endDrainTimeoutMillis must be positive" }
-    }
-
-    fun beginStart(): Long {
+    fun beginStart(conversationId: Uuid): Long {
         currentGeneration += 1
+        configurationJob?.cancel()
+        configurationJob = null
         endJobTracker.clearTracking()
+        notificationJob?.cancel()
+        notificationJob = null
         host.cancelNotification()
+        val currentState = controller.state.value
+        val foregroundState = if (
+            controller.activeConversationId.value == conversationId &&
+            currentState.call is VoiceCallStatus.Degraded
+        ) {
+            currentState
+        } else {
+            currentState.copy(call = VoiceCallStatus.ForegroundStarting)
+        }
+        host.startForeground(
+            conversationId.toString(),
+            foregroundState,
+        )
         return currentGeneration
     }
 
     fun isCurrent(generation: Long): Boolean = generation == currentGeneration
 
-    fun isStartupTerminal(startGeneration: Long, session: VoiceSessionStatus): Boolean =
-        isVoiceAgentStartupTerminal(startGeneration, currentGeneration, session)
-
-    fun handleStartupTerminal(conversationId: Uuid, session: VoiceSessionStatus): Boolean = when (session) {
-        VoiceSessionStatus.Connected -> false
-        is VoiceSessionStatus.Error -> {
-            tearDownFailedStart(
-                conversationId = conversationId,
-                error = IllegalStateException(session.message),
-                preserveSessionRequested = true,
-            )
-            true
-        }
-        VoiceSessionStatus.Ended -> {
-            tearDownFailedStart(
-                conversationId = conversationId,
-                error = IllegalStateException("Voice call ended before startup completed"),
-            )
-            true
-        }
-        else -> false
-    }
-
-    fun tearDownFailedStart(
+    fun launchStartConfiguration(
+        generation: Long,
         conversationId: Uuid,
-        error: Throwable,
-        preserveSessionRequested: Boolean = false,
+        resolveRequest: suspend () -> VoiceAgentCallRequest,
     ) {
-        val detail = error.message ?: error.javaClass.simpleName
-        val preserveSession = preserveSessionRequested && manager.canPreserveActiveSession(conversationId)
-        val cleanupFailure = runCatching {
-            runVoiceAgentCleanupStages(
-                host::cancelNotification,
-                { manager.recordDiagnostic("voice_call_start_failed", detail) },
-                { if (!preserveSession) manager.closeNow() },
-                { manager.updateCallStatus(VoiceCallStatus.Degraded("Voice call startup failed: $detail")) },
-                { host.startForeground(conversationId.toString(), manager.state.value) },
-                { if (!preserveSession) host.stopForeground() },
-                { if (!preserveSession) host.stopSelf() },
-            )
-        }.exceptionOrNull()
-        cleanupFailure?.let(::reportCleanupFailureSafely)
+        configurationJob?.cancel()
+        configurationJob = serviceScope.launch {
+            try {
+                val request = resolveRequest()
+                if (!isCurrent(generation)) return@launch
+                when (val result = controller.start(request)) {
+                    is VoiceAgentCallStartResult.Active -> observeActiveCall(generation, conversationId)
+                    VoiceAgentCallStartResult.Superseded -> Unit
+                    is VoiceAgentCallStartResult.Failed -> stopFailedStartIfCurrent(
+                        generation = generation,
+                        conversationId = conversationId,
+                        error = result.error,
+                    )
+                }
+            } catch (cancellation: CancellationException) {
+                throw cancellation
+            } catch (error: Throwable) {
+                stopFailedStartIfCurrent(generation, conversationId, error)
+            }
+        }
     }
 
     fun endCall(): Boolean {
         if (endJobTracker.job?.isActive == true) return false
 
+        configurationJob?.cancel()
+        configurationJob = null
+        notificationJob?.cancel()
+        notificationJob = null
         host.cancelNotification()
-        val endingConversationId = manager.activeConversationId.value
-        if (shouldStartForegroundForVoiceAgentEnd(endingConversationId)) {
-            host.startForeground(
-                endingConversationId?.toString() ?: FALLBACK_END_NOTIFICATION_CONVERSATION_ID,
-                manager.state.value.copy(call = VoiceCallStatus.Ending),
-            )
-        }
+        val endingConversationId = controller.activeConversationId.value
+        host.startForeground(
+            endingConversationId?.toString() ?: FALLBACK_END_NOTIFICATION_CONVERSATION_ID,
+            controller.state.value.copy(call = VoiceCallStatus.Ending),
+        )
         currentGeneration += 1
         val endGeneration = currentGeneration
-        val session = manager.detachForEndAndDrain()
         endJobTracker.launch(serviceScope) {
-            val cleanupFailure = runCatching {
-                runVoiceAgentSuspendCleanupStages(
-                    { session?.let { drainOwnedSession(it) } },
-                    { if (isCurrent(endGeneration)) host.endCompleted(endingConversationId) },
-                    { if (isCurrent(endGeneration)) host.stopForeground() },
-                    { if (isCurrent(endGeneration)) host.stopSelf() },
+            val result = controller.end()
+            if (!isCurrent(endGeneration)) return@launch
+            if (result is VoiceAgentCallEndResult.Failed) {
+                reportFailureSafely(result.error)
+            }
+            val hostFailure = runCatching {
+                runVoiceAgentCleanupStages(
+                    { host.endCompleted(endingConversationId) },
+                    host::stopForeground,
+                    host::stopSelf,
                 )
             }.exceptionOrNull()
-            cleanupFailure?.let(::reportCleanupFailureSafely)
+            hostFailure?.let(::reportFailureSafely)
         }
         return true
     }
@@ -119,20 +125,91 @@ internal class VoiceAgentCallServiceLifecycle(
     fun destroy() {
         currentGeneration += 1
         runVoiceAgentCleanupStages(
+            controller::closeNow,
             host::cancelNotification,
+            { configurationJob?.cancel() },
+            { notificationJob?.cancel() },
             endJobTracker::clearTracking,
-            manager::closeNow,
             serviceScope::cancel,
             host::destroyBaseService,
         )
     }
 
-    private suspend fun drainOwnedSession(session: RouteOwnedManagedVoiceCallSession) {
-        session.endAndDrainWithin(endDrainTimeoutMillis)
+    private fun stopFailedStartIfCurrent(
+        generation: Long,
+        conversationId: Uuid,
+        error: Throwable,
+    ) {
+        if (!isCurrent(generation)) return
+        val detail = error.toVoiceAgentLogDetail()
+        val hostFailure = runCatching {
+            runVoiceAgentCleanupStages(
+                host::cancelNotification,
+                {
+                    host.startForeground(
+                        conversationId.toString(),
+                        controller.state.value.copy(
+                            call = VoiceCallStatus.Degraded("Voice call startup failed: $detail"),
+                        ),
+                    )
+                },
+                { host.reportFailure(error) },
+                host::stopForeground,
+                host::stopSelf,
+            )
+        }.exceptionOrNull()
+        if (hostFailure != null && hostFailure !== error) {
+            reportFailureSafely(hostFailure)
+        }
     }
 
-    private fun reportCleanupFailureSafely(error: Throwable) {
-        runCatching { host.reportCleanupFailure(error) }
+    private fun observeActiveCall(generation: Long, conversationId: Uuid) {
+        if (!isCurrent(generation)) return
+        notificationJob?.cancel()
+        notificationJob = serviceScope.launch {
+            coroutineScope {
+                launch {
+                    controller.state.collect { state ->
+                        if (isCurrent(generation)) {
+                            host.startForeground(conversationId.toString(), state)
+                        }
+                    }
+                }
+                launch {
+                    var observedOwnedLifecycle = false
+                    controller.lifecycle.collect { lifecycle ->
+                        when (lifecycle) {
+                            VoiceAgentCallLifecycle.Idle -> {
+                                if (observedOwnedLifecycle) stopAutonomousIfCurrent(generation)
+                            }
+                            is VoiceAgentCallLifecycle.Starting,
+                            is VoiceAgentCallLifecycle.Active,
+                            is VoiceAgentCallLifecycle.Stopping,
+                            -> observedOwnedLifecycle = true
+                            is VoiceAgentCallLifecycle.CleanupFailed -> {
+                                reportFailureSafely(lifecycle.error)
+                                stopAutonomousIfCurrent(generation)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private fun stopAutonomousIfCurrent(generation: Long) {
+        if (!isCurrent(generation)) return
+        runCatching {
+            runVoiceAgentCleanupStages(
+                host::cancelNotification,
+                host::stopForeground,
+                host::stopSelf,
+            )
+        }.exceptionOrNull()?.let(::reportFailureSafely)
+    }
+
+    private fun reportFailureSafely(error: Throwable) {
+        runCatching { host.reportFailure(error) }
     }
 
     private companion object {
@@ -176,12 +253,3 @@ internal class VoiceAgentEndJobTracker {
         }
     }
 }
-
-internal fun isVoiceAgentStartupTerminal(
-    startGeneration: Long,
-    currentGeneration: Long,
-    session: VoiceSessionStatus,
-): Boolean = startGeneration != currentGeneration ||
-    session == VoiceSessionStatus.Connected ||
-    session is VoiceSessionStatus.Error ||
-    session == VoiceSessionStatus.Ended

@@ -295,26 +295,12 @@ class VoiceAgentCallManagerTest {
         val matching = async(Dispatchers.Default, start = CoroutineStart.UNDISPATCHED) {
             manager.matchingRoute(conversationId, config)
         }
-        var resolveCalls = 0
-        val startup = VoiceAgentCallStartup(manager) {
-            resolveCalls += 1
-            error("direct supersession must not resolve another route")
-        }
-        val startupMatch = async(Dispatchers.Default, start = CoroutineStart.UNDISPATCHED) {
-            startup.start(conversationId, config, this@runTest) { true }
-        }
-
         manager.end()
 
         assertEquals(
             VoiceAgentRouteMatchResult.Superseded(originalLease.lease.metadata),
             matching.await(),
         )
-        assertEquals(
-            VoiceAgentCallStartupResult.Stale(originalLease.lease.metadata),
-            startupMatch.await(),
-        )
-        assertEquals(0, resolveCalls)
         assertEquals(1, factory.createdCalls.get())
         assertEquals(0, factory.session.startCalls)
 

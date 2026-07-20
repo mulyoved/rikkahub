@@ -35,25 +35,10 @@ class VoiceAgentCallManagerPublicationTest {
             val waiter = async(Dispatchers.Default, start = CoroutineStart.UNDISPATCHED) {
                 manager.start(conversationId, config, waiterLease.lease, this@runPublicationTest)
             }
-            var resolveCalls = 0
-            val startup = VoiceAgentCallStartup(manager) {
-                resolveCalls += 1
-                error("pending matching publication must not resolve another route")
-            }
-            val startupWaiter = async(Dispatchers.Default, start = CoroutineStart.UNDISPATCHED) {
-                startup.start(conversationId, config, this@runPublicationTest) { true }
-            }
-
             assertFalse(waiter.isCompleted)
-            assertFalse(startupWaiter.isCompleted)
             manager.end()
 
             assertEquals(VoiceAgentManagerStartResult.Superseded, waiter.await())
-            assertEquals(
-                VoiceAgentCallStartupResult.Stale(ownerLease.lease.metadata),
-                startupWaiter.await(),
-            )
-            assertEquals(0, resolveCalls)
             collectorDispatcher.release()
             assertEquals(VoiceAgentManagerStartResult.Superseded, owner.await())
 
@@ -94,17 +79,7 @@ class VoiceAgentCallManagerPublicationTest {
                 val waiter = async(Dispatchers.Default, start = CoroutineStart.UNDISPATCHED) {
                     manager.start(staleConversation, staleConfig, waiterLease.lease, this@runPublicationTest)
                 }
-                var resolveCalls = 0
-                val startup = VoiceAgentCallStartup(manager) {
-                    resolveCalls += 1
-                    error("superseded matching publication must not resolve another route")
-                }
-                val startupWaiter = async(Dispatchers.Default, start = CoroutineStart.UNDISPATCHED) {
-                    startup.start(staleConversation, staleConfig, this@runPublicationTest) { true }
-                }
-
                 assertFalse(waiter.isCompleted)
-                assertFalse(startupWaiter.isCompleted)
                 val replacementConversation = Uuid.random()
                 val replacementLease = CountingTelecomLease()
                 assertEquals(
@@ -118,11 +93,6 @@ class VoiceAgentCallManagerPublicationTest {
                 )
 
                 assertEquals(VoiceAgentManagerStartResult.Superseded, waiter.await())
-                assertEquals(
-                    VoiceAgentCallStartupResult.Stale(staleLease.lease.metadata),
-                    startupWaiter.await(),
-                )
-                assertEquals(0, resolveCalls)
                 collectorDispatcher.release()
                 assertEquals(VoiceAgentManagerStartResult.Superseded, staleOwner.await())
 
