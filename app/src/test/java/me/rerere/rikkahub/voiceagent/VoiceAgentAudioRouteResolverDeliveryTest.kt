@@ -26,6 +26,89 @@ import org.junit.Test
 
 class VoiceAgentAudioRouteResolverDeliveryTest {
     @Test
+    fun `rejected allocated cleanup dispatch preserves cancellation and consumes attempt`() = runBlocking {
+        val registry = VoiceAgentTelecomCallRegistry()
+        val registerCalls = AtomicInteger()
+        val startCalls = AtomicInteger()
+        val gateway = object : VoiceAgentTelecomGateway {
+            override fun register(): Result<Unit> {
+                registerCalls.incrementAndGet()
+                return Result.success(Unit)
+            }
+
+            override fun startCall(attemptId: VoiceAgentTelecomAttemptId): Result<Unit> {
+                startCalls.incrementAndGet()
+                return Result.success(Unit)
+            }
+        }
+        val main = MainDeliveryGateDispatcher()
+        val acquisitionExecutor = Executors.newSingleThreadExecutor()
+        val cancellation = CanonicalCancellationException(Any())
+        val schedulingFailure = NonCopyableCleanupException(Any(), "allocated cleanup dispatch rejected")
+        val resolutionRef = AtomicReference<Deferred<VoiceAgentRouteResolution>>()
+        val mainBlocked = CountDownLatch(1)
+        val releaseMain = CountDownLatch(1)
+        val cancellationTriggered = CountDownLatch(1)
+        val sentinelRan = CountDownLatch(1)
+        val resolutionReturned = CountDownLatch(1)
+        val observed = AtomicReference<Throwable>()
+        val acquisitionDispatcher = AfterFirstTaskDispatcher(
+            executor = acquisitionExecutor,
+            beforeFirstTask = {
+                main.execute {
+                    mainBlocked.countDown()
+                    check(releaseMain.await(5, TimeUnit.SECONDS)) { "Main gate was not released" }
+                }
+                check(mainBlocked.await(1, TimeUnit.SECONDS)) { "Main gate was not entered" }
+            },
+            afterFirstTask = {
+                checkNotNull(resolutionRef.get()).cancel(cancellation)
+                cancellationTriggered.countDown()
+                releaseMain.countDown()
+            },
+        )
+
+        try {
+            val resolution = async(main) {
+                try {
+                    VoiceAgentAudioRouteResolver(
+                        gateway = gateway,
+                        registry = registry,
+                        timeoutMs = 1_000,
+                        blockingDispatcher = acquisitionDispatcher,
+                        cleanupDispatcher = RejectingDispatcher(schedulingFailure),
+                    ).resolve()
+                } catch (error: Throwable) {
+                    observed.set(error)
+                    throw error
+                } finally {
+                    resolutionReturned.countDown()
+                }
+            }
+            resolutionRef.set(resolution)
+            assertTrue(cancellationTriggered.await(1, TimeUnit.SECONDS))
+            main.execute { sentinelRan.countDown() }
+
+            assertTrue(sentinelRan.await(1, TimeUnit.SECONDS))
+            assertTrue(resolutionReturned.await(1, TimeUnit.SECONDS))
+            val thrown = observed.get()
+            assertSame(cancellation, thrown)
+            assertEquals(1, thrown.suppressed.size)
+            assertSame(schedulingFailure, thrown.suppressed.single())
+            assertEquals(0, registerCalls.get())
+            assertEquals(0, startCalls.get())
+            assertEquals(null, registry.awaitOutcomeIfPresent(VoiceAgentTelecomAttemptId(1)))
+
+            val next = registry.beginAttempt().requireAllocatedAttemptId()
+            assertEquals(2L, next.value)
+        } finally {
+            releaseMain.countDown()
+            main.close()
+            acquisitionExecutor.shutdownNow()
+        }
+    }
+
+    @Test
     fun `blocked replacement join leaves Main responsive to cancellation`() = runBlocking {
         supervisorScope {
             val cleanupFailure = IllegalStateException("blocked predecessor cleanup failed")
@@ -493,6 +576,23 @@ private class RejectingDispatcher(
 ) : CoroutineDispatcher() {
     override fun dispatch(context: CoroutineContext, block: Runnable) {
         throw failure
+    }
+}
+
+private class AfterFirstTaskDispatcher(
+    private val executor: java.util.concurrent.Executor,
+    private val beforeFirstTask: () -> Unit,
+    private val afterFirstTask: () -> Unit,
+) : CoroutineDispatcher() {
+    private val first = java.util.concurrent.atomic.AtomicBoolean(true)
+
+    override fun dispatch(context: CoroutineContext, block: Runnable) {
+        executor.execute {
+            val isFirst = first.compareAndSet(true, false)
+            if (isFirst) beforeFirstTask()
+            block.run()
+            if (isFirst) afterFirstTask()
+        }
     }
 }
 

@@ -186,22 +186,41 @@ class VoiceAgentAudioRouteResolver internal constructor(
         attempt: VoiceAgentTelecomAttemptId,
         cancellation: CancellationException,
     ) {
-        withContext(NonCancellable + cleanupDispatcher) {
-            val retirementError = runCatching {
-                registry.retireAttempt(
-                    attempt,
-                    VoiceAgentTelecomFailure(
-                        diagnosticName = "telecom_resolution_cancelled",
-                        detail = cancellation.message ?: cancellation.javaClass.simpleName,
-                    ),
-                )
-            }.exceptionOrNull()
-            val acknowledgementError = runCatching {
-                registry.awaitOutcome(attempt)
-            }.exceptionOrNull()
-            retirementError?.let { cancellation.addSuppressedDistinct(it) }
-            acknowledgementError?.let { cancellation.addSuppressedDistinct(it) }
+        val schedulingError = withContext(NonCancellable) {
+            runCatching {
+                withContext(cleanupDispatcher) {
+                    retireAndAcknowledgeCancelledAttempt(attempt, cancellation)
+                }
+            }.exceptionOrNull()?.exactSchedulingFailure()
         }
+        if (schedulingError != null) {
+            cancellation.addSuppressedDistinct(schedulingError)
+            withContext(NonCancellable) {
+                withContext(DefaultVoiceAgentRouteBlockingDispatcher) {
+                    retireAndAcknowledgeCancelledAttempt(attempt, cancellation)
+                }
+            }
+        }
+    }
+
+    private suspend fun retireAndAcknowledgeCancelledAttempt(
+        attempt: VoiceAgentTelecomAttemptId,
+        cancellation: CancellationException,
+    ) {
+        val retirementError = runCatching {
+            registry.retireAttempt(
+                attempt,
+                VoiceAgentTelecomFailure(
+                    diagnosticName = "telecom_resolution_cancelled",
+                    detail = cancellation.message ?: cancellation.javaClass.simpleName,
+                ),
+            )
+        }.exceptionOrNull()
+        val acknowledgementError = runCatching {
+            registry.awaitOutcome(attempt)
+        }.exceptionOrNull()
+        retirementError?.let { cancellation.addSuppressedDistinct(it) }
+        acknowledgementError?.let { cancellation.addSuppressedDistinct(it) }
     }
 
     private suspend fun fallback(
