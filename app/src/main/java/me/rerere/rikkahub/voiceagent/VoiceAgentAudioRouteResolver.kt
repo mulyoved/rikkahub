@@ -242,7 +242,7 @@ private class FinalResolutionDelivery(
             is VoiceAgentRouteResolution.Resolved -> when (val lease = undelivered.lease) {
                 is TelecomVoiceAgentRouteLease -> TelecomFinalDeliveryCleanup(
                     lease = lease,
-                    claim = lease.claimUndeliveredCleanup(),
+                    acquisition = lease.claimUndeliveredCleanup(),
                 )
                 is DirectFallbackVoiceAgentRouteLease -> DirectFinalDeliveryCleanup(lease)
             }
@@ -308,15 +308,15 @@ private sealed interface FinalDeliveryCleanupWork {
 
 private class TelecomFinalDeliveryCleanup(
     private val lease: TelecomVoiceAgentRouteLease,
-    private val claim: UndeliveredRouteCleanupClaim,
+    private val acquisition: UndeliveredRouteCleanupAcquisition,
 ) : FinalDeliveryCleanupWork {
-    override fun execute() = lease.executeUndeliveredCleanup(claim)
+    override fun execute() = lease.executeUndeliveredCleanup(acquisition)
 
     override fun rejectScheduling(error: Throwable) {
-        lease.rejectUndeliveredCleanupScheduling(claim, error)
+        lease.rejectUndeliveredCleanupScheduling(acquisition.claim, error)
     }
 
-    override suspend fun awaitResult(): Result<Unit> = claim.awaitResult()
+    override suspend fun awaitResult(): Result<Unit> = acquisition.claim.awaitResult()
 }
 
 private class DirectFinalDeliveryCleanup(

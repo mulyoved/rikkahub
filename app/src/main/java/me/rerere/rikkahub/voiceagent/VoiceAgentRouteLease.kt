@@ -41,6 +41,14 @@ internal class UndeliveredRouteCleanupClaim internal constructor(
     internal val attempt: SynchronousAttemptResult = SynchronousAttemptResult(),
 ) {
     private val completion = CompletableDeferred<Result<Unit>>()
+    @Volatile
+    private var schedulingRejected = false
+
+    internal fun markSchedulingRejected() {
+        schedulingRejected = true
+    }
+
+    internal fun wasSchedulingRejected(): Boolean = schedulingRejected
 
     internal fun publishAttemptAndCompletion(result: Result<Unit>) {
         attempt.publish(result)
@@ -68,16 +76,36 @@ internal class TelecomVoiceAgentRouteLease(
         registry.retireOwnedAttempt(attemptId, this)
     }
 
-    internal fun claimUndeliveredCleanup(): UndeliveredRouteCleanupClaim =
+    internal fun claimUndeliveredCleanup(): UndeliveredRouteCleanupAcquisition =
         registry.claimUndeliveredRouteCleanup(attemptId, this)
 
-    internal fun executeUndeliveredCleanup(claim: UndeliveredRouteCleanupClaim) {
-        val result = runCatching {
-            retirement.retire {
-                registry.retireClaimedUndeliveredRoute(attemptId, this, claim)
+    internal fun executeUndeliveredCleanup(acquisition: UndeliveredRouteCleanupAcquisition) {
+        val claim = acquisition.claim
+        var step = acquisition.step
+        while (true) {
+            when (val current = step) {
+                UndeliveredRouteCleanupStep.Complete -> {
+                    claim.publishAttemptAndCompletion(Result.success(Unit))
+                    return
+                }
+                UndeliveredRouteCleanupStep.Execute -> {
+                    val result = runCatching {
+                        retirement.retire {
+                            registry.retireClaimedUndeliveredRoute(attemptId, this, claim)
+                        }
+                    }
+                    registry.completeUndeliveredRouteCleanup(attemptId, this, claim, result)
+                    return
+                }
+                is UndeliveredRouteCleanupStep.JoinRetirement -> {
+                    current.attempt.awaitResult()
+                }
+                is UndeliveredRouteCleanupStep.JoinFailurePublication -> {
+                    current.publication.awaitResult()
+                }
             }
+            step = registry.continueClaimedUndeliveredRouteCleanup(attemptId, this, claim)
         }
-        registry.completeUndeliveredRouteCleanup(attemptId, this, claim, result)
     }
 
     internal fun rejectUndeliveredCleanupScheduling(

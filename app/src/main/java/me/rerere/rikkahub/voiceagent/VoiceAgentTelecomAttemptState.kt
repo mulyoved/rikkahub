@@ -1,6 +1,7 @@
 package me.rerere.rikkahub.voiceagent
 
 import kotlinx.coroutines.CompletableDeferred
+import me.rerere.rikkahub.voiceagent.audio.VoiceAudioRouteOwner
 
 interface VoiceAgentTelecomCall {
     fun disconnectFromApp()
@@ -139,6 +140,10 @@ internal sealed interface ActiveOutcomeConsumptionDecision {
     ) : ActiveOutcomeConsumptionDecision
 }
 
+internal fun supersededActiveConsumption() = VoiceAgentRouteResolution.Superseded(
+    VoiceAgentRouteMetadata(VoiceAudioRouteOwner.Telecom),
+)
+
 internal fun predecessorDecision(
     id: VoiceAgentTelecomAttemptId,
     record: AttemptRecord,
@@ -181,9 +186,16 @@ internal fun predecessorDecision(
         when (val ownership = phase.ownership) {
             is RetirementOwnership.Registry -> requireExactRegistryOwnership(id, ownership)
             is RetirementOwnership.RouteLease -> {
-                val delivery = ownership.delivery
-                if (delivery is RouteLeaseDelivery.RetryingUndelivered) {
-                    return BeginAttemptDecision.JoinUndeliveredRoute(delivery.attempt)
+                when (val delivery = ownership.delivery) {
+                    is RouteLeaseDelivery.RetryingUndelivered -> {
+                        return BeginAttemptDecision.JoinUndeliveredRoute(delivery.attempt)
+                    }
+                    is RouteLeaseDelivery.CleanupClaimed -> {
+                        return BeginAttemptDecision.JoinUndeliveredRoute(delivery.claim.attempt)
+                    }
+                    RouteLeaseDelivery.Delivered,
+                    RouteLeaseDelivery.RetainedUndelivered,
+                    -> Unit
                 }
             }
         }
@@ -193,6 +205,10 @@ internal fun predecessorDecision(
         BeginAttemptDecision.JoinUndeliveredRoute(phase.retry.attempt)
     }
     is AttemptPhase.PublishingFailure -> {
+        val delivery = (phase.ownership as? RetirementOwnership.RouteLease)?.delivery
+        if (delivery is RouteLeaseDelivery.CleanupClaimed) {
+            return BeginAttemptDecision.JoinUndeliveredRoute(delivery.claim.attempt)
+        }
         BeginAttemptDecision.JoinFailurePublication(phase.publication)
     }
     is AttemptPhase.CleaningUndeliveredRoute -> {
@@ -253,6 +269,38 @@ internal data class ClaimedUndeliveredCleanupWork(
     val record: AttemptRecord,
     val connection: VoiceAgentTelecomCall,
 )
+
+internal data class UndeliveredRouteCleanupAcquisition(
+    val claim: UndeliveredRouteCleanupClaim,
+    val step: UndeliveredRouteCleanupStep,
+)
+
+internal sealed interface UndeliveredRouteCleanupStep {
+    data object Execute : UndeliveredRouteCleanupStep
+
+    data object Complete : UndeliveredRouteCleanupStep
+
+    data class JoinRetirement(
+        val attempt: SynchronousAttemptResult,
+    ) : UndeliveredRouteCleanupStep
+
+    data class JoinFailurePublication(
+        val publication: RetirementFailurePublication,
+    ) : UndeliveredRouteCleanupStep
+}
+
+internal sealed interface RejectedUndeliveredCleanupDecision {
+    data class PublishFailure(
+        val record: AttemptRecord,
+        val phase: AttemptPhase.PublishingFailure.UndeliveredCleanupScheduling,
+    ) : RejectedUndeliveredCleanupDecision
+
+    data object ExternalRetirement : RejectedUndeliveredCleanupDecision
+
+    data object Retained : RejectedUndeliveredCleanupDecision
+
+    data object Complete : RejectedUndeliveredCleanupDecision
+}
 
 internal sealed interface UndeliveredRouteRetryCompletion {
     data class Failed(
@@ -343,6 +391,17 @@ internal fun callbackRetirementExecution(ownership: RetirementOwnership): Retire
     is RetirementOwnership.RouteLease -> RetirementExecution.RouteCallback(ownership)
 }
 
+internal fun RetirementExecution.withRouteOwnership(
+    ownership: RetirementOwnership.RouteLease,
+): RetirementExecution = when (this) {
+    is RetirementExecution.RouteCallback -> copy(ownership = ownership)
+    is RetirementExecution.RouteSynchronous -> copy(ownership = ownership)
+    is RetirementExecution.RegistryCallback,
+    is RetirementExecution.RegistryDeferredToActivation,
+    is RetirementExecution.RegistrySynchronous,
+    -> error("Registry retirement cannot acquire route delivery cleanup")
+}
+
 internal val RetirementExecution.isSynchronous: Boolean
     get() = this is RetirementExecution.RegistrySynchronous || this is RetirementExecution.RouteSynchronous
 
@@ -378,6 +437,7 @@ internal sealed interface AttemptPhase {
         val connection: VoiceAgentTelecomCall,
         val lease: TelecomVoiceAgentRouteLease,
         val claim: UndeliveredRouteCleanupClaim,
+        val outcomeFailure: VoiceAgentTelecomFailure,
     ) : AttemptPhase {
         val ownership = RetirementOwnership.RouteLease(
             lease = lease,
@@ -465,6 +525,202 @@ internal sealed interface AttemptPhase {
     }
 
     data class Failed(val failure: VoiceAgentTelecomFailure) : AttemptPhase
+}
+
+internal fun acquireUndeliveredRouteCleanup(
+    id: VoiceAgentTelecomAttemptId,
+    record: AttemptRecord?,
+    lease: TelecomVoiceAgentRouteLease,
+    claim: UndeliveredRouteCleanupClaim,
+): UndeliveredRouteCleanupAcquisition {
+    val step = when (val phase = record?.phase) {
+        null,
+        is AttemptPhase.Failed,
+        -> UndeliveredRouteCleanupStep.Complete
+        is AttemptPhase.Active.RouteDelivered -> {
+            requireExactDeliveredLease(id, phase.lease, lease)
+            record.phase = AttemptPhase.CleaningUndeliveredRoute(
+                connection = phase.connection,
+                lease = lease,
+                claim = claim,
+                outcomeFailure = cancelledFailure(id),
+            )
+            UndeliveredRouteCleanupStep.Execute
+        }
+        is AttemptPhase.Retiring -> {
+            val ownership = phase.ownership.requireDeliveredLease(id, lease)
+            record.phase = phase.copy(
+                execution = phase.execution.withRouteOwnership(
+                    ownership.copy(delivery = RouteLeaseDelivery.CleanupClaimed(claim)),
+                ),
+            )
+            UndeliveredRouteCleanupStep.JoinRetirement(phase.attempt)
+        }
+        is AttemptPhase.PublishingFailure.RouteRetirement -> {
+            val ownership = phase.ownership.requireDeliveredLease(id, lease)
+            record.phase = phase.copy(
+                ownership = ownership.copy(delivery = RouteLeaseDelivery.CleanupClaimed(claim)),
+            )
+            UndeliveredRouteCleanupStep.JoinFailurePublication(phase.publication)
+        }
+        is AttemptPhase.RetirementFailed.RouteLease -> {
+            phase.ownership.requireDeliveredLease(id, lease)
+            record.phase = AttemptPhase.CleaningUndeliveredRoute(
+                connection = phase.connection,
+                lease = lease,
+                claim = claim,
+                outcomeFailure = phase.outcomeFailure,
+            )
+            UndeliveredRouteCleanupStep.Execute
+        }
+        else -> error(
+            "Telecom attempt ${id.value} cannot acquire undelivered cleanup from " +
+                phase.javaClass.simpleName,
+        )
+    }
+    return UndeliveredRouteCleanupAcquisition(claim, step)
+}
+
+internal fun continueUndeliveredRouteCleanup(
+    id: VoiceAgentTelecomAttemptId,
+    record: AttemptRecord?,
+    lease: TelecomVoiceAgentRouteLease,
+    claim: UndeliveredRouteCleanupClaim,
+): UndeliveredRouteCleanupStep {
+    val phase = record?.phase ?: return UndeliveredRouteCleanupStep.Complete
+    return when (phase) {
+        is AttemptPhase.Retiring -> {
+            phase.ownership.requireCleanupClaim(id, lease, claim)
+            UndeliveredRouteCleanupStep.JoinRetirement(phase.attempt)
+        }
+        is AttemptPhase.PublishingFailure -> {
+            phase.ownership.requireCleanupClaim(id, lease, claim)
+            UndeliveredRouteCleanupStep.JoinFailurePublication(phase.publication)
+        }
+        is AttemptPhase.RetirementFailed.RouteLease -> {
+            phase.ownership.requireCleanupClaim(id, lease, claim)
+            record.phase = AttemptPhase.CleaningUndeliveredRoute(
+                connection = phase.connection,
+                lease = lease,
+                claim = claim,
+                outcomeFailure = phase.outcomeFailure,
+            )
+            UndeliveredRouteCleanupStep.Execute
+        }
+        is AttemptPhase.Failed -> UndeliveredRouteCleanupStep.Complete
+        else -> error(
+            "Telecom attempt ${id.value} lost claimed undelivered cleanup in " +
+                phase.javaClass.simpleName,
+        )
+    }
+}
+
+internal fun rejectUndeliveredRouteCleanup(
+    id: VoiceAgentTelecomAttemptId,
+    record: AttemptRecord?,
+    lease: TelecomVoiceAgentRouteLease,
+    claim: UndeliveredRouteCleanupClaim,
+    error: Throwable,
+): RejectedUndeliveredCleanupDecision {
+    claim.markSchedulingRejected()
+    return when (val phase = record?.phase) {
+        is AttemptPhase.CleaningUndeliveredRoute -> {
+            check(phase.lease === lease && phase.claim === claim) {
+                "Telecom attempt ${id.value} rejected a different cleanup claim"
+            }
+            val publishing = AttemptPhase.PublishingFailure.UndeliveredCleanupScheduling(
+                connection = phase.connection,
+                lease = lease,
+                claim = claim,
+                outcomeFailure = phase.outcomeFailure,
+                cleanupError = error,
+                publication = RetirementFailurePublication(claim.attempt),
+            )
+            record.phase = publishing
+            RejectedUndeliveredCleanupDecision.PublishFailure(record, publishing)
+        }
+        is AttemptPhase.Retiring -> {
+            phase.ownership.requireCleanupClaim(id, lease, claim)
+            RejectedUndeliveredCleanupDecision.ExternalRetirement
+        }
+        is AttemptPhase.PublishingFailure -> {
+            phase.ownership.requireCleanupClaim(id, lease, claim)
+            RejectedUndeliveredCleanupDecision.ExternalRetirement
+        }
+        is AttemptPhase.RetirementFailed.RouteLease -> {
+            val ownership = phase.ownership.requireCleanupClaim(id, lease, claim)
+            record.phase = phase.copy(
+                ownership = ownership.copy(delivery = RouteLeaseDelivery.RetainedUndelivered),
+            )
+            RejectedUndeliveredCleanupDecision.Retained
+        }
+        is AttemptPhase.Failed,
+        null,
+        -> RejectedUndeliveredCleanupDecision.Complete
+        else -> error(
+            "Telecom attempt ${id.value} lost rejected undelivered cleanup in " +
+                phase.javaClass.simpleName,
+        )
+    }
+}
+
+internal fun RetirementOwnership.requireCleanupClaim(
+    id: VoiceAgentTelecomAttemptId,
+    lease: TelecomVoiceAgentRouteLease,
+    claim: UndeliveredRouteCleanupClaim,
+): RetirementOwnership.RouteLease {
+    val route = this as? RetirementOwnership.RouteLease
+        ?: error("Telecom attempt ${id.value} retirement is not route-owned")
+    val claimed = route.delivery as? RouteLeaseDelivery.CleanupClaimed
+    check(route.lease === lease && claimed?.claim === claim) {
+        "Telecom attempt ${id.value} retirement has a different delivery cleanup claim"
+    }
+    return route
+}
+
+internal fun RetirementOwnership.finalizeFailedDelivery(): RetirementOwnership = when (this) {
+    is RetirementOwnership.Registry -> this
+    is RetirementOwnership.RouteLease -> {
+        val claim = (delivery as? RouteLeaseDelivery.CleanupClaimed)?.claim
+        if (claim?.wasSchedulingRejected() == true) {
+            copy(delivery = RouteLeaseDelivery.RetainedUndelivered)
+        } else {
+            this
+        }
+    }
+}
+
+internal fun requireExactUndeliveredRouteRetry(
+    decision: BeginAttemptDecision.RetryUndeliveredRoute,
+    ownership: RetirementOwnership.RouteLease?,
+    retry: RouteLeaseDelivery.RetryingUndelivered?,
+) {
+    check(ownership?.lease === decision.lease && retry?.attempt === decision.attempt) {
+        "Telecom attempt ${decision.id.value} lost its retained route retry ownership"
+    }
+}
+
+private fun RetirementOwnership.requireDeliveredLease(
+    id: VoiceAgentTelecomAttemptId,
+    lease: TelecomVoiceAgentRouteLease,
+): RetirementOwnership.RouteLease {
+    val route = this as? RetirementOwnership.RouteLease
+        ?: error("Telecom attempt ${id.value} retirement is not route-owned")
+    requireExactDeliveredLease(id, route.lease, lease)
+    check(route.delivery === RouteLeaseDelivery.Delivered) {
+        "Telecom attempt ${id.value} route delivery was already claimed"
+    }
+    return route
+}
+
+private fun requireExactDeliveredLease(
+    id: VoiceAgentTelecomAttemptId,
+    actual: TelecomVoiceAgentRouteLease,
+    expected: TelecomVoiceAgentRouteLease,
+) {
+    check(actual === expected) {
+        "Telecom attempt ${id.value} route delivery belongs to a different lease"
+    }
 }
 
 internal fun cancelledFailure(id: VoiceAgentTelecomAttemptId) = VoiceAgentTelecomFailure(

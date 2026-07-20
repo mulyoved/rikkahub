@@ -1,7 +1,5 @@
 package me.rerere.rikkahub.voiceagent
 
-import me.rerere.rikkahub.voiceagent.audio.VoiceAudioRouteOwner
-
 class VoiceAgentTelecomCallRegistry internal constructor(
     private val probe: VoiceAgentTelecomRegistryProbe = NoOpVoiceAgentTelecomRegistryProbe,
 ) {
@@ -367,10 +365,6 @@ class VoiceAgentTelecomCallRegistry internal constructor(
         }
     }
 
-    private fun supersededActiveConsumption() = VoiceAgentRouteResolution.Superseded(
-        VoiceAgentRouteMetadata(VoiceAudioRouteOwner.Telecom),
-    )
-
     internal suspend fun awaitOutcomeIfPresent(
         id: VoiceAgentTelecomAttemptId,
     ): VoiceAgentTelecomOutcome? {
@@ -418,22 +412,17 @@ class VoiceAgentTelecomCallRegistry internal constructor(
     internal fun claimUndeliveredRouteCleanup(
         id: VoiceAgentTelecomAttemptId,
         lease: TelecomVoiceAgentRouteLease,
-    ): UndeliveredRouteCleanupClaim = synchronized(lock) {
-        val record = requireNotNull(attempts[id]) {
-            "Unknown Telecom attempt ${id.value} for undelivered cleanup claim"
-        }
-        val phase = record.phase as? AttemptPhase.Active.RouteDelivered
-            ?: error("Telecom attempt ${id.value} is not active for undelivered cleanup")
-        check(phase.lease === lease) {
-            "Telecom attempt ${id.value} route delivery was already claimed"
-        }
+    ): UndeliveredRouteCleanupAcquisition = synchronized(lock) {
         val claim = UndeliveredRouteCleanupClaim(lease)
-        record.phase = AttemptPhase.CleaningUndeliveredRoute(
-            connection = phase.connection,
-            lease = lease,
-            claim = claim,
-        )
-        claim
+        acquireUndeliveredRouteCleanup(id, attempts[id], lease, claim)
+    }
+
+    internal fun continueClaimedUndeliveredRouteCleanup(
+        id: VoiceAgentTelecomAttemptId,
+        lease: TelecomVoiceAgentRouteLease,
+        claim: UndeliveredRouteCleanupClaim,
+    ): UndeliveredRouteCleanupStep = synchronized(lock) {
+        continueUndeliveredRouteCleanup(id, attempts[id], lease, claim)
     }
 
     internal fun retireClaimedUndeliveredRoute(
@@ -452,7 +441,7 @@ class VoiceAgentTelecomCallRegistry internal constructor(
             }
             record.phase = AttemptPhase.Retiring(
                 connection = phase.connection,
-                failure = cancelledFailure(id),
+                failure = phase.outcomeFailure,
                 attempt = claim.attempt,
                 execution = RetirementExecution.RouteSynchronous(phase.ownership),
             )
@@ -499,30 +488,21 @@ class VoiceAgentTelecomCallRegistry internal constructor(
         claim: UndeliveredRouteCleanupClaim,
         error: Throwable,
     ) {
-        val publication = synchronized(lock) {
-            val record = requireNotNull(attempts[id]) {
-                "Telecom attempt ${id.value} lost its rejected cleanup claim"
+        val decision = synchronized(lock) {
+            rejectUndeliveredRouteCleanup(id, attempts[id], lease, claim, error).also { result ->
+                if (result is RejectedUndeliveredCleanupDecision.Retained && currentAttemptId == id) {
+                    currentAttemptId = null
+                }
             }
-            val phase = record.phase as? AttemptPhase.CleaningUndeliveredRoute
-                ?: error("Telecom attempt ${id.value} lost its rejected cleanup claim")
-            check(phase.lease === lease && phase.claim === claim) {
-                "Telecom attempt ${id.value} rejected a different cleanup claim"
-            }
-            val publishingPhase = AttemptPhase.PublishingFailure.UndeliveredCleanupScheduling(
-                connection = phase.connection,
-                lease = lease,
-                claim = claim,
-                outcomeFailure = cancelledFailure(id),
-                cleanupError = error,
-                publication = RetirementFailurePublication(claim.attempt),
-            )
-            record.phase = publishingPhase
-            Triple(record, publishingPhase, publishingPhase.publication)
+        }
+        if (decision !is RejectedUndeliveredCleanupDecision.PublishFailure) {
+            claim.publishAttemptAndCompletion(Result.failure(error))
+            return
         }
         probe.onEvent(VoiceAgentTelecomRegistryProbeEvent.UndeliveredCleanupFailurePublishing)
         claim.publishAttemptAndCompletion(Result.failure(error))
         synchronized(lock) {
-            val (record, publishingPhase) = publication
+            val (record, publishingPhase) = decision
             check(attempts[id] === record && record.phase === publishingPhase) {
                 "Telecom attempt ${id.value} changed before rejected cleanup publication"
             }
@@ -537,7 +517,7 @@ class VoiceAgentTelecomCallRegistry internal constructor(
             )
             if (currentAttemptId == id) currentAttemptId = null
         }
-        publication.third.publishFinalized()
+        decision.phase.publication.publishFinalized()
     }
 
     private fun completeUndeliveredRouteRetry(
@@ -592,16 +572,6 @@ class VoiceAgentTelecomCallRegistry internal constructor(
                     }
                 }
             }
-        }
-    }
-
-    private fun requireExactUndeliveredRouteRetry(
-        decision: BeginAttemptDecision.RetryUndeliveredRoute,
-        ownership: RetirementOwnership.RouteLease?,
-        retry: RouteLeaseDelivery.RetryingUndelivered?,
-    ) {
-        check(ownership?.lease === decision.lease && retry?.attempt === decision.attempt) {
-            "Telecom attempt ${decision.id.value} lost its retained route retry ownership"
         }
     }
 
@@ -902,37 +872,42 @@ class VoiceAgentTelecomCallRegistry internal constructor(
         probe.onEvent(VoiceAgentTelecomRegistryProbeEvent.FailedRetirementResultPublishing)
 
         var outcomePublication: OutcomePublication? = null
-        val (id, record, phase) = failedPublication
-        phase.publication.attempt.publish(Result.failure(phase.cleanupError))
+        val (id, record, stagedPhase) = failedPublication
+        stagedPhase.publication.attempt.publish(Result.failure(stagedPhase.cleanupError))
         probe.onEvent(
             VoiceAgentTelecomRegistryProbeEvent.FailedRetirementResultPublishedBeforeFinalization,
         )
         synchronized(lock) {
-            check(attempts[id] === record && record.phase === phase) {
+            val phase = record.phase as? AttemptPhase.PublishingFailure.Retirement
+            check(attempts[id] === record && phase?.publication === stagedPhase.publication) {
                 "Telecom attempt ${id.value} changed before failed retirement publication"
             }
-            record.phase = when (val ownership = phase.ownership) {
+            val exactPhase = checkNotNull(phase)
+            record.phase = when (val ownership = exactPhase.ownership.finalizeFailedDelivery()) {
                 is RetirementOwnership.Registry -> AttemptPhase.RetirementFailed.Registry(
-                    connection = phase.connection,
-                    outcomeFailure = phase.outcomeFailure,
-                    cleanupError = phase.cleanupError,
+                    connection = exactPhase.connection,
+                    outcomeFailure = exactPhase.outcomeFailure,
+                    cleanupError = exactPhase.cleanupError,
                     ownership = ownership,
                 )
                 is RetirementOwnership.RouteLease -> AttemptPhase.RetirementFailed.RouteLease(
-                    connection = phase.connection,
-                    outcomeFailure = phase.outcomeFailure,
-                    cleanupError = phase.cleanupError,
+                    connection = exactPhase.connection,
+                    outcomeFailure = exactPhase.outcomeFailure,
+                    cleanupError = exactPhase.cleanupError,
                     ownership = ownership,
                 )
             }
             if (currentAttemptId == id) currentAttemptId = null
-            if (phase.ownership is RetirementOwnership.Registry) {
+            if (exactPhase.ownership is RetirementOwnership.Registry) {
                 outcomePublication = record.selectOutcome(
-                    VoiceAgentTelecomOutcome.CleanupFailed(phase.outcomeFailure, phase.cleanupError),
+                    VoiceAgentTelecomOutcome.CleanupFailed(
+                        exactPhase.outcomeFailure,
+                        exactPhase.cleanupError,
+                    ),
                 )
             }
         }
-        phase.publication.publishFinalized()
+        stagedPhase.publication.publishFinalized()
         probe.onEvent(VoiceAgentTelecomRegistryProbeEvent.FailedRetirementResultPublished)
         outcomePublication?.publish()
     }

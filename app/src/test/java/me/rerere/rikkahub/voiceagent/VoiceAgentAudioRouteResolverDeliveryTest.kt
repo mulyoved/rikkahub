@@ -3,17 +3,20 @@ package me.rerere.rikkahub.voiceagent
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.coroutines.CoroutineContext
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeoutOrNull
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertSame
@@ -21,6 +24,16 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class VoiceAgentAudioRouteResolverDeliveryTest {
+    @Test
+    fun `delivery cancellation joins framework failure publication before exact retry`() = runBlocking {
+        verifyFrameworkFailureDuringFinalDelivery(pauseFailurePublication = true)
+    }
+
+    @Test
+    fun `delivery cancellation retries finalized framework failure with exact lease`() = runBlocking {
+        verifyFrameworkFailureDuringFinalDelivery(pauseFailurePublication = false)
+    }
+
     @Test
     fun `main cancellation returns while exact delivery cleanup blocks`() = runBlocking {
         val registry = VoiceAgentTelecomCallRegistry()
@@ -205,6 +218,150 @@ class VoiceAgentAudioRouteResolverDeliveryTest {
             cleanupScope.cancel()
         }
     }
+
+    private suspend fun CoroutineScope.verifyFrameworkFailureDuringFinalDelivery(
+        pauseFailurePublication: Boolean,
+    ) {
+        val cleanupFailure = IllegalStateException("framework delivery cleanup failed")
+        val currentFailure = AtomicReference<Throwable?>(cleanupFailure)
+        val activeOutcomeClaimed = CountDownLatch(1)
+        val publicationEntered = CountDownLatch(1)
+        val releasePublication = CountDownLatch(if (pauseFailurePublication) 1 else 0)
+        val retryEntered = CountDownLatch(1)
+        val releaseRetry = CountDownLatch(1)
+        val registry = VoiceAgentTelecomCallRegistry(
+            probe = VoiceAgentTelecomRegistryProbe { event ->
+                when (event) {
+                    VoiceAgentTelecomRegistryProbeEvent.ActiveOutcomeClaimed -> {
+                        activeOutcomeClaimed.countDown()
+                    }
+                    VoiceAgentTelecomRegistryProbeEvent.FailedRetirementResultPublishing -> {
+                        publicationEntered.countDown()
+                        check(releasePublication.await(5, TimeUnit.SECONDS)) {
+                            "framework failure publication was not released"
+                        }
+                    }
+                    else -> Unit
+                }
+            },
+        )
+        val call = CallbackFaithfulResolverCall(
+            registry = registry,
+            cleanupFailure = currentFailure,
+            onCleanup = { callNumber ->
+                if (callNumber == 2) {
+                    retryEntered.countDown()
+                    check(releaseRetry.await(5, TimeUnit.SECONDS)) {
+                        "exact delivery retry was not released"
+                    }
+                }
+            },
+        )
+        val gateway = DeliveryTestGateway { attempt ->
+            assertTrue(registry.activate(attempt, call))
+        }
+        val main = MainDeliveryGateDispatcher()
+        val cleanupExecutor = Executors.newSingleThreadExecutor()
+        val cleanupDispatcher = cleanupExecutor.asCoroutineDispatcher()
+        val cleanupScope = CoroutineScope(SupervisorJob() + cleanupDispatcher)
+        val frameworkExecutor = Executors.newSingleThreadExecutor()
+        val replacementExecutor = Executors.newSingleThreadExecutor()
+        val observed = AtomicReference<Throwable>()
+        val resolverReturned = CountDownLatch(1)
+        val cancellation = CancellationException("cancel after framework cleanup failure")
+        val cancelReturned = CountDownLatch(1)
+        val frameworkFailure = AtomicReference<Throwable>()
+        var resolution: Deferred<VoiceAgentRouteResolution>? = null
+
+        try {
+            resolution = async(main) {
+                try {
+                    VoiceAgentAudioRouteResolver(
+                        gateway = gateway,
+                        registry = registry,
+                        timeoutMs = 1_000,
+                        cleanupScope = cleanupScope,
+                        cleanupDispatcher = cleanupDispatcher,
+                        deliveryProbe = VoiceAgentRouteDeliveryProbe { job ->
+                            assertTrue(activeOutcomeClaimed.await(1, TimeUnit.SECONDS))
+                            val framework = frameworkExecutor.submit {
+                                runCatching(call::disconnectFromApp)
+                                    .exceptionOrNull()
+                                    ?.let(frameworkFailure::set)
+                            }
+                            assertTrue(publicationEntered.await(1, TimeUnit.SECONDS))
+                            if (!pauseFailurePublication) {
+                                framework.get(1, TimeUnit.SECONDS)
+                            }
+                            job.cancel(cancellation)
+                            cancelReturned.countDown()
+                        },
+                    ).resolve()
+                } catch (error: Throwable) {
+                    observed.set(error)
+                    throw error
+                } finally {
+                    resolverReturned.countDown()
+                }
+            }
+            assertTrue(cancelReturned.await(1, TimeUnit.SECONDS))
+            assertTrue(main.awaitIdle())
+            val replacement = replacementExecutor.submit<VoiceAgentTelecomAttemptStartResult> {
+                registry.beginAttempt()
+            }
+            assertFutureBlocked(replacement)
+            assertFalse(checkNotNull(resolution).isCompleted)
+            assertFalse(resolverReturned.await(100, TimeUnit.MILLISECONDS))
+            if (pauseFailurePublication) {
+                assertEquals(1, call.disconnectCalls.get())
+            } else {
+                assertTrue(retryEntered.await(1, TimeUnit.SECONDS))
+                assertEquals(2, call.disconnectCalls.get())
+            }
+
+            releasePublication.countDown()
+            assertTrue(retryEntered.await(1, TimeUnit.SECONDS))
+            assertFutureBlocked(replacement)
+            assertFalse(checkNotNull(resolution).isCompleted)
+            assertEquals(2, call.disconnectCalls.get())
+
+            releaseRetry.countDown()
+            assertTrue(resolverReturned.await(1, TimeUnit.SECONDS))
+            val thrown = observed.get()
+            assertTrue(thrown is CancellationException)
+            assertEquals(cancellation.message, thrown.message)
+            assertEquals(1, thrown.suppressed.size)
+            assertSame(cleanupFailure, thrown.suppressed.single())
+            assertSame(cleanupFailure, frameworkFailure.get())
+            val blocked = replacement.get(1, TimeUnit.SECONDS)
+            assertTrue(blocked is VoiceAgentTelecomAttemptStartResult.CleanupFailed)
+            assertSame(cleanupFailure, (blocked as VoiceAgentTelecomAttemptStartResult.CleanupFailed).error)
+            assertEquals(2, call.disconnectCalls.get())
+
+            currentFailure.set(null)
+            val replacementAttempt = registry.beginAttempt().requireAllocatedAttemptId()
+            assertEquals(2L, replacementAttempt.value)
+            assertEquals(3, call.disconnectCalls.get())
+        } finally {
+            currentFailure.set(null)
+            releasePublication.countDown()
+            releaseRetry.countDown()
+            withTimeoutOrNull(1_000) { resolution?.join() }
+            main.close()
+            cleanupScope.cancel()
+            cleanupDispatcher.close()
+            cleanupExecutor.shutdownNow()
+            frameworkExecutor.shutdownNow()
+            replacementExecutor.shutdownNow()
+        }
+    }
+}
+
+private fun assertFutureBlocked(future: java.util.concurrent.Future<*>) {
+    assertTrue(
+        runCatching { future.get(100, TimeUnit.MILLISECONDS) }
+            .exceptionOrNull() is TimeoutException,
+    )
 }
 
 private class MainDeliveryGateDispatcher : CoroutineDispatcher(), AutoCloseable {

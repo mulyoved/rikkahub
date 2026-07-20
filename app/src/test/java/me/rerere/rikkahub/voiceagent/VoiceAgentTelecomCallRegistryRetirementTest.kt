@@ -183,7 +183,7 @@ class VoiceAgentTelecomCallRegistryRetirementTest {
         val call = FakeTelecomCall()
         assertTrue(registry.activate(previous, call))
         val lease = registry.consumeActiveOutcome(previous).requireResolvedLease() as TelecomVoiceAgentRouteLease
-        val claim = lease.claimUndeliveredCleanup()
+        val claim = lease.claimUndeliveredCleanup().claim
         val publisherFailure = AtomicReference<Throwable>()
         val publisher = thread {
             runCatching {
