@@ -87,10 +87,11 @@ zero or not attempted.
 | Device cost | battery start/end and percent/hour, CPU average/peak, thermal start/end/peak |
 | Correlation | SHA-256 trace/call/session IDs and arrays of hashed Sentry/LiveKit event IDs |
 
-Read-only before/after snapshots use `adb shell dumpsys batterystats`,
-`adb shell dumpsys thermalservice`, `adb shell dumpsys cpuinfo`, and UID-filtered
-`adb shell dumpsys netstats detail`. Do not reset device statistics as part of
-measurement.
+Read-only measurement uses before/after `adb shell dumpsys batterystats` plus
+five-second `adb shell dumpsys thermalservice`, `adb shell dumpsys cpuinfo`,
+UID-filtered `adb shell dumpsys netstats detail`, and battery samples. The app
+UID must be a non-empty positive integer. Do not reset device statistics as part
+of measurement, and do not retain raw dumps after numeric extraction.
 
 ## Stage 1 review
 
@@ -99,6 +100,13 @@ p50/p95 interruption stop, dropout rate, reconnect and handover outcomes,
 bytes/minute, battery cost, CPU, and thermal status. The provisional guardrails
 are no more than 150 ms LiveKit p50 first-audio regression against Direct and no
 more than 250 ms LiveKit p50 interruption stop.
+
+The validator derives summaries from the run objects. Percentiles use nearest
+rank (`sorted[ceil(p*n)-1]`); dropout, per-run byte rates, battery/hour, and
+average CPU use arithmetic means; CPU/thermal peaks use maxima. Per-run
+`dropoutRate` is count divided by actual seconds, and bytes/minute is
+`(rxBytes + txBytes) * 60 / actualDurationSeconds`. Every required reconnect
+and handover attempt must succeed for PASS.
 
 The reviewer records an explicit `pass` or `stop`, UTC timestamp, evidence-file
 list, and rationale. A missing applicable row, unmatched pair, unavailable
