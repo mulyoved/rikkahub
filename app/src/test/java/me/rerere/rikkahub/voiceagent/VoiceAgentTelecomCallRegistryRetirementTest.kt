@@ -165,6 +165,122 @@ class VoiceAgentTelecomCallRegistryRetirementTest {
     }
 
     @Test
+    fun `rejected cleanup scheduling stays joined until exact failure publication finishes`() = runBlocking {
+        val schedulingFailure = IllegalStateException("cleanup scheduling rejected")
+        val publicationEntered = CountDownLatch(1)
+        val releasePublication = CountDownLatch(1)
+        val registry = VoiceAgentTelecomCallRegistry(
+            probe = VoiceAgentTelecomRegistryProbe { event ->
+                if (event is VoiceAgentTelecomRegistryProbeEvent.UndeliveredCleanupFailurePublishing) {
+                    publicationEntered.countDown()
+                    check(releasePublication.await(5, TimeUnit.SECONDS)) {
+                        "rejected cleanup publication was not released"
+                    }
+                }
+            },
+        )
+        val previous = registry.beginAttempt().requireAllocatedAttemptId()
+        val call = FakeTelecomCall()
+        assertTrue(registry.activate(previous, call))
+        val lease = registry.consumeActiveOutcome(previous).requireResolvedLease() as TelecomVoiceAgentRouteLease
+        val claim = lease.claimUndeliveredCleanup()
+        val publisherFailure = AtomicReference<Throwable>()
+        val publisher = thread {
+            runCatching {
+                lease.rejectUndeliveredCleanupScheduling(claim, schedulingFailure)
+            }.onFailure(publisherFailure::set)
+        }
+        val executor = Executors.newSingleThreadExecutor()
+
+        try {
+            assertTrue(publicationEntered.await(1, TimeUnit.SECONDS))
+            val joinerThread = AtomicReference<Thread>()
+            val joiner = executor.submit<VoiceAgentTelecomAttemptStartResult> {
+                joinerThread.set(Thread.currentThread())
+                registry.beginAttempt()
+            }
+
+            awaitBlocked(joinerThread)
+            assertFalse(joiner.isDone)
+            assertEquals(0, call.disconnectCalls)
+            assertEquals(null, registry.awaitOutcomeIfPresent(VoiceAgentTelecomAttemptId(previous.value + 1)))
+
+            releasePublication.countDown()
+            val joined = joiner.get(1, TimeUnit.SECONDS)
+            assertCleanupFailure(joined, schedulingFailure)
+            publisher.join(1_000)
+            assertFalse(publisher.isAlive)
+            throwWorkerFailure(publisherFailure, "rejected cleanup publisher")
+            assertEquals(0, call.disconnectCalls)
+
+            val replacement = registry.beginAttempt().requireAllocatedAttemptId()
+            assertEquals(previous.value + 1, replacement.value)
+            assertEquals(1, call.disconnectCalls)
+        } finally {
+            releasePublication.countDown()
+            executor.shutdownNow()
+            publisher.join(1_000)
+        }
+    }
+
+    @Test
+    fun `failed retirement result publication does not hold registry lock`() {
+        val cleanupFailure = IllegalStateException("failed retirement publication")
+        val publicationObserved = CountDownLatch(1)
+        val probeFailure = AtomicReference<Throwable>()
+        val registryRef = AtomicReference<VoiceAgentTelecomCallRegistry>()
+        val attemptRef = AtomicReference<VoiceAgentTelecomAttemptId>()
+        val lockExecutor = Executors.newSingleThreadExecutor()
+        val registry = VoiceAgentTelecomCallRegistry(
+            probe = VoiceAgentTelecomRegistryProbe { event ->
+                if (event is VoiceAgentTelecomRegistryProbeEvent.FailedRetirementResultPublishedBeforeFinalization) {
+                    runCatching {
+                        val lockWasAvailable = lockExecutor.submit<Boolean> {
+                            registryRef.get().isOwnedAttemptActive(attemptRef.get())
+                        }.get(1, TimeUnit.SECONDS)
+                        assertFalse(lockWasAvailable)
+                    }.onFailure(probeFailure::set)
+                    publicationObserved.countDown()
+                }
+            },
+        )
+        registryRef.set(registry)
+        val previous = registry.beginAttempt().requireAllocatedAttemptId()
+        attemptRef.set(previous)
+        val call = FakeTelecomCall { throw cleanupFailure }
+        assertTrue(registry.activate(previous, call))
+
+        try {
+            val result = registry.beginAttempt()
+
+            assertCleanupFailure(result, cleanupFailure)
+            assertTrue(publicationObserved.await(1, TimeUnit.SECONDS))
+            throwWorkerFailure(probeFailure, "post-publication lock probe")
+            assertEquals(1, call.disconnectCalls)
+        } finally {
+            lockExecutor.shutdownNow()
+        }
+    }
+
+    @Test
+    fun `retired undelivered tombstone derives ownership from one retry identity`() {
+        val registry = VoiceAgentTelecomCallRegistry()
+        val id = registry.beginAttempt().requireAllocatedAttemptId()
+        val lease = TelecomVoiceAgentRouteLease(id, registry)
+        val attempt = SynchronousAttemptResult()
+        val retry = RetryingUndeliveredRouteOwnership(lease, attempt)
+        val phase = AttemptPhase.RetiredUndeliveredRoute(
+            failure = VoiceAgentTelecomFailure("test", "typed tombstone"),
+            retry = retry,
+        )
+
+        assertSame(lease, phase.ownership.lease)
+        val delivery = phase.ownership.delivery as RouteLeaseDelivery.RetryingUndelivered
+        assertSame(attempt, delivery.attempt)
+        assertSame(attempt, phase.retry.attempt)
+    }
+
+    @Test
     fun `successful retained route retry stays joined until outer result publication`() = runBlocking {
         val firstFailure = IllegalStateException("initial undelivered cleanup failed")
         val cleanupFailure = AtomicReference<Throwable?>(firstFailure)

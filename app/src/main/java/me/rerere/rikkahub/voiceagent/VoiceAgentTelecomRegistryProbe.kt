@@ -14,11 +14,15 @@ internal sealed interface VoiceAgentTelecomRegistryProbeEvent {
 
     data object FailedRetirementResultPublished : VoiceAgentTelecomRegistryProbeEvent
 
+    data object FailedRetirementResultPublishedBeforeFinalization : VoiceAgentTelecomRegistryProbeEvent
+
     data object RouteRetirementJoining : VoiceAgentTelecomRegistryProbeEvent
 
     data object ActiveOutcomeClaimed : VoiceAgentTelecomRegistryProbeEvent
 
     data object UndeliveredRouteRetryResultPublishing : VoiceAgentTelecomRegistryProbeEvent
+
+    data object UndeliveredCleanupFailurePublishing : VoiceAgentTelecomRegistryProbeEvent
 }
 
 internal object NoOpVoiceAgentTelecomRegistryProbe : VoiceAgentTelecomRegistryProbe {

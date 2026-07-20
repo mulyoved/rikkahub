@@ -108,6 +108,10 @@ internal sealed interface BeginAttemptDecision {
         val attempt: SynchronousAttemptResult,
     ) : BeginAttemptDecision
 
+    data class JoinFailurePublication(
+        val publication: RetirementFailurePublication,
+    ) : BeginAttemptDecision
+
     data class Retry(
         val id: VoiceAgentTelecomAttemptId,
         val record: AttemptRecord,
@@ -128,6 +132,10 @@ internal sealed interface ActiveOutcomeConsumptionDecision {
 
     data class Join(
         val attempt: SynchronousAttemptResult,
+    ) : ActiveOutcomeConsumptionDecision
+
+    data class JoinFailurePublication(
+        val publication: RetirementFailurePublication,
     ) : ActiveOutcomeConsumptionDecision
 }
 
@@ -184,6 +192,9 @@ internal fun predecessorDecision(
     is AttemptPhase.RetiredUndeliveredRoute -> {
         BeginAttemptDecision.JoinUndeliveredRoute(phase.retry.attempt)
     }
+    is AttemptPhase.PublishingFailure -> {
+        BeginAttemptDecision.JoinFailurePublication(phase.publication)
+    }
     is AttemptPhase.CleaningUndeliveredRoute -> {
         BeginAttemptDecision.JoinUndeliveredRoute(phase.claim.attempt)
     }
@@ -219,9 +230,24 @@ internal fun predecessorDecision(
 internal data class FailedRetirementPublication(
     val id: VoiceAgentTelecomAttemptId,
     val record: AttemptRecord,
-    val phase: AttemptPhase.Retiring,
-    val cleanupError: Throwable,
+    val phase: AttemptPhase.PublishingFailure.Retirement,
 )
+
+internal class RetirementFailurePublication(
+    val attempt: SynchronousAttemptResult,
+) {
+    private val finalized = SynchronousAttemptResult()
+
+    fun awaitResult(): Result<Unit> {
+        val result = attempt.awaitResult()
+        finalized.awaitResult().getOrThrow()
+        return result
+    }
+
+    fun publishFinalized() {
+        finalized.publish(Result.success(Unit))
+    }
+}
 
 internal data class ClaimedUndeliveredCleanupWork(
     val record: AttemptRecord,
@@ -272,6 +298,16 @@ internal sealed interface RouteLeaseDelivery {
     ) : RouteLeaseDelivery
 }
 
+internal data class RetryingUndeliveredRouteOwnership(
+    val lease: TelecomVoiceAgentRouteLease,
+    val attempt: SynchronousAttemptResult,
+) {
+    val ownership = RetirementOwnership.RouteLease(
+        lease = lease,
+        delivery = RouteLeaseDelivery.RetryingUndelivered(attempt),
+    )
+}
+
 internal sealed interface RetirementExecution {
     val ownership: RetirementOwnership
 
@@ -287,10 +323,6 @@ internal sealed interface RetirementExecution {
         override val ownership: RetirementOwnership.Registry,
     ) : RetirementExecution
 
-    data class RegistryPublishingFailure(
-        override val ownership: RetirementOwnership.Registry,
-    ) : RetirementExecution
-
     data class RouteCallback(
         override val ownership: RetirementOwnership.RouteLease,
     ) : RetirementExecution
@@ -299,9 +331,6 @@ internal sealed interface RetirementExecution {
         override val ownership: RetirementOwnership.RouteLease,
     ) : RetirementExecution
 
-    data class RoutePublishingFailure(
-        override val ownership: RetirementOwnership.RouteLease,
-    ) : RetirementExecution
 }
 
 internal fun synchronousRetirementExecution(ownership: RetirementOwnership): RetirementExecution = when (ownership) {
@@ -314,22 +343,8 @@ internal fun callbackRetirementExecution(ownership: RetirementOwnership): Retire
     is RetirementOwnership.RouteLease -> RetirementExecution.RouteCallback(ownership)
 }
 
-internal fun RetirementExecution.publishingFailure(): RetirementExecution = when (this) {
-    is RetirementExecution.RegistryDeferredToActivation -> RetirementExecution.RegistryPublishingFailure(ownership)
-    is RetirementExecution.RegistryCallback -> RetirementExecution.RegistryPublishingFailure(ownership)
-    is RetirementExecution.RegistrySynchronous -> RetirementExecution.RegistryPublishingFailure(ownership)
-    is RetirementExecution.RouteCallback -> RetirementExecution.RoutePublishingFailure(ownership)
-    is RetirementExecution.RouteSynchronous -> RetirementExecution.RoutePublishingFailure(ownership)
-    is RetirementExecution.RegistryPublishingFailure,
-    is RetirementExecution.RoutePublishingFailure,
-    -> this
-}
-
 internal val RetirementExecution.isSynchronous: Boolean
     get() = this is RetirementExecution.RegistrySynchronous || this is RetirementExecution.RouteSynchronous
-
-internal val RetirementExecution.isPublishingFailure: Boolean
-    get() = this is RetirementExecution.RegistryPublishingFailure || this is RetirementExecution.RoutePublishingFailure
 
 internal sealed interface AttemptPhase {
     data object Pending : AttemptPhase
@@ -380,6 +395,46 @@ internal sealed interface AttemptPhase {
             get() = execution.ownership
     }
 
+    sealed interface PublishingFailure : AttemptPhase {
+        val connection: VoiceAgentTelecomCall
+        val outcomeFailure: VoiceAgentTelecomFailure
+        val cleanupError: Throwable
+        val ownership: RetirementOwnership
+        val publication: RetirementFailurePublication
+
+        sealed interface Retirement : PublishingFailure
+
+        data class RegistryRetirement(
+            override val connection: VoiceAgentTelecomCall,
+            override val outcomeFailure: VoiceAgentTelecomFailure,
+            override val cleanupError: Throwable,
+            override val ownership: RetirementOwnership.Registry,
+            override val publication: RetirementFailurePublication,
+        ) : Retirement
+
+        data class RouteRetirement(
+            override val connection: VoiceAgentTelecomCall,
+            override val outcomeFailure: VoiceAgentTelecomFailure,
+            override val cleanupError: Throwable,
+            override val ownership: RetirementOwnership.RouteLease,
+            override val publication: RetirementFailurePublication,
+        ) : Retirement
+
+        data class UndeliveredCleanupScheduling(
+            override val connection: VoiceAgentTelecomCall,
+            val lease: TelecomVoiceAgentRouteLease,
+            val claim: UndeliveredRouteCleanupClaim,
+            override val outcomeFailure: VoiceAgentTelecomFailure,
+            override val cleanupError: Throwable,
+            override val publication: RetirementFailurePublication,
+        ) : PublishingFailure {
+            override val ownership = RetirementOwnership.RouteLease(
+                lease = lease,
+                delivery = RouteLeaseDelivery.CleanupClaimed(claim),
+            )
+        }
+    }
+
     sealed interface RetirementFailed : AttemptPhase {
         val connection: VoiceAgentTelecomCall
         val outcomeFailure: VoiceAgentTelecomFailure
@@ -403,9 +458,11 @@ internal sealed interface AttemptPhase {
 
     data class RetiredUndeliveredRoute(
         val failure: VoiceAgentTelecomFailure,
-        val ownership: RetirementOwnership.RouteLease,
-        val retry: RouteLeaseDelivery.RetryingUndelivered,
-    ) : AttemptPhase
+        val retry: RetryingUndeliveredRouteOwnership,
+    ) : AttemptPhase {
+        val ownership: RetirementOwnership.RouteLease
+            get() = retry.ownership
+    }
 
     data class Failed(val failure: VoiceAgentTelecomFailure) : AttemptPhase
 }
