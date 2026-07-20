@@ -1,61 +1,66 @@
 ## Current Result
 
 - Status: DONE
-- Commit: `22623daf5cf6e49d76c724591af52b1cd0633886` (`fix(voice): prove direct capture adapter contracts`)
-- Summary: Restored executable proof for the Android capture-device boundary without restoring a platform handle or domain operations abstraction. `AndroidDirectCaptureDeviceAdapter` now owns a candidate-local action seam whose production closures retain each private `AudioDeviceInfo`; focused tests execute the adapter and prove permission short-circuiting, exact selected-candidate actions, accepted-only cleanup ownership, exactly-once clearing, and best-effort platform failures.
+- Code commit: `41b5f3842a7014a08d3417e2bcd3f54ea5819a72` (`refactor(voice): publish typed active calls`)
+- Summary: Added the typed startup operation and singleton orchestration boundary. Admission constructs one unstarted
+  child call scope only for the newest admitted request, then route resolution, typed factory creation, session start,
+  immutable `session.state.value` capture, complete active publication, and lazy collector startup all follow the Task 4
+  ownership order. The reducer driver drains `AdmitStart` while locked and runs launches, cancellation, cleanup, deferred
+  completion, session access, and collector work only after unlock.
 
 ## Tests
 
-- RED: The exact focused command failed in `:app:compileDebugUnitTestKotlin` after the focused adapter tests were added. After correcting a test-only `AudioRecord` allocator reference, the expected RED was solely the missing adapter seam: `No parameter with name 'hasConnectPermission'`, `No parameter with name 'captureDevices'`, `No parameter with name 'clearCommunicationDevice'`, and unresolved `AndroidDirectCaptureDeviceCandidate`.
-- Focused GREEN: The exact Task 4 command passed with `BUILD SUCCESSFUL in 10s`. The generated XML reports 50 selected tests, 0 skipped, 0 failures, and 0 errors: 29 `DirectAudioRouteCapabilitiesTest`, 19 `AndroidDirectAudioRouteControllerTest`, and 2 `VoiceAudioRouteSelectorTest`.
+- RED: After adding the happy-path and matching-start tests, the exact startup command failed in
+  `:app:compileDebugUnitTestKotlin` because `VoiceAgentCallOrchestrator` did not exist. The compiler reported
+  `Unresolved reference 'VoiceAgentCallOrchestrator'`; the dependent state-flow and inference diagnostics were direct
+  cascades from that missing Task 4 API.
+
+  ```text
+  ./gradlew :app:testDebugUnitTest --tests '*VoiceAgentCallOrchestratorStartupTest'
+  ```
+
+- Focused GREEN: The exact Task 4 startup-plus-reducer command passed with `BUILD SUCCESSFUL in 15s`. Generated XML
+  reports 35 selected tests, 0 skipped, 0 failures, and 0 errors: 15
+  `VoiceAgentCallOrchestratorStartupTest` and 20 `VoiceAgentCallStateMachineTest`.
 
   ```text
   ./gradlew :app:testDebugUnitTest \
-    --tests '*DirectAudioRouteCapabilitiesTest' \
-    --tests '*AndroidDirectAudioRouteControllerTest' \
-    --tests '*VoiceAudioRouteSelectorTest'
+    --tests '*VoiceAgentCallStateMachineTest' \
+    --tests '*VoiceAgentCallOrchestratorStartupTest'
   ```
 
-- Prohibited-boundary scans: Both exact Task 4 Step 5 scans exited `0` with no matches. No prohibited sleeps, lifecycle/recorder markers, Bluetooth marker types, capture-device handles/operations, or recovery casts exist in the scanned production and audio-test paths.
-- Boundary review: `AudioDeviceInfo` appears only in `AndroidDirectCaptureDeviceAdapter.kt`. `AndroidDirectAudioRouteController.kt`, `VoiceAudioRouteSelector.kt`, `VoiceAudioRouteSelectorTest.kt`, `DirectAudioRouteCapabilities.kt`, and `AndroidDirectAudioRouteControllerTest.kt` are unchanged from the task head.
-- Diff hygiene: `git diff --check` exited `0`.
-- Full fix evidence: `.superpowers/ce1/voice-concurrency-ce1-20260717/task-8-wave-1-fix-report.md`.
+- Self-review: `git diff --cached --check` passed before the code commit. A manual lock-boundary scan found no route,
+  factory, session, collector, deferred completion, job cancellation/join, or cleanup execution under the orchestrator
+  lock. The repository has no bundled external-Codex, simplify, or AI-slop review adapter, so the review used the core
+  correctness, contract, concurrency, maintainability, and test passes directly.
 
 ## Files Changed
 
-- `app/src/main/java/me/rerere/rikkahub/voiceagent/audio/AndroidDirectCaptureDeviceAdapter.kt` — adds the candidate-local action seam while retaining every `AudioDeviceInfo` inside production closures owned by the Android adapter.
-- `app/src/test/java/me/rerere/rikkahub/voiceagent/audio/DirectAudioRouteCapabilitiesTest.kt` — adds focused adapter behavioral coverage for permission denial/failure, enumeration failure, exact selected-candidate configuration, preferred/communication failure containment, accepted-only lease ownership, and exactly-once cleanup.
-- `.superpowers/sdd/task-4-report.md` — records the CE1 fix result and archives the superseded original result below.
-- `.superpowers/ce1/voice-concurrency-ce1-20260717/task-8-wave-1-fix-report.md` — records complete CE1-T8-001 fix evidence.
+- `app/src/main/java/me/rerere/rikkahub/voiceagent/VoiceAgentStartOperation.kt` — implements sealed startup phases,
+  typed factory-result consumption, exact phase cleanup ownership, immutable post-start state capture, complete active
+  bundle construction, and lazy collector creation.
+- `app/src/main/java/me/rerere/rikkahub/voiceagent/VoiceAgentCallOrchestrator.kt` — implements the final controller API,
+  synchronized reducer admission, post-lock effect execution, state/lifecycle projections, caller cancellation handling,
+  identity-bound session policy, and active commands.
+- `app/src/test/java/me/rerere/rikkahub/voiceagent/VoiceAgentCallOrchestratorTestFixtures.kt` — supplies typed route,
+  factory, session, and cleanup fixtures.
+- `app/src/test/java/me/rerere/rikkahub/voiceagent/VoiceAgentCallOrchestratorStartupTest.kt` — covers happy and matching
+  startup, clean/dirty failures, all ownership cancellation boundaries, shared waiters, lightweight pending replacement,
+  cleanup-failure retry admission, immutable active publication, and the lazy-collector end race.
+- `.superpowers/sdd/task-4-report.md` — records Task 4 RED/GREEN, review, commit, and verification evidence.
 
 ## Concerns
 
-- None. The focused build retained the repository's pre-existing unresolved `ExperimentalNavigation3Api` opt-in warning; it did not affect compilation or tests.
+- None. The focused build retained the repository's pre-existing unresolved `ExperimentalNavigation3Api` opt-in warning;
+  it did not affect compilation or the selected tests.
 
 ## Attempt Appendix
 
-### Attempt 1 — Original Task 4 implementation (superseded by CE1-T8-001 fix)
-
-#### Prior Current Result
-
-- Status: DONE
-- Commit: `36bc327e` (`refactor(voice): type direct capture adapters`)
-- Summary: Added `AndroidDirectCaptureDeviceAdapter` as the complete Android capture-device boundary. Android `AudioDeviceInfo` values remain private to the adapter; the shared capability file now exposes only `DirectCaptureDeviceCapability`. Controller tests fake that capability directly, while route-selection policy remains in the pure selector tests.
-
-#### Prior Tests
-
-- RED: After removing the obsolete operation/handle fake and its contract-only tests, the exact focused command failed in `:app:compileDebugUnitTestKotlin` because `AndroidDirectAudioRouteControllerTest` still referenced the removed `FakeCaptureDeviceOperations`. The compiler reported `Unresolved reference 'FakeCaptureDeviceOperations'` plus the dependent obsolete fake fields. This was the expected old-contract compile shape before production changed.
-- Focused GREEN: The exact Task 4 command passed with `BUILD SUCCESSFUL in 11s`; `:app:testDebugUnitTest` executed and all selected tests passed.
-- Prohibited-boundary scans: Both exact Step 5 scans exited `0` with no matches.
-- Diff hygiene: `git diff --check` exited `0` before commit.
-
-#### Prior Files Changed
-
-- `app/src/main/java/me/rerere/rikkahub/voiceagent/audio/AndroidDirectCaptureDeviceAdapter.kt` — owned permission gating, Android input enumeration, domain mapping and selection, recorder preference, communication-device selection, and idempotent cleanup.
-- `app/src/main/java/me/rerere/rikkahub/voiceagent/audio/DirectAudioRouteCapabilities.kt` — wired the Android adapter and removed opaque capture-device operations, handles, and recovery casts.
-- `app/src/test/java/me/rerere/rikkahub/voiceagent/audio/DirectAudioRouteCapabilitiesTest.kt` — removed contract-only capture-device operation/handle tests and fakes.
-- `app/src/test/java/me/rerere/rikkahub/voiceagent/audio/AndroidDirectAudioRouteControllerTest.kt` — tested capture-device best-effort failure through a direct `DirectCaptureDeviceCapability` fake.
-
-#### Prior Concerns
-
-- None recorded. The later stable review identified the residual executable coverage gap now fixed by CE1-T8-001.
+- Self-review RED/GREEN 1: A last-waiter cancellation test initially showed that the worker could run the first failed
+  cleanup and the external cleanup effect could retry it immediately, losing `CleanupFailed`. The startup cleanup handle
+  now marks cleanup transfer before canceling the worker; one external attempt publishes the first failure and suppresses
+  it onto the caller's canonical cancellation.
+- Self-review RED/GREEN 2: Post-route and post-factory cancellation tests initially showed that synchronous transfer could
+  enter the next external phase before the canceled caller dispatched `StartCancelled`. Cleanup ownership is now installed
+  before an explicit cancellation yield at each transfer boundary, so the exact returned lease/session is cleaned and the
+  factory/session start is not entered after cancellation.
