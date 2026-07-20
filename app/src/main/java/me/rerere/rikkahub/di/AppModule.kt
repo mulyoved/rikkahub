@@ -131,8 +131,8 @@ val appModule = module {
 
     single<VoiceAgentCallFactory> {
         TransportSelectingVoiceAgentCallFactory(
-            directFactory = get<DefaultVoiceAgentCallFactory>(),
-            liveKitFactory = get<LiveKitVoiceCallFactory>(),
+            directFactoryProvider = { get<DefaultVoiceAgentCallFactory>() },
+            liveKitFactoryProvider = { get<LiveKitVoiceCallFactory>() },
         )
     }
 

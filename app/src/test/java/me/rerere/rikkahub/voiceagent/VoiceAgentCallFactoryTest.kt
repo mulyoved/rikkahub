@@ -25,6 +25,7 @@ import me.rerere.rikkahub.voiceagent.telemetry.VoiceSpan
 import me.rerere.rikkahub.voiceagent.telemetry.VoiceTraceContext
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -37,15 +38,23 @@ class VoiceAgentCallFactoryTest {
     fun `LiveKit transport bypasses direct factory`() = runTest {
         val directSession = OrchestratorFakeSession()
         val liveKitSession = OrchestratorFakeSession()
-        val directFactory = OrchestratorFakeFactory { _, _, _ ->
-            VoiceAgentSessionCreationResult.Created(directSession)
-        }
-        val liveKitFactory = OrchestratorFakeFactory { _, _, _ ->
-            VoiceAgentSessionCreationResult.Created(liveKitSession)
-        }
+        var directConstructions = 0
+        var liveKitConstructions = 0
+        var directFactory: OrchestratorFakeFactory? = null
+        var liveKitFactory: OrchestratorFakeFactory? = null
         val selectingFactory = TransportSelectingVoiceAgentCallFactory(
-            directFactory = directFactory,
-            liveKitFactory = liveKitFactory,
+            directFactoryProvider = {
+                directConstructions += 1
+                OrchestratorFakeFactory { _, _, _ ->
+                    VoiceAgentSessionCreationResult.Created(directSession)
+                }.also { directFactory = it }
+            },
+            liveKitFactoryProvider = {
+                liveKitConstructions += 1
+                OrchestratorFakeFactory { _, _, _ ->
+                    VoiceAgentSessionCreationResult.Created(liveKitSession)
+                }.also { liveKitFactory = it }
+            },
         )
         val request = VoiceAgentCallRequest(
             conversationId = Uuid.random(),
@@ -59,21 +68,34 @@ class VoiceAgentCallFactoryTest {
             scope = this,
         )
 
-        assertEquals(0, directFactory.calls)
-        assertEquals(1, liveKitFactory.calls)
+        assertEquals(0, directConstructions)
+        assertEquals(1, liveKitConstructions)
+        assertNull(directFactory)
+        assertEquals(1, liveKitFactory?.calls)
         assertSame(liveKitSession, (result as VoiceAgentSessionCreationResult.Created).session)
     }
 
     @Test
     fun `Direct transport bypasses LiveKit factory`() = runTest {
         val directSession = OrchestratorFakeSession()
-        val directFactory = OrchestratorFakeFactory { _, _, _ ->
-            VoiceAgentSessionCreationResult.Created(directSession)
-        }
-        val liveKitFactory = OrchestratorFakeFactory { _, _, _ ->
-            error("LiveKit factory must not run")
-        }
-        val selectingFactory = TransportSelectingVoiceAgentCallFactory(directFactory, liveKitFactory)
+        var directConstructions = 0
+        var liveKitConstructions = 0
+        var directFactory: OrchestratorFakeFactory? = null
+        var liveKitFactory: OrchestratorFakeFactory? = null
+        val selectingFactory = TransportSelectingVoiceAgentCallFactory(
+            directFactoryProvider = {
+                directConstructions += 1
+                OrchestratorFakeFactory { _, _, _ ->
+                    VoiceAgentSessionCreationResult.Created(directSession)
+                }.also { directFactory = it }
+            },
+            liveKitFactoryProvider = {
+                liveKitConstructions += 1
+                OrchestratorFakeFactory { _, _, _ ->
+                    error("LiveKit factory must not run")
+                }.also { liveKitFactory = it }
+            },
+        )
 
         val result = selectingFactory.createOwned(
             request = VoiceAgentCallRequest(
@@ -85,8 +107,10 @@ class VoiceAgentCallFactoryTest {
             scope = this,
         )
 
-        assertEquals(1, directFactory.calls)
-        assertEquals(0, liveKitFactory.calls)
+        assertEquals(1, directConstructions)
+        assertEquals(0, liveKitConstructions)
+        assertEquals(1, directFactory?.calls)
+        assertNull(liveKitFactory)
         assertSame(directSession, (result as VoiceAgentSessionCreationResult.Created).session)
     }
 

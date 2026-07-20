@@ -45,16 +45,16 @@ internal interface VoiceAgentCallFactory {
 }
 
 internal class TransportSelectingVoiceAgentCallFactory(
-    private val directFactory: VoiceAgentCallFactory,
-    private val liveKitFactory: VoiceAgentCallFactory,
+    private val directFactoryProvider: () -> VoiceAgentCallFactory,
+    private val liveKitFactoryProvider: () -> VoiceAgentCallFactory,
 ) : VoiceAgentCallFactory {
     override suspend fun createOwned(
         request: VoiceAgentCallRequest,
         routeLease: VoiceAgentRouteLease,
         scope: CoroutineScope,
     ): VoiceAgentSessionCreationResult = when (request.transport) {
-        VoiceAgentTransport.DirectGemini -> directFactory.createOwned(request, routeLease, scope)
-        VoiceAgentTransport.LiveKitExperimental -> liveKitFactory.createOwned(request, routeLease, scope)
+        VoiceAgentTransport.DirectGemini -> directFactoryProvider().createOwned(request, routeLease, scope)
+        VoiceAgentTransport.LiveKitExperimental -> liveKitFactoryProvider().createOwned(request, routeLease, scope)
     }
 }
 
