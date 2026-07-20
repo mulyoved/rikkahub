@@ -27,25 +27,86 @@ class VoiceAgentCallStateMachineTest {
         val staleCall = activeCall(request)
         val endReply = endReply()
         val cancellation = pendingCancellation()
+        val cancelledReply = startReply()
+        val cleanFailure = Exception("stale")
 
         val cases = listOf(
-            VoiceAgentCallEvent.StartRequested(pending) to VoiceAgentCallState.Starting.Admitting::class.java,
-            VoiceAgentCallEvent.EndRequested(endReply) to VoiceAgentCallState.Idle::class.java,
-            VoiceAgentCallEvent.CloseNowRequested to VoiceAgentCallState.Idle::class.java,
-            VoiceAgentCallEvent.StartCancelled(startReply(), cancellation) to VoiceAgentCallState.Idle::class.java,
-            VoiceAgentCallEvent.StartAdmitted(Any(), operation) to VoiceAgentCallState.Idle::class.java,
-            VoiceAgentCallEvent.StartFinished(operation, VoiceAgentStartOutcome.FailedClean(Exception("stale"))) to
-                VoiceAgentCallState.Idle::class.java,
-            VoiceAgentCallEvent.CleanupFinished(staleCleanup, VoiceAgentCleanupResult.Completed) to
-                VoiceAgentCallState.Idle::class.java,
-            VoiceAgentCallEvent.SessionStateChanged(staleCall, VoiceAgentUiState(), true) to
-                VoiceAgentCallState.Idle::class.java,
+            IdleCase(
+                event = VoiceAgentCallEvent.StartRequested(pending),
+                expectedState = VoiceAgentCallState.Starting.Admitting::class.java,
+                expectedEffects = listOf(VoiceAgentCallEffect.AdmitStart(pending)),
+            ),
+            IdleCase(
+                event = VoiceAgentCallEvent.EndRequested(endReply),
+                expectedState = VoiceAgentCallState.Idle::class.java,
+                expectedEffects = listOf(
+                    VoiceAgentCallEffect.CompleteEnds(
+                        listOf(endReply),
+                        VoiceAgentCallEndResult.Completed,
+                    ),
+                ),
+            ),
+            IdleCase(
+                event = VoiceAgentCallEvent.CloseNowRequested,
+                expectedState = VoiceAgentCallState.Idle::class.java,
+                expectedEffects = emptyList(),
+            ),
+            IdleCase(
+                event = VoiceAgentCallEvent.StartCancelled(cancelledReply, cancellation),
+                expectedState = VoiceAgentCallState.Idle::class.java,
+                expectedEffects = listOf(
+                    VoiceAgentCallEffect.CompleteCancellations(listOf(cancellation), null),
+                ),
+            ),
+            IdleCase(
+                event = VoiceAgentCallEvent.StartAdmitted(Any(), operation),
+                expectedState = VoiceAgentCallState.Idle::class.java,
+                expectedEffects = listOf(
+                    VoiceAgentCallEffect.CancelStart(operation),
+                    VoiceAgentCallEffect.RunCleanup(operation.cleanup, VoiceAgentCleanupMode.Immediate),
+                ),
+            ),
+            IdleCase(
+                event = VoiceAgentCallEvent.StartFinished(
+                    operation,
+                    VoiceAgentStartOutcome.FailedClean(cleanFailure),
+                ),
+                expectedState = VoiceAgentCallState.Idle::class.java,
+                expectedEffects = emptyList(),
+            ),
+            IdleCase(
+                event = VoiceAgentCallEvent.CleanupFinished(staleCleanup, VoiceAgentCleanupResult.Completed),
+                expectedState = VoiceAgentCallState.Idle::class.java,
+                expectedEffects = emptyList(),
+            ),
+            IdleCase(
+                event = VoiceAgentCallEvent.SessionStateChanged(staleCall, VoiceAgentUiState(), true),
+                expectedState = VoiceAgentCallState.Idle::class.java,
+                expectedEffects = emptyList(),
+            ),
         )
 
-        cases.forEach { (event, expectedState) ->
-            val transition = reduceVoiceAgentCallState(VoiceAgentCallState.Idle, event)
-            assertEquals(expectedState, transition.state.javaClass)
+        cases.forEach { case ->
+            val transition = reduceVoiceAgentCallState(VoiceAgentCallState.Idle, case.event)
+            assertEquals(case.expectedState, transition.state.javaClass)
+            assertEquals(case.expectedEffects, transition.effects)
         }
+    }
+
+    @Test
+    fun `matching active reduction is unchanged by mutable session flow`() {
+        val request = request("deterministic")
+        val call = activeCall(request, sessionStatus = VoiceSessionStatus.Connected)
+        val state = activeState(call)
+        val event = VoiceAgentCallEvent.StartRequested(pending(request))
+
+        val beforeMutation = reduceVoiceAgentCallState(state, event)
+        call.testSession.state.value = VoiceAgentUiState(session = VoiceSessionStatus.Error("out of band"))
+        val afterMutation = reduceVoiceAgentCallState(state, event)
+
+        assertEquals(beforeMutation, afterMutation)
+        assertEquals(1, afterMutation.effects.size)
+        assertType<VoiceAgentCallEffect.CompleteStarts>(afterMutation.effects.single())
     }
 
     @Test
@@ -102,7 +163,7 @@ class VoiceAgentCallStateMachineTest {
                 )
             },
             TransitionCase("matching active completes without reconnect") {
-                val state = VoiceAgentCallState.Active(active)
+                val state = activeState(active)
                 val transition = reduceVoiceAgentCallState(state, VoiceAgentCallEvent.StartRequested(firstPending))
                 assertSame(state, transition.state)
                 assertEquals(1, transition.effects.size)
@@ -111,7 +172,10 @@ class VoiceAgentCallStateMachineTest {
             },
             TransitionCase("matching active error reconnects after completion") {
                 val errorActive = activeCall(first, sessionStatus = VoiceSessionStatus.Error("retry"))
-                val state = VoiceAgentCallState.Active(errorActive)
+                val state = activeState(
+                    errorActive,
+                    VoiceAgentUiState(session = VoiceSessionStatus.Error("retry")),
+                )
                 val transition = reduceVoiceAgentCallState(state, VoiceAgentCallEvent.StartRequested(firstPending))
                 assertSame(state, transition.state)
                 assertType<VoiceAgentCallEffect.CompleteStarts>(transition.effects[0])
@@ -119,7 +183,7 @@ class VoiceAgentCallStateMachineTest {
             },
             TransitionCase("different active starts replacement cleanup") {
                 val transition = reduceVoiceAgentCallState(
-                    VoiceAgentCallState.Active(active),
+                    activeState(active),
                     VoiceAgentCallEvent.StartRequested(secondPending),
                 )
                 val next = assertType<VoiceAgentCallState.Stopping.ForReplacement>(transition.state)
@@ -224,7 +288,7 @@ class VoiceAgentCallStateMachineTest {
         val active = activeCall(request)
         val activeEnd = endReply()
         val stoppedActive = reduceVoiceAgentCallState(
-            VoiceAgentCallState.Active(active),
+            activeState(active),
             VoiceAgentCallEvent.EndRequested(activeEnd),
         )
         val activeState = assertType<VoiceAgentCallState.Stopping.ForEnd>(stoppedActive.state)
@@ -458,10 +522,49 @@ class VoiceAgentCallStateMachineTest {
 
         val ready = reduceVoiceAgentCallState(
             running,
-            VoiceAgentCallEvent.StartFinished(operation, VoiceAgentStartOutcome.Ready(call)),
+            VoiceAgentCallEvent.StartFinished(
+                operation,
+                VoiceAgentStartOutcome.Ready(
+                    call,
+                    VoiceAgentUiState(session = VoiceSessionStatus.Connected),
+                ),
+            ),
         )
-        assertSame(call, assertType<VoiceAgentCallState.Active>(ready.state).call)
+        val activeState = assertType<VoiceAgentCallState.Active>(ready.state)
+        assertSame(call, activeState.call)
+        assertEquals(VoiceSessionStatus.Connected, activeState.sessionState.session)
         assertType<VoiceAgentCallEffect.CompleteStarts>(ready.effects.first())
+
+        val cleanError = IllegalArgumentException("clean")
+        val clean = reduceVoiceAgentCallState(
+            running,
+            VoiceAgentCallEvent.StartFinished(operation, VoiceAgentStartOutcome.FailedClean(cleanError)),
+        )
+        assertType<VoiceAgentCallState.Idle>(clean.state)
+        assertEquals(
+            listOf(
+                VoiceAgentCallEffect.CompleteStarts(
+                    pending.replies,
+                    VoiceAgentCallStartResult.Failed(cleanError),
+                ),
+            ),
+            clean.effects,
+        )
+
+        val cancelled = reduceVoiceAgentCallState(
+            running,
+            VoiceAgentCallEvent.StartFinished(operation, VoiceAgentStartOutcome.Cancelled),
+        )
+        assertType<VoiceAgentCallState.Idle>(cancelled.state)
+        assertEquals(
+            listOf(
+                VoiceAgentCallEffect.CompleteStarts(
+                    pending.replies,
+                    VoiceAgentCallStartResult.Superseded,
+                ),
+            ),
+            cancelled.effects,
+        )
 
         val dirtyCleanup = FakeCleanupOperation()
         val dirtyError = IllegalStateException("dirty")
@@ -551,7 +654,10 @@ class VoiceAgentCallStateMachineTest {
         val staleCall = activeCall(request("stale"))
         val finished = reduceVoiceAgentCallState(
             current,
-            VoiceAgentCallEvent.StartFinished(staleOperation, VoiceAgentStartOutcome.Ready(staleCall)),
+            VoiceAgentCallEvent.StartFinished(
+                staleOperation,
+                VoiceAgentStartOutcome.Ready(staleCall, VoiceAgentUiState()),
+            ),
         )
         assertSame(current, finished.state)
         assertEquals(
@@ -568,7 +674,7 @@ class VoiceAgentCallStateMachineTest {
         assertTrue(cleanupFinished.effects.isEmpty())
 
         val collector = reduceVoiceAgentCallState(
-            VoiceAgentCallState.Active(activeCall(request)),
+            activeState(activeCall(request)),
             VoiceAgentCallEvent.SessionStateChanged(staleCall, VoiceAgentUiState(), routeUsable = true),
         )
         assertType<VoiceAgentCallState.Active>(collector.state)
@@ -578,14 +684,16 @@ class VoiceAgentCallStateMachineTest {
     @Test
     fun `session state policy keeps usable errors active and detaches terminal states`() {
         val call = activeCall(request("session"))
-        val active = VoiceAgentCallState.Active(call)
+        val active = activeState(call)
         val errorState = VoiceAgentUiState(session = VoiceSessionStatus.Error("network"))
 
         val usableError = reduceVoiceAgentCallState(
             active,
             VoiceAgentCallEvent.SessionStateChanged(call, errorState, routeUsable = true),
         )
-        assertSame(active, usableError.state)
+        val retained = assertType<VoiceAgentCallState.Active>(usableError.state)
+        assertSame(call, retained.call)
+        assertEquals(errorState, retained.sessionState)
         assertEquals(
             listOf(
                 VoiceAgentCallEffect.RecordDiagnostic(call, "voice_call_start_failed", "network"),
@@ -630,7 +738,7 @@ class VoiceAgentCallStateMachineTest {
                 VoiceAgentCallLifecycle.Starting(request.conversationId),
             VoiceAgentCallState.Starting.Running(pending, operation) to
                 VoiceAgentCallLifecycle.Starting(request.conversationId),
-            VoiceAgentCallState.Active(active) to VoiceAgentCallLifecycle.Active(request.conversationId),
+            activeState(active) to VoiceAgentCallLifecycle.Active(request.conversationId),
             VoiceAgentCallState.Stopping.ForReplacement(
                 cleanup,
                 pending,
@@ -695,7 +803,7 @@ class VoiceAgentCallStateMachineTest {
 
         val active = activeCall(first)
         val replacingActive = reduceVoiceAgentCallState(
-            VoiceAgentCallState.Active(active),
+            activeState(active),
             VoiceAgentCallEvent.StartRequested(pending(second)),
         )
         assertLogicalOwnerCount(replacingActive, 1)
@@ -725,7 +833,7 @@ class VoiceAgentCallStateMachineTest {
             VoiceAgentCallEvent.EndRequested(endReply),
         )
         reduceVoiceAgentCallState(
-            VoiceAgentCallState.Active(active),
+            activeState(active),
             VoiceAgentCallEvent.StartRequested(pending(request("different"))),
         )
 
@@ -740,6 +848,12 @@ class VoiceAgentCallStateMachineTest {
     private data class TransitionCase(
         val name: String,
         val verify: () -> Unit,
+    )
+
+    private data class IdleCase(
+        val event: VoiceAgentCallEvent,
+        val expectedState: Class<out VoiceAgentCallState>,
+        val expectedEffects: List<VoiceAgentCallEffect>,
     )
 }
 
@@ -846,6 +960,11 @@ private fun activeCall(
         cleanup = cleanup,
     )
 }
+
+private fun activeState(
+    call: ActiveVoiceAgentCall,
+    sessionState: VoiceAgentUiState = VoiceAgentUiState(session = VoiceSessionStatus.Connected),
+): VoiceAgentCallState.Active = VoiceAgentCallState.Active(call, sessionState)
 
 private fun pending(request: VoiceAgentCallRequest): PendingVoiceAgentStart =
     PendingVoiceAgentStart(Any(), request, listOf(startReply()))
