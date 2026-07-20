@@ -37,8 +37,6 @@ internal fun launchActions(experimentEnabled: Boolean): List<VoiceAgentLaunchAct
     }
 }
 
-internal fun isVoiceAgentLiveKitExperimentEnabled(rawValue: String?): Boolean = rawValue == "true"
-
 internal fun voiceAgentScreen(
     conversationId: String,
     action: VoiceAgentLaunchAction,

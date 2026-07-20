@@ -37,14 +37,6 @@ class VoiceAgentLaunchActionsTest {
     }
 
     @Test
-    fun `feature flag accepts only exact literal true`() {
-        assertTrue(isVoiceAgentLiveKitExperimentEnabled("true"))
-        for (disabled in listOf(null, "", "false", "TRUE", "True", " true", "true ")) {
-            assertFalse(isVoiceAgentLiveKitExperimentEnabled(disabled))
-        }
-    }
-
-    @Test
     fun `launch actions preserve transport in navigation`() {
         val direct = voiceAgentScreen("conversation-1", launchActions(false).single())
         val experimental = voiceAgentScreen(
