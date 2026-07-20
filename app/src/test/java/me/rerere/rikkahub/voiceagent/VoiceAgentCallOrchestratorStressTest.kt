@@ -11,7 +11,9 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import me.rerere.rikkahub.voiceagent.audio.VoiceAudioRouteOwner
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNotSame
 import org.junit.Assert.assertSame
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -24,6 +26,22 @@ class VoiceAgentCallOrchestratorStressTest {
             StressHarness(seed).run()
         }
     }
+
+    @Test
+    fun `ownership invariant rejects an active bundle with unrelated cleanup roots`() {
+        val callCleanup = StressCleanupOperation(StressResourceState.Live)
+        val sessionCleanup = StressCleanupOperation(StressResourceState.Live)
+        val malformed = VoiceAgentCallState.Active(
+            call = createActiveCall(orchestratorRequest("malformed"), callCleanup, sessionCleanup),
+            sessionState = VoiceAgentUiState(session = VoiceSessionStatus.Connected),
+        )
+
+        val failure = assertThrows(AssertionError::class.java) {
+            assertStressOwnerInvariant(malformed) { true }
+        }
+
+        assertTrue(failure.message.orEmpty().contains("independent resource owner"))
+    }
 }
 
 private class StressHarness(seed: Long) {
@@ -32,7 +50,9 @@ private class StressHarness(seed: Long) {
     private val startReplies = mutableListOf<CompletableDeferred<VoiceAgentCallStartResult>>()
     private val endReplies = mutableListOf<CompletableDeferred<VoiceAgentCallEndResult>>()
     private val cancellationReplies = mutableListOf<CompletableDeferred<Throwable?>>()
-    private val ownedCleanups = mutableListOf<StressCleanupOperation>()
+    private val allCleanups = mutableListOf<StressCleanupOperation>()
+    private val allOperations = mutableListOf<StressStartOperation>()
+    private val allCalls = mutableListOf<ActiveVoiceAgentCall>()
     private val coverage = mutableSetOf<String>()
     private var state: VoiceAgentCallState = VoiceAgentCallState.Idle
     private var generatedEvents = 0
@@ -49,7 +69,7 @@ private class StressHarness(seed: Long) {
         assertTrue("all start replies must terminate", startReplies.all { it.isCompleted })
         assertTrue("all end replies must terminate", endReplies.all { it.isCompleted })
         assertTrue("all cancellation replies must terminate", cancellationReplies.all { it.isCompleted })
-        assertTrue("every acquired fake resource must be cleaned", ownedCleanups.all { it.cleaned })
+        assertRegisteredResourceFinality()
     }
 
     private fun exerciseRequiredVariants() {
@@ -122,8 +142,7 @@ private class StressHarness(seed: Long) {
     }
 
     private fun requestStart(request: VoiceAgentCallRequest, variant: String) {
-        val reply = CompletableDeferred<VoiceAgentCallStartResult>()
-        startReplies += reply
+        val reply = newStartReply()
         coverage += "StartRequested"
         coverage += "StartRequested:$variant"
         dispatch(
@@ -152,11 +171,10 @@ private class StressHarness(seed: Long) {
     private fun cancelStart(current: Boolean) {
         val ownedReply = state.startWaiters().firstOrNull { !it.isCompleted }
         val isCurrent = current && ownedReply != null
-        val reply = if (isCurrent) checkNotNull(ownedReply) else CompletableDeferred()
+        val reply = if (isCurrent) checkNotNull(ownedReply) else newStartReply()
         val error = CancellationException("stress cancellation")
-        if (isCurrent) reply.cancel(error)
-        val completion = CompletableDeferred<Throwable?>()
-        cancellationReplies += completion
+        reply.cancel(error)
+        val completion = newCancellationReply()
         coverage += "StartCancelled"
         coverage += "StartCancelled:${if (isCurrent) "current" else "stale"}"
         dispatch(
@@ -169,8 +187,7 @@ private class StressHarness(seed: Long) {
     }
 
     private fun endCall() {
-        val reply = CompletableDeferred<VoiceAgentCallEndResult>()
-        endReplies += reply
+        val reply = newEndReply()
         coverage += "EndRequested"
         dispatch(VoiceAgentCallEvent.EndRequested(reply))
     }
@@ -185,8 +202,13 @@ private class StressHarness(seed: Long) {
         val isCurrent = current && running != null
         val operation = if (isCurrent) running.operation else newOperation(requests.random(random))
         val outcome = outcome(kind, operation)
-        if (isCurrent && (kind == StartOutcomeKind.FailedClean || kind == StartOutcomeKind.Cancelled)) {
-            (operation.cleanup as StressCleanupOperation).cleaned = true
+        when (kind) {
+            StartOutcomeKind.Ready,
+            StartOutcomeKind.FailedDirty,
+            -> operation.cleanup.asStressCleanup().markLive()
+            StartOutcomeKind.FailedClean,
+            StartOutcomeKind.Cancelled,
+            -> operation.cleanup.asStressCleanup().markAlreadyClean()
         }
         coverage += "StartFinished"
         coverage += "StartFinished:${if (isCurrent) "current" else "stale"}"
@@ -199,7 +221,7 @@ private class StressHarness(seed: Long) {
         operation: VoiceAgentStartOperation,
     ): VoiceAgentStartOutcome = when (kind) {
         StartOutcomeKind.Ready -> VoiceAgentStartOutcome.Ready(
-            activeCall(operation.request, operation.cleanup),
+            newActiveCall(operation.request, operation.cleanup as StressCleanupOperation),
             VoiceAgentUiState(session = VoiceSessionStatus.Connected),
         )
         StartOutcomeKind.FailedClean -> VoiceAgentStartOutcome.FailedClean(
@@ -215,9 +237,19 @@ private class StressHarness(seed: Long) {
     private fun cleanup(result: VoiceAgentCleanupResult, current: Boolean) {
         val stopping = state as? VoiceAgentCallState.Stopping
         val isCurrent = current && stopping != null
-        val cleanup = if (isCurrent) stopping.cleanup else newCleanup()
+        val cleanup = if (isCurrent) {
+            stopping.cleanup
+        } else {
+            newCleanup(
+                if (result == VoiceAgentCleanupResult.Completed) {
+                    StressResourceState.AlreadyClean
+                } else {
+                    StressResourceState.TerminalWithoutResources
+                },
+            )
+        }
         if (isCurrent && result == VoiceAgentCleanupResult.Completed) {
-            (cleanup as StressCleanupOperation).cleaned = true
+            (cleanup as StressCleanupOperation).markCleaned()
         }
         coverage += "CleanupFinished"
         coverage += "CleanupFinished:${if (isCurrent) "current" else "stale"}"
@@ -231,7 +263,7 @@ private class StressHarness(seed: Long) {
     private fun session(kind: SessionKind, current: Boolean) {
         val active = state as? VoiceAgentCallState.Active
         val isCurrent = current && active != null
-        val call = if (isCurrent) active.call else activeCall(requests.random(random), newCleanup())
+        val call = if (isCurrent) active.call else newAlreadyCleanCall(requests.random(random))
         val routeUsable = kind != SessionKind.ErrorUnusable
         val sessionState = VoiceAgentUiState(
             session = when (kind) {
@@ -252,18 +284,17 @@ private class StressHarness(seed: Long) {
     }
 
     private fun dispatch(event: VoiceAgentCallEvent, stale: Boolean = false, generated: Boolean = true) {
+        assertEventObjectsRegistered(event)
         val before = state
-        val beforeCleanup = before.cleanupOwner()
+        val beforeCleanup = before.soleRootCleanupOrNull()
         val transition = reduceVoiceAgentCallState(before, event)
         if (stale) {
             assertSame("stale identity changed state for $event", before, transition.state)
         }
         state = transition.state
-        (state.cleanupOwner() as? StressCleanupOperation)?.let { cleanup ->
-            if (ownedCleanups.none { it === cleanup }) ownedCleanups += cleanup
-        }
+        markStateResourcesLive()
         assertOwnerInvariant()
-        val afterCleanup = state.cleanupOwner()
+        val afterCleanup = state.soleRootCleanupOrNull()
         if (beforeCleanup != null && afterCleanup != null) {
             assertSame("cleanup identity changed without release", beforeCleanup, afterCleanup)
         }
@@ -281,8 +312,8 @@ private class StressHarness(seed: Long) {
                 }
                 is VoiceAgentCallEffect.RunCleanup -> {
                     assertNotNull(effect.cleanup.token)
-                    if (effect.cleanup !== state.cleanupOwner()) {
-                        (effect.cleanup as? StressCleanupOperation)?.cleaned = true
+                    if (effect.cleanup !== state.soleRootCleanupOrNull()) {
+                        (effect.cleanup as? StressCleanupOperation)?.markCleaned()
                     }
                 }
                 is VoiceAgentCallEffect.AdmitStart,
@@ -298,19 +329,7 @@ private class StressHarness(seed: Long) {
     }
 
     private fun assertOwnerInvariant() {
-        val owners = Collections.newSetFromMap(IdentityHashMap<Any, Boolean>())
-        state.cleanupOwner()?.let { owners += it.token }
-        assertTrue("state published more than one resource owner", owners.size <= 1)
-        val active = state as? VoiceAgentCallState.Active ?: return
-        assertNotNull(active.call.route)
-        assertNotNull(active.call.session)
-        assertNotNull(active.call.callScope)
-        assertNotNull(active.call.callJob)
-        assertNotNull(active.call.collector)
-        assertNotNull(active.call.cleanup)
-        assertSame(active.call.callJob, active.call.callScope.coroutineContext[Job])
-        assertEquals(active.call.route, active.call.session.routeMetadata)
-        assertSame(active.call.cleanup, active.call.session.cleanupOperation)
+        assertStressOwnerInvariant(state, ::isRegistered)
     }
 
     private fun drainToTerminalState() {
@@ -340,7 +359,7 @@ private class StressHarness(seed: Long) {
 
     private fun finishForDrain() {
         val running = state as VoiceAgentCallState.Starting.Running
-        (running.operation.cleanup as StressCleanupOperation).cleaned = true
+        (running.operation.cleanup as StressCleanupOperation).markAlreadyClean()
         dispatch(
             VoiceAgentCallEvent.StartFinished(
                 running.operation,
@@ -351,14 +370,13 @@ private class StressHarness(seed: Long) {
     }
 
     private fun endForDrain() {
-        val reply = CompletableDeferred<VoiceAgentCallEndResult>()
-        endReplies += reply
+        val reply = newEndReply()
         dispatch(VoiceAgentCallEvent.EndRequested(reply), generated = false)
     }
 
     private fun cleanupForDrain() {
         val stopping = state as VoiceAgentCallState.Stopping
-        (stopping.cleanup as StressCleanupOperation).cleaned = true
+        (stopping.cleanup as StressCleanupOperation).markCleaned()
         dispatch(
             VoiceAgentCallEvent.CleanupFinished(stopping.cleanup, VoiceAgentCleanupResult.Completed),
             generated = false,
@@ -370,9 +388,116 @@ private class StressHarness(seed: Long) {
     }
 
     private fun newOperation(request: VoiceAgentCallRequest): StressStartOperation =
-        StressStartOperation(request, newCleanup())
+        StressStartOperation(request, newCleanup()).also(allOperations::add)
 
-    private fun newCleanup(): StressCleanupOperation = StressCleanupOperation()
+    private fun newCleanup(
+        initialState: StressResourceState = StressResourceState.Allocated,
+    ): StressCleanupOperation = StressCleanupOperation(initialState).also(allCleanups::add)
+
+    private fun newActiveCall(
+        request: VoiceAgentCallRequest,
+        callCleanup: StressCleanupOperation,
+    ): ActiveVoiceAgentCall {
+        val sessionCleanup = newCleanup()
+        callCleanup.containsResource(sessionCleanup)
+        callCleanup.markLive()
+        return createActiveCall(request, callCleanup, sessionCleanup).also(allCalls::add)
+    }
+
+    private fun newAlreadyCleanCall(request: VoiceAgentCallRequest): ActiveVoiceAgentCall {
+        val callCleanup = newCleanup(StressResourceState.AlreadyClean)
+        val sessionCleanup = newCleanup(StressResourceState.AlreadyClean)
+        callCleanup.containsResource(sessionCleanup)
+        return createActiveCall(request, callCleanup, sessionCleanup).also(allCalls::add)
+    }
+
+    private fun newStartReply(): CompletableDeferred<VoiceAgentCallStartResult> =
+        CompletableDeferred<VoiceAgentCallStartResult>().also(startReplies::add)
+
+    private fun newEndReply(): CompletableDeferred<VoiceAgentCallEndResult> =
+        CompletableDeferred<VoiceAgentCallEndResult>().also(endReplies::add)
+
+    private fun newCancellationReply(): CompletableDeferred<Throwable?> =
+        CompletableDeferred<Throwable?>().also(cancellationReplies::add)
+
+    private fun markStateResourcesLive() {
+        state.ownershipCleanupReferences().forEach { reference -> reference.cleanup.markLive() }
+    }
+
+    private fun assertEventObjectsRegistered(event: VoiceAgentCallEvent) {
+        when (event) {
+            is VoiceAgentCallEvent.StartRequested -> event.pending.replies.forEach { reply ->
+                assertTrue("unregistered start reply", startReplies.any { it === reply })
+            }
+            is VoiceAgentCallEvent.StartAdmitted -> {
+                assertTrue("unregistered start operation", allOperations.any { it === event.operation })
+            }
+            is VoiceAgentCallEvent.StartCancelled -> {
+                assertTrue("unregistered cancelled start reply", startReplies.any { it === event.reply })
+                assertTrue(
+                    "unregistered cancellation completion",
+                    cancellationReplies.any { it === event.cancellation.completion },
+                )
+            }
+            is VoiceAgentCallEvent.EndRequested -> {
+                assertTrue("unregistered end reply", endReplies.any { it === event.reply })
+            }
+            is VoiceAgentCallEvent.StartFinished -> {
+                assertTrue("unregistered finished operation", allOperations.any { it === event.operation })
+                when (val outcome = event.outcome) {
+                    is VoiceAgentStartOutcome.Ready -> {
+                        assertTrue("unregistered ready call", allCalls.any { it === outcome.call })
+                    }
+                    is VoiceAgentStartOutcome.FailedDirty -> {
+                        assertTrue("unregistered dirty cleanup", isRegistered(outcome.cleanup))
+                    }
+                    is VoiceAgentStartOutcome.FailedClean,
+                    VoiceAgentStartOutcome.Cancelled,
+                    -> Unit
+                }
+            }
+            is VoiceAgentCallEvent.CleanupFinished -> {
+                assertTrue("unregistered cleanup completion", isRegistered(event.cleanup))
+            }
+            is VoiceAgentCallEvent.SessionStateChanged -> {
+                assertTrue("unregistered session call", allCalls.any { it === event.call })
+            }
+            VoiceAgentCallEvent.CloseNowRequested -> Unit
+        }
+    }
+
+    private fun isRegistered(cleanup: VoiceAgentCleanupOperation): Boolean =
+        allCleanups.any { it === cleanup }
+
+    private fun assertRegisteredResourceFinality() {
+        val currentActive = (state as? VoiceAgentCallState.Active)?.call
+        val currentRunning = (state as? VoiceAgentCallState.Starting.Running)?.operation
+        allCleanups.forEach { cleanup ->
+            val retainedByActive = currentActive?.let { call ->
+                cleanup === call.cleanup || (call.cleanup as StressCleanupOperation).contains(cleanup)
+            } ?: false
+            val retainedByStartup = currentRunning?.cleanup === cleanup
+            assertTrue(
+                "registered cleanup ${cleanup.token} is neither terminal nor the exact current owner",
+                cleanup.isTerminal || retainedByActive || retainedByStartup,
+            )
+        }
+        allOperations.forEach { operation ->
+            assertTrue(
+                "operation cleanup is neither terminal nor current",
+                operation.cleanup.asStressCleanup().isTerminal || operation === currentRunning,
+            )
+            assertTrue("operation call job must be terminal", operation.phase.callJob.isCompleted)
+        }
+        allCalls.forEach { call ->
+            assertTrue(
+                "call cleanup is neither terminal nor current",
+                call.cleanup.asStressCleanup().isTerminal || call === currentActive,
+            )
+            assertTrue("call job must be terminal", call.callJob.isCompleted)
+            assertTrue("collector must be terminal", call.collector.isCompleted)
+        }
+    }
 
     private fun assertRequiredCoverage() {
         val required = buildSet {
@@ -424,9 +549,59 @@ private class StressStartOperation(
     override fun cancel() = Unit
 }
 
-private class StressCleanupOperation : VoiceAgentCleanupOperation {
+private enum class StressResourceState {
+    Allocated,
+    Live,
+    AlreadyClean,
+    Cleaned,
+    TerminalWithoutResources,
+}
+
+private class StressCleanupOperation(
+    private var resourceState: StressResourceState,
+) : VoiceAgentCleanupOperation {
     override val token: Any = Any()
-    var cleaned = false
+    private val containedResources = mutableListOf<StressCleanupOperation>()
+    val isTerminal: Boolean
+        get() = resourceState == StressResourceState.AlreadyClean ||
+            resourceState == StressResourceState.Cleaned ||
+            resourceState == StressResourceState.TerminalWithoutResources
+
+    fun containsResource(cleanup: StressCleanupOperation) {
+        check(containedResources.none { it === cleanup })
+        containedResources += cleanup
+        when (resourceState) {
+            StressResourceState.Live -> cleanup.markLive()
+            StressResourceState.AlreadyClean -> cleanup.markAlreadyClean()
+            StressResourceState.Cleaned -> cleanup.markCleaned()
+            StressResourceState.TerminalWithoutResources -> cleanup.markTerminalWithoutResources()
+            StressResourceState.Allocated -> Unit
+        }
+    }
+
+    fun contains(cleanup: StressCleanupOperation): Boolean =
+        containedResources.any { child -> child === cleanup || child.contains(cleanup) }
+
+    fun markLive() {
+        check(!isTerminal) { "terminal cleanup cannot reacquire resources" }
+        resourceState = StressResourceState.Live
+        containedResources.forEach(StressCleanupOperation::markLive)
+    }
+
+    fun markAlreadyClean() {
+        resourceState = StressResourceState.AlreadyClean
+        containedResources.forEach(StressCleanupOperation::markAlreadyClean)
+    }
+
+    fun markCleaned() {
+        resourceState = StressResourceState.Cleaned
+        containedResources.forEach(StressCleanupOperation::markCleaned)
+    }
+
+    private fun markTerminalWithoutResources() {
+        resourceState = StressResourceState.TerminalWithoutResources
+        containedResources.forEach(StressCleanupOperation::markTerminalWithoutResources)
+    }
 
     override suspend fun run(mode: VoiceAgentCleanupMode): VoiceAgentCleanupResult =
         VoiceAgentCleanupResult.Completed
@@ -446,11 +621,12 @@ private class StressRouteOwnedSession(
     override fun recordDiagnostic(name: String, detail: String) = Unit
 }
 
-private fun activeCall(
+private fun createActiveCall(
     request: VoiceAgentCallRequest,
-    cleanup: VoiceAgentCleanupOperation,
+    callCleanup: VoiceAgentCleanupOperation,
+    sessionCleanup: VoiceAgentCleanupOperation,
 ): ActiveVoiceAgentCall {
-    val session = StressRouteOwnedSession(cleanup)
+    val session = StressRouteOwnedSession(sessionCleanup)
     val callJob = completedStressJob()
     return ActiveVoiceAgentCall(
         token = Any(),
@@ -460,7 +636,7 @@ private fun activeCall(
         callScope = CoroutineScope(callJob),
         callJob = callJob,
         collector = completedStressJob(),
-        cleanup = cleanup,
+        cleanup = callCleanup,
     )
 }
 
@@ -486,15 +662,89 @@ private fun VoiceAgentCallState.startWaiters(): List<CompletableDeferred<VoiceAg
     is VoiceAgentCallState.Stopping.ForReplacement -> supersededStarts + pending.replies
 }
 
-private fun VoiceAgentCallState.cleanupOwner(): VoiceAgentCleanupOperation? = when (this) {
+private data class StressOwnershipReference(
+    val label: String,
+    val cleanup: StressCleanupOperation,
+)
+
+private fun VoiceAgentCallState.ownershipCleanupReferences(): List<StressOwnershipReference> = when (this) {
     VoiceAgentCallState.Idle,
     is VoiceAgentCallState.Starting.Admitting,
-    -> null
-    is VoiceAgentCallState.Starting.Running -> operation.cleanup
-    is VoiceAgentCallState.Active -> call.cleanup
-    is VoiceAgentCallState.Stopping -> cleanup
-    is VoiceAgentCallState.CleanupFailed -> cleanup
+    -> emptyList()
+    is VoiceAgentCallState.Starting.Running -> listOf(
+        StressOwnershipReference("running operation", operation.cleanup.asStressCleanup()),
+    )
+    is VoiceAgentCallState.Active -> listOf(
+        StressOwnershipReference("active call", call.cleanup.asStressCleanup()),
+        StressOwnershipReference("active session", call.session.cleanupOperation.asStressCleanup()),
+    )
+    is VoiceAgentCallState.Stopping -> listOf(
+        StressOwnershipReference("stopping cleanup", cleanup.asStressCleanup()),
+    )
+    is VoiceAgentCallState.CleanupFailed -> listOf(
+        StressOwnershipReference("cleanup-failed owner", cleanup.asStressCleanup()),
+    )
 }
+
+private fun assertStressOwnerInvariant(
+    state: VoiceAgentCallState,
+    isRegistered: (VoiceAgentCleanupOperation) -> Boolean,
+) {
+    val references = state.ownershipCleanupReferences()
+    val distinctTokens = Collections.newSetFromMap(IdentityHashMap<Any, Boolean>())
+    references.forEach { reference ->
+        assertTrue("state cleanup was not registered: ${reference.label}", isRegistered(reference.cleanup))
+        distinctTokens += reference.cleanup.token
+    }
+    val rootOwners = references.filter { candidate ->
+        references.none { other ->
+            other !== candidate && other.cleanup.contains(candidate.cleanup)
+        }
+    }
+    val distinctRoots = Collections.newSetFromMap(IdentityHashMap<Any, Boolean>())
+    rootOwners.forEach { distinctRoots += it.cleanup.token }
+    assertTrue("state published more than one independent resource owner", distinctRoots.size <= 1)
+
+    when (val current = state) {
+        VoiceAgentCallState.Idle,
+        is VoiceAgentCallState.Starting.Admitting,
+        -> assertEquals(0, distinctTokens.size)
+        is VoiceAgentCallState.Starting.Running -> {
+            assertEquals(1, distinctTokens.size)
+            assertSame(current.operation.phase.callJob, current.operation.phase.callScope.coroutineContext[Job])
+        }
+        is VoiceAgentCallState.Active -> {
+            assertEquals(2, distinctTokens.size)
+            val sessionCleanup = current.call.session.cleanupOperation.asStressCleanup()
+            val callCleanup = current.call.cleanup.asStressCleanup()
+            assertNotSame(callCleanup, sessionCleanup)
+            assertTrue("active cleanup must contain the session cleanup", callCleanup.contains(sessionCleanup))
+            assertNotNull(current.call.route)
+            assertNotNull(current.call.session)
+            assertNotNull(current.call.callScope)
+            assertNotNull(current.call.callJob)
+            assertNotNull(current.call.collector)
+            assertSame(current.call.callJob, current.call.callScope.coroutineContext[Job])
+            assertEquals(current.call.route, current.call.session.routeMetadata)
+        }
+        is VoiceAgentCallState.Stopping,
+        is VoiceAgentCallState.CleanupFailed,
+        -> assertEquals(1, distinctTokens.size)
+    }
+}
+
+private fun VoiceAgentCallState.soleRootCleanupOrNull(): VoiceAgentCleanupOperation? =
+    ownershipCleanupReferences()
+        .filter { candidate ->
+            ownershipCleanupReferences().none { other ->
+                other !== candidate && other.cleanup.contains(candidate.cleanup)
+            }
+        }
+        .singleOrNull()
+        ?.cleanup
+
+private fun VoiceAgentCleanupOperation.asStressCleanup(): StressCleanupOperation =
+    this as StressCleanupOperation
 
 private const val EVENTS_PER_SEED = 250
 private const val MAX_DRAIN_EVENTS = 16
