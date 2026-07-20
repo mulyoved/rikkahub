@@ -18,6 +18,7 @@ import me.rerere.rikkahub.utils.JsonInstant
 import me.rerere.rikkahub.utils.SoundEffectPlayer
 import me.rerere.rikkahub.utils.UpdateChecker
 import me.rerere.rikkahub.voiceagent.DefaultVoiceAgentCallFactory
+import me.rerere.rikkahub.voiceagent.TransportSelectingVoiceAgentCallFactory
 import me.rerere.rikkahub.voiceagent.VoiceAgentAudioRouteResolver
 import me.rerere.rikkahub.voiceagent.VoiceAgentCallFactory
 import me.rerere.rikkahub.voiceagent.VoiceAgentCallOrchestrator
@@ -28,6 +29,7 @@ import me.rerere.rikkahub.voiceagent.VoiceSessionMetadataStore
 import me.rerere.rikkahub.voiceagent.VoiceAgentTelecomAdapter
 import me.rerere.rikkahub.voiceagent.VoiceAgentTelecomCallRegistry
 import me.rerere.rikkahub.voiceagent.VoiceAgentTelecomGateway
+import me.rerere.rikkahub.voiceagent.livekit.LiveKitVoiceCallFactory
 import me.rerere.rikkahub.voiceagent.telemetry.SentryVoiceObservabilityConfig
 import me.rerere.rikkahub.voiceagent.telemetry.VoiceObservability
 import me.rerere.rikkahub.voiceagent.telemetry.createSentryVoiceObservability
@@ -113,13 +115,24 @@ val appModule = module {
         )
     }
 
-    single<VoiceAgentCallFactory> {
+    single {
         DefaultVoiceAgentCallFactory(
             context = get(),
             chatService = get(),
             settingsStore = get(),
             okHttpClient = get(),
             observability = get(),
+        )
+    }
+
+    single {
+        LiveKitVoiceCallFactory(context = get())
+    }
+
+    single<VoiceAgentCallFactory> {
+        TransportSelectingVoiceAgentCallFactory(
+            directFactory = get<DefaultVoiceAgentCallFactory>(),
+            liveKitFactory = get<LiveKitVoiceCallFactory>(),
         )
     }
 

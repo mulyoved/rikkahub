@@ -34,6 +34,63 @@ import kotlin.uuid.Uuid
 
 class VoiceAgentCallFactoryTest {
     @Test
+    fun `LiveKit transport bypasses direct factory`() = runTest {
+        val directSession = OrchestratorFakeSession()
+        val liveKitSession = OrchestratorFakeSession()
+        val directFactory = OrchestratorFakeFactory { _, _, _ ->
+            VoiceAgentSessionCreationResult.Created(directSession)
+        }
+        val liveKitFactory = OrchestratorFakeFactory { _, _, _ ->
+            VoiceAgentSessionCreationResult.Created(liveKitSession)
+        }
+        val selectingFactory = TransportSelectingVoiceAgentCallFactory(
+            directFactory = directFactory,
+            liveKitFactory = liveKitFactory,
+        )
+        val request = VoiceAgentCallRequest(
+            conversationId = Uuid.random(),
+            config = factoryLaunchConfig(),
+            transport = VoiceAgentTransport.LiveKitExperimental,
+        )
+
+        val result = selectingFactory.createOwned(
+            request = request,
+            routeLease = OrchestratorFakeRoute().lease,
+            scope = this,
+        )
+
+        assertEquals(0, directFactory.calls)
+        assertEquals(1, liveKitFactory.calls)
+        assertSame(liveKitSession, (result as VoiceAgentSessionCreationResult.Created).session)
+    }
+
+    @Test
+    fun `Direct transport bypasses LiveKit factory`() = runTest {
+        val directSession = OrchestratorFakeSession()
+        val directFactory = OrchestratorFakeFactory { _, _, _ ->
+            VoiceAgentSessionCreationResult.Created(directSession)
+        }
+        val liveKitFactory = OrchestratorFakeFactory { _, _, _ ->
+            error("LiveKit factory must not run")
+        }
+        val selectingFactory = TransportSelectingVoiceAgentCallFactory(directFactory, liveKitFactory)
+
+        val result = selectingFactory.createOwned(
+            request = VoiceAgentCallRequest(
+                conversationId = Uuid.random(),
+                config = factoryLaunchConfig(),
+                transport = VoiceAgentTransport.DirectGemini,
+            ),
+            routeLease = OrchestratorFakeRoute().lease,
+            scope = this,
+        )
+
+        assertEquals(1, directFactory.calls)
+        assertEquals(0, liveKitFactory.calls)
+        assertSame(directSession, (result as VoiceAgentSessionCreationResult.Created).session)
+    }
+
+    @Test
     fun `livekit request never falls back to direct session creation`() = runTest {
         val root = Files.createTempDirectory("voice-factory-livekit-unavailable").toFile()
         val conversationId = Uuid.random()

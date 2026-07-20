@@ -44,6 +44,20 @@ internal interface VoiceAgentCallFactory {
     ): VoiceAgentSessionCreationResult
 }
 
+internal class TransportSelectingVoiceAgentCallFactory(
+    private val directFactory: VoiceAgentCallFactory,
+    private val liveKitFactory: VoiceAgentCallFactory,
+) : VoiceAgentCallFactory {
+    override suspend fun createOwned(
+        request: VoiceAgentCallRequest,
+        routeLease: VoiceAgentRouteLease,
+        scope: CoroutineScope,
+    ): VoiceAgentSessionCreationResult = when (request.transport) {
+        VoiceAgentTransport.DirectGemini -> directFactory.createOwned(request, routeLease, scope)
+        VoiceAgentTransport.LiveKitExperimental -> liveKitFactory.createOwned(request, routeLease, scope)
+    }
+}
+
 internal sealed interface VoiceAgentSessionCreationResult {
     data class Created(
         val session: RouteOwnedManagedVoiceCallSession,
@@ -127,7 +141,7 @@ internal class DefaultVoiceAgentCallFactory internal constructor(
                 },
             )
         } catch (creationError: Throwable) {
-            finishFailedOwnedCreation(creationError, cleanup)
+            finishFailedOwnedVoiceSessionCreation(creationError, cleanup)
         }
     }
 
@@ -195,30 +209,31 @@ internal class DefaultVoiceAgentCallFactory internal constructor(
         return RouteOwnedVoiceCallSession(coreSession, routeLease)
     }
 
-    private suspend fun finishFailedOwnedCreation(
-        creationError: Throwable,
-        cleanup: VoiceAgentCleanupOperation,
-    ): VoiceAgentSessionCreationResult {
-        val cleanupResult = try {
-            cleanup.run(VoiceAgentCleanupMode.Immediate)
-        } catch (cleanupCancellation: CancellationException) {
-            val canonical = cleanupCancellation.canonicalFactoryCancellation()
-            canonical.addSuppressedDistinct(creationError.canonicalIfCancellation())
-            throw canonical
+}
+
+internal suspend fun finishFailedOwnedVoiceSessionCreation(
+    creationError: Throwable,
+    cleanup: VoiceAgentCleanupOperation,
+): VoiceAgentSessionCreationResult {
+    val cleanupResult = try {
+        cleanup.run(VoiceAgentCleanupMode.Immediate)
+    } catch (cleanupCancellation: CancellationException) {
+        val canonical = cleanupCancellation.canonicalFactoryCancellation()
+        canonical.addSuppressedDistinct(creationError.canonicalIfCancellation())
+        throw canonical
+    }
+    if (creationError is CancellationException) {
+        val canonical = creationError.canonicalFactoryCancellation()
+        if (cleanupResult is VoiceAgentCleanupResult.Failed) {
+            canonical.addSuppressedDistinct(cleanupResult.error)
         }
-        if (creationError is CancellationException) {
-            val canonical = creationError.canonicalFactoryCancellation()
-            if (cleanupResult is VoiceAgentCleanupResult.Failed) {
-                canonical.addSuppressedDistinct(cleanupResult.error)
-            }
-            throw canonical
-        }
-        return when (cleanupResult) {
-            VoiceAgentCleanupResult.Completed -> VoiceAgentSessionCreationResult.FailedClean(creationError)
-            is VoiceAgentCleanupResult.Failed -> {
-                creationError.addSuppressedDistinct(cleanupResult.error)
-                VoiceAgentSessionCreationResult.FailedDirty(creationError, cleanup)
-            }
+        throw canonical
+    }
+    return when (cleanupResult) {
+        VoiceAgentCleanupResult.Completed -> VoiceAgentSessionCreationResult.FailedClean(creationError)
+        is VoiceAgentCleanupResult.Failed -> {
+            creationError.addSuppressedDistinct(cleanupResult.error)
+            VoiceAgentSessionCreationResult.FailedDirty(creationError, cleanup)
         }
     }
 }
