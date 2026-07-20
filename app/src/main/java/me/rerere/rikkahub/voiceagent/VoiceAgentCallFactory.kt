@@ -50,7 +50,9 @@ internal interface VoiceAgentCallFactory {
         config: VoiceAgentLaunchConfig,
         routeLease: VoiceAgentRouteLease,
         scope: CoroutineScope,
-    ): RouteOwnedManagedVoiceCallSession
+    ): RouteOwnedManagedVoiceCallSession = error(
+        "Legacy VoiceAgentCallFactory.create is not implemented",
+    )
 }
 
 internal sealed interface VoiceAgentSessionCreationResult {

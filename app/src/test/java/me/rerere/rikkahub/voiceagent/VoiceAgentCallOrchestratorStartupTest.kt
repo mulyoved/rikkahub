@@ -226,6 +226,72 @@ class VoiceAgentCallOrchestratorStartupTest {
     }
 
     @Test
+    fun `resource cancellation with failed cleanup publishes canonical dirty failure`() = runTest {
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val appJob = SupervisorJob()
+        val route = OrchestratorFakeRoute()
+        val cancellation = CancellationException("session resource cancelled")
+        val wrapper = CancellationException(cancellation.message).apply { initCause(cancellation) }
+        val cleanupError = IllegalStateException("resource cleanup failed")
+        val cleanup = OrchestratorFakeCleanupOperation {
+            VoiceAgentCleanupResult.Failed(cleanupError)
+        }
+        val session = OrchestratorFakeSession(
+            routeMetadata = route.lease.metadata,
+            cleanupOperation = cleanup,
+            onStart = { throw wrapper },
+        )
+        val orchestrator = VoiceAgentCallOrchestrator(
+            factory = OrchestratorFakeFactory { _, _, _ ->
+                VoiceAgentSessionCreationResult.Created(session)
+            },
+            resolveRoute = { route.lease },
+            appScope = CoroutineScope(appJob + dispatcher),
+        )
+
+        val result = async { orchestrator.start(orchestratorRequest("resource-cancel-dirty")) }
+        runCurrent()
+
+        val failure = (result.await() as VoiceAgentCallStartResult.Failed).error
+        assertSame(cancellation, failure)
+        assertEquals(listOf(cleanupError), failure.suppressed.toList())
+        assertEquals(VoiceAgentCallLifecycle.CleanupFailed(cancellation), orchestrator.lifecycle.value)
+        assertEquals(listOf(VoiceAgentCleanupMode.Immediate), cleanup.modes)
+        assertEquals(0, appJob.children.count())
+    }
+
+    @Test
+    fun `final pre-collector resource cancellation cleans once without starting collector or leaking job`() = runTest {
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val appJob = SupervisorJob()
+        val route = OrchestratorFakeRoute()
+        val cancellation = CancellationException("pre-collector resource cancelled")
+        val cleanup = OrchestratorFakeCleanupOperation()
+        val session = OrchestratorFakeSession(
+            routeMetadata = route.lease.metadata,
+            cleanupOperation = cleanup,
+            onRouteMetadataRead = { throw cancellation },
+        )
+        val orchestrator = VoiceAgentCallOrchestrator(
+            factory = OrchestratorFakeFactory { _, _, _ ->
+                VoiceAgentSessionCreationResult.Created(session)
+            },
+            resolveRoute = { route.lease },
+            appScope = CoroutineScope(appJob + dispatcher),
+        )
+
+        val result = async { orchestrator.start(orchestratorRequest("pre-collector-resource-cancel")) }
+        runCurrent()
+
+        val failure = (result.await() as VoiceAgentCallStartResult.Failed).error
+        assertSame(cancellation, failure)
+        assertEquals(listOf(VoiceAgentCleanupMode.Immediate), cleanup.modes)
+        assertEquals(0, session.collectorCount())
+        assertEquals(VoiceAgentCallLifecycle.Idle, orchestrator.lifecycle.value)
+        assertEquals(0, appJob.children.count())
+    }
+
+    @Test
     fun `caller cancellation while resolving a route preserves the canonical cancellation`() = runTest {
         val dispatcher = StandardTestDispatcher(testScheduler)
         val appJob = SupervisorJob()

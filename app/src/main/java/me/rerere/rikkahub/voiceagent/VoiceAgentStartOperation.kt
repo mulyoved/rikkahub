@@ -1,7 +1,5 @@
 package me.rerere.rikkahub.voiceagent
 
-import java.util.Collections
-import java.util.IdentityHashMap
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CompletableJob
@@ -92,12 +90,11 @@ private class DefaultVoiceAgentStartOperation(
                 }
             }
         } catch (cancellation: CancellationException) {
-            if (!startupCleanup.wasCleanupRequested()) {
-                val canonical = cancellation.canonicalStartupCancellation()
-                val cleanupFailure = cleanCurrentResourceAfterCancellation()
-                cleanupFailure?.let(canonical::addSuppressedDistinct)
+            if (startupCleanup.wasCleanupRequested()) {
+                VoiceAgentStartOutcome.Cancelled
+            } else {
+                finishResourceCancellation(cancellation)
             }
-            VoiceAgentStartOutcome.Cancelled
         } catch (error: Throwable) {
             finishFailure(error)
         }
@@ -112,6 +109,7 @@ private class DefaultVoiceAgentStartOperation(
             session.start()
             yield()
             val initialState = session.state.value
+            val routeMetadata = session.routeMetadata
             lateinit var call: ActiveVoiceAgentCall
             val collector = callScope.launch(start = CoroutineStart.LAZY) {
                 session.state.collect { state ->
@@ -127,7 +125,7 @@ private class DefaultVoiceAgentStartOperation(
             call = ActiveVoiceAgentCall(
                 token = token,
                 request = request,
-                route = session.routeMetadata,
+                route = routeMetadata,
                 session = session,
                 callScope = callScope,
                 callJob = callJob,
@@ -155,23 +153,36 @@ private class DefaultVoiceAgentStartOperation(
                 VoiceAgentStartOutcome.FailedClean(error)
             }
             is VoiceAgentCleanupResult.Failed -> {
-                error.addSuppressedDistinct(result.error)
+                error.addVoiceAgentSuppressedDistinct(result.error)
                 VoiceAgentStartOutcome.FailedDirty(error, startupCleanup)
             }
         }
     }
 
-    private suspend fun cleanCurrentResourceAfterCancellation(): Throwable? = withContext(NonCancellable) {
+    private suspend fun finishResourceCancellation(
+        cancellation: CancellationException,
+    ): VoiceAgentStartOutcome {
+        val canonical = cancellation.canonicalVoiceAgentCancellation()
         val cleanup = when (val target = startupCleanup.currentTarget()) {
-            StartupCleanupTarget.None -> return@withContext null
+            StartupCleanupTarget.None -> return VoiceAgentStartOutcome.FailedClean(canonical)
             is StartupCleanupTarget.Owned -> target.cleanup
         }
-        when (val result = cleanup.run(VoiceAgentCleanupMode.Immediate)) {
-            VoiceAgentCleanupResult.Completed -> {
-                startupCleanup.clearDelegate(cleanup)
-                null
+        return withContext(NonCancellable) {
+            val result = try {
+                cleanup.run(VoiceAgentCleanupMode.Immediate)
+            } catch (cleanupError: Throwable) {
+                VoiceAgentCleanupResult.Failed(cleanupError)
             }
-            is VoiceAgentCleanupResult.Failed -> result.error
+            when (result) {
+                VoiceAgentCleanupResult.Completed -> {
+                    startupCleanup.clearDelegate(cleanup)
+                    VoiceAgentStartOutcome.FailedClean(canonical)
+                }
+                is VoiceAgentCleanupResult.Failed -> {
+                    canonical.addVoiceAgentSuppressedDistinct(result.error)
+                    VoiceAgentStartOutcome.FailedDirty(canonical, startupCleanup)
+                }
+            }
         }
     }
 
@@ -327,21 +338,4 @@ private fun Throwable?.appendStartupFailure(error: Throwable): Throwable = when 
     this == null -> error
     this !== error && error !in suppressed -> apply { addSuppressed(error) }
     else -> this
-}
-
-private fun Throwable.addSuppressedDistinct(error: Throwable) {
-    if (error !== this && error !in suppressed) addSuppressed(error)
-}
-
-private fun CancellationException.canonicalStartupCancellation(): CancellationException {
-    var canonical = this
-    val visited = Collections.newSetFromMap(
-        IdentityHashMap<CancellationException, Boolean>(),
-    )
-    visited += canonical
-    while (true) {
-        val original = canonical.cause as? CancellationException ?: return canonical
-        if (original.message != canonical.message || !visited.add(original)) return canonical
-        canonical = original
-    }
 }

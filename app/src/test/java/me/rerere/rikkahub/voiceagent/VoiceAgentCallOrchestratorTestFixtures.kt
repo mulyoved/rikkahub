@@ -30,12 +30,19 @@ internal class OrchestratorFakeRoute {
 
 internal class OrchestratorFakeSession(
     initialState: VoiceAgentUiState = VoiceAgentUiState(session = VoiceSessionStatus.Connected),
-    override val routeMetadata: VoiceAgentRouteMetadata = VoiceAgentRouteMetadata(VoiceAudioRouteOwner.Telecom),
+    routeMetadata: VoiceAgentRouteMetadata = VoiceAgentRouteMetadata(VoiceAudioRouteOwner.Telecom),
     override val cleanupOperation: VoiceAgentCleanupOperation = OrchestratorFakeCleanupOperation(),
     private val onStart: () -> Unit = {},
+    private val onRouteMetadataRead: () -> Unit = {},
 ) : RouteOwnedManagedVoiceCallSession {
     private val mutableState = MutableStateFlow(initialState)
+    private val configuredRouteMetadata = routeMetadata
     override val state: StateFlow<VoiceAgentUiState> = mutableState
+    override val routeMetadata: VoiceAgentRouteMetadata
+        get() {
+            onRouteMetadataRead()
+            return configuredRouteMetadata
+        }
     override var isRouteUsable: Boolean = true
     var startCalls = 0
     var interruptCalls = 0
@@ -116,13 +123,6 @@ internal class OrchestratorFakeFactory(
         scopes += scope
         return createResult(request, routeLease, scope)
     }
-
-    override fun create(
-        conversationId: Uuid,
-        config: VoiceAgentLaunchConfig,
-        routeLease: VoiceAgentRouteLease,
-        scope: CoroutineScope,
-    ): RouteOwnedManagedVoiceCallSession = error("createOwned is the only supported test boundary")
 }
 
 internal fun orchestratorRequest(label: String): VoiceAgentCallRequest = VoiceAgentCallRequest(

@@ -1,7 +1,5 @@
 package me.rerere.rikkahub.voiceagent
 
-import java.util.Collections
-import java.util.IdentityHashMap
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -61,7 +59,7 @@ internal class VoiceAgentCallOrchestrator(
         return try {
             reply.await()
         } catch (cancellation: CancellationException) {
-            val canonical = cancellation.canonicalOrchestratorCancellation()
+            val canonical = cancellation.canonicalVoiceAgentCancellation()
             val completion = CompletableDeferred<Throwable?>()
             dispatch(
                 VoiceAgentCallEvent.StartCancelled(
@@ -70,7 +68,7 @@ internal class VoiceAgentCallOrchestrator(
                 ),
             )
             val cleanupFailure = withContext(NonCancellable) { completion.await() }
-            cleanupFailure?.let(canonical::addSuppressedDistinct)
+            cleanupFailure?.let(canonical::addVoiceAgentSuppressedDistinct)
             throw canonical
         }
     }
@@ -237,20 +235,3 @@ internal class VoiceAgentCallOrchestrator(
 }
 
 private fun CoroutineContext.withJob(job: Job): CoroutineContext = minusKey(Job) + job
-
-private fun Throwable.addSuppressedDistinct(error: Throwable) {
-    if (error !== this && error !in suppressed) addSuppressed(error)
-}
-
-private fun CancellationException.canonicalOrchestratorCancellation(): CancellationException {
-    var canonical = this
-    val visited = Collections.newSetFromMap(
-        IdentityHashMap<CancellationException, Boolean>(),
-    )
-    visited += canonical
-    while (true) {
-        val original = canonical.cause as? CancellationException ?: return canonical
-        if (original.message != canonical.message || !visited.add(original)) return canonical
-        canonical = original
-    }
-}
