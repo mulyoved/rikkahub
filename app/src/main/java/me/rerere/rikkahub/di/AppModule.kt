@@ -18,7 +18,6 @@ import me.rerere.rikkahub.utils.JsonInstant
 import me.rerere.rikkahub.utils.SoundEffectPlayer
 import me.rerere.rikkahub.utils.UpdateChecker
 import me.rerere.rikkahub.voiceagent.DefaultVoiceAgentCallFactory
-import me.rerere.rikkahub.voiceagent.DefaultVoiceAgentRouteExecutionDispatchers
 import me.rerere.rikkahub.voiceagent.VoiceAgentAudioRouteResolver
 import me.rerere.rikkahub.voiceagent.VoiceAgentCallFactory
 import me.rerere.rikkahub.voiceagent.VoiceAgentCallManager
@@ -167,7 +166,6 @@ val appModule = module {
             gateway = get(),
             registry = get(),
             cleanupScope = get<AppScope>(),
-            executionDispatchers = DefaultVoiceAgentRouteExecutionDispatchers,
         )
     }
 
