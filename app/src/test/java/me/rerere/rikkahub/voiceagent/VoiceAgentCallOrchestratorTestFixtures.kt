@@ -89,13 +89,6 @@ internal class OrchestratorFakeSession(
         onDiagnostic(name, detail)
     }
 
-    override fun end() = Unit
-
-    override suspend fun endAndDrain() = Unit
-
-    override suspend fun endAndDrainWithin(timeoutMillis: Long) = Unit
-
-    override fun closeNow() = Unit
 }
 
 internal class OrchestratorFakeCleanupOperation(

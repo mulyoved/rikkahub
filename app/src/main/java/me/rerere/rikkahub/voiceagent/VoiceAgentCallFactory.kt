@@ -41,18 +41,7 @@ internal interface VoiceAgentCallFactory {
         request: VoiceAgentCallRequest,
         routeLease: VoiceAgentRouteLease,
         scope: CoroutineScope,
-    ): VoiceAgentSessionCreationResult = VoiceAgentSessionCreationResult.Created(
-        create(request.conversationId, request.config, routeLease, scope),
-    )
-
-    fun create(
-        conversationId: Uuid,
-        config: VoiceAgentLaunchConfig,
-        routeLease: VoiceAgentRouteLease,
-        scope: CoroutineScope,
-    ): RouteOwnedManagedVoiceCallSession = error(
-        "Legacy VoiceAgentCallFactory.create is not implemented",
-    )
+    ): VoiceAgentSessionCreationResult
 }
 
 internal sealed interface VoiceAgentSessionCreationResult {
@@ -114,22 +103,6 @@ internal class DefaultVoiceAgentCallFactory internal constructor(
         observability = observability,
         metadataEpochNowMs = System::currentTimeMillis,
     )
-
-    override fun create(
-        conversationId: Uuid,
-        config: VoiceAgentLaunchConfig,
-        routeLease: VoiceAgentRouteLease,
-        scope: CoroutineScope,
-    ): RouteOwnedManagedVoiceCallSession {
-        try {
-            return createSession(conversationId, config, routeLease, scope)
-        } catch (creationError: Throwable) {
-            runCatching(routeLease::retire)
-                .exceptionOrNull()
-                ?.let(creationError::addSuppressed)
-            throw creationError
-        }
-    }
 
     override suspend fun createOwned(
         request: VoiceAgentCallRequest,

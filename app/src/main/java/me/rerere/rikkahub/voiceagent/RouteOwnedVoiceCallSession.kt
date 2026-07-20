@@ -1,15 +1,17 @@
 package me.rerere.rikkahub.voiceagent
 
-import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.withTimeoutOrNull
-import java.util.Collections
-import java.util.IdentityHashMap
+import kotlinx.coroutines.flow.StateFlow
 
-internal interface RouteOwnedManagedVoiceCallSession : ManagedVoiceCallSession {
+internal interface RouteOwnedManagedVoiceCallSession {
+    val state: StateFlow<VoiceAgentUiState>
     val routeMetadata: VoiceAgentRouteMetadata
     val isRouteUsable: Boolean
     val cleanupOperation: VoiceAgentCleanupOperation
-    suspend fun endAndDrainWithin(timeoutMillis: Long)
+    fun start()
+    fun interrupt()
+    fun setMuted(value: Boolean)
+    fun reconnect()
+    fun recordDiagnostic(name: String, detail: String)
 }
 
 internal class RouteOwnedVoiceCallSession(
@@ -35,72 +37,4 @@ internal class RouteOwnedVoiceCallSession(
     override fun reconnect() = delegate.reconnect()
 
     override fun recordDiagnostic(name: String, detail: String) = delegate.recordDiagnostic(name, detail)
-
-    override fun end() = runVoiceAgentCleanupStages(routeLease::retire, delegate::end)
-
-    override suspend fun endAndDrain() = runVoiceAgentSuspendCleanupStages(
-        { routeLease.retire() },
-        delegate::endAndDrain,
-    )
-
-    override suspend fun endAndDrainWithin(timeoutMillis: Long) {
-        require(timeoutMillis > 0) { "timeoutMillis must be positive" }
-        var failure = runCatching(routeLease::retire).exceptionOrNull()
-        var drainFailure: Throwable? = null
-        val completedNormally = try {
-            withTimeoutOrNull(timeoutMillis) {
-                delegate.endAndDrain()
-                true
-            } ?: false
-        } catch (cancellation: CancellationException) {
-            failure = closeDelegateNow(failure)
-            val callerCancellation = cancellation.canonicalCancellation()
-            failure?.takeIf { it !== callerCancellation }?.let(callerCancellation::addSuppressed)
-            throw callerCancellation
-        } catch (error: Throwable) {
-            drainFailure = error
-            false
-        }
-        if (completedNormally) {
-            failure?.let { throw it }
-            return
-        }
-
-        drainFailure?.let { failure = failure.withEndDrainFailure(it) }
-        if (drainFailure != null) {
-            failure = closeDelegateNow(failure)
-            throw checkNotNull(failure)
-        }
-
-        failure = failure.withEndDrainFailure(VoiceAgentEndDrainTimeoutException(timeoutMillis))
-        failure = closeDelegateNow(failure)
-        throw checkNotNull(failure)
-    }
-
-    private fun closeDelegateNow(failure: Throwable?): Throwable? =
-        runCatching(delegate::closeNow)
-            .exceptionOrNull()
-            ?.let { closeFailure -> failure.withEndDrainFailure(closeFailure) }
-            ?: failure
-
-    override fun closeNow() = runVoiceAgentCleanupStages(routeLease::retire, delegate::closeNow)
-}
-
-private fun Throwable?.withEndDrainFailure(error: Throwable): Throwable = when {
-    this == null -> error
-    this !== error -> apply { addSuppressed(error) }
-    else -> this
-}
-
-private fun CancellationException.canonicalCancellation(): CancellationException {
-    var canonical = this
-    val visited = Collections.newSetFromMap(
-        IdentityHashMap<CancellationException, Boolean>(),
-    )
-    visited += canonical
-    while (true) {
-        val original = canonical.cause as? CancellationException ?: return canonical
-        if (original.message != canonical.message || !visited.add(original)) return canonical
-        canonical = original
-    }
 }

@@ -2,6 +2,7 @@ package me.rerere.rikkahub.voiceagent
 
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 
 internal class FakeTelecomGateway(
@@ -119,3 +120,12 @@ internal object ImmediateOutcomeTimeout : VoiceAgentTelecomOutcomeTimeout {
         observe: suspend () -> VoiceAgentTelecomOutcome,
     ): VoiceAgentTelecomOutcome? = null
 }
+
+internal class CanonicalCancellationException(
+    @Suppress("unused") private val identityMarker: Any,
+) : CancellationException("cancel matching waiter")
+
+internal class NonCopyableCleanupException(
+    @Suppress("unused") private val identityMarker: Any,
+    message: String,
+) : IllegalStateException(message)

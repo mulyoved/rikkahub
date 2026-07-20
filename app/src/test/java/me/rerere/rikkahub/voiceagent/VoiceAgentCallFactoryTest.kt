@@ -239,12 +239,15 @@ class VoiceAgentCallFactoryTest {
             }
             assertTrue(registry.activate(attempt, telecomCall))
             registry.acknowledgeOutcome(attempt)
-            val session = factory.create(
-                conversationId = conversationId,
-                config = factoryLaunchConfig(voiceModelId = "factory-gemini"),
+            val creation = factory.createOwned(
+                request = VoiceAgentCallRequest(
+                    conversationId = conversationId,
+                    config = factoryLaunchConfig(voiceModelId = "factory-gemini"),
+                ),
                 routeLease = registry.consumeActiveOutcome(attempt).requireResolvedLease(),
                 scope = sessionScope,
             )
+            val session = (creation as VoiceAgentSessionCreationResult.Created).session
             assertTrue(sessionMobileApi != null)
             assertSame(sessionMobileApi, toolMobileApi)
             assertEquals(VoiceAudioRouteOwner.Telecom, audioRouteOwner)
@@ -279,57 +282,15 @@ class VoiceAgentCallFactoryTest {
                 started.boolean("sentryTracingEnabled"),
             )
             assertTrue(started.boolean("sentryPropagationCreated"))
-            session.closeNow()
+            assertSame(
+                VoiceAgentCleanupResult.Completed,
+                session.cleanupOperation.run(VoiceAgentCleanupMode.Immediate),
+            )
             assertEquals(1, disconnectCalls)
             assertFalse(registry.isOwnedAttemptActive(attempt))
         } finally {
             blockedConnect?.release?.complete(Unit)
             sessionScope.cancel()
-            root.deleteRecursively()
-        }
-    }
-
-    @Test
-    fun `default call factory keeps creation failure primary and suppresses lease retirement failure`() = runTest {
-        val root = Files.createTempDirectory("voice-factory-failure").toFile()
-        val creationFailure = IllegalStateException("session API creation failed")
-        val retirementFailure = IllegalArgumentException("Telecom retirement failed")
-        val context = object : ContextWrapper(null) {
-            override fun getNoBackupFilesDir(): File = root
-            override fun getPackageName(): String = "me.rerere.rikkahub.factorytest"
-        }
-        val registry = VoiceAgentTelecomCallRegistry()
-        val attempt = registry.beginAttempt().requireAllocatedAttemptId()
-        val telecomCall = object : VoiceAgentTelecomCall {
-            override fun disconnectFromApp() {
-                throw retirementFailure
-            }
-        }
-        assertTrue(registry.activate(attempt, telecomCall))
-        registry.acknowledgeOutcome(attempt)
-        val factory = DefaultVoiceAgentCallFactory(
-            context = context,
-            chatService = null,
-            settingsStore = null,
-            okHttpClient = okhttp3.OkHttpClient(),
-            observability = NoOpVoiceObservability,
-            metadataEpochNowMs = { 1_700_000_010_000 },
-            sessionApiFactory = { throw creationFailure },
-        )
-
-        try {
-            val thrown = runCatching {
-                factory.create(
-                    conversationId = Uuid.random(),
-                    config = factoryLaunchConfig(),
-                    routeLease = registry.consumeActiveOutcome(attempt).requireResolvedLease(),
-                    scope = this,
-                )
-            }.exceptionOrNull()
-
-            assertSame(creationFailure, thrown)
-            assertEquals(listOf(retirementFailure), thrown?.suppressed?.toList())
-        } finally {
             root.deleteRecursively()
         }
     }

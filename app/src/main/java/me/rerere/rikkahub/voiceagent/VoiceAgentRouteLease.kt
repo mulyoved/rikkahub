@@ -36,7 +36,7 @@ internal sealed interface UndeliveredRouteRetirement {
     ) : UndeliveredRouteRetirement
 }
 
-internal class UndeliveredRouteCleanupClaim internal constructor(
+internal class UndeliveredRouteRetirementOwner internal constructor(
     internal val lease: TelecomVoiceAgentRouteLease,
     internal val attempt: SynchronousAttemptResult = SynchronousAttemptResult(),
 ) {
@@ -109,7 +109,7 @@ internal class TelecomVoiceAgentRouteLease(
     }
 
     internal fun rejectUndeliveredCleanupScheduling(
-        claim: UndeliveredRouteCleanupClaim,
+        claim: UndeliveredRouteRetirementOwner,
         error: Throwable,
     ) {
         registry.rejectUndeliveredRouteCleanup(attemptId, this, claim, error)

@@ -922,21 +922,6 @@ private class InertRouteOwnedSession(
         resourceCalls += 1
     }
 
-    override fun end() {
-        resourceCalls += 1
-    }
-
-    override suspend fun endAndDrain() {
-        resourceCalls += 1
-    }
-
-    override suspend fun endAndDrainWithin(timeoutMillis: Long) {
-        resourceCalls += 1
-    }
-
-    override fun closeNow() {
-        resourceCalls += 1
-    }
 }
 
 private val ActiveVoiceAgentCall.testSession: InertRouteOwnedSession

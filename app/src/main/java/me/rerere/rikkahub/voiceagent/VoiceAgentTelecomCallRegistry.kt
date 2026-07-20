@@ -413,14 +413,14 @@ class VoiceAgentTelecomCallRegistry internal constructor(
         id: VoiceAgentTelecomAttemptId,
         lease: TelecomVoiceAgentRouteLease,
     ): UndeliveredRouteCleanupAcquisition = synchronized(lock) {
-        val claim = UndeliveredRouteCleanupClaim(lease)
+        val claim = UndeliveredRouteRetirementOwner(lease)
         acquireUndeliveredRouteCleanup(id, attempts[id], lease, claim)
     }
 
     internal fun continueClaimedUndeliveredRouteCleanup(
         id: VoiceAgentTelecomAttemptId,
         lease: TelecomVoiceAgentRouteLease,
-        claim: UndeliveredRouteCleanupClaim,
+        claim: UndeliveredRouteRetirementOwner,
     ): UndeliveredRouteCleanupStep = synchronized(lock) {
         continueUndeliveredRouteCleanup(id, attempts[id], lease, claim)
     }
@@ -428,7 +428,7 @@ class VoiceAgentTelecomCallRegistry internal constructor(
     internal fun retireClaimedUndeliveredRoute(
         id: VoiceAgentTelecomAttemptId,
         lease: TelecomVoiceAgentRouteLease,
-        claim: UndeliveredRouteCleanupClaim,
+        claim: UndeliveredRouteRetirementOwner,
     ) {
         val work = synchronized(lock) {
             val record = requireNotNull(attempts[id]) {
@@ -455,7 +455,7 @@ class VoiceAgentTelecomCallRegistry internal constructor(
     internal fun completeUndeliveredRouteCleanup(
         id: VoiceAgentTelecomAttemptId,
         lease: TelecomVoiceAgentRouteLease,
-        claim: UndeliveredRouteCleanupClaim,
+        claim: UndeliveredRouteRetirementOwner,
         result: Result<Unit>,
     ) {
         synchronized(lock) {
@@ -466,7 +466,7 @@ class VoiceAgentTelecomCallRegistry internal constructor(
                 val phase = record.phase as? AttemptPhase.RetirementFailed.RouteLease
                     ?: error("Telecom attempt ${id.value} did not retain claimed cleanup failure")
                 val ownership = phase.ownership
-                val claimed = ownership.delivery as? RouteLeaseDelivery.CleanupClaimed
+                val claimed = ownership.delivery as? RouteLeaseDelivery.RetirementOwned
                 check(ownership.lease === lease && claimed?.claim === claim) {
                     "Telecom attempt ${id.value} completed a different cleanup claim"
                 }
@@ -485,7 +485,7 @@ class VoiceAgentTelecomCallRegistry internal constructor(
     internal fun rejectUndeliveredRouteCleanup(
         id: VoiceAgentTelecomAttemptId,
         lease: TelecomVoiceAgentRouteLease,
-        claim: UndeliveredRouteCleanupClaim,
+        claim: UndeliveredRouteRetirementOwner,
         error: Throwable,
     ) {
         val decision = synchronized(lock) {
