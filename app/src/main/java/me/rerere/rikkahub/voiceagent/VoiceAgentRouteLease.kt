@@ -1,5 +1,6 @@
 package me.rerere.rikkahub.voiceagent
 
+import kotlinx.coroutines.CompletableDeferred
 import me.rerere.rikkahub.voiceagent.audio.VoiceAudioRouteOwner
 
 data class VoiceAgentRouteMetadata(
@@ -35,6 +36,24 @@ internal sealed interface UndeliveredRouteRetirement {
     ) : UndeliveredRouteRetirement
 }
 
+internal class UndeliveredRouteCleanupClaim internal constructor(
+    internal val lease: TelecomVoiceAgentRouteLease,
+    internal val attempt: SynchronousAttemptResult = SynchronousAttemptResult(),
+) {
+    private val completion = CompletableDeferred<Result<Unit>>()
+
+    internal fun publishAttemptAndCompletion(result: Result<Unit>) {
+        attempt.publish(result)
+        publishCompletion(result)
+    }
+
+    internal fun publishCompletion(result: Result<Unit>) {
+        check(completion.complete(result)) { "Undelivered route cleanup claim was already completed" }
+    }
+
+    internal suspend fun awaitResult(): Result<Unit> = completion.await()
+}
+
 internal class TelecomVoiceAgentRouteLease(
     private val attemptId: VoiceAgentTelecomAttemptId,
     private val registry: VoiceAgentTelecomCallRegistry,
@@ -47,6 +66,25 @@ internal class TelecomVoiceAgentRouteLease(
 
     override fun retire() = retirement.retire {
         registry.retireOwnedAttempt(attemptId, this)
+    }
+
+    internal fun claimUndeliveredCleanup(): UndeliveredRouteCleanupClaim =
+        registry.claimUndeliveredRouteCleanup(attemptId, this)
+
+    internal fun executeUndeliveredCleanup(claim: UndeliveredRouteCleanupClaim) {
+        val result = runCatching {
+            retirement.retire {
+                registry.retireClaimedUndeliveredRoute(attemptId, this, claim)
+            }
+        }
+        registry.completeUndeliveredRouteCleanup(attemptId, this, claim, result)
+    }
+
+    internal fun rejectUndeliveredCleanupScheduling(
+        claim: UndeliveredRouteCleanupClaim,
+        error: Throwable,
+    ) {
+        registry.rejectUndeliveredRouteCleanup(attemptId, this, claim, error)
     }
 
     fun retireUndelivered(): UndeliveredRouteRetirement {

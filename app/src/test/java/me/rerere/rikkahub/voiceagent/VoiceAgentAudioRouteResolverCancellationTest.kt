@@ -9,12 +9,13 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.thread
-import kotlin.coroutines.CoroutineContext
 import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
@@ -34,44 +35,39 @@ class VoiceAgentAudioRouteResolverCancellationTest {
         val gateway = DeliveryGateTelecomGateway { attempt ->
             assertTrue(registry.activate(attempt, call))
         }
-        val dispatcher = FinalDeliveryGateDispatcher()
         val observedFailure = AtomicReference<Throwable>()
         val resolutionReturned = CountDownLatch(1)
+        val cancellation = CancellationException("cancel armed resolved delivery")
 
-        try {
-            val resolution = async(dispatcher, start = CoroutineStart.UNDISPATCHED) {
-                try {
-                    VoiceAgentAudioRouteResolver(gateway, registry, 1_000).resolve()
-                } catch (error: Throwable) {
-                    observedFailure.set(error)
-                    throw error
-                } finally {
-                    resolutionReturned.countDown()
-                }
+        val resolution = async(start = CoroutineStart.UNDISPATCHED) {
+            try {
+                VoiceAgentAudioRouteResolver(
+                    gateway = gateway,
+                    registry = registry,
+                    timeoutMs = 1_000,
+                    deliveryProbe = VoiceAgentRouteDeliveryProbe { job -> job.cancel(cancellation) },
+                ).resolve()
+            } catch (error: Throwable) {
+                observedFailure.set(error)
+                throw error
+            } finally {
+                resolutionReturned.countDown()
             }
-            assertTrue(dispatcher.deliveryArmed.await(1, TimeUnit.SECONDS))
-            val cancellation = CancellationException("cancel armed resolved delivery")
-
-            resolution.cancel(cancellation)
-            dispatcher.releaseDelivery.countDown()
-
-            assertTrue(resolutionReturned.await(1, TimeUnit.SECONDS))
-            val thrown = observedFailure.get()
-            assertTrue(thrown is CancellationException)
-            assertEquals(cancellation.message, thrown.message)
-            assertEquals(0, thrown.suppressed.size)
-            assertEquals(1, call.disconnectCalls.get())
-            withTimeout(1_000) {
-                assertAttemptWasConsumed(registry, VoiceAgentTelecomAttemptId(1))
-            }
-
-            val next = registry.beginAttempt().requireAllocatedAttemptId()
-            assertEquals(2L, next.value)
-            registry.retireAttempt(next, VoiceAgentTelecomFailure("test_cleanup", "test cleanup"))
-            registry.awaitOutcome(next)
-        } finally {
-            dispatcher.close()
         }
+        assertTrue(resolutionReturned.await(1, TimeUnit.SECONDS))
+        val thrown = observedFailure.get()
+        assertTrue(thrown is CancellationException)
+        assertEquals(cancellation.message, thrown.message)
+        assertEquals(0, thrown.suppressed.size)
+        assertEquals(1, call.disconnectCalls.get())
+        withTimeout(1_000) {
+            assertAttemptWasConsumed(registry, VoiceAgentTelecomAttemptId(1))
+        }
+
+        val next = registry.beginAttempt().requireAllocatedAttemptId()
+        assertEquals(2L, next.value)
+        registry.retireAttempt(next, VoiceAgentTelecomFailure("test_cleanup", "test cleanup"))
+        registry.awaitOutcome(next)
         Unit
     }
 
@@ -84,9 +80,11 @@ class VoiceAgentAudioRouteResolverCancellationTest {
         val releaseRetry = CountDownLatch(1)
         val events = mutableListOf<String>()
         val registry = VoiceAgentTelecomCallRegistry(
-            afterActivationOutcomeSelected = { _, _ -> },
-            beforeFailedRetirementResultPublished = {},
-            beforeRouteRetirementJoin = retryJoined::countDown,
+            probe = VoiceAgentTelecomRegistryProbe { event ->
+                if (event is VoiceAgentTelecomRegistryProbeEvent.RouteRetirementJoining) {
+                    retryJoined.countDown()
+                }
+            },
         )
         val oldCall = DeliveryGateTelecomCall(
             cleanupFailure = cleanupFailureRef,
@@ -103,15 +101,27 @@ class VoiceAgentAudioRouteResolverCancellationTest {
         val initialGateway = DeliveryGateTelecomGateway { attempt ->
             assertTrue(registry.activate(attempt, oldCall))
         }
-        val dispatcher = FinalDeliveryGateDispatcher()
         val observedFailure = AtomicReference<Throwable>()
         val resolutionReturned = CountDownLatch(1)
         val beginExecutor = Executors.newFixedThreadPool(2)
+        val resolverExecutor = Executors.newSingleThreadExecutor()
+        val resolverDispatcher = resolverExecutor.asCoroutineDispatcher()
+        val cleanupExecutor = Executors.newSingleThreadExecutor()
+        val cleanupDispatcher = cleanupExecutor.asCoroutineDispatcher()
+        val cleanupScope = CoroutineScope(SupervisorJob() + cleanupDispatcher)
+        val cancellation = CancellationException("cancel armed route with failing cleanup")
 
         try {
-            val resolution = async(dispatcher, start = CoroutineStart.UNDISPATCHED) {
+            async(resolverDispatcher) {
                 try {
-                    VoiceAgentAudioRouteResolver(initialGateway, registry, 1_000).resolve()
+                    VoiceAgentAudioRouteResolver(
+                        gateway = initialGateway,
+                        registry = registry,
+                        timeoutMs = 1_000,
+                        cleanupScope = cleanupScope,
+                        cleanupDispatcher = cleanupDispatcher,
+                        deliveryProbe = VoiceAgentRouteDeliveryProbe { job -> job.cancel(cancellation) },
+                    ).resolve()
                 } catch (error: Throwable) {
                     observedFailure.set(error)
                     throw error
@@ -119,12 +129,6 @@ class VoiceAgentAudioRouteResolverCancellationTest {
                     resolutionReturned.countDown()
                 }
             }
-            assertTrue(dispatcher.deliveryArmed.await(1, TimeUnit.SECONDS))
-            val cancellation = CancellationException("cancel armed route with failing cleanup")
-
-            resolution.cancel(cancellation)
-            dispatcher.releaseDelivery.countDown()
-
             assertTrue(resolutionReturned.await(1, TimeUnit.SECONDS))
             val thrown = observedFailure.get()
             assertTrue(thrown is CancellationException)
@@ -179,8 +183,12 @@ class VoiceAgentAudioRouteResolverCancellationTest {
         } finally {
             releaseRetry.countDown()
             cleanupFailureRef.set(null)
-            dispatcher.close()
             beginExecutor.shutdownNow()
+            resolverDispatcher.close()
+            resolverExecutor.shutdownNow()
+            cleanupScope.cancel()
+            cleanupDispatcher.close()
+            cleanupExecutor.shutdownNow()
         }
         Unit
     }
@@ -203,14 +211,19 @@ class VoiceAgentAudioRouteResolverCancellationTest {
                 }.exceptionOrNull(),
             )
         }
-        val dispatcher = FinalDeliveryGateDispatcher()
         val observedFailure = AtomicReference<Throwable>()
         val resolutionReturned = CountDownLatch(1)
+        val cancellation = CancellationException("cancel armed cleanup failure")
 
         try {
-            val resolution = async(dispatcher, start = CoroutineStart.UNDISPATCHED) {
+            async(start = CoroutineStart.UNDISPATCHED) {
                 try {
-                    VoiceAgentAudioRouteResolver(gateway, registry, 1_000).resolve()
+                    VoiceAgentAudioRouteResolver(
+                        gateway = gateway,
+                        registry = registry,
+                        timeoutMs = 1_000,
+                        deliveryProbe = VoiceAgentRouteDeliveryProbe { job -> job.cancel(cancellation) },
+                    ).resolve()
                 } catch (error: Throwable) {
                     observedFailure.set(error)
                     throw error
@@ -218,12 +231,6 @@ class VoiceAgentAudioRouteResolverCancellationTest {
                     resolutionReturned.countDown()
                 }
             }
-            assertTrue(dispatcher.deliveryArmed.await(1, TimeUnit.SECONDS))
-            val cancellation = CancellationException("cancel armed cleanup failure")
-
-            resolution.cancel(cancellation)
-            dispatcher.releaseDelivery.countDown()
-
             assertTrue(resolutionReturned.await(1, TimeUnit.SECONDS))
             val thrown = observedFailure.get()
             assertTrue(thrown is CancellationException)
@@ -240,7 +247,6 @@ class VoiceAgentAudioRouteResolverCancellationTest {
             registry.awaitOutcome(next)
         } finally {
             cleanupFailureRef.set(null)
-            dispatcher.close()
         }
         Unit
     }
@@ -250,11 +256,11 @@ class VoiceAgentAudioRouteResolverCancellationTest {
         val claimEntered = CountDownLatch(1)
         val releaseClaim = CountDownLatch(1)
         val registry = VoiceAgentTelecomCallRegistry(
-            afterActivationOutcomeSelected = { _, _ -> },
-            beforeFailedRetirementResultPublished = {},
-            afterActiveOutcomeClaimed = {
-                claimEntered.countDown()
-                check(releaseClaim.await(5, TimeUnit.SECONDS)) { "active claim was not released" }
+            probe = VoiceAgentTelecomRegistryProbe { event ->
+                if (event is VoiceAgentTelecomRegistryProbeEvent.ActiveOutcomeClaimed) {
+                    claimEntered.countDown()
+                    check(releaseClaim.await(5, TimeUnit.SECONDS)) { "active claim was not released" }
+                }
             },
         )
         val telecomCall = ResolverFakeCall()
@@ -315,9 +321,11 @@ class VoiceAgentAudioRouteResolverCancellationTest {
         val releaseCleanup = CountDownLatch(1)
         val consumptionJoinEntered = CountDownLatch(1)
         val registry = VoiceAgentTelecomCallRegistry(
-            afterActivationOutcomeSelected = { _, _ -> },
-            beforeFailedRetirementResultPublished = {},
-            beforeRouteRetirementJoin = consumptionJoinEntered::countDown,
+            probe = VoiceAgentTelecomRegistryProbe { event ->
+                if (event is VoiceAgentTelecomRegistryProbeEvent.RouteRetirementJoining) {
+                    consumptionJoinEntered.countDown()
+                }
+            },
         )
         val activeCall = CallbackFaithfulResolverCall(
             registry = registry,
@@ -816,31 +824,6 @@ class VoiceAgentAudioRouteResolverCancellationTest {
         assertFalse(accepted.get())
         assertEquals(1, call.disconnectCalls)
         assertFalse(registry.isOwnedAttemptActive(requireNotNull(attempt)))
-    }
-}
-
-private class FinalDeliveryGateDispatcher : CoroutineDispatcher(), AutoCloseable {
-    private val executor = Executors.newSingleThreadExecutor()
-    private val dispatches = AtomicInteger()
-    val deliveryArmed = CountDownLatch(1)
-    val releaseDelivery = CountDownLatch(1)
-
-    override fun dispatch(context: CoroutineContext, block: Runnable) {
-        val dispatch = dispatches.incrementAndGet()
-        executor.execute {
-            if (dispatch == 2) {
-                deliveryArmed.countDown()
-                check(releaseDelivery.await(5, TimeUnit.SECONDS)) {
-                    "armed delivery was not released"
-                }
-            }
-            block.run()
-        }
-    }
-
-    override fun close() {
-        releaseDelivery.countDown()
-        executor.shutdownNow()
     }
 }
 

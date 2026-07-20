@@ -1,68 +1,11 @@
 package me.rerere.rikkahub.voiceagent
 
-import kotlinx.coroutines.CompletableDeferred
 import me.rerere.rikkahub.voiceagent.audio.VoiceAudioRouteOwner
 
-interface VoiceAgentTelecomCall {
-    fun disconnectFromApp()
-}
-
-@JvmInline
-value class VoiceAgentTelecomAttemptId(val value: Long)
-
-data class VoiceAgentTelecomFailure(
-    val diagnosticName: String,
-    val detail: String,
-)
-
-sealed interface VoiceAgentTelecomAttemptStartResult {
-    data class Allocated(
-        val attemptId: VoiceAgentTelecomAttemptId,
-    ) : VoiceAgentTelecomAttemptStartResult
-
-    data class CleanupFailed(
-        val error: Throwable,
-    ) : VoiceAgentTelecomAttemptStartResult
-}
-
-sealed interface VoiceAgentTelecomOutcome {
-    data object Active : VoiceAgentTelecomOutcome
-
-    data class Failed(val failure: VoiceAgentTelecomFailure) : VoiceAgentTelecomOutcome
-
-    data class CleanupFailed(
-        val failure: VoiceAgentTelecomFailure,
-        val cleanupError: Throwable,
-    ) : VoiceAgentTelecomOutcome
-}
-
 class VoiceAgentTelecomCallRegistry internal constructor(
-    private val afterActivationOutcomeSelected: (
-        VoiceAgentTelecomAttemptId,
-        VoiceAgentTelecomOutcome,
-    ) -> Unit,
-    private val beforeFailedRetirementResultPublished: () -> Unit,
-    private val afterFailedRetirementResultPublished: () -> Unit = {},
-    private val beforeRouteRetirementJoin: () -> Unit = {},
-    private val afterActiveOutcomeClaimed: () -> Unit = {},
-    private val beforeUndeliveredRouteRetryResultPublished: () -> Unit = {},
+    private val probe: VoiceAgentTelecomRegistryProbe = NoOpVoiceAgentTelecomRegistryProbe,
 ) {
-    internal constructor(
-        afterActivationOutcomeSelected: (
-            VoiceAgentTelecomAttemptId,
-            VoiceAgentTelecomOutcome,
-        ) -> Unit,
-    ) : this(
-        afterActivationOutcomeSelected,
-        beforeFailedRetirementResultPublished = {},
-        afterFailedRetirementResultPublished = {},
-    )
-
-    constructor() : this(
-        afterActivationOutcomeSelected = { _, _ -> },
-        beforeFailedRetirementResultPublished = {},
-        afterFailedRetirementResultPublished = {},
-    )
+    constructor() : this(NoOpVoiceAgentTelecomRegistryProbe)
 
     private val lock = Any()
     private val attempts = mutableMapOf<VoiceAgentTelecomAttemptId, AttemptRecord>()
@@ -86,7 +29,7 @@ class VoiceAgentTelecomCallRegistry internal constructor(
                     }
                 }
                 is BeginAttemptDecision.JoinUndeliveredRoute -> {
-                    beforeRouteRetirementJoin()
+                    probe.onEvent(VoiceAgentTelecomRegistryProbeEvent.RouteRetirementJoining)
                     val cleanupError = decision.attempt.awaitResult().exceptionOrNull()
                     if (cleanupError != null) {
                         return VoiceAgentTelecomAttemptStartResult.CleanupFailed(cleanupError)
@@ -117,7 +60,7 @@ class VoiceAgentTelecomCallRegistry internal constructor(
 
     private fun decideBeginAttempt(): BeginAttemptDecision = synchronized(lock) {
         attempts.entries.firstNotNullOfOrNull { (id, record) ->
-            predecessorDecisionLocked(id, record)
+            predecessorDecision(id, record)
         }?.let { return@synchronized it }
 
         check(nextAttemptId < Long.MAX_VALUE) { "Telecom attempt IDs exhausted" }
@@ -135,10 +78,11 @@ class VoiceAgentTelecomCallRegistry internal constructor(
             AttemptPhase.Pending -> {
                 val outcome = VoiceAgentTelecomOutcome.Failed(checkNotNull(supersededFailure))
                 previousRecord.phase = AttemptPhase.Failed(outcome.failure)
-                supersededPublication = selectOutcomeLocked(previousRecord, outcome)
+                supersededPublication = previousRecord.selectOutcome(outcome)
             }
             is AttemptPhase.Active,
             is AttemptPhase.Activating,
+            is AttemptPhase.CleaningUndeliveredRoute,
             is AttemptPhase.Retiring,
             is AttemptPhase.RetirementFailed,
             is AttemptPhase.RetiredUndeliveredRoute,
@@ -151,90 +95,6 @@ class VoiceAgentTelecomCallRegistry internal constructor(
         attempts[id] = AttemptRecord(id)
         currentAttemptId = id
         BeginAttemptDecision.Allocated(id, supersededPublication)
-    }
-
-    private fun predecessorDecisionLocked(
-        id: VoiceAgentTelecomAttemptId,
-        record: AttemptRecord,
-    ): BeginAttemptDecision? = when (val phase = record.phase) {
-        is AttemptPhase.RetirementFailed -> {
-            when (val ownership = phase.ownership) {
-                is RetirementOwnership.Registry -> {
-                    requireExactRegistryOwnership(id, ownership)
-                    record.phase = AttemptPhase.Retiring(
-                        connection = phase.connection,
-                        failure = phase.outcomeFailure,
-                        attempt = SynchronousAttemptResult(),
-                        ownership = ownership,
-                        execution = RetirementExecution.Synchronous,
-                    )
-                    BeginAttemptDecision.Retry(id, record, phase.connection)
-                }
-                is RetirementOwnership.RouteLease -> when (val delivery = ownership.delivery) {
-                    RouteLeaseDelivery.Delivered -> BeginAttemptDecision.CleanupFailed(phase.cleanupError)
-                    RouteLeaseDelivery.RetainedUndelivered -> {
-                        val attempt = SynchronousAttemptResult()
-                        record.phase = phase.copy(
-                            ownership = ownership.copy(
-                                delivery = RouteLeaseDelivery.RetryingUndelivered(attempt),
-                            ),
-                        )
-                        BeginAttemptDecision.RetryUndeliveredRoute(
-                            id = id,
-                            lease = ownership.lease,
-                            attempt = attempt,
-                        )
-                    }
-                    is RouteLeaseDelivery.RetryingUndelivered -> {
-                        BeginAttemptDecision.JoinUndeliveredRoute(delivery.attempt)
-                    }
-                }
-            }
-        }
-        is AttemptPhase.Retiring -> {
-            when (val ownership = phase.ownership) {
-                is RetirementOwnership.Registry -> requireExactRegistryOwnership(id, ownership)
-                is RetirementOwnership.RouteLease -> {
-                    val delivery = ownership.delivery
-                    if (delivery is RouteLeaseDelivery.RetryingUndelivered) {
-                        return BeginAttemptDecision.JoinUndeliveredRoute(delivery.attempt)
-                    }
-                }
-            }
-            BeginAttemptDecision.Join(phase.attempt)
-        }
-        is AttemptPhase.RetiredUndeliveredRoute -> {
-            BeginAttemptDecision.JoinUndeliveredRoute(phase.retry.attempt)
-        }
-        is AttemptPhase.Active -> {
-            (phase.ownership as? RetirementOwnership.Registry)?.let { ownership ->
-                requireExactRegistryOwnership(id, ownership)
-            }
-            record.phase = AttemptPhase.Retiring(
-                connection = phase.connection,
-                failure = replacementRequestedFailure(id),
-                attempt = SynchronousAttemptResult(),
-                ownership = phase.ownership,
-                execution = RetirementExecution.Synchronous,
-            )
-            BeginAttemptDecision.Retry(id, record, phase.connection)
-        }
-        is AttemptPhase.Activating -> {
-            val ownership = phase.ownership as? RetirementOwnership.Registry ?: return null
-            requireExactRegistryOwnership(id, ownership)
-            val attempt = SynchronousAttemptResult()
-            record.phase = AttemptPhase.Retiring(
-                connection = phase.connection,
-                failure = replacementRequestedFailure(id),
-                attempt = attempt,
-                ownership = ownership,
-                execution = RetirementExecution.DeferredToActivation,
-            )
-            BeginAttemptDecision.Join(attempt)
-        }
-        AttemptPhase.Pending,
-        is AttemptPhase.Failed,
-        -> null
     }
 
     fun activate(
@@ -270,8 +130,7 @@ class VoiceAgentTelecomCallRegistry internal constructor(
                             connection = connection,
                             failure = failure,
                             attempt = SynchronousAttemptResult(),
-                            ownership = phase.ownership,
-                            execution = RetirementExecution.Synchronous,
+                            execution = RetirementExecution.RegistrySynchronous(phase.ownership),
                         )
                         shouldDisconnect = true
                         false
@@ -281,32 +140,38 @@ class VoiceAgentTelecomCallRegistry internal constructor(
                             connection = connection,
                             failure = failure,
                             attempt = SynchronousAttemptResult(),
-                            ownership = phase.ownership,
-                            execution = RetirementExecution.Synchronous,
+                            execution = RetirementExecution.RegistrySynchronous(phase.ownership),
                         )
                         shouldDisconnect = true
                         false
                     } else {
-                        record.phase = AttemptPhase.Active(
+                        record.phase = AttemptPhase.Active.Registry(
                             connection = connection,
                             ownership = phase.ownership,
                         )
                         publication = checkNotNull(
-                            selectOutcomeLocked(record, VoiceAgentTelecomOutcome.Active),
+                            record.selectOutcome(VoiceAgentTelecomOutcome.Active),
                         )
                         true
                     }
                 }
                 is AttemptPhase.Retiring -> {
                     if (phase.connection === connection) {
-                        when (phase.execution) {
-                            RetirementExecution.DeferredToActivation -> {
-                                record.phase = phase.copy(execution = RetirementExecution.Synchronous)
+                        when (val execution = phase.execution) {
+                            is RetirementExecution.RegistryDeferredToActivation -> {
+                                record.phase = phase.copy(
+                                    execution = RetirementExecution.RegistrySynchronous(execution.ownership),
+                                )
                                 shouldDisconnect = true
                             }
-                            RetirementExecution.Callback -> shouldDisconnect = true
-                            RetirementExecution.Synchronous -> joinedAttempt = phase.attempt
-                            RetirementExecution.PublishingFailure -> joinedAttempt = phase.attempt
+                            is RetirementExecution.RegistryCallback,
+                            is RetirementExecution.RouteCallback,
+                            -> shouldDisconnect = true
+                            is RetirementExecution.RegistrySynchronous,
+                            is RetirementExecution.RouteSynchronous,
+                            is RetirementExecution.RegistryPublishingFailure,
+                            is RetirementExecution.RoutePublishingFailure,
+                            -> joinedAttempt = phase.attempt
                         }
                     } else {
                         shouldDisconnect = true
@@ -315,6 +180,7 @@ class VoiceAgentTelecomCallRegistry internal constructor(
                 }
                 AttemptPhase.Pending,
                 is AttemptPhase.Active,
+                is AttemptPhase.CleaningUndeliveredRoute,
                 is AttemptPhase.Failed,
                 is AttemptPhase.RetiredUndeliveredRoute,
                 -> {
@@ -328,7 +194,9 @@ class VoiceAgentTelecomCallRegistry internal constructor(
             }
         }
         publication?.let { selected ->
-            afterActivationOutcomeSelected(id, selected.outcome)
+            probe.onEvent(
+                VoiceAgentTelecomRegistryProbeEvent.ActivationOutcomeSelected(id, selected.outcome),
+            )
         }
         joinedAttempt?.awaitResult()?.getOrThrow()
 
@@ -353,8 +221,7 @@ class VoiceAgentTelecomCallRegistry internal constructor(
             when (val phase = record.phase) {
                 AttemptPhase.Pending -> {
                     record.phase = AttemptPhase.Failed(failure)
-                    publication = selectOutcomeLocked(
-                        record,
+                    publication = record.selectOutcome(
                         VoiceAgentTelecomOutcome.Failed(failure),
                     )
                 }
@@ -363,11 +230,11 @@ class VoiceAgentTelecomCallRegistry internal constructor(
                         connection = phase.connection,
                         failure = failure,
                         attempt = SynchronousAttemptResult(),
-                        ownership = phase.ownership,
-                        execution = RetirementExecution.DeferredToActivation,
+                        execution = RetirementExecution.RegistryDeferredToActivation(phase.ownership),
                     )
                 }
                 is AttemptPhase.Active,
+                is AttemptPhase.CleaningUndeliveredRoute,
                 is AttemptPhase.Retiring,
                 is AttemptPhase.RetirementFailed,
                 is AttemptPhase.RetiredUndeliveredRoute,
@@ -388,13 +255,13 @@ class VoiceAgentTelecomCallRegistry internal constructor(
     fun acknowledgeOutcome(id: VoiceAgentTelecomAttemptId) {
         synchronized(lock) {
             val record = attempts[id] ?: return
-            if (!record.completion.isCompleted) return
             when (record.phase) {
                 is AttemptPhase.Active,
+                is AttemptPhase.CleaningUndeliveredRoute,
                 is AttemptPhase.Retiring,
                 is AttemptPhase.RetirementFailed,
                 is AttemptPhase.RetiredUndeliveredRoute,
-                -> record.outcomeAcknowledged = true
+                -> record.acknowledgePublishedOutcome()
                 is AttemptPhase.Failed -> {
                     attempts.remove(id)
                     if (currentAttemptId == id) currentAttemptId = null
@@ -419,12 +286,12 @@ class VoiceAgentTelecomCallRegistry internal constructor(
             when (val decision = decideActiveOutcomeConsumption(id)) {
                 is ActiveOutcomeConsumptionDecision.Return -> {
                     if (decision.resolution is VoiceAgentRouteResolution.Resolved) {
-                        afterActiveOutcomeClaimed()
+                        probe.onEvent(VoiceAgentTelecomRegistryProbeEvent.ActiveOutcomeClaimed)
                     }
                     return decision.resolution
                 }
                 is ActiveOutcomeConsumptionDecision.Join -> {
-                    beforeRouteRetirementJoin()
+                    probe.onEvent(VoiceAgentTelecomRegistryProbeEvent.RouteRetirementJoining)
                     decision.attempt.awaitResult()
                 }
             }
@@ -437,27 +304,28 @@ class VoiceAgentTelecomCallRegistry internal constructor(
         val record = attempts[id] ?: return@synchronized ActiveOutcomeConsumptionDecision.Return(
             supersededActiveConsumption(),
         )
-        check(record.selectedOutcome == VoiceAgentTelecomOutcome.Active) {
+        check(record.selectedOutcome() == VoiceAgentTelecomOutcome.Active) {
             "Telecom attempt ${id.value} did not select an active outcome"
         }
         when (val phase = record.phase) {
-            is AttemptPhase.Active -> {
-                val ownership = phase.ownership as? RetirementOwnership.Registry
-                    ?: return@synchronized ActiveOutcomeConsumptionDecision.Return(
-                        supersededActiveConsumption(),
-                    )
-                requireExactRegistryOwnership(id, ownership)
+            is AttemptPhase.Active.Registry -> {
+                requireExactRegistryOwnership(id, phase.ownership)
                 val lease = TelecomVoiceAgentRouteLease(id, this)
-                record.phase = phase.copy(
-                    ownership = RetirementOwnership.RouteLease(
-                        lease = lease,
-                        delivery = RouteLeaseDelivery.Delivered,
-                    ),
+                record.phase = AttemptPhase.Active.RouteDelivered(
+                    connection = phase.connection,
+                    lease = lease,
                 )
-                record.outcomeAcknowledged = true
+                record.acknowledgePublishedOutcome()
                 ActiveOutcomeConsumptionDecision.Return(
                     VoiceAgentRouteResolution.Resolved(lease),
                 )
+            }
+            is AttemptPhase.Active.RouteDelivered -> {
+                ActiveOutcomeConsumptionDecision.Return(supersededActiveConsumption())
+            }
+            is AttemptPhase.CleaningUndeliveredRoute -> {
+                record.acknowledgePublishedOutcome()
+                ActiveOutcomeConsumptionDecision.Join(phase.claim.attempt)
             }
             is AttemptPhase.Failed -> {
                 attempts.remove(id)
@@ -465,17 +333,17 @@ class VoiceAgentTelecomCallRegistry internal constructor(
                 ActiveOutcomeConsumptionDecision.Return(supersededActiveConsumption())
             }
             is AttemptPhase.Retiring -> {
-                record.outcomeAcknowledged = true
+                record.acknowledgePublishedOutcome()
                 ActiveOutcomeConsumptionDecision.Join(phase.attempt)
             }
             is AttemptPhase.RetirementFailed -> {
-                record.outcomeAcknowledged = true
+                record.acknowledgePublishedOutcome()
                 ActiveOutcomeConsumptionDecision.Return(
                     VoiceAgentRouteResolution.CleanupFailed(phase.cleanupError),
                 )
             }
             is AttemptPhase.RetiredUndeliveredRoute -> {
-                record.outcomeAcknowledged = true
+                record.acknowledgePublishedOutcome()
                 ActiveOutcomeConsumptionDecision.Join(phase.retry.attempt)
             }
             AttemptPhase.Pending,
@@ -517,13 +385,12 @@ class VoiceAgentTelecomCallRegistry internal constructor(
             val record = requireNotNull(attempts[id]) {
                 "Unknown Telecom attempt ${id.value} for undelivered route retention"
             }
-            val phase = record.phase as? AttemptPhase.RetirementFailed
+            val phase = record.phase as? AttemptPhase.RetirementFailed.RouteLease
                 ?: error("Telecom attempt ${id.value} did not retain a failed route retirement")
             check(phase.cleanupError === cleanupError) {
                 "Telecom attempt ${id.value} retained a different cleanup failure"
             }
-            val ownership = phase.ownership as? RetirementOwnership.RouteLease
-                ?: error("Telecom attempt ${id.value} no longer has route-lease ownership")
+            val ownership = phase.ownership
             check(ownership.lease === lease) {
                 "Telecom attempt ${id.value} retained a different route lease"
             }
@@ -531,6 +398,113 @@ class VoiceAgentTelecomCallRegistry internal constructor(
                 ownership = ownership.copy(delivery = RouteLeaseDelivery.RetainedUndelivered),
             )
         }
+    }
+
+    internal fun claimUndeliveredRouteCleanup(
+        id: VoiceAgentTelecomAttemptId,
+        lease: TelecomVoiceAgentRouteLease,
+    ): UndeliveredRouteCleanupClaim = synchronized(lock) {
+        val record = requireNotNull(attempts[id]) {
+            "Unknown Telecom attempt ${id.value} for undelivered cleanup claim"
+        }
+        val phase = record.phase as? AttemptPhase.Active.RouteDelivered
+            ?: error("Telecom attempt ${id.value} is not active for undelivered cleanup")
+        check(phase.lease === lease) {
+            "Telecom attempt ${id.value} route delivery was already claimed"
+        }
+        val claim = UndeliveredRouteCleanupClaim(lease)
+        record.phase = AttemptPhase.CleaningUndeliveredRoute(
+            connection = phase.connection,
+            lease = lease,
+            claim = claim,
+        )
+        claim
+    }
+
+    internal fun retireClaimedUndeliveredRoute(
+        id: VoiceAgentTelecomAttemptId,
+        lease: TelecomVoiceAgentRouteLease,
+        claim: UndeliveredRouteCleanupClaim,
+    ) {
+        val work = synchronized(lock) {
+            val record = requireNotNull(attempts[id]) {
+                "Unknown Telecom attempt ${id.value} for claimed undelivered cleanup"
+            }
+            val phase = record.phase as? AttemptPhase.CleaningUndeliveredRoute
+                ?: error("Telecom attempt ${id.value} lost its cleanup claim")
+            check(phase.lease === lease && phase.claim === claim) {
+                "Telecom attempt ${id.value} cleanup claim does not match its lease"
+            }
+            record.phase = AttemptPhase.Retiring(
+                connection = phase.connection,
+                failure = cancelledFailure(id),
+                attempt = claim.attempt,
+                execution = RetirementExecution.RouteSynchronous(phase.ownership),
+            )
+            ClaimedUndeliveredCleanupWork(record, phase.connection)
+        }
+        val result = runCatching { work.connection.disconnectFromApp() }
+        finishRetiring(id, work.record, work.connection, result.exceptionOrNull())
+        result.getOrThrow()
+    }
+
+    internal fun completeUndeliveredRouteCleanup(
+        id: VoiceAgentTelecomAttemptId,
+        lease: TelecomVoiceAgentRouteLease,
+        claim: UndeliveredRouteCleanupClaim,
+        result: Result<Unit>,
+    ) {
+        synchronized(lock) {
+            if (result.isFailure) {
+                val record = requireNotNull(attempts[id]) {
+                    "Telecom attempt ${id.value} lost its failed cleanup claim"
+                }
+                val phase = record.phase as? AttemptPhase.RetirementFailed.RouteLease
+                    ?: error("Telecom attempt ${id.value} did not retain claimed cleanup failure")
+                val ownership = phase.ownership
+                val claimed = ownership.delivery as? RouteLeaseDelivery.CleanupClaimed
+                check(ownership.lease === lease && claimed?.claim === claim) {
+                    "Telecom attempt ${id.value} completed a different cleanup claim"
+                }
+                record.phase = phase.copy(
+                    ownership = ownership.copy(delivery = RouteLeaseDelivery.RetainedUndelivered),
+                )
+            } else {
+                check(attempts[id] == null) {
+                    "Telecom attempt ${id.value} kept ownership after successful claimed cleanup"
+                }
+            }
+        }
+        claim.publishCompletion(result)
+    }
+
+    internal fun rejectUndeliveredRouteCleanup(
+        id: VoiceAgentTelecomAttemptId,
+        lease: TelecomVoiceAgentRouteLease,
+        claim: UndeliveredRouteCleanupClaim,
+        error: Throwable,
+    ) {
+        synchronized(lock) {
+            val record = requireNotNull(attempts[id]) {
+                "Telecom attempt ${id.value} lost its rejected cleanup claim"
+            }
+            val phase = record.phase as? AttemptPhase.CleaningUndeliveredRoute
+                ?: error("Telecom attempt ${id.value} lost its rejected cleanup claim")
+            check(phase.lease === lease && phase.claim === claim) {
+                "Telecom attempt ${id.value} rejected a different cleanup claim"
+            }
+            record.phase = AttemptPhase.RetirementFailed.RouteLease(
+                connection = phase.connection,
+                outcomeFailure = cancelledFailure(id),
+                cleanupError = error,
+                ownership = RetirementOwnership.RouteLease(
+                    lease = lease,
+                    delivery = RouteLeaseDelivery.RetainedUndelivered,
+                ),
+            )
+            if (currentAttemptId == id) currentAttemptId = null
+        }
+        claim.publishAttemptAndCompletion(Result.failure(error))
     }
 
     private fun completeUndeliveredRouteRetry(
@@ -542,12 +516,12 @@ class VoiceAgentTelecomCallRegistry internal constructor(
                 "Telecom attempt ${decision.id.value} lost its retained route retry record"
             }
             when (val phase = record.phase) {
-                is AttemptPhase.RetirementFailed -> {
+                is AttemptPhase.RetirementFailed.RouteLease -> {
                     check(result.isFailure) {
                         "Telecom attempt ${decision.id.value} retained a successful route retry"
                     }
-                    val ownership = phase.ownership as? RetirementOwnership.RouteLease
-                    val retry = ownership?.delivery as? RouteLeaseDelivery.RetryingUndelivered
+                    val ownership = phase.ownership
+                    val retry = ownership.delivery as? RouteLeaseDelivery.RetryingUndelivered
                     requireExactUndeliveredRouteRetry(decision, ownership, retry)
                     UndeliveredRouteRetryCompletion.Failed(record, phase, checkNotNull(ownership))
                 }
@@ -562,7 +536,7 @@ class VoiceAgentTelecomCallRegistry internal constructor(
             }
         }
         if (completion is UndeliveredRouteRetryCompletion.Succeeded) {
-            beforeUndeliveredRouteRetryResultPublished()
+            probe.onEvent(VoiceAgentTelecomRegistryProbeEvent.UndeliveredRouteRetryResultPublishing)
         }
         decision.attempt.publish(result)
         synchronized(lock) {
@@ -626,8 +600,7 @@ class VoiceAgentTelecomCallRegistry internal constructor(
                 AttemptPhase.Pending -> {
                     requireExpectedOwnership(id, candidate.registryOwnership, expectedOwnership)
                     candidate.phase = AttemptPhase.Failed(failure)
-                    publication = selectOutcomeLocked(
-                        candidate,
+                    publication = candidate.selectOutcome(
                         VoiceAgentTelecomOutcome.Failed(failure),
                     )
                     if (currentAttemptId == id) currentAttemptId = null
@@ -638,8 +611,7 @@ class VoiceAgentTelecomCallRegistry internal constructor(
                         connection = phase.connection,
                         failure = failure,
                         attempt = SynchronousAttemptResult(),
-                        ownership = phase.ownership,
-                        execution = RetirementExecution.DeferredToActivation,
+                        execution = RetirementExecution.RegistryDeferredToActivation(phase.ownership),
                     )
                 }
                 is AttemptPhase.Active -> {
@@ -648,11 +620,14 @@ class VoiceAgentTelecomCallRegistry internal constructor(
                         connection = phase.connection,
                         failure = failure,
                         attempt = SynchronousAttemptResult(),
-                        ownership = phase.ownership,
-                        execution = RetirementExecution.Synchronous,
+                        execution = synchronousRetirementExecution(phase.ownership),
                     )
                     record = candidate
                     connection = phase.connection
+                }
+                is AttemptPhase.CleaningUndeliveredRoute -> {
+                    requireExpectedOwnership(id, phase.ownership, expectedOwnership)
+                    joinedAttempt = phase.claim.attempt
                 }
                 is AttemptPhase.RetirementFailed -> {
                     requireExpectedOwnership(id, phase.ownership, expectedOwnership)
@@ -660,8 +635,7 @@ class VoiceAgentTelecomCallRegistry internal constructor(
                         connection = phase.connection,
                         failure = phase.outcomeFailure,
                         attempt = SynchronousAttemptResult(),
-                        ownership = phase.ownership,
-                        execution = RetirementExecution.Synchronous,
+                        execution = synchronousRetirementExecution(phase.ownership),
                     )
                     record = candidate
                     connection = phase.connection
@@ -702,17 +676,16 @@ class VoiceAgentTelecomCallRegistry internal constructor(
                     connection = connection,
                     failure = disconnectedFailure(duringActivation = true),
                     attempt = SynchronousAttemptResult(),
-                    ownership = phase.ownership,
-                    execution = RetirementExecution.Callback,
+                    execution = RetirementExecution.RegistryCallback(phase.ownership),
                 )
                 is AttemptPhase.Active -> record.phase = AttemptPhase.Retiring(
                     connection = connection,
                     failure = disconnectedFailure(duringActivation = false),
                     attempt = SynchronousAttemptResult(),
-                    ownership = phase.ownership,
-                    execution = RetirementExecution.Callback,
+                    execution = callbackRetirementExecution(phase.ownership),
                 )
                 AttemptPhase.Pending,
+                is AttemptPhase.CleaningUndeliveredRoute,
                 is AttemptPhase.Retiring,
                 is AttemptPhase.RetirementFailed,
                 is AttemptPhase.RetiredUndeliveredRoute,
@@ -731,10 +704,7 @@ class VoiceAgentTelecomCallRegistry internal constructor(
             val currentPhase = record.phase
             if (
                 currentPhase is AttemptPhase.Retiring &&
-                (
-                    currentPhase.execution == RetirementExecution.Synchronous ||
-                        currentPhase.execution == RetirementExecution.PublishingFailure
-                    )
+                (currentPhase.execution.isSynchronous || currentPhase.execution.isPublishingFailure)
             ) {
                 return@synchronized
             }
@@ -760,6 +730,7 @@ class VoiceAgentTelecomCallRegistry internal constructor(
                     ownership = phase.ownership
                 }
                 is AttemptPhase.RetiredUndeliveredRoute -> return
+                is AttemptPhase.CleaningUndeliveredRoute -> return
                 AttemptPhase.Pending,
                 is AttemptPhase.Failed,
                 -> return
@@ -777,16 +748,23 @@ class VoiceAgentTelecomCallRegistry internal constructor(
                         cleanupError = cleanupError,
                     )
                 } else {
-                    record.phase = AttemptPhase.RetirementFailed(
-                        connection = connection,
-                        outcomeFailure = failure,
-                        cleanupError = cleanupError,
-                        ownership = ownership,
-                    )
+                    record.phase = when (ownership) {
+                        is RetirementOwnership.Registry -> AttemptPhase.RetirementFailed.Registry(
+                            connection = connection,
+                            outcomeFailure = failure,
+                            cleanupError = cleanupError,
+                            ownership = ownership,
+                        )
+                        is RetirementOwnership.RouteLease -> AttemptPhase.RetirementFailed.RouteLease(
+                            connection = connection,
+                            outcomeFailure = failure,
+                            cleanupError = cleanupError,
+                            ownership = ownership,
+                        )
+                    }
                     if (currentAttemptId == id) currentAttemptId = null
                     if (ownership is RetirementOwnership.Registry) {
-                        publication = selectOutcomeLocked(
-                            record,
+                        publication = record.selectOutcome(
                             VoiceAgentTelecomOutcome.CleanupFailed(failure, cleanupError),
                         )
                     }
@@ -828,7 +806,7 @@ class VoiceAgentTelecomCallRegistry internal constructor(
                     } else {
                         publication = terminalizeLocked(id, record, phase.failure)
                     }
-                } else if (phase.execution != RetirementExecution.PublishingFailure) {
+                } else if (!phase.execution.isPublishingFailure) {
                     failedRetirementPublication = stageFailedRetirementPublicationLocked(
                         id = id,
                         record = record,
@@ -853,7 +831,7 @@ class VoiceAgentTelecomCallRegistry internal constructor(
         phase: AttemptPhase.Retiring,
         cleanupError: Throwable,
     ): FailedRetirementPublication {
-        val publishingPhase = phase.copy(execution = RetirementExecution.PublishingFailure)
+        val publishingPhase = phase.copy(execution = phase.execution.publishingFailure())
         record.phase = publishingPhase
         return FailedRetirementPublication(
             id = id,
@@ -864,7 +842,7 @@ class VoiceAgentTelecomCallRegistry internal constructor(
     }
 
     private fun publishFailedRetirement(failedPublication: FailedRetirementPublication) {
-        beforeFailedRetirementResultPublished()
+        probe.onEvent(VoiceAgentTelecomRegistryProbeEvent.FailedRetirementResultPublishing)
 
         var outcomePublication: OutcomePublication? = null
         synchronized(lock) {
@@ -872,21 +850,28 @@ class VoiceAgentTelecomCallRegistry internal constructor(
             if (attempts[id] !== record || record.phase !== phase) return@synchronized
 
             phase.attempt.publish(Result.failure(cleanupError))
-            record.phase = AttemptPhase.RetirementFailed(
-                connection = phase.connection,
-                outcomeFailure = phase.failure,
-                cleanupError = cleanupError,
-                ownership = phase.ownership,
-            )
+            record.phase = when (val ownership = phase.ownership) {
+                is RetirementOwnership.Registry -> AttemptPhase.RetirementFailed.Registry(
+                    connection = phase.connection,
+                    outcomeFailure = phase.failure,
+                    cleanupError = cleanupError,
+                    ownership = ownership,
+                )
+                is RetirementOwnership.RouteLease -> AttemptPhase.RetirementFailed.RouteLease(
+                    connection = phase.connection,
+                    outcomeFailure = phase.failure,
+                    cleanupError = cleanupError,
+                    ownership = ownership,
+                )
+            }
             if (currentAttemptId == id) currentAttemptId = null
             if (phase.ownership is RetirementOwnership.Registry) {
-                outcomePublication = selectOutcomeLocked(
-                    record,
+                outcomePublication = record.selectOutcome(
                     VoiceAgentTelecomOutcome.CleanupFailed(phase.failure, cleanupError),
                 )
             }
         }
-        afterFailedRetirementResultPublished()
+        probe.onEvent(VoiceAgentTelecomRegistryProbeEvent.FailedRetirementResultPublished)
         outcomePublication?.publish()
     }
 
@@ -896,12 +881,11 @@ class VoiceAgentTelecomCallRegistry internal constructor(
         failure: VoiceAgentTelecomFailure,
     ): OutcomePublication? {
         record.phase = AttemptPhase.Failed(failure)
-        val publication = selectOutcomeLocked(
-            record,
+        val publication = record.selectOutcome(
             VoiceAgentTelecomOutcome.Failed(failure),
         )
         if (currentAttemptId == id) currentAttemptId = null
-        if (record.outcomeAcknowledged && attempts[id] === record) {
+        if (record.hasAcknowledgedOutcome() && attempts[id] === record) {
             attempts.remove(id)
         }
         return publication
@@ -913,6 +897,7 @@ class VoiceAgentTelecomCallRegistry internal constructor(
         val phaseConnection = when (val phase = entry.value.phase) {
             is AttemptPhase.Activating -> phase.connection
             is AttemptPhase.Active -> phase.connection
+            is AttemptPhase.CleaningUndeliveredRoute -> phase.connection
             is AttemptPhase.Retiring -> phase.connection
             is AttemptPhase.RetirementFailed -> phase.connection
             is AttemptPhase.RetiredUndeliveredRoute -> null
@@ -923,210 +908,4 @@ class VoiceAgentTelecomCallRegistry internal constructor(
         (entry.key to entry.value).takeIf { phaseConnection === connection }
     }
 
-    private fun cancelledFailure(id: VoiceAgentTelecomAttemptId) = VoiceAgentTelecomFailure(
-        diagnosticName = "telecom_attempt_cancelled",
-        detail = "Telecom attempt ${id.value} canceled by cleanup",
-    )
-
-    private fun replacementRequestedFailure(id: VoiceAgentTelecomAttemptId) = VoiceAgentTelecomFailure(
-        diagnosticName = "telecom_attempt_superseded",
-        detail = "Telecom attempt ${id.value} superseded by replacement request",
-    )
-
-    private fun requireExactRegistryOwnership(
-        id: VoiceAgentTelecomAttemptId,
-        ownership: RetirementOwnership.Registry,
-    ) {
-        check(ownership.attemptId == id) {
-            "Telecom registry ownership does not match attempt ${id.value}"
-        }
-    }
-
-    private fun requireExpectedOwnership(
-        id: VoiceAgentTelecomAttemptId,
-        actual: RetirementOwnership,
-        expected: ExpectedRetirementOwnership,
-    ) {
-        val matches = when (expected) {
-            is ExpectedRetirementOwnership.Registry -> actual == RetirementOwnership.Registry(expected.attemptId)
-            is ExpectedRetirementOwnership.RouteLease -> {
-                actual is RetirementOwnership.RouteLease && actual.lease === expected.lease
-            }
-        }
-        check(matches) {
-            "Telecom attempt ${id.value} cleanup ownership does not match its caller"
-        }
-        (actual as? RetirementOwnership.Registry)?.let { requireExactRegistryOwnership(id, it) }
-    }
-
-    private fun activationFailure(error: Throwable) = VoiceAgentTelecomFailure(
-        diagnosticName = "telecom_activation_failed",
-        detail = error.message ?: error.javaClass.simpleName,
-    )
-
-    private fun disconnectedFailure(duringActivation: Boolean) = VoiceAgentTelecomFailure(
-        diagnosticName = "telecom_connection_disconnected",
-        detail = if (duringActivation) {
-            "Telecom connection disconnected during activation"
-        } else {
-            "Telecom connection disconnected"
-        },
-    )
-
-    private fun selectOutcomeLocked(
-        record: AttemptRecord,
-        outcome: VoiceAgentTelecomOutcome,
-    ): OutcomePublication? {
-        if (record.selectedOutcome != null) return null
-        record.selectedOutcome = outcome
-        return OutcomePublication(record.completion, outcome)
-    }
-
-    private data class OutcomePublication(
-        val completion: CompletableDeferred<VoiceAgentTelecomOutcome>,
-        val outcome: VoiceAgentTelecomOutcome,
-    ) {
-        fun publish() {
-            completion.complete(outcome)
-        }
-    }
-
-    private class AttemptRecord(id: VoiceAgentTelecomAttemptId) {
-        val completion = CompletableDeferred<VoiceAgentTelecomOutcome>()
-        val registryOwnership = RetirementOwnership.Registry(id)
-        var phase: AttemptPhase = AttemptPhase.Pending
-        var selectedOutcome: VoiceAgentTelecomOutcome? = null
-        var outcomeAcknowledged = false
-    }
-
-    private sealed interface BeginAttemptDecision {
-        data class Allocated(
-            val id: VoiceAgentTelecomAttemptId,
-            val supersededPublication: OutcomePublication?,
-        ) : BeginAttemptDecision
-
-        data class CleanupFailed(val error: Throwable) : BeginAttemptDecision
-
-        data class Join(val attempt: SynchronousAttemptResult) : BeginAttemptDecision
-
-        data class JoinUndeliveredRoute(
-            val attempt: SynchronousAttemptResult,
-        ) : BeginAttemptDecision
-
-        data class Retry(
-            val id: VoiceAgentTelecomAttemptId,
-            val record: AttemptRecord,
-            val connection: VoiceAgentTelecomCall,
-        ) : BeginAttemptDecision
-
-        data class RetryUndeliveredRoute(
-            val id: VoiceAgentTelecomAttemptId,
-            val lease: TelecomVoiceAgentRouteLease,
-            val attempt: SynchronousAttemptResult,
-        ) : BeginAttemptDecision
-    }
-
-    private sealed interface ActiveOutcomeConsumptionDecision {
-        data class Return(
-            val resolution: VoiceAgentRouteResolution,
-        ) : ActiveOutcomeConsumptionDecision
-
-        data class Join(
-            val attempt: SynchronousAttemptResult,
-        ) : ActiveOutcomeConsumptionDecision
-    }
-
-    private data class FailedRetirementPublication(
-        val id: VoiceAgentTelecomAttemptId,
-        val record: AttemptRecord,
-        val phase: AttemptPhase.Retiring,
-        val cleanupError: Throwable,
-    )
-
-    private sealed interface UndeliveredRouteRetryCompletion {
-        data class Failed(
-            val record: AttemptRecord,
-            val phase: AttemptPhase.RetirementFailed,
-            val ownership: RetirementOwnership.RouteLease,
-        ) : UndeliveredRouteRetryCompletion
-
-        data class Succeeded(
-            val record: AttemptRecord,
-            val phase: AttemptPhase.RetiredUndeliveredRoute,
-        ) : UndeliveredRouteRetryCompletion
-    }
-
-    private sealed interface RetirementOwnership {
-        data class Registry(val attemptId: VoiceAgentTelecomAttemptId) : RetirementOwnership
-
-        data class RouteLease(
-            val lease: TelecomVoiceAgentRouteLease,
-            val delivery: RouteLeaseDelivery,
-        ) : RetirementOwnership
-    }
-
-    private sealed interface ExpectedRetirementOwnership {
-        data class Registry(val attemptId: VoiceAgentTelecomAttemptId) : ExpectedRetirementOwnership
-
-        data class RouteLease(
-            val lease: TelecomVoiceAgentRouteLease,
-        ) : ExpectedRetirementOwnership
-    }
-
-    private sealed interface RouteLeaseDelivery {
-        data object Delivered : RouteLeaseDelivery
-
-        data object RetainedUndelivered : RouteLeaseDelivery
-
-        data class RetryingUndelivered(
-            val attempt: SynchronousAttemptResult,
-        ) : RouteLeaseDelivery
-    }
-
-    private sealed interface RetirementExecution {
-        data object DeferredToActivation : RetirementExecution
-
-        data object Callback : RetirementExecution
-
-        data object Synchronous : RetirementExecution
-
-        data object PublishingFailure : RetirementExecution
-    }
-
-    private sealed interface AttemptPhase {
-        data object Pending : AttemptPhase
-
-        data class Activating(
-            val connection: VoiceAgentTelecomCall,
-            val ownership: RetirementOwnership,
-        ) : AttemptPhase
-
-        data class Active(
-            val connection: VoiceAgentTelecomCall,
-            val ownership: RetirementOwnership,
-        ) : AttemptPhase
-
-        data class Retiring(
-            val connection: VoiceAgentTelecomCall,
-            val failure: VoiceAgentTelecomFailure,
-            val attempt: SynchronousAttemptResult,
-            val ownership: RetirementOwnership,
-            val execution: RetirementExecution,
-        ) : AttemptPhase
-
-        data class RetirementFailed(
-            val connection: VoiceAgentTelecomCall,
-            val outcomeFailure: VoiceAgentTelecomFailure,
-            val cleanupError: Throwable,
-            val ownership: RetirementOwnership,
-        ) : AttemptPhase
-
-        data class RetiredUndeliveredRoute(
-            val failure: VoiceAgentTelecomFailure,
-            val ownership: RetirementOwnership.RouteLease,
-            val retry: RouteLeaseDelivery.RetryingUndelivered,
-        ) : AttemptPhase
-
-        data class Failed(val failure: VoiceAgentTelecomFailure) : AttemptPhase
-    }
 }

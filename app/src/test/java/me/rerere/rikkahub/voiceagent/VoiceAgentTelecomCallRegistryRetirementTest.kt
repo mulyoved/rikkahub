@@ -172,13 +172,16 @@ class VoiceAgentTelecomCallRegistryRetirementTest {
         val retryJoined = CountDownLatch(1)
         val releasePublication = CountDownLatch(1)
         val registry = VoiceAgentTelecomCallRegistry(
-            afterActivationOutcomeSelected = { _, _ -> },
-            beforeFailedRetirementResultPublished = {},
-            beforeRouteRetirementJoin = retryJoined::countDown,
-            beforeUndeliveredRouteRetryResultPublished = {
-                publicationEntered.countDown()
-                check(releasePublication.await(5, TimeUnit.SECONDS)) {
-                    "successful retained retry publication was not released"
+            probe = VoiceAgentTelecomRegistryProbe { event ->
+                when (event) {
+                    VoiceAgentTelecomRegistryProbeEvent.RouteRetirementJoining -> retryJoined.countDown()
+                    VoiceAgentTelecomRegistryProbeEvent.UndeliveredRouteRetryResultPublishing -> {
+                        publicationEntered.countDown()
+                        check(releasePublication.await(5, TimeUnit.SECONDS)) {
+                            "successful retained retry publication was not released"
+                        }
+                    }
+                    else -> Unit
                 }
             },
         )
@@ -233,11 +236,12 @@ class VoiceAgentTelecomCallRegistryRetirementTest {
         val publicationEntered = CountDownLatch(1)
         val releasePublication = CountDownLatch(1)
         val registry = VoiceAgentTelecomCallRegistry(
-            afterActivationOutcomeSelected = { _, _ -> },
-            beforeFailedRetirementResultPublished = {
-                publicationEntered.countDown()
-                check(releasePublication.await(5, TimeUnit.SECONDS)) {
-                    "synchronous failure publication was not released"
+            probe = VoiceAgentTelecomRegistryProbe { event ->
+                if (event is VoiceAgentTelecomRegistryProbeEvent.FailedRetirementResultPublishing) {
+                    publicationEntered.countDown()
+                    check(releasePublication.await(5, TimeUnit.SECONDS)) {
+                        "synchronous failure publication was not released"
+                    }
                 }
             },
         )
@@ -287,11 +291,12 @@ class VoiceAgentTelecomCallRegistryRetirementTest {
         val publicationEntered = CountDownLatch(1)
         val releasePublication = CountDownLatch(1)
         val registry = VoiceAgentTelecomCallRegistry(
-            afterActivationOutcomeSelected = { _, _ -> },
-            beforeFailedRetirementResultPublished = {
-                publicationEntered.countDown()
-                check(releasePublication.await(5, TimeUnit.SECONDS)) {
-                    "callback failure publication was not released"
+            probe = VoiceAgentTelecomRegistryProbe { event ->
+                if (event is VoiceAgentTelecomRegistryProbeEvent.FailedRetirementResultPublishing) {
+                    publicationEntered.countDown()
+                    check(releasePublication.await(5, TimeUnit.SECONDS)) {
+                        "callback failure publication was not released"
+                    }
                 }
             },
         )

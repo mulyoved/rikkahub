@@ -270,9 +270,11 @@ class VoiceAgentCallStartupTest {
         val releaseCleanup = CountDownLatch(1)
         val consumptionJoinEntered = CountDownLatch(1)
         val registry = VoiceAgentTelecomCallRegistry(
-            afterActivationOutcomeSelected = { _, _ -> },
-            beforeFailedRetirementResultPublished = {},
-            beforeRouteRetirementJoin = consumptionJoinEntered::countDown,
+            probe = VoiceAgentTelecomRegistryProbe { event ->
+                if (event is VoiceAgentTelecomRegistryProbeEvent.RouteRetirementJoining) {
+                    consumptionJoinEntered.countDown()
+                }
+            },
         )
         val previous = VoiceAgentTelecomAttemptId(1)
         val previousCall = StartupBlockingTelecomCall(
@@ -344,9 +346,11 @@ class VoiceAgentCallStartupTest {
         val releaseCleanup = CountDownLatch(1)
         val consumptionJoinEntered = CountDownLatch(1)
         val registry = VoiceAgentTelecomCallRegistry(
-            afterActivationOutcomeSelected = { _, _ -> },
-            beforeFailedRetirementResultPublished = {},
-            beforeRouteRetirementJoin = consumptionJoinEntered::countDown,
+            probe = VoiceAgentTelecomRegistryProbe { event ->
+                if (event is VoiceAgentTelecomRegistryProbeEvent.RouteRetirementJoining) {
+                    consumptionJoinEntered.countDown()
+                }
+            },
         )
         val previous = VoiceAgentTelecomAttemptId(1)
         val previousCall = StartupBlockingTelecomCall(

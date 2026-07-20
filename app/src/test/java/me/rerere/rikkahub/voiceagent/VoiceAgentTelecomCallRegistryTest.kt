@@ -373,14 +373,18 @@ class VoiceAgentTelecomCallRegistryTest {
         var attempt: VoiceAgentTelecomAttemptId? = null
         val committedAttempt = AtomicReference<VoiceAgentTelecomAttemptId>()
         val committedOutcome = AtomicReference<VoiceAgentTelecomOutcome>()
-        val registry = VoiceAgentTelecomCallRegistry { selectedAttempt, selectedOutcome ->
-            committedAttempt.set(selectedAttempt)
-            committedOutcome.set(selectedOutcome)
-            selectionCommitted.countDown()
-            check(releaseNotification.await(1, TimeUnit.SECONDS)) {
-                "outcome notification was not released"
+        val registry = VoiceAgentTelecomCallRegistry(
+            probe = VoiceAgentTelecomRegistryProbe { event ->
+                if (event is VoiceAgentTelecomRegistryProbeEvent.ActivationOutcomeSelected) {
+                    committedAttempt.set(event.attemptId)
+                    committedOutcome.set(event.outcome)
+                    selectionCommitted.countDown()
+                    check(releaseNotification.await(1, TimeUnit.SECONDS)) {
+                        "outcome notification was not released"
+                    }
+                }
             }
-        }
+        )
         attempt = registry.beginAttempt().requireAllocatedAttemptId()
         val call = FakeTelecomCall()
         val accepted = AtomicBoolean()

@@ -87,16 +87,20 @@ internal fun assertAwakenedJoinerImmediatelyRetries(callbackCompletion: Boolean)
     val releasePublication = CountDownLatch(1)
     val immediateRetryStarted = CountDownLatch(1)
     val registry = VoiceAgentTelecomCallRegistry(
-        afterActivationOutcomeSelected = { _, _ -> },
-        beforeFailedRetirementResultPublished = {
-            publicationEntered.countDown()
-            check(releasePublication.await(5, TimeUnit.SECONDS)) {
-                "failed retirement publication was not released"
-            }
-        },
-        afterFailedRetirementResultPublished = {
-            check(immediateRetryStarted.await(1, TimeUnit.SECONDS)) {
-                "awakened joiner did not start its immediate retry"
+        probe = VoiceAgentTelecomRegistryProbe { event ->
+            when (event) {
+                VoiceAgentTelecomRegistryProbeEvent.FailedRetirementResultPublishing -> {
+                    publicationEntered.countDown()
+                    check(releasePublication.await(5, TimeUnit.SECONDS)) {
+                        "failed retirement publication was not released"
+                    }
+                }
+                VoiceAgentTelecomRegistryProbeEvent.FailedRetirementResultPublished -> {
+                    check(immediateRetryStarted.await(1, TimeUnit.SECONDS)) {
+                        "awakened joiner did not start its immediate retry"
+                    }
+                }
+                else -> Unit
             }
         },
     )

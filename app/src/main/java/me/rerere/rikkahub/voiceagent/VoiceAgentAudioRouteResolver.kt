@@ -2,19 +2,32 @@ package me.rerere.rikkahub.voiceagent
 
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
-import kotlin.coroutines.ContinuationInterceptor
+import java.util.concurrent.atomic.AtomicBoolean
 
 internal fun interface VoiceAgentTelecomOutcomeTimeout {
     suspend fun awaitOutcome(
         timeoutMs: Long,
         observe: suspend () -> VoiceAgentTelecomOutcome,
     ): VoiceAgentTelecomOutcome?
+}
+
+internal fun interface VoiceAgentRouteDeliveryProbe {
+    fun onDeliveryArmed(job: Job)
+}
+
+private object NoOpVoiceAgentRouteDeliveryProbe : VoiceAgentRouteDeliveryProbe {
+    override fun onDeliveryArmed(job: Job) = Unit
 }
 
 private object DefaultVoiceAgentTelecomOutcomeTimeout : VoiceAgentTelecomOutcomeTimeout {
@@ -29,12 +42,55 @@ class VoiceAgentAudioRouteResolver internal constructor(
     private val registry: VoiceAgentTelecomCallRegistry,
     private val timeoutMs: Long,
     private val outcomeTimeout: VoiceAgentTelecomOutcomeTimeout,
+    private val cleanupScope: CoroutineScope,
+    private val cleanupDispatcher: CoroutineDispatcher,
+    private val deliveryProbe: VoiceAgentRouteDeliveryProbe,
 ) {
+    internal constructor(
+        gateway: VoiceAgentTelecomGateway,
+        registry: VoiceAgentTelecomCallRegistry,
+        timeoutMs: Long = 3_000L,
+        outcomeTimeout: VoiceAgentTelecomOutcomeTimeout,
+    ) : this(
+        gateway,
+        registry,
+        timeoutMs,
+        outcomeTimeout,
+        DefaultVoiceAgentRouteCleanupScope,
+        Dispatchers.IO,
+        NoOpVoiceAgentRouteDeliveryProbe,
+    )
+
     constructor(
         gateway: VoiceAgentTelecomGateway,
         registry: VoiceAgentTelecomCallRegistry,
         timeoutMs: Long = 3_000L,
-    ) : this(gateway, registry, timeoutMs, DefaultVoiceAgentTelecomOutcomeTimeout)
+    ) : this(
+        gateway,
+        registry,
+        timeoutMs,
+        DefaultVoiceAgentTelecomOutcomeTimeout,
+        DefaultVoiceAgentRouteCleanupScope,
+        Dispatchers.IO,
+        NoOpVoiceAgentRouteDeliveryProbe,
+    )
+
+    internal constructor(
+        gateway: VoiceAgentTelecomGateway,
+        registry: VoiceAgentTelecomCallRegistry,
+        timeoutMs: Long = 3_000L,
+        cleanupScope: CoroutineScope = DefaultVoiceAgentRouteCleanupScope,
+        cleanupDispatcher: CoroutineDispatcher = Dispatchers.IO,
+        deliveryProbe: VoiceAgentRouteDeliveryProbe = NoOpVoiceAgentRouteDeliveryProbe,
+    ) : this(
+        gateway,
+        registry,
+        timeoutMs,
+        DefaultVoiceAgentTelecomOutcomeTimeout,
+        cleanupScope,
+        cleanupDispatcher,
+        deliveryProbe,
+    )
 
     suspend fun resolve(): VoiceAgentRouteResolution {
         val attempt = beginAttemptRespectingCancellation()
@@ -44,12 +100,20 @@ class VoiceAgentAudioRouteResolver internal constructor(
             cleanupCancelledAttempt(attempt, cancellation)
             throw cancellation
         }
-        val delivery = FinalResolutionDelivery(resolution)
+        val delivery = FinalResolutionDelivery(
+            resolution = resolution,
+            cleanupScope = cleanupScope,
+            cleanupDispatcher = cleanupDispatcher,
+        )
         return try {
             deliverResolution(delivery)
         } catch (cancellation: CancellationException) {
-            delivery.attachCleanupFailureTo(cancellation)
+            delivery.awaitCleanupAndAttachTo(cancellation)
             throw cancellation
+        } catch (error: Throwable) {
+            delivery.requestCleanup(error)
+            delivery.awaitCleanupAndAttachTo(error)
+            throw error
         }
     }
 
@@ -151,59 +215,151 @@ class VoiceAgentAudioRouteResolver internal constructor(
     private suspend fun deliverResolution(
         delivery: FinalResolutionDelivery,
     ): VoiceAgentRouteResolution = suspendCancellableCoroutine { continuation ->
-        val dispatcher = continuation.context[ContinuationInterceptor] as? CoroutineDispatcher
-            ?: error("Voice Agent route delivery requires a coroutine dispatcher")
-        continuation.invokeOnCancellation(delivery::cleanupUndeliveredResolution)
-        dispatcher.dispatch(continuation.context) {
+        continuation.invokeOnCancellation(delivery::requestCleanup)
+        deliveryProbe.onDeliveryArmed(checkNotNull(continuation.context[Job]))
+        try {
             continuation.resume(delivery.resolution) { cancellation, _, _ ->
-                delivery.cleanupUndeliveredResolution(cancellation)
+                delivery.requestCleanup(cancellation)
             }
+        } catch (error: Throwable) {
+            delivery.requestCleanup(error)
+            throw error
         }
     }
 }
 
 private class FinalResolutionDelivery(
     val resolution: VoiceAgentRouteResolution,
+    private val cleanupScope: CoroutineScope,
+    private val cleanupDispatcher: CoroutineDispatcher,
 ) {
     private var cleanup: FinalDeliveryCleanup = FinalDeliveryCleanup.Pending
 
     @Synchronized
-    fun cleanupUndeliveredResolution(cancellation: Throwable?) {
-        val cleanupError = when (val state = cleanup) {
-            FinalDeliveryCleanup.Pending -> when (val undelivered = resolution) {
-                is VoiceAgentRouteResolution.Resolved -> {
-                    when (val retirement = undelivered.lease.retireUndelivered()) {
-                        UndeliveredRouteRetirement.Retired -> null
-                        is UndeliveredRouteRetirement.Retained -> retirement.error
-                    }
-                }
-                is VoiceAgentRouteResolution.CleanupFailed -> undelivered.error
-                is VoiceAgentRouteResolution.Superseded -> null
+    fun requestCleanup(cancellation: Throwable?) {
+        if (cleanup !is FinalDeliveryCleanup.Pending) return
+        val work = when (val undelivered = resolution) {
+            is VoiceAgentRouteResolution.Resolved -> when (val lease = undelivered.lease) {
+                is TelecomVoiceAgentRouteLease -> TelecomFinalDeliveryCleanup(
+                    lease = lease,
+                    claim = lease.claimUndeliveredCleanup(),
+                )
+                is DirectFallbackVoiceAgentRouteLease -> DirectFinalDeliveryCleanup(lease)
             }
-            FinalDeliveryCleanup.Retired -> return
-            is FinalDeliveryCleanup.Failed -> state.error
+            is VoiceAgentRouteResolution.CleanupFailed -> CompletedFinalDeliveryCleanup(
+                Result.failure(undelivered.error),
+            )
+            is VoiceAgentRouteResolution.Superseded -> CompletedFinalDeliveryCleanup(Result.success(Unit))
         }
-        cleanup = cleanupError?.let(FinalDeliveryCleanup::Failed) ?: FinalDeliveryCleanup.Retired
-        if (cleanupError != null && cancellation != null) cancellation.addSuppressedDistinct(cleanupError)
+        cleanup = FinalDeliveryCleanup.Claimed(work)
+        if (work !is CompletedFinalDeliveryCleanup) schedule(work, cancellation)
     }
 
-    @Synchronized
-    fun attachCleanupFailureTo(cancellation: Throwable) {
-        val state = cleanup
-        if (state is FinalDeliveryCleanup.Failed) {
-            cancellation.addSuppressedDistinct(state.error)
+    private fun schedule(
+        work: FinalDeliveryCleanupWork,
+        cancellation: Throwable?,
+    ) {
+        val entered = AtomicBoolean()
+        val task = try {
+            cleanupScope.async(cleanupDispatcher) {
+                entered.set(true)
+                work.execute()
+            }
+        } catch (error: Throwable) {
+            val schedulingError = error.exactSchedulingFailure()
+            work.rejectScheduling(schedulingError)
+            cancellation?.addSuppressedDistinct(schedulingError)
+            return
         }
+        task.invokeOnCompletion { completionError ->
+            if (entered.compareAndSet(false, true)) {
+                val schedulingError = completionError?.exactSchedulingFailure()
+                    ?: CancellationException("Voice Agent route cleanup did not start")
+                work.rejectScheduling(schedulingError)
+                cancellation?.addSuppressedDistinct(schedulingError)
+            }
+        }
+    }
+
+    suspend fun awaitCleanupAndAttachTo(primary: Throwable) {
+        val work = synchronized(this) {
+            (cleanup as? FinalDeliveryCleanup.Claimed)?.work
+        } ?: return
+        val cleanupError = withContext(NonCancellable) {
+            work.awaitResult().exceptionOrNull()
+        }
+        cleanupError?.let(primary::addSuppressedDistinct)
     }
 }
 
 private sealed interface FinalDeliveryCleanup {
     data object Pending : FinalDeliveryCleanup
 
-    data object Retired : FinalDeliveryCleanup
-
-    data class Failed(val error: Throwable) : FinalDeliveryCleanup
+    data class Claimed(
+        val work: FinalDeliveryCleanupWork,
+    ) : FinalDeliveryCleanup
 }
+
+private sealed interface FinalDeliveryCleanupWork {
+    fun execute()
+    fun rejectScheduling(error: Throwable)
+    suspend fun awaitResult(): Result<Unit>
+}
+
+private class TelecomFinalDeliveryCleanup(
+    private val lease: TelecomVoiceAgentRouteLease,
+    private val claim: UndeliveredRouteCleanupClaim,
+) : FinalDeliveryCleanupWork {
+    override fun execute() = lease.executeUndeliveredCleanup(claim)
+
+    override fun rejectScheduling(error: Throwable) {
+        lease.rejectUndeliveredCleanupScheduling(claim, error)
+    }
+
+    override suspend fun awaitResult(): Result<Unit> = claim.awaitResult()
+}
+
+private class DirectFinalDeliveryCleanup(
+    private val lease: DirectFallbackVoiceAgentRouteLease,
+) : FinalDeliveryCleanupWork {
+    private val completion = kotlinx.coroutines.CompletableDeferred<Result<Unit>>()
+
+    override fun execute() {
+        completion.complete(runCatching(lease::retire))
+    }
+
+    override fun rejectScheduling(error: Throwable) {
+        completion.complete(Result.failure(error))
+    }
+
+    override suspend fun awaitResult(): Result<Unit> = completion.await()
+}
+
+private class CompletedFinalDeliveryCleanup(
+    private val result: Result<Unit>,
+) : FinalDeliveryCleanupWork {
+    override fun execute() = Unit
+
+    override fun rejectScheduling(error: Throwable) = Unit
+
+    override suspend fun awaitResult(): Result<Unit> = result
+}
+
+private object DefaultVoiceAgentRouteCleanupScope : CoroutineScope by CoroutineScope(
+    SupervisorJob() + Dispatchers.IO,
+)
 
 private fun Throwable.addSuppressedDistinct(error: Throwable) {
     if (error !== this && suppressed.none { it === error }) addSuppressed(error)
+}
+
+private fun Throwable.exactSchedulingFailure(): Throwable {
+    var exact = this
+    while (
+        exact.cause != null &&
+        (exact is CancellationException || exact.javaClass.simpleName == "DispatchException")
+    ) {
+        exact = checkNotNull(exact.cause)
+    }
+    return exact
 }
