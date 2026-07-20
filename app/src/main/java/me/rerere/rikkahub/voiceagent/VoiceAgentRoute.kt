@@ -64,7 +64,10 @@ import org.koin.compose.koinInject
 import kotlin.uuid.Uuid
 
 @Composable
-fun VoiceAgentRoute(conversationId: Uuid) {
+fun VoiceAgentRoute(
+    conversationId: Uuid,
+    transport: VoiceAgentTransport,
+) {
     val navController = LocalNavController.current
     val settingsStore = koinInject<SettingsStore>()
     val chatService = koinInject<ChatService>()
@@ -89,7 +92,7 @@ fun VoiceAgentRoute(conversationId: Uuid) {
                         voiceAgentCallStartIntent(
                             context,
                             conversationId.toString(),
-                            VoiceAgentTransport.DirectGemini,
+                            transport,
                         ),
                     )
                 },

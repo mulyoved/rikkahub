@@ -130,6 +130,7 @@ import me.rerere.rikkahub.ui.theme.RikkahubTheme
 import me.rerere.rikkahub.utils.CrashHandler
 import me.rerere.rikkahub.utils.openUsageAccessSettings
 import me.rerere.rikkahub.voiceagent.VoiceAgentRoute
+import me.rerere.rikkahub.voiceagent.VoiceAgentTransport
 import okhttp3.OkHttpClient
 import org.koin.android.ext.android.inject
 import org.koin.compose.koinInject
@@ -150,8 +151,18 @@ internal fun voiceAgentIntentScreen(conversationId: String?): Screen.VoiceAgent?
     return conversationId?.trim()
         ?.takeIf { it.isNotEmpty() }
         ?.let { id -> runCatching { Uuid.parse(id).toString() }.getOrNull() }
-        ?.let { id -> Screen.VoiceAgent(conversationId = id) }
+        ?.let { id ->
+            Screen.VoiceAgent(
+                conversationId = id,
+                transportWireName = VoiceAgentTransport.DirectGemini.wireName,
+            )
+        }
 }
+
+internal fun decodeVoiceAgentTransport(transportWireName: String?): VoiceAgentTransport =
+    requireNotNull(VoiceAgentTransport.fromWireName(transportWireName)) {
+        "Voice Agent navigation transport is missing or unknown"
+    }
 
 internal fun MutableList<NavKey>.openConversationIntent(conversationId: String?): Boolean {
     val screen = conversationIntentScreen(conversationId) ?: return false
@@ -371,7 +382,10 @@ class RouteActivity : ComponentActivity() {
                             }
 
                             entry<Screen.VoiceAgent> { key ->
-                                VoiceAgentRoute(conversationId = Uuid.parse(key.conversationId))
+                                VoiceAgentRoute(
+                                    conversationId = Uuid.parse(key.conversationId),
+                                    transport = decodeVoiceAgentTransport(key.transportWireName),
+                                )
                             }
 
                             entry<Screen.ShareHandler> { key ->
@@ -622,7 +636,10 @@ sealed interface Screen : NavKey {
     ) : Screen
 
     @Serializable
-    data class VoiceAgent(val conversationId: String) : Screen
+    data class VoiceAgent(
+        val conversationId: String,
+        val transportWireName: String,
+    ) : Screen
 
     @Serializable
     data class ShareHandler(val text: String, val streamUri: String? = null) : Screen
