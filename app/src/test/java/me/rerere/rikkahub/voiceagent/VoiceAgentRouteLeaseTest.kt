@@ -633,15 +633,16 @@ class VoiceAgentRouteLeaseTest {
     }
 
     @Test
-    fun `closeNow retires route before closing session`() {
+    fun `cleanup operation retires route before closing session`() = runTest {
         val events = mutableListOf<String>()
         val owned = RouteOwnedVoiceCallSession(
             delegate = RecordingManagedSession(events = events),
             routeLease = activeTelecomLease(events),
         )
 
-        owned.closeNow()
+        val result = owned.cleanupOperation.run(VoiceAgentCleanupMode.Immediate)
 
+        assertSame(VoiceAgentCleanupResult.Completed, result)
         assertEquals(listOf("route-retire", "session-close-now"), events)
     }
 

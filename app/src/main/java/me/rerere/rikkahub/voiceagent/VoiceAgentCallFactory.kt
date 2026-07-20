@@ -1,6 +1,7 @@
 package me.rerere.rikkahub.voiceagent
 
 import android.content.Context
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.flow.StateFlow
 import me.rerere.rikkahub.BuildConfig
@@ -19,6 +20,8 @@ import me.rerere.rikkahub.voiceagent.hermesvoice.HermesVoiceApi
 import me.rerere.rikkahub.voiceagent.hermesvoice.HermesVoiceTraceHeaders
 import okhttp3.OkHttpClient
 import java.io.File
+import java.util.Collections
+import java.util.IdentityHashMap
 import kotlin.uuid.Uuid
 
 interface ManagedVoiceCallSession {
@@ -33,7 +36,15 @@ interface ManagedVoiceCallSession {
     fun closeNow()
 }
 
-interface VoiceAgentCallFactory {
+internal interface VoiceAgentCallFactory {
+    suspend fun createOwned(
+        request: VoiceAgentCallRequest,
+        routeLease: VoiceAgentRouteLease,
+        scope: CoroutineScope,
+    ): VoiceAgentSessionCreationResult = VoiceAgentSessionCreationResult.Created(
+        create(request.conversationId, request.config, routeLease, scope),
+    )
+
     fun create(
         conversationId: Uuid,
         config: VoiceAgentLaunchConfig,
@@ -42,7 +53,22 @@ interface VoiceAgentCallFactory {
     ): RouteOwnedManagedVoiceCallSession
 }
 
-class DefaultVoiceAgentCallFactory internal constructor(
+internal sealed interface VoiceAgentSessionCreationResult {
+    data class Created(
+        val session: RouteOwnedManagedVoiceCallSession,
+    ) : VoiceAgentSessionCreationResult
+
+    data class FailedClean(
+        val error: Throwable,
+    ) : VoiceAgentSessionCreationResult
+
+    data class FailedDirty(
+        val error: Throwable,
+        val cleanup: VoiceAgentCleanupOperation,
+    ) : VoiceAgentSessionCreationResult
+}
+
+internal class DefaultVoiceAgentCallFactory internal constructor(
     private val context: Context,
     private val chatService: ChatService?,
     private val settingsStore: SettingsStore?,
@@ -94,68 +120,139 @@ class DefaultVoiceAgentCallFactory internal constructor(
         scope: CoroutineScope,
     ): RouteOwnedManagedVoiceCallSession {
         try {
-            val route = routeLease.metadata
-            val baseTraceContext = newVoiceTraceContext()
-            val propagatedTraceContext = runCatching {
-                observability.withSentryPropagation(baseTraceContext)
-            }.getOrDefault(baseTraceContext)
-            val (traceContext, traceHeaders) = runCatching {
-                propagatedTraceContext to HermesVoiceTraceHeaders.from(propagatedTraceContext)
-            }.getOrElse {
-                runCatching {
-                    observability.recordEvent(
-                        name = "hermes_voice.mobile.session.ended",
-                        trace = propagatedTraceContext,
-                        attributes = mapOf("modelId" to config.voiceModelId),
-                    )
-                }
-                baseTraceContext to HermesVoiceTraceHeaders.from(baseTraceContext)
-            }
-            val coreSession = runCatching {
-                val mobileApi = HermesVoiceApi(
-                    baseUrl = config.hermesVoiceBaseUrl,
-                    credentials = config.credentials,
-                    traceHeaders = traceHeaders,
-                )
-                VoiceAgentCallSession(
-                    modelId = config.voiceModelId,
-                    sessionApi = sessionApiFactory(mobileApi),
-                    toolApi = toolApiFactory(mobileApi),
-                    gemini = geminiFactory(),
-                    audio = audioFactory(route.owner),
-                    conversationStore = conversationStoreFactory(conversationId),
-                    contextProvider = contextProviderFactory(config.voiceModelId),
-                    observability = observability,
-                    traceContext = traceContext,
-                    voiceE2EArtifacts = artifactWriterFactory(context.noBackupFilesDir, traceContext, scope),
-                    sessionMetadata = buildDefaultVoiceE2ESessionMetadata(
-                        traceContext = traceContext,
-                        conversationId = conversationId,
-                        packageName = context.packageName,
-                        voiceModelId = config.voiceModelId,
-                        routeOwner = route.owner,
-                        startedAtEpochMs = metadataEpochNowMs(),
-                    ),
-                    metadataEpochNowMs = metadataEpochNowMs,
-                    scope = scope,
-                )
-            }.getOrElse { throwable ->
-                runCatching {
-                    observability.recordEvent(
-                        name = "hermes_voice.mobile.session.ended",
-                        trace = traceContext,
-                        attributes = mapOf("modelId" to config.voiceModelId),
-                    )
-                }
-                throw throwable
-            }
-            return RouteOwnedVoiceCallSession(coreSession, routeLease)
+            return createSession(conversationId, config, routeLease, scope)
         } catch (creationError: Throwable) {
             runCatching(routeLease::retire)
                 .exceptionOrNull()
                 ?.let(creationError::addSuppressed)
             throw creationError
         }
+    }
+
+    override suspend fun createOwned(
+        request: VoiceAgentCallRequest,
+        routeLease: VoiceAgentRouteLease,
+        scope: CoroutineScope,
+    ): VoiceAgentSessionCreationResult {
+        val cleanup = voiceAgentRouteCleanupOperation(routeLease)
+        return try {
+            VoiceAgentSessionCreationResult.Created(
+                createSession(request.conversationId, request.config, routeLease, scope),
+            )
+        } catch (creationError: Throwable) {
+            finishFailedOwnedCreation(creationError, cleanup)
+        }
+    }
+
+    private fun createSession(
+        conversationId: Uuid,
+        config: VoiceAgentLaunchConfig,
+        routeLease: VoiceAgentRouteLease,
+        scope: CoroutineScope,
+    ): RouteOwnedManagedVoiceCallSession {
+        val route = routeLease.metadata
+        val baseTraceContext = newVoiceTraceContext()
+        val propagatedTraceContext = runCatching {
+            observability.withSentryPropagation(baseTraceContext)
+        }.getOrDefault(baseTraceContext)
+        val (traceContext, traceHeaders) = runCatching {
+            propagatedTraceContext to HermesVoiceTraceHeaders.from(propagatedTraceContext)
+        }.getOrElse {
+            runCatching {
+                observability.recordEvent(
+                    name = "hermes_voice.mobile.session.ended",
+                    trace = propagatedTraceContext,
+                    attributes = mapOf("modelId" to config.voiceModelId),
+                )
+            }
+            baseTraceContext to HermesVoiceTraceHeaders.from(baseTraceContext)
+        }
+        val coreSession = runCatching {
+            val mobileApi = HermesVoiceApi(
+                baseUrl = config.hermesVoiceBaseUrl,
+                credentials = config.credentials,
+                traceHeaders = traceHeaders,
+            )
+            VoiceAgentCallSession(
+                modelId = config.voiceModelId,
+                sessionApi = sessionApiFactory(mobileApi),
+                toolApi = toolApiFactory(mobileApi),
+                gemini = geminiFactory(),
+                audio = audioFactory(route.owner),
+                conversationStore = conversationStoreFactory(conversationId),
+                contextProvider = contextProviderFactory(config.voiceModelId),
+                observability = observability,
+                traceContext = traceContext,
+                voiceE2EArtifacts = artifactWriterFactory(context.noBackupFilesDir, traceContext, scope),
+                sessionMetadata = buildDefaultVoiceE2ESessionMetadata(
+                    traceContext = traceContext,
+                    conversationId = conversationId,
+                    packageName = context.packageName,
+                    voiceModelId = config.voiceModelId,
+                    routeOwner = route.owner,
+                    startedAtEpochMs = metadataEpochNowMs(),
+                ),
+                metadataEpochNowMs = metadataEpochNowMs,
+                scope = scope,
+            )
+        }.getOrElse { throwable ->
+            runCatching {
+                observability.recordEvent(
+                    name = "hermes_voice.mobile.session.ended",
+                    trace = traceContext,
+                    attributes = mapOf("modelId" to config.voiceModelId),
+                )
+            }
+            throw throwable
+        }
+        return RouteOwnedVoiceCallSession(coreSession, routeLease)
+    }
+
+    private suspend fun finishFailedOwnedCreation(
+        creationError: Throwable,
+        cleanup: VoiceAgentCleanupOperation,
+    ): VoiceAgentSessionCreationResult {
+        val cleanupResult = try {
+            cleanup.run(VoiceAgentCleanupMode.Immediate)
+        } catch (cleanupCancellation: CancellationException) {
+            val canonical = cleanupCancellation.canonicalFactoryCancellation()
+            canonical.addSuppressedDistinct(creationError.canonicalIfCancellation())
+            throw canonical
+        }
+        if (creationError is CancellationException) {
+            val canonical = creationError.canonicalFactoryCancellation()
+            if (cleanupResult is VoiceAgentCleanupResult.Failed) {
+                canonical.addSuppressedDistinct(cleanupResult.error)
+            }
+            throw canonical
+        }
+        return when (cleanupResult) {
+            VoiceAgentCleanupResult.Completed -> VoiceAgentSessionCreationResult.FailedClean(creationError)
+            is VoiceAgentCleanupResult.Failed -> {
+                creationError.addSuppressedDistinct(cleanupResult.error)
+                VoiceAgentSessionCreationResult.FailedDirty(creationError, cleanup)
+            }
+        }
+    }
+}
+
+private fun Throwable.canonicalIfCancellation(): Throwable =
+    (this as? CancellationException)?.canonicalFactoryCancellation() ?: this
+
+private fun Throwable.addSuppressedDistinct(error: Throwable) {
+    if (error !== this && error !in suppressed) addSuppressed(error)
+}
+
+private fun CancellationException.canonicalFactoryCancellation(): CancellationException {
+    var canonical = this
+    val visited = Collections.newSetFromMap(
+        IdentityHashMap<CancellationException, Boolean>(),
+    )
+    visited += canonical
+    while (true) {
+        val original = canonical.cause as? CancellationException ?: return canonical
+        if (original.message != canonical.message || !visited.add(original)) return canonical
+        canonical = original
     }
 }
 

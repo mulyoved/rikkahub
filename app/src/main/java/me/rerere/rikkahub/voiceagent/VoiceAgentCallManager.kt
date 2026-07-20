@@ -30,7 +30,7 @@ internal sealed interface VoiceAgentRouteMatchResult {
     data class Superseded(val route: VoiceAgentRouteMetadata) : VoiceAgentRouteMatchResult
 }
 
-class VoiceAgentCallManager(
+class VoiceAgentCallManager internal constructor(
     private val factory: VoiceAgentCallFactory,
 ) {
     private class PendingPublication(
@@ -264,7 +264,7 @@ class VoiceAgentCallManager(
         }
     }
 
-    fun detachForEndAndDrain(): RouteOwnedManagedVoiceCallSession? {
+    internal fun detachForEndAndDrain(): RouteOwnedManagedVoiceCallSession? {
         val detached = synchronized(lock) {
             callStatus = VoiceCallStatus.Ending
             _state.value = _state.value.copy(call = VoiceCallStatus.Ending)

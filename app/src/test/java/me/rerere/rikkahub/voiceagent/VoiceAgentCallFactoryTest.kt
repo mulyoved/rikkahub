@@ -1,6 +1,7 @@
 package me.rerere.rikkahub.voiceagent
 
 import android.content.ContextWrapper
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
@@ -32,6 +33,158 @@ import java.nio.file.Files
 import kotlin.uuid.Uuid
 
 class VoiceAgentCallFactoryTest {
+    @Test
+    fun `successful owned creation returns Created and leaves route live`() = runTest {
+        val root = Files.createTempDirectory("voice-factory-owned-success").toFile()
+        val sessionScope = CoroutineScope(coroutineContext + SupervisorJob())
+        val conversationId = Uuid.random()
+        val registry = VoiceAgentTelecomCallRegistry()
+        val attempt = registry.beginAttempt().requireAllocatedAttemptId()
+        val telecomCall = RecordingFactoryTelecomCall()
+        assertTrue(registry.activate(attempt, telecomCall))
+        registry.acknowledgeOutcome(attempt)
+        val lease = registry.consumeActiveOutcome(attempt).requireResolvedLease()
+        val factory = ownedCreationFactory(root, conversationId)
+        try {
+            val result = factory.createOwned(
+                request = VoiceAgentCallRequest(conversationId, factoryLaunchConfig()),
+                routeLease = lease,
+                scope = sessionScope,
+            )
+
+            assertTrue(result is VoiceAgentSessionCreationResult.Created)
+            assertEquals(0, telecomCall.disconnectCalls)
+            assertTrue(registry.isOwnedAttemptActive(attempt))
+
+            val created = result as VoiceAgentSessionCreationResult.Created
+            assertSame(
+                VoiceAgentCleanupResult.Completed,
+                created.session.cleanupOperation.run(VoiceAgentCleanupMode.Immediate),
+            )
+        } finally {
+            sessionScope.cancel()
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `owned creation failure with successful retirement returns FailedClean`() = runTest {
+        val root = Files.createTempDirectory("voice-factory-owned-clean-failure").toFile()
+        val creationFailure = IllegalStateException("session API creation failed")
+        val conversationId = Uuid.random()
+        val registry = VoiceAgentTelecomCallRegistry()
+        val attempt = registry.beginAttempt().requireAllocatedAttemptId()
+        val telecomCall = RecordingFactoryTelecomCall()
+        assertTrue(registry.activate(attempt, telecomCall))
+        registry.acknowledgeOutcome(attempt)
+        val factory = ownedCreationFactory(root, conversationId) { throw creationFailure }
+        try {
+            val result = factory.createOwned(
+                request = VoiceAgentCallRequest(conversationId, factoryLaunchConfig()),
+                routeLease = registry.consumeActiveOutcome(attempt).requireResolvedLease(),
+                scope = this,
+            )
+
+            assertTrue(result is VoiceAgentSessionCreationResult.FailedClean)
+            assertSame(creationFailure, (result as VoiceAgentSessionCreationResult.FailedClean).error)
+            assertTrue(creationFailure.suppressed.isEmpty())
+            assertEquals(1, telecomCall.disconnectCalls)
+            assertFalse(registry.isOwnedAttemptActive(attempt))
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `owned creation failure with failed retirement returns FailedDirty`() = runTest {
+        val root = Files.createTempDirectory("voice-factory-owned-dirty-failure").toFile()
+        val creationFailure = IllegalStateException("session API creation failed")
+        val retirementFailure = IllegalArgumentException("Telecom retirement failed")
+        val conversationId = Uuid.random()
+        val registry = VoiceAgentTelecomCallRegistry()
+        val attempt = registry.beginAttempt().requireAllocatedAttemptId()
+        val telecomCall = RecordingFactoryTelecomCall(retirementFailure)
+        assertTrue(registry.activate(attempt, telecomCall))
+        registry.acknowledgeOutcome(attempt)
+        val factory = ownedCreationFactory(root, conversationId) { throw creationFailure }
+        try {
+            val result = factory.createOwned(
+                request = VoiceAgentCallRequest(conversationId, factoryLaunchConfig()),
+                routeLease = registry.consumeActiveOutcome(attempt).requireResolvedLease(),
+                scope = this,
+            )
+
+            assertTrue(result is VoiceAgentSessionCreationResult.FailedDirty)
+            val dirty = result as VoiceAgentSessionCreationResult.FailedDirty
+            assertSame(creationFailure, dirty.error)
+            assertEquals(listOf(retirementFailure), creationFailure.suppressed.toList())
+            assertEquals(1, telecomCall.disconnectCalls)
+
+            telecomCall.retirementFailure = null
+            assertSame(VoiceAgentCleanupResult.Completed, dirty.cleanup.run(VoiceAgentCleanupMode.Immediate))
+            assertEquals(2, telecomCall.disconnectCalls)
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `owned creation cancellation retires route and throws exact cancellation`() = runTest {
+        val root = Files.createTempDirectory("voice-factory-owned-cancellation").toFile()
+        val cancellation = CancellationException("creation cancelled")
+        val conversationId = Uuid.random()
+        val registry = VoiceAgentTelecomCallRegistry()
+        val attempt = registry.beginAttempt().requireAllocatedAttemptId()
+        val telecomCall = RecordingFactoryTelecomCall()
+        assertTrue(registry.activate(attempt, telecomCall))
+        registry.acknowledgeOutcome(attempt)
+        val factory = ownedCreationFactory(root, conversationId) { throw cancellation }
+        try {
+            val thrown = runCatching {
+                factory.createOwned(
+                    request = VoiceAgentCallRequest(conversationId, factoryLaunchConfig()),
+                    routeLease = registry.consumeActiveOutcome(attempt).requireResolvedLease(),
+                    scope = this,
+                )
+            }.exceptionOrNull()
+
+            assertSame(cancellation, thrown)
+            assertEquals(1, telecomCall.disconnectCalls)
+            assertFalse(registry.isOwnedAttemptActive(attempt))
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `owned creation cancellation suppresses retirement failure onto exact cancellation`() = runTest {
+        val root = Files.createTempDirectory("voice-factory-owned-dirty-cancellation").toFile()
+        val cancellation = CancellationException("creation cancelled")
+        val retirementFailure = IllegalStateException("Telecom retirement failed")
+        val conversationId = Uuid.random()
+        val registry = VoiceAgentTelecomCallRegistry()
+        val attempt = registry.beginAttempt().requireAllocatedAttemptId()
+        val telecomCall = RecordingFactoryTelecomCall(retirementFailure)
+        assertTrue(registry.activate(attempt, telecomCall))
+        registry.acknowledgeOutcome(attempt)
+        val factory = ownedCreationFactory(root, conversationId) { throw cancellation }
+        try {
+            val thrown = runCatching {
+                factory.createOwned(
+                    request = VoiceAgentCallRequest(conversationId, factoryLaunchConfig()),
+                    routeLease = registry.consumeActiveOutcome(attempt).requireResolvedLease(),
+                    scope = this,
+                )
+            }.exceptionOrNull()
+
+            assertSame(cancellation, thrown)
+            assertEquals(listOf(retirementFailure), cancellation.suppressed.toList())
+            assertEquals(1, telecomCall.disconnectCalls)
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
     @Test
     fun `default call factory started session writes propagated metadata through real artifact writer`() = runTest {
         val root = Files.createTempDirectory("voice-e2e-default-factory-session").toFile()
@@ -218,7 +371,47 @@ class VoiceAgentCallFactoryTest {
 
     private fun JsonObject.boolean(key: String): Boolean = getValue(key).jsonPrimitive.boolean
 
+    private fun ownedCreationFactory(
+        root: File,
+        conversationId: Uuid,
+        sessionApiFactory: (HermesVoiceApi) -> VoiceSessionApi = { FakeVoiceSessionApi() },
+    ): DefaultVoiceAgentCallFactory {
+        val context = object : ContextWrapper(null) {
+            override fun getNoBackupFilesDir(): File = root
+            override fun getPackageName(): String = "me.rerere.rikkahub.factorytest"
+        }
+        return DefaultVoiceAgentCallFactory(
+            context = context,
+            chatService = null,
+            settingsStore = null,
+            okHttpClient = okhttp3.OkHttpClient(),
+            observability = NoOpVoiceObservability,
+            metadataEpochNowMs = { 1_700_000_010_000 },
+            sessionApiFactory = sessionApiFactory,
+            toolApiFactory = { FakeVoiceToolApi() },
+            geminiFactory = { FakeGeminiLiveVoiceClient() },
+            audioFactory = { FakeVoiceAudioEngine() },
+            conversationStoreFactory = {
+                InMemoryVoiceConversationStore(Conversation.ofId(id = conversationId))
+            },
+            contextProviderFactory = {
+                FakeVoiceAgentContextProvider(VoiceContext(systemInstruction = "system", turns = emptyList()))
+            },
+        )
+    }
+
     private fun runTest(block: suspend CoroutineScope.() -> Unit) = runBlocking(block = block)
+}
+
+private class RecordingFactoryTelecomCall(
+    var retirementFailure: Throwable? = null,
+) : VoiceAgentTelecomCall {
+    var disconnectCalls = 0
+
+    override fun disconnectFromApp() {
+        disconnectCalls += 1
+        retirementFailure?.let { throw it }
+    }
 }
 
 private fun factoryLaunchConfig(

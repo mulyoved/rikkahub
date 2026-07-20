@@ -5,18 +5,24 @@ import kotlinx.coroutines.withTimeoutOrNull
 import java.util.Collections
 import java.util.IdentityHashMap
 
-interface RouteOwnedManagedVoiceCallSession : ManagedVoiceCallSession {
+internal interface RouteOwnedManagedVoiceCallSession : ManagedVoiceCallSession {
     val routeMetadata: VoiceAgentRouteMetadata
     val isRouteUsable: Boolean
+    val cleanupOperation: VoiceAgentCleanupOperation
     suspend fun endAndDrainWithin(timeoutMillis: Long)
 }
 
-class RouteOwnedVoiceCallSession(
+internal class RouteOwnedVoiceCallSession(
     private val delegate: ManagedVoiceCallSession,
     private val routeLease: VoiceAgentRouteLease,
 ) : RouteOwnedManagedVoiceCallSession {
     override val state = delegate.state
     override val routeMetadata = routeLease.metadata
+    override val cleanupOperation = voiceAgentSessionCleanupOperation(
+        delegate = delegate,
+        routeLease = routeLease,
+        endDrainTimeoutMillis = VOICE_AGENT_END_DRAIN_TIMEOUT_MS,
+    )
     override val isRouteUsable: Boolean
         get() = routeLease.isUsable
 
@@ -79,10 +85,6 @@ class RouteOwnedVoiceCallSession(
 
     override fun closeNow() = runVoiceAgentCleanupStages(routeLease::retire, delegate::closeNow)
 }
-
-internal class VoiceAgentEndDrainTimeoutException(
-    timeoutMillis: Long,
-) : RuntimeException("Voice Agent end drain timed out after ${timeoutMillis}ms")
 
 private fun Throwable?.withEndDrainFailure(error: Throwable): Throwable = when {
     this == null -> error
