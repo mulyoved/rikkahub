@@ -128,6 +128,144 @@ class VoiceAgentCallServiceLifecycleTest {
     }
 
     @Test
+    fun `matching repeated intent does not cancel submitted controller start`() = runTest {
+        val firstResult = CompletableDeferred<VoiceAgentCallStartResult>()
+        val secondResult = CompletableDeferred<VoiceAgentCallStartResult>()
+        val controller = RecordingServiceController(
+            startResults = ArrayDeque(listOf(firstResult, secondResult)),
+        )
+        val host = RecordingLifecycleHost()
+        val scope = CoroutineScope(coroutineContext + SupervisorJob())
+        val lifecycle = VoiceAgentCallServiceLifecycle(controller, scope, host)
+        val request = serviceRequest()
+        try {
+            val firstGeneration = lifecycle.beginStart(request.conversationId)
+            lifecycle.launchStartConfiguration(firstGeneration, request.conversationId) { request }
+            runCurrent()
+
+            val secondGeneration = lifecycle.beginStart(request.conversationId)
+            lifecycle.launchStartConfiguration(secondGeneration, request.conversationId) { request }
+            runCurrent()
+
+            assertEquals(0, controller.startCancellations)
+            assertEquals(listOf(request, request), controller.requests)
+            controller.lifecycle.value = VoiceAgentCallLifecycle.Active(request.conversationId)
+            secondResult.complete(activeServiceStartResult())
+            firstResult.complete(VoiceAgentCallStartResult.Superseded)
+            runCurrent()
+            assertEquals(0, host.stopSelfCalls)
+        } finally {
+            firstResult.complete(VoiceAgentCallStartResult.Superseded)
+            secondResult.complete(VoiceAgentCallStartResult.Superseded)
+            scope.cancel()
+        }
+    }
+
+    @Test
+    fun `different repeated intent does not cancel submitted controller start`() = runTest {
+        val firstResult = CompletableDeferred<VoiceAgentCallStartResult>()
+        val secondResult = CompletableDeferred<VoiceAgentCallStartResult>()
+        val controller = RecordingServiceController(
+            startResults = ArrayDeque(listOf(firstResult, secondResult)),
+        )
+        val host = RecordingLifecycleHost()
+        val scope = CoroutineScope(coroutineContext + SupervisorJob())
+        val lifecycle = VoiceAgentCallServiceLifecycle(controller, scope, host)
+        val first = serviceRequest(voiceModelId = "first")
+        val replacement = serviceRequest(voiceModelId = "replacement")
+        try {
+            val firstGeneration = lifecycle.beginStart(first.conversationId)
+            lifecycle.launchStartConfiguration(firstGeneration, first.conversationId) { first }
+            runCurrent()
+
+            val secondGeneration = lifecycle.beginStart(replacement.conversationId)
+            lifecycle.launchStartConfiguration(secondGeneration, replacement.conversationId) { replacement }
+            runCurrent()
+
+            assertEquals(0, controller.startCancellations)
+            assertEquals(listOf(first, replacement), controller.requests)
+            controller.lifecycle.value = VoiceAgentCallLifecycle.Active(replacement.conversationId)
+            secondResult.complete(activeServiceStartResult())
+            firstResult.complete(VoiceAgentCallStartResult.Superseded)
+            runCurrent()
+            assertEquals(replacement.conversationId.toString(), host.foregroundConversationIds.last())
+            assertEquals(0, host.stopSelfCalls)
+        } finally {
+            firstResult.complete(VoiceAgentCallStartResult.Superseded)
+            secondResult.complete(VoiceAgentCallStartResult.Superseded)
+            scope.cancel()
+        }
+    }
+
+    @Test
+    fun `configuration failure preserves hosted controller through host stop lifecycle`() = runTest {
+        val activeConversation = Uuid.random()
+        val controller = RecordingServiceController(activeConversation = activeConversation)
+        controller.lifecycle.value = VoiceAgentCallLifecycle.Active(activeConversation)
+        val scope = CoroutineScope(coroutineContext + SupervisorJob())
+        lateinit var lifecycle: VoiceAgentCallServiceLifecycle
+        val host = RecordingLifecycleHost(onStopSelf = { lifecycle.destroy() })
+        lifecycle = VoiceAgentCallServiceLifecycle(controller, scope, host)
+        try {
+            val invalidConversation = Uuid.random()
+            val generation = lifecycle.beginStart(invalidConversation)
+            lifecycle.launchStartConfiguration(generation, invalidConversation) {
+                throw VoiceAgentCallConfigurationException("api_key=[redacted]")
+            }
+            runCurrent()
+
+            assertEquals(0, host.stopSelfCalls)
+            assertEquals(0, controller.closeNowCalls)
+            assertEquals(0, controller.endCalls)
+            assertTrue(controller.requests.isEmpty())
+            assertTrue(controller.statuses.isEmpty())
+            assertEquals(activeConversation.toString(), host.foregroundConversationIds.last())
+        } finally {
+            scope.cancel()
+        }
+    }
+
+    @Test
+    fun `malformed intent rejection preserves hosted controller through host stop lifecycle`() = runTest {
+        val activeConversation = Uuid.random()
+        val controller = RecordingServiceController(activeConversation = activeConversation)
+        controller.lifecycle.value = VoiceAgentCallLifecycle.Active(activeConversation)
+        val scope = CoroutineScope(coroutineContext + SupervisorJob())
+        lateinit var lifecycle: VoiceAgentCallServiceLifecycle
+        val host = RecordingLifecycleHost(onStopSelf = { lifecycle.destroy() })
+        lifecycle = VoiceAgentCallServiceLifecycle(controller, scope, host)
+        try {
+            lifecycle.rejectInvalidStart(VoiceAgentCallConfigurationException("invalid conversation id"))
+
+            assertEquals(0, host.stopSelfCalls)
+            assertEquals(0, controller.closeNowCalls)
+            assertEquals(0, controller.endCalls)
+            assertTrue(controller.requests.isEmpty())
+            assertTrue(controller.statuses.isEmpty())
+        } finally {
+            scope.cancel()
+        }
+    }
+
+    @Test
+    fun `idle malformed intent stop and destroy perform no controller mutation`() = runTest {
+        val controller = RecordingServiceController()
+        val scope = CoroutineScope(coroutineContext + SupervisorJob())
+        lateinit var lifecycle: VoiceAgentCallServiceLifecycle
+        val host = RecordingLifecycleHost(onStopSelf = { lifecycle.destroy() })
+        lifecycle = VoiceAgentCallServiceLifecycle(controller, scope, host)
+
+        lifecycle.rejectInvalidStart(VoiceAgentCallConfigurationException("invalid conversation id"))
+
+        assertEquals(1, host.stopSelfCalls)
+        assertEquals(1, host.destroyBaseCalls)
+        assertEquals(0, controller.closeNowCalls)
+        assertEquals(0, controller.endCalls)
+        assertTrue(controller.requests.isEmpty())
+        assertTrue(controller.statuses.isEmpty())
+    }
+
+    @Test
     fun `failed start reports exact error and stops only matching generation`() = runTest {
         val failure = IllegalStateException("token=private")
         val controller = RecordingServiceController(
@@ -213,6 +351,25 @@ class VoiceAgentCallServiceLifecycleTest {
 
             controller.lifecycle.value = VoiceAgentCallLifecycle.Idle
             runCurrent()
+            assertEquals(1, host.stopForegroundCalls)
+            assertEquals(1, host.stopSelfCalls)
+        } finally {
+            scope.cancel()
+        }
+    }
+
+    @Test
+    fun `active result followed by already idle lifecycle stops matching generation`() = runTest {
+        val request = serviceRequest()
+        val controller = RecordingServiceController()
+        val host = RecordingLifecycleHost()
+        val scope = CoroutineScope(coroutineContext + SupervisorJob())
+        val lifecycle = VoiceAgentCallServiceLifecycle(controller, scope, host)
+        try {
+            val generation = lifecycle.beginStart(request.conversationId)
+            lifecycle.launchStartConfiguration(generation, request.conversationId) { request }
+            runCurrent()
+
             assertEquals(1, host.stopForegroundCalls)
             assertEquals(1, host.stopSelfCalls)
         } finally {
@@ -316,6 +473,36 @@ class VoiceAgentCallServiceLifecycleTest {
         assertEquals(1, host.destroyBaseCalls)
         assertEquals(listOf("closeNow", "cancelNotification", "destroyBase"), events)
     }
+
+    @Test
+    fun `destroy closes controller before cancelling blocked end waiter`() = runTest {
+        val events = mutableListOf<String>()
+        val blockedEnd = CompletableDeferred<VoiceAgentCallEndResult>()
+        val controller = RecordingServiceController(
+            endResults = ArrayDeque(listOf(blockedEnd)),
+            events = events,
+        )
+        val scope = CoroutineScope(coroutineContext + SupervisorJob())
+        val lifecycle = VoiceAgentCallServiceLifecycle(
+            controller = controller,
+            serviceScope = scope,
+            host = RecordingLifecycleHost(events),
+        )
+        try {
+            assertTrue(lifecycle.endCall())
+            runCurrent()
+
+            lifecycle.destroy()
+            runCurrent()
+
+            assertEquals(1, controller.closeNowCalls)
+            assertEquals(1, controller.endCancellations)
+            assertTrue(events.indexOf("closeNow") < events.indexOf("endCancelled"))
+        } finally {
+            blockedEnd.complete(VoiceAgentCallEndResult.Completed)
+            scope.cancel()
+        }
+    }
 }
 
 internal class RecordingServiceController(
@@ -329,18 +516,30 @@ internal class RecordingServiceController(
     override val state = MutableStateFlow(VoiceAgentUiState())
     val requests = mutableListOf<VoiceAgentCallRequest>()
     val statuses = mutableListOf<VoiceCallStatus>()
+    var startCancellations = 0
     var endCalls = 0
+    var endCancellations = 0
     var closeNowCalls = 0
 
     override suspend fun start(request: VoiceAgentCallRequest): VoiceAgentCallStartResult {
         requests += request
-        return startResults.removeFirstOrNull()?.await()
-            ?: VoiceAgentCallStartResult.Active(VoiceAgentRouteMetadata(VoiceAudioRouteOwner.DirectFallback))
+        return try {
+            startResults.removeFirstOrNull()?.await() ?: activeServiceStartResult()
+        } catch (cancellation: kotlinx.coroutines.CancellationException) {
+            startCancellations += 1
+            throw cancellation
+        }
     }
 
     override suspend fun end(): VoiceAgentCallEndResult {
         endCalls += 1
-        return endResults.removeFirstOrNull()?.await() ?: VoiceAgentCallEndResult.Completed
+        return try {
+            endResults.removeFirstOrNull()?.await() ?: VoiceAgentCallEndResult.Completed
+        } catch (cancellation: kotlinx.coroutines.CancellationException) {
+            endCancellations += 1
+            events?.add("endCancelled")
+            throw cancellation
+        }
     }
 
     override fun closeNow() {
@@ -355,6 +554,7 @@ internal class RecordingServiceController(
 
 internal class RecordingLifecycleHost(
     val events: MutableList<String> = mutableListOf(),
+    private val onStopSelf: (() -> Unit)? = null,
 ) : VoiceAgentCallServiceLifecycleHost {
     val reportedFailures = mutableListOf<Throwable>()
     val foregroundStates = mutableListOf<VoiceAgentUiState>()
@@ -389,6 +589,7 @@ internal class RecordingLifecycleHost(
     override fun stopSelf() {
         events += "stopSelf"
         stopSelfCalls += 1
+        onStopSelf?.invoke()
     }
 
     override fun reportFailure(error: Throwable) {
@@ -401,6 +602,10 @@ internal class RecordingLifecycleHost(
         destroyBaseCalls += 1
     }
 }
+
+private fun activeServiceStartResult() = VoiceAgentCallStartResult.Active(
+    VoiceAgentRouteMetadata(VoiceAudioRouteOwner.DirectFallback),
+)
 
 internal fun serviceRequest(
     conversationId: Uuid = Uuid.random(),

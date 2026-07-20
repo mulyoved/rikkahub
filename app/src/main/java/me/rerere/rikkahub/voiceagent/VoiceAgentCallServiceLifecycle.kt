@@ -4,12 +4,10 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 import kotlin.uuid.Uuid
 
 internal const val VOICE_AGENT_END_DRAIN_TIMEOUT_MS = 15_000L
@@ -31,15 +29,19 @@ internal class VoiceAgentCallServiceLifecycle(
 ) {
     private val endJobTracker = VoiceAgentEndJobTracker()
     private var configurationJob: Job? = null
+    private var configurationToken: Any? = null
     private var notificationJob: Job? = null
+    private var closeControllerOnDestroy = true
 
     var currentGeneration: Long = 0L
         private set
 
     fun beginStart(conversationId: Uuid): Long {
         currentGeneration += 1
+        closeControllerOnDestroy = true
         configurationJob?.cancel()
         configurationJob = null
+        configurationToken = null
         endJobTracker.clearTracking()
         notificationJob?.cancel()
         notificationJob = null
@@ -68,10 +70,15 @@ internal class VoiceAgentCallServiceLifecycle(
         resolveRequest: suspend () -> VoiceAgentCallRequest,
     ) {
         configurationJob?.cancel()
+        val token = Any()
+        configurationToken = token
         configurationJob = serviceScope.launch {
+            var submitted = false
             try {
                 val request = resolveRequest()
                 if (!isCurrent(generation)) return@launch
+                clearConfigurationTracking(token)
+                submitted = true
                 when (val result = controller.start(request)) {
                     is VoiceAgentCallStartResult.Active -> observeActiveCall(generation, conversationId)
                     VoiceAgentCallStartResult.Superseded -> Unit
@@ -84,8 +91,29 @@ internal class VoiceAgentCallServiceLifecycle(
             } catch (cancellation: CancellationException) {
                 throw cancellation
             } catch (error: Throwable) {
-                stopFailedStartIfCurrent(generation, conversationId, error)
+                stopFailedStartIfCurrent(
+                    generation = generation,
+                    conversationId = conversationId,
+                    error = error,
+                    skipControllerCloseOnDestroy = !submitted,
+                )
+            } finally {
+                clearConfigurationTracking(token)
             }
+        }
+    }
+
+    fun rejectInvalidStart(error: Throwable) {
+        if (hasHostedCall()) {
+            reportFailureSafely(error)
+        } else {
+            closeControllerOnDestroy = false
+            runCatching {
+                runVoiceAgentCleanupStages(
+                    { host.reportFailure(error) },
+                    host::stopSelf,
+                )
+            }.exceptionOrNull()?.let(::reportFailureSafely)
         }
     }
 
@@ -94,6 +122,7 @@ internal class VoiceAgentCallServiceLifecycle(
 
         configurationJob?.cancel()
         configurationJob = null
+        configurationToken = null
         notificationJob?.cancel()
         notificationJob = null
         host.cancelNotification()
@@ -125,7 +154,7 @@ internal class VoiceAgentCallServiceLifecycle(
     fun destroy() {
         currentGeneration += 1
         runVoiceAgentCleanupStages(
-            controller::closeNow,
+            { if (closeControllerOnDestroy) controller.closeNow() },
             host::cancelNotification,
             { configurationJob?.cancel() },
             { notificationJob?.cancel() },
@@ -139,8 +168,20 @@ internal class VoiceAgentCallServiceLifecycle(
         generation: Long,
         conversationId: Uuid,
         error: Throwable,
+        skipControllerCloseOnDestroy: Boolean = false,
     ) {
         if (!isCurrent(generation)) return
+        if (hasHostedCall()) {
+            reportFailureSafely(error)
+            observeActiveCall(
+                generation = generation,
+                conversationId = hostedConversationId(conversationId),
+            )
+            return
+        }
+        if (skipControllerCloseOnDestroy) {
+            closeControllerOnDestroy = false
+        }
         val detail = error.toVoiceAgentLogDetail()
         val hostFailure = runCatching {
             runVoiceAgentCleanupStages(
@@ -176,16 +217,13 @@ internal class VoiceAgentCallServiceLifecycle(
                     }
                 }
                 launch {
-                    var observedOwnedLifecycle = false
                     controller.lifecycle.collect { lifecycle ->
                         when (lifecycle) {
-                            VoiceAgentCallLifecycle.Idle -> {
-                                if (observedOwnedLifecycle) stopAutonomousIfCurrent(generation)
-                            }
+                            VoiceAgentCallLifecycle.Idle -> stopAutonomousIfCurrent(generation)
                             is VoiceAgentCallLifecycle.Starting,
                             is VoiceAgentCallLifecycle.Active,
                             is VoiceAgentCallLifecycle.Stopping,
-                            -> observedOwnedLifecycle = true
+                            -> Unit
                             is VoiceAgentCallLifecycle.CleanupFailed -> {
                                 reportFailureSafely(lifecycle.error)
                                 stopAutonomousIfCurrent(generation)
@@ -212,6 +250,34 @@ internal class VoiceAgentCallServiceLifecycle(
         runCatching { host.reportFailure(error) }
     }
 
+    private fun clearConfigurationTracking(token: Any) {
+        if (configurationToken === token) {
+            configurationToken = null
+            configurationJob = null
+        }
+    }
+
+    private fun hasHostedCall(): Boolean =
+        controller.activeConversationId.value != null || when (controller.lifecycle.value) {
+            is VoiceAgentCallLifecycle.Starting,
+            is VoiceAgentCallLifecycle.Active,
+            is VoiceAgentCallLifecycle.Stopping,
+            -> true
+            VoiceAgentCallLifecycle.Idle,
+            is VoiceAgentCallLifecycle.CleanupFailed,
+            -> false
+        }
+
+    private fun hostedConversationId(fallback: Uuid): Uuid =
+        controller.activeConversationId.value ?: when (val lifecycle = controller.lifecycle.value) {
+            is VoiceAgentCallLifecycle.Starting -> lifecycle.conversationId
+            is VoiceAgentCallLifecycle.Active -> lifecycle.conversationId
+            is VoiceAgentCallLifecycle.Stopping -> lifecycle.conversationId ?: fallback
+            VoiceAgentCallLifecycle.Idle,
+            is VoiceAgentCallLifecycle.CleanupFailed,
+            -> fallback
+        }
+
     private companion object {
         const val FALLBACK_END_NOTIFICATION_CONVERSATION_ID = "voice-agent"
     }
@@ -233,12 +299,10 @@ internal class VoiceAgentEndJobTracker {
         operationToken = token
         job = null
         val launchedJob = scope.launch(start = CoroutineStart.UNDISPATCHED) {
-            withContext(NonCancellable) {
-                try {
-                    block()
-                } finally {
-                    clearIfCurrent(token)
-                }
+            try {
+                block()
+            } finally {
+                clearIfCurrent(token)
             }
         }
         if (operationToken === token) {

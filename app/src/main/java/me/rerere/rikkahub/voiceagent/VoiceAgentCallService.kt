@@ -99,7 +99,9 @@ class VoiceAgentCallService : Service() {
             ?.let { runCatching { Uuid.parse(it) }.getOrNull() }
         if (conversationId == null) {
             VoiceAgentLog.w(TAG, "start ignored: missing or invalid conversation id")
-            stopSelf()
+            lifecycle.rejectInvalidStart(
+                VoiceAgentCallConfigurationException("Missing or invalid conversation id"),
+            )
         }
         return conversationId
     }
