@@ -1,43 +1,51 @@
 # Current Result
 
 - Status: DONE
-- Commit: `e1eccab0f0eb27bf538289d1f0ccf3e1b0072741` (`refactor(voice): define call orchestration states`)
-- Summary: Added the complete immutable voice-call orchestration protocol and one exhaustive pure reducer. The reducer
-  retains exact operation and cleanup identity, applies latest-request-wins semantics, defers all external work to ordered
-  effects, and never launches a coroutine, runs cleanup, invokes a session, or completes a deferred.
-- Self-review: Clean after simplifying one single-use transition wrapper and narrowing the terminal waiter helper. The
-  repository has no bundled external-Codex, simplify, or AI-slop review adapters, so the review used the core correctness,
-  API-contract, maintainability, and test rubric manually. UI, React, security, and data adapters were not applicable.
+- Current code commit: `25443f2c4e99cbe43b065dc1a553ca3e83691773`
+  (`fix(voice): keep reducer session state immutable`)
+- Foundation code commit: `e1eccab0f0eb27bf538289d1f0ccf3e1b0072741`
+  (`refactor(voice): define call orchestration states`)
+- Summary: The pure call reducer now owns an immutable `VoiceAgentUiState` snapshot in both startup-ready outcomes and
+  active state. Matching active starts consult only that snapshot. Exact `SessionStateChanged` events replace the snapshot,
+  while stale events remain inert. The reducer no longer reads `call.session.state.value` or any other mutable resource.
+- Review closure: The deterministic regression binds identical state/event inputs to identical effects despite an
+  out-of-band session `StateFlow` mutation. The idle-event table now asserts exact effects, and current `FailedClean` and
+  `Cancelled` startup completions have direct exact state/result/effect assertions.
 
 # Tests
 
-- RED: With the reducer tests added before production changes, the focused command failed in
-  `:app:compileDebugUnitTestKotlin` with the expected unresolved contracts, beginning with
-  `Unresolved reference 'reduceVoiceAgentCallState'`, `VoiceAgentCallState`, `VoiceAgentCallEvent`, and
-  `VoiceAgentCallEffect`. This was the missing-feature failure required by the TDD cycle.
-- Focused GREEN: The final fresh focused command completed with `BUILD SUCCESSFUL in 11s`. The generated XML reports
-  19 tests, 0 skipped, 0 failures, and 0 errors.
+- RED: After adding the deterministic regression before production changes, the focused command ran 20 tests and failed
+  exactly `matching active reduction is unchanged by mutable session flow`. The same reducer state/event emitted a
+  `Reconnect` only after the backing session flow changed, proving the reducer depended on mutable resource state.
+- Focused GREEN: After adding immutable snapshots and removing the session-flow read, the same command completed with
+  `BUILD SUCCESSFUL in 14s`. The generated XML reports 20 tests, 0 skipped, 0 failures, and 0 errors.
 
   ```text
   ./gradlew :app:testDebugUnitTest --tests '*VoiceAgentCallStateMachineTest'
   ```
 
-- The tests use inert completed jobs and no `runTest`, `runBlocking`, live coroutine, latch, or Android fake. They cover
-  every event admitted from idle, all startup phase values, matching and different starts, both stopping variants,
-  terminal cleanup success/failure, retry, waiter cancellation, stale identities, active session policy, projections,
-  logical owner counts, effect order, and the absence of direct resource/deferred calls.
-- `git diff --check` passed, and both changed Kotlin files contain no line longer than 120 characters.
+- `git diff --check` passed, neither changed Kotlin file contains a line longer than 120 characters, and
+  `rg -n "call\\.session\\.state|session\\.state\\.value" VoiceAgentCallStateMachine.kt` returned no matches.
 
 # Files Changed
 
-- `app/src/main/java/me/rerere/rikkahub/voiceagent/VoiceAgentCallStateMachine.kt` — defines the exact request/results,
-  lifecycle, startup phases/outcomes, complete active-call value, pending waiters, states, events, effects, projections,
-  transition value, and pure reducer.
-- `app/src/test/java/me/rerere/rikkahub/voiceagent/VoiceAgentCallStateMachineTest.kt` — adds focused table-driven and
-  invariant coverage using only inert reducer fixtures.
+- `app/src/main/java/me/rerere/rikkahub/voiceagent/VoiceAgentCallStateMachine.kt` — adds immutable session snapshots to
+  `VoiceAgentStartOutcome.Ready` and `VoiceAgentCallState.Active`, uses the snapshot for matching-start reconnect policy,
+  and updates it only from an exact `SessionStateChanged` event.
+- `app/src/test/java/me/rerere/rikkahub/voiceagent/VoiceAgentCallStateMachineTest.kt` — adds the deterministic purity
+  regression and strengthens idle, clean-failure, and cancellation transition assertions.
 
 # Concerns
 
 - No known Task 3 correctness concerns.
-- The focused build retains the repository's existing unresolved `ExperimentalNavigation3Api` opt-in warning; this task
-  does not touch navigation and the warning did not affect compilation or tests.
+- The focused build retains the repository's pre-existing unresolved `ExperimentalNavigation3Api` opt-in warning. This
+  task does not touch navigation; the warning did not affect compilation or tests and remains recorded for final triage.
+
+# Attempt Appendix
+
+## Initial Task 3 result
+
+- Code commit `e1eccab0f0eb27bf538289d1f0ccf3e1b0072741` introduced the complete state/effect protocol and original reducer.
+- Report commit `9533cf2368b8d7a1a74edf439acca7103509bbec` recorded the initial RED compilation failure and a 19-test focused GREEN
+  run. That result was superseded when review found the matching-active branch read `call.session.state.value`, so identical
+  reducer inputs could produce different effects after mutable session state changed.
