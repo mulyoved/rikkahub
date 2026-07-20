@@ -419,7 +419,9 @@ class VoiceAgentAudioRouteResolverTest {
                 registry = registry,
                 timeoutMs = 1_000,
                 outcomeTimeout = ImmediateOutcomeTimeout,
-                blockingDispatcher = Dispatchers.Unconfined,
+                executionDispatchers = DefaultVoiceAgentRouteExecutionDispatchers.copy(
+                    acquisition = Dispatchers.Unconfined,
+                ),
             ).resolve().also {
                 events += "fallback"
             }

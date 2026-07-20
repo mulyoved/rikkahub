@@ -4,7 +4,6 @@ import com.google.firebase.Firebase
 import com.google.firebase.analytics.analytics
 import com.google.firebase.crashlytics.crashlytics
 import com.google.firebase.remoteconfig.remoteConfig
-import kotlinx.coroutines.Dispatchers
 import kotlinx.serialization.json.Json
 import me.rerere.highlight.Highlighter
 import me.rerere.rikkahub.AppScope
@@ -19,6 +18,7 @@ import me.rerere.rikkahub.utils.JsonInstant
 import me.rerere.rikkahub.utils.SoundEffectPlayer
 import me.rerere.rikkahub.utils.UpdateChecker
 import me.rerere.rikkahub.voiceagent.DefaultVoiceAgentCallFactory
+import me.rerere.rikkahub.voiceagent.DefaultVoiceAgentRouteExecutionDispatchers
 import me.rerere.rikkahub.voiceagent.VoiceAgentAudioRouteResolver
 import me.rerere.rikkahub.voiceagent.VoiceAgentCallFactory
 import me.rerere.rikkahub.voiceagent.VoiceAgentCallManager
@@ -167,7 +167,7 @@ val appModule = module {
             gateway = get(),
             registry = get(),
             cleanupScope = get<AppScope>(),
-            cleanupDispatcher = Dispatchers.IO,
+            executionDispatchers = DefaultVoiceAgentRouteExecutionDispatchers,
         )
     }
 

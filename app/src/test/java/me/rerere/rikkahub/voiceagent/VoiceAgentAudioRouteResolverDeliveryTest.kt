@@ -26,6 +26,154 @@ import org.junit.Test
 
 class VoiceAgentAudioRouteResolverDeliveryTest {
     @Test
+    fun `reserved cleanup releases an admission domain filled with exact joiners`() = runBlocking {
+        supervisorScope {
+            val cleanupFailure = IllegalStateException("reserved cleanup failed")
+            val currentFailure = AtomicReference<Throwable?>(cleanupFailure)
+            val cleanupEntered = CountDownLatch(1)
+            val releaseCleanup = CountDownLatch(1)
+            val cleanupThread = AtomicReference<Thread>()
+            val joinEntered = CountDownLatch(2)
+            val registry = VoiceAgentTelecomCallRegistry(
+                probe = VoiceAgentTelecomRegistryProbe { event ->
+                    if (event is VoiceAgentTelecomRegistryProbeEvent.RouteRetirementJoining) {
+                        joinEntered.countDown()
+                    }
+                },
+            )
+            val call = CallbackFaithfulResolverCall(
+                registry = registry,
+                cleanupFailure = currentFailure,
+                onCleanup = {
+                    cleanupThread.set(Thread.currentThread())
+                    cleanupEntered.countDown()
+                    check(releaseCleanup.await(5, TimeUnit.SECONDS)) {
+                        "reserved cleanup was not released"
+                    }
+                },
+            )
+            val ownerGateway = DeliveryTestGateway { attempt ->
+                assertTrue(registry.activate(attempt, call))
+            }
+            val joinerRegisterCalls = AtomicInteger()
+            val joinerStartCalls = AtomicInteger()
+            val joinerGateway = object : VoiceAgentTelecomGateway {
+                override fun register(): Result<Unit> {
+                    joinerRegisterCalls.incrementAndGet()
+                    return Result.success(Unit)
+                }
+
+                override fun startCall(attemptId: VoiceAgentTelecomAttemptId): Result<Unit> {
+                    joinerStartCalls.incrementAndGet()
+                    return Result.success(Unit)
+                }
+            }
+            val admissionExecutor = Executors.newFixedThreadPool(2)
+            val admissionReady = CountDownLatch(2)
+            val releaseAdmission = CountDownLatch(1)
+            val admissionDispatcher = FirstTasksGateDispatcher(
+                executor = admissionExecutor,
+                taskCount = 2,
+                entered = admissionReady,
+                release = releaseAdmission,
+            )
+            val reservedCleanupExecutor = Executors.newSingleThreadExecutor()
+            val reservedCleanupDispatcher = reservedCleanupExecutor.asCoroutineDispatcher()
+            val executionDispatchers = VoiceAgentRouteExecutionDispatchers(
+                acquisition = admissionDispatcher,
+                cleanup = reservedCleanupDispatcher,
+            )
+            val callerExecutor = Executors.newFixedThreadPool(2)
+            val cleanupScope = CoroutineScope(SupervisorJob() + reservedCleanupDispatcher)
+            val main = MainDeliveryGateDispatcher()
+            val mainThread = AtomicReference<Thread>()
+            val cancellation = CancellationException("cancel into reserved cleanup")
+            val joiners = AtomicReference<List<java.util.concurrent.Future<Throwable?>>>()
+            val observed = AtomicReference<Throwable>()
+            var resolution: Deferred<VoiceAgentRouteResolution>? = null
+
+            try {
+                resolution = async(main) {
+                    try {
+                        VoiceAgentAudioRouteResolver(
+                            gateway = ownerGateway,
+                            registry = registry,
+                            timeoutMs = 1_000,
+                            executionDispatchers = VoiceAgentRouteExecutionDispatchers(
+                                acquisition = kotlinx.coroutines.Dispatchers.Unconfined,
+                                cleanup = reservedCleanupDispatcher,
+                            ),
+                            cleanupScope = cleanupScope,
+                            deliveryProbe = VoiceAgentRouteDeliveryProbe { job ->
+                                mainThread.set(Thread.currentThread())
+                                joiners.set(
+                                    List(2) {
+                                        callerExecutor.submit<Throwable?> {
+                                            runBlocking {
+                                                runCatching {
+                                                    VoiceAgentAudioRouteResolver(
+                                                        gateway = joinerGateway,
+                                                        registry = registry,
+                                                        timeoutMs = 1_000,
+                                                        executionDispatchers = executionDispatchers,
+                                                    ).resolve()
+                                                }.exceptionOrNull()
+                                            }
+                                        }
+                                    },
+                                )
+                                check(admissionReady.await(1, TimeUnit.SECONDS)) {
+                                    "admission domain was not filled"
+                                }
+                                job.cancel(cancellation)
+                                releaseAdmission.countDown()
+                            },
+                        ).resolve()
+                    } catch (error: Throwable) {
+                        observed.set(error)
+                        throw error
+                    }
+                }
+
+                assertTrue(joinEntered.await(1, TimeUnit.SECONDS))
+                assertTrue(cleanupEntered.await(1, TimeUnit.SECONDS))
+                assertEquals(0, joinerRegisterCalls.get())
+                assertEquals(0, joinerStartCalls.get())
+                assertEquals(1, call.disconnectCalls.get())
+                assertTrue(cleanupThread.get() !== mainThread.get())
+
+                releaseCleanup.countDown()
+                checkNotNull(joiners.get()).forEach { joiner ->
+                    assertSame(cleanupFailure, joiner.get(1, TimeUnit.SECONDS))
+                }
+                withTimeoutOrNull(1_000) { checkNotNull(resolution).join() }
+                val thrown = observed.get()
+                assertTrue(thrown is CancellationException)
+                assertEquals(cancellation.message, thrown.message)
+                assertEquals(1, thrown.suppressed.size)
+                assertSame(cleanupFailure, thrown.suppressed.single())
+                assertEquals(1, call.disconnectCalls.get())
+
+                currentFailure.set(null)
+                val next = registry.beginAttempt().requireAllocatedAttemptId()
+                assertEquals(2, call.disconnectCalls.get())
+                assertEquals(2L, next.value)
+            } finally {
+                releaseAdmission.countDown()
+                releaseCleanup.countDown()
+                withTimeoutOrNull(1_000) { resolution?.join() }
+                currentFailure.set(null)
+                main.close()
+                cleanupScope.cancel()
+                reservedCleanupDispatcher.close()
+                reservedCleanupExecutor.shutdownNow()
+                callerExecutor.shutdownNow()
+                admissionExecutor.shutdownNow()
+            }
+        }
+    }
+
+    @Test
     fun `rejected allocated cleanup dispatch preserves cancellation and consumes attempt`() = runBlocking {
         val registry = VoiceAgentTelecomCallRegistry()
         val registerCalls = AtomicInteger()
@@ -75,8 +223,10 @@ class VoiceAgentAudioRouteResolverDeliveryTest {
                         gateway = gateway,
                         registry = registry,
                         timeoutMs = 1_000,
-                        blockingDispatcher = acquisitionDispatcher,
-                        cleanupDispatcher = RejectingDispatcher(schedulingFailure),
+                        executionDispatchers = VoiceAgentRouteExecutionDispatchers(
+                            acquisition = acquisitionDispatcher,
+                            cleanup = RejectingDispatcher(schedulingFailure),
+                        ),
                     ).resolve()
                 } catch (error: Throwable) {
                     observed.set(error)
@@ -160,7 +310,9 @@ class VoiceAgentAudioRouteResolverDeliveryTest {
                             gateway = DeliveryTestGateway { error("gateway must not run") },
                             registry = registry,
                             timeoutMs = 1_000,
-                            blockingDispatcher = blockingDispatcher,
+                            executionDispatchers = DefaultVoiceAgentRouteExecutionDispatchers.copy(
+                                acquisition = blockingDispatcher,
+                            ),
                         ).resolve()
                     } catch (error: Throwable) {
                         observed.set(error)
@@ -242,7 +394,9 @@ class VoiceAgentAudioRouteResolverDeliveryTest {
                         registry = registry,
                         timeoutMs = 1_000,
                         cleanupScope = cleanupScope,
-                        cleanupDispatcher = cleanupDispatcher,
+                        executionDispatchers = DefaultVoiceAgentRouteExecutionDispatchers.copy(
+                            cleanup = cleanupDispatcher,
+                        ),
                         deliveryProbe = VoiceAgentRouteDeliveryProbe { job ->
                             job.cancel(cancellation)
                             cancelReturned.countDown()
@@ -307,7 +461,9 @@ class VoiceAgentAudioRouteResolverDeliveryTest {
                         registry = registry,
                         timeoutMs = 1_000,
                         cleanupScope = cleanupScope,
-                        cleanupDispatcher = cleanupDispatcher,
+                        executionDispatchers = DefaultVoiceAgentRouteExecutionDispatchers.copy(
+                            cleanup = cleanupDispatcher,
+                        ),
                         deliveryProbe = VoiceAgentRouteDeliveryProbe { job ->
                             job.cancel(cancellation)
                             cancelReturned.countDown()
@@ -373,7 +529,9 @@ class VoiceAgentAudioRouteResolverDeliveryTest {
                         registry = registry,
                         timeoutMs = 1_000,
                         cleanupScope = cleanupScope,
-                        cleanupDispatcher = RejectingDispatcher(schedulingFailure),
+                        executionDispatchers = DefaultVoiceAgentRouteExecutionDispatchers.copy(
+                            cleanup = RejectingDispatcher(schedulingFailure),
+                        ),
                         deliveryProbe = VoiceAgentRouteDeliveryProbe { job ->
                             job.cancel(cancellation)
                             cancelReturned.countDown()
@@ -467,7 +625,9 @@ class VoiceAgentAudioRouteResolverDeliveryTest {
                         registry = registry,
                         timeoutMs = 1_000,
                         cleanupScope = cleanupScope,
-                        cleanupDispatcher = cleanupDispatcher,
+                        executionDispatchers = DefaultVoiceAgentRouteExecutionDispatchers.copy(
+                            cleanup = cleanupDispatcher,
+                        ),
                         deliveryProbe = VoiceAgentRouteDeliveryProbe { job ->
                             assertTrue(activeOutcomeClaimed.await(1, TimeUnit.SECONDS))
                             val framework = frameworkExecutor.submit {
@@ -592,6 +752,25 @@ private class AfterFirstTaskDispatcher(
             if (isFirst) beforeFirstTask()
             block.run()
             if (isFirst) afterFirstTask()
+        }
+    }
+}
+
+private class FirstTasksGateDispatcher(
+    private val executor: java.util.concurrent.Executor,
+    taskCount: Int,
+    private val entered: CountDownLatch,
+    private val release: CountDownLatch,
+) : CoroutineDispatcher() {
+    private val remainingGatedTasks = AtomicInteger(taskCount)
+
+    override fun dispatch(context: CoroutineContext, block: Runnable) {
+        executor.execute {
+            if (remainingGatedTasks.getAndDecrement() > 0) {
+                entered.countDown()
+                check(release.await(5, TimeUnit.SECONDS)) { "admission gate was not released" }
+            }
+            block.run()
         }
     }
 }

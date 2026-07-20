@@ -46,7 +46,9 @@ class VoiceAgentAudioRouteResolverCancellationTest {
                     gateway = gateway,
                     registry = registry,
                     timeoutMs = 1_000,
-                    blockingDispatcher = Dispatchers.Unconfined,
+                    executionDispatchers = DefaultVoiceAgentRouteExecutionDispatchers.copy(
+                        acquisition = Dispatchers.Unconfined,
+                    ),
                     deliveryProbe = VoiceAgentRouteDeliveryProbe { job -> job.cancel(cancellation) },
                 ).resolve()
             } catch (error: Throwable) {
@@ -121,7 +123,9 @@ class VoiceAgentAudioRouteResolverCancellationTest {
                         registry = registry,
                         timeoutMs = 1_000,
                         cleanupScope = cleanupScope,
-                        cleanupDispatcher = cleanupDispatcher,
+                        executionDispatchers = DefaultVoiceAgentRouteExecutionDispatchers.copy(
+                            cleanup = cleanupDispatcher,
+                        ),
                         deliveryProbe = VoiceAgentRouteDeliveryProbe { job -> job.cancel(cancellation) },
                     ).resolve()
                 } catch (error: Throwable) {
@@ -224,7 +228,9 @@ class VoiceAgentAudioRouteResolverCancellationTest {
                         gateway = gateway,
                         registry = registry,
                         timeoutMs = 1_000,
-                        blockingDispatcher = Dispatchers.Unconfined,
+                        executionDispatchers = DefaultVoiceAgentRouteExecutionDispatchers.copy(
+                            acquisition = Dispatchers.Unconfined,
+                        ),
                         deliveryProbe = VoiceAgentRouteDeliveryProbe { job -> job.cancel(cancellation) },
                     ).resolve()
                 } catch (error: Throwable) {
@@ -717,7 +723,9 @@ class VoiceAgentAudioRouteResolverCancellationTest {
                 gateway = initialGateway,
                 registry = registry,
                 timeoutMs = 1_000,
-                blockingDispatcher = Dispatchers.Unconfined,
+                executionDispatchers = DefaultVoiceAgentRouteExecutionDispatchers.copy(
+                    acquisition = Dispatchers.Unconfined,
+                ),
             ).resolve()
         }.exceptionOrNull()
 
@@ -811,8 +819,10 @@ class VoiceAgentAudioRouteResolverCancellationTest {
             }),
             registry,
             1_000,
-            blockingDispatcher = Dispatchers.Unconfined,
-            cleanupDispatcher = Dispatchers.Unconfined,
+            executionDispatchers = VoiceAgentRouteExecutionDispatchers(
+                acquisition = Dispatchers.Unconfined,
+                cleanup = Dispatchers.Unconfined,
+            ),
         )
         val resolution = async(start = CoroutineStart.UNDISPATCHED) { resolver.resolve() }
         val cancellation = CancellationException("caller cancelled during activation")
