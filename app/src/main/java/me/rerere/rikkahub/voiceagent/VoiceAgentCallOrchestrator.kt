@@ -3,6 +3,7 @@ package me.rerere.rikkahub.voiceagent
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
@@ -181,7 +182,7 @@ internal class VoiceAgentCallOrchestrator(
             is VoiceAgentCallEffect.AdmitStart -> error("Admissions must be drained under the orchestrator lock")
             is VoiceAgentCallEffect.LaunchStart -> effect.operation.start()
             is VoiceAgentCallEffect.CancelStart -> effect.operation.cancel()
-            is VoiceAgentCallEffect.RunCleanup -> appScope.launch {
+            is VoiceAgentCallEffect.RunCleanup -> appScope.launch(Dispatchers.Default) {
                 val result = try {
                     effect.cleanup.run(effect.mode)
                 } catch (error: Throwable) {
@@ -217,7 +218,10 @@ internal class VoiceAgentCallOrchestrator(
     private fun applySessionState(call: ActiveVoiceAgentCall, value: VoiceAgentUiState) {
         synchronized(lock) {
             val current = (callState as? VoiceAgentCallState.Active)?.call
-            if (current?.token === call.token) _state.value = value
+            if (current?.token === call.token) {
+                val callStatus = value.call.takeUnless { it == VoiceCallStatus.Idle } ?: _state.value.call
+                _state.value = value.copy(call = callStatus)
+            }
         }
     }
 

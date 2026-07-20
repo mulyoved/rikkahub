@@ -58,7 +58,7 @@ class VoiceAgentCallOrchestratorStartupTest {
         assertEquals(VoiceAgentCallStartResult.Active(lease.metadata), result.await())
         assertEquals(VoiceAgentCallLifecycle.Active(request.conversationId), orchestrator.lifecycle.value)
         assertEquals(request.conversationId, orchestrator.activeConversationId.value)
-        assertEquals(initialState, orchestrator.state.value)
+        assertEquals(initialState.copy(call = VoiceCallStatus.BackgroundCapable), orchestrator.state.value)
         assertEquals(1, routeCalls)
         assertEquals(1, factory.calls)
         assertSame(lease, factory.leases.single())

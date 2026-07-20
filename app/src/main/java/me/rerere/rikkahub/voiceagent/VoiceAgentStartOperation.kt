@@ -110,7 +110,13 @@ private class DefaultVoiceAgentStartOperation(
             val routeMetadata = session.routeMetadata
             lateinit var call: ActiveVoiceAgentCall
             val collector = callScope.launch(start = CoroutineStart.LAZY) {
+                var firstState = true
                 session.state.collect { state ->
+                    if (firstState && state == initialState) {
+                        firstState = false
+                        return@collect
+                    }
+                    firstState = false
                     onSessionState(call, state, session.isRouteUsable)
                 }
             }

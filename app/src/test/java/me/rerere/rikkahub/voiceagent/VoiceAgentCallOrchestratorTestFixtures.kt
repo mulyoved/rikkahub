@@ -7,7 +7,9 @@ import me.rerere.rikkahub.voiceagent.audio.VoiceAudioRouteOwner
 import me.rerere.rikkahub.voiceagent.hermesvoice.HermesVoiceCredentials
 import kotlin.uuid.Uuid
 
-internal class OrchestratorFakeRoute {
+internal class OrchestratorFakeRoute(
+    private val onDisconnect: () -> Unit = {},
+) {
     private val registry = VoiceAgentTelecomCallRegistry()
     private val attempt = registry.beginAttempt().requireAllocatedAttemptId()
     var retirementCalls = 0
@@ -20,6 +22,7 @@ internal class OrchestratorFakeRoute {
                 object : VoiceAgentTelecomCall {
                     override fun disconnectFromApp() {
                         retirementCalls += 1
+                        onDisconnect()
                     }
                 },
             ),
@@ -34,6 +37,10 @@ internal class OrchestratorFakeSession(
     override val cleanupOperation: VoiceAgentCleanupOperation = OrchestratorFakeCleanupOperation(),
     private val onStart: () -> Unit = {},
     private val onRouteMetadataRead: () -> Unit = {},
+    private val onInterrupt: () -> Unit = {},
+    private val onSetMuted: (Boolean) -> Unit = {},
+    private val onReconnect: () -> Unit = {},
+    private val onDiagnostic: (String, String) -> Unit = { _, _ -> },
 ) : RouteOwnedManagedVoiceCallSession {
     private val mutableState = MutableStateFlow(initialState)
     private val configuredRouteMetadata = routeMetadata
@@ -63,18 +70,22 @@ internal class OrchestratorFakeSession(
 
     override fun interrupt() {
         interruptCalls += 1
+        onInterrupt()
     }
 
     override fun setMuted(value: Boolean) {
         mutedValues += value
+        onSetMuted(value)
     }
 
     override fun reconnect() {
         reconnectCalls += 1
+        onReconnect()
     }
 
     override fun recordDiagnostic(name: String, detail: String) {
         diagnostics += name to detail
+        onDiagnostic(name, detail)
     }
 
     override fun end() = Unit
@@ -97,6 +108,41 @@ internal class OrchestratorFakeCleanupOperation(
     override suspend fun run(mode: VoiceAgentCleanupMode): VoiceAgentCleanupResult {
         modes += mode
         return block(mode)
+    }
+}
+
+internal class OrchestratorCleanupDelegate : ManagedVoiceCallSession {
+    override val state: StateFlow<VoiceAgentUiState> = MutableStateFlow(VoiceAgentUiState())
+    var endCalls = 0
+    var drainCalls = 0
+    var closeCalls = 0
+    var endFailure: Throwable? = null
+    var drainFailure: Throwable? = null
+    var closeFailure: Throwable? = null
+
+    override fun start() = Unit
+
+    override fun interrupt() = Unit
+
+    override fun setMuted(value: Boolean) = Unit
+
+    override fun reconnect() = Unit
+
+    override fun recordDiagnostic(name: String, detail: String) = Unit
+
+    override fun end() {
+        endCalls += 1
+        endFailure?.let { throw it }
+    }
+
+    override suspend fun endAndDrain() {
+        drainCalls += 1
+        drainFailure?.let { throw it }
+    }
+
+    override fun closeNow() {
+        closeCalls += 1
+        closeFailure?.let { throw it }
     }
 }
 
