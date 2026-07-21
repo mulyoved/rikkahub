@@ -1,32 +1,123 @@
 package me.rerere.rikkahub.voiceagent.livekit
 
+import android.content.ContextWrapper
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.withContext
+import me.rerere.rikkahub.voiceagent.DirectFallbackVoiceAgentRouteLease
 import me.rerere.rikkahub.voiceagent.OrchestratorFakeRoute
+import me.rerere.rikkahub.voiceagent.VoiceAgentSessionCreationResult
+import me.rerere.rikkahub.voiceagent.VoiceAgentTelecomFailure
+import me.rerere.rikkahub.voiceagent.VoiceAgentTransport
 import me.rerere.rikkahub.voiceagent.VoiceAgentCleanupMode
 import me.rerere.rikkahub.voiceagent.VoiceAgentCleanupResult
 import me.rerere.rikkahub.voiceagent.VoiceAudioStatus
 import me.rerere.rikkahub.voiceagent.VoiceSessionStatus
+import me.rerere.rikkahub.voiceagent.orchestratorRequest
+import me.rerere.rikkahub.voiceagent.telemetry.VoiceTraceContext
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 
 class LiveKitVoiceCallSessionTest {
+    @Test
+    fun `autonomous failure cleanup does not block the session Main dispatcher`() = runTest {
+        val mainDispatcher = Executors.newSingleThreadExecutor().asCoroutineDispatcher()
+        val cleanupDispatcher = Executors.newSingleThreadExecutor().asCoroutineDispatcher()
+        val sessionScope = CoroutineScope(SupervisorJob() + mainDispatcher)
+        val cleanupStarted = CountDownLatch(1)
+        val releaseCleanup = CountDownLatch(1)
+        val route = OrchestratorFakeRoute {
+            cleanupStarted.countDown()
+            check(releaseCleanup.await(5, TimeUnit.SECONDS)) { "cleanup release timed out" }
+        }
+        val fixture = fixture(
+            connectFailure = IllegalStateException("connect failed"),
+            route = route,
+            sessionScope = sessionScope,
+            cleanupDispatcher = cleanupDispatcher,
+        )
+        try {
+            fixture.session.start()
+            assertTrue("autonomous cleanup did not start", cleanupStarted.await(5, TimeUnit.SECONDS))
+
+            val mainProbe = CountDownLatch(1)
+            sessionScope.launch { mainProbe.countDown() }
+
+            assertTrue(
+                "session Main dispatcher was blocked by autonomous cleanup",
+                mainProbe.await(1, TimeUnit.SECONDS),
+            )
+        } finally {
+            releaseCleanup.countDown()
+            sessionScope.cancel()
+            cleanupDispatcher.close()
+            mainDispatcher.close()
+        }
+    }
+
+    @Test
+    fun `closed fallback session reports its route unusable`() = runTest {
+        val session = LiveKitVoiceCallSession(
+            details = details(),
+            traceId = TEST_TRACE_ID,
+            room = FakeLiveKitRoomFacade(),
+            routeLease = DirectFallbackVoiceAgentRouteLease(
+                VoiceAgentTelecomFailure("telecom_unavailable", "test fallback"),
+            ),
+            scope = backgroundScope,
+        )
+
+        assertEquals(
+            VoiceAgentCleanupResult.Completed,
+            session.cleanupOperation.run(VoiceAgentCleanupMode.Immediate),
+        )
+
+        assertFalse(session.isRouteUsable)
+    }
+
+    @Test
+    fun `factory trace ID is published in the LiveKit session UI state`() = runTest {
+        val trace = VoiceTraceContext(traceId = "VA123456-0000000000000001", voiceSessionId = "voice-session")
+        val factory = LiveKitVoiceCallFactory(
+            context = ContextWrapper(null),
+            traceContextFactory = { trace },
+            sessionDetailsFactory = { _, _ -> details() },
+            roomFactory = { FakeLiveKitRoomFacade() },
+        )
+
+        val result = factory.createOwned(
+            request = orchestratorRequest("livekit-trace").copy(
+                transport = VoiceAgentTransport.LiveKitExperimental,
+            ),
+            routeLease = OrchestratorFakeRoute().lease,
+            scope = backgroundScope,
+        )
+
+        val session = (result as VoiceAgentSessionCreationResult.Created).session
+        assertEquals(trace.traceId, session.state.value.traceId)
+    }
+
     @Test
     fun `room connection is not usable until expected worker ready`() = runTest {
         val fixture = fixture()
@@ -108,6 +199,45 @@ class LiveKitVoiceCallSessionTest {
         assertEquals(listOf(true, false), fixture.room.microphoneValues)
         assertFalse(fixture.room.sdkMicrophoneEnabled)
         assertEquals(VoiceAudioStatus.Muted, fixture.session.state.value.audio)
+    }
+
+    @Test
+    fun `false microphone publication result fails and cleans the experimental call`() = runTest {
+        val fixture = fixture()
+        fixture.room.microphoneResult = false
+
+        fixture.session.start()
+        runCurrent()
+
+        val status = fixture.session.state.value.session
+        assertTrue(status is VoiceSessionStatus.Error)
+        assertTrue((status as VoiceSessionStatus.Error).message.contains("microphone", ignoreCase = true))
+        assertTrue(
+            fixture.session.state.value.diagnostics.any { it.name == "livekit_microphone_failed" },
+        )
+        assertFalse(fixture.session.isRouteUsable)
+        assertEquals(1, fixture.route.retirementCalls)
+        assertEquals(1, fixture.room.disconnectCalls)
+        assertEquals(1, fixture.room.closeCalls)
+    }
+
+    @Test
+    fun `microphone publication exception fails and cleans the experimental call`() = runTest {
+        val fixture = fixture()
+        fixture.room.microphoneFailure = IllegalStateException("synthetic publication failure")
+
+        fixture.session.start()
+        runCurrent()
+
+        val status = fixture.session.state.value.session
+        assertTrue(status is VoiceSessionStatus.Error)
+        assertTrue((status as VoiceSessionStatus.Error).message.contains("microphone", ignoreCase = true))
+        assertTrue(
+            fixture.session.state.value.diagnostics.any { it.name == "livekit_microphone_failed" },
+        )
+        assertEquals(1, fixture.route.retirementCalls)
+        assertEquals(1, fixture.room.disconnectCalls)
+        assertEquals(1, fixture.room.closeCalls)
     }
 
     @Test
@@ -466,17 +596,20 @@ class LiveKitVoiceCallSessionTest {
         readyTimeoutMillis: Long = 30_000,
         route: OrchestratorFakeRoute = OrchestratorFakeRoute(),
         sessionScope: CoroutineScope = backgroundScope,
+        cleanupDispatcher: CoroutineDispatcher = StandardTestDispatcher(testScheduler),
     ): SessionFixture {
         val room = FakeLiveKitRoomFacade(connectFailure)
         return SessionFixture(
             session = LiveKitVoiceCallSession(
                 details = details(),
+                traceId = TEST_TRACE_ID,
                 room = room,
                 routeLease = route.lease,
                 scope = sessionScope,
                 rpcMethods = rpcMethods,
                 connectTimeoutMillis = 10_000,
                 readyTimeoutMillis = readyTimeoutMillis,
+                cleanupDispatcher = cleanupDispatcher,
             ),
             room = room,
             route = route,
@@ -517,6 +650,8 @@ private class FakeLiveKitRoomFacade(
     var disconnectFailure: Throwable? = null
     var closeFailure: Throwable? = null
     var microphoneGate: CompletableDeferred<Unit>? = null
+    var microphoneResult = true
+    var microphoneFailure: Throwable? = null
     var performRpcGate: CompletableDeferred<Unit>? = null
     var performRpcTerminationGate: CompletableDeferred<Unit>? = null
     var sdkMicrophoneEnabled = false
@@ -548,8 +683,9 @@ private class FakeLiveKitRoomFacade(
     override suspend fun setMicrophoneEnabled(enabled: Boolean): Boolean {
         microphoneValues += enabled
         microphoneGate?.await()
-        sdkMicrophoneEnabled = enabled
-        return true
+        microphoneFailure?.let { throw it }
+        if (microphoneResult) sdkMicrophoneEnabled = enabled
+        return microphoneResult
     }
 
     override suspend fun performRpc(destination: String, method: String, payload: String): String {
@@ -612,3 +748,4 @@ private const val VOICE_SESSION_ID = "lvs_1"
 private const val AGENT_IDENTITY = "agent_lvs_1"
 private const val READY_TOPIC = "voice.ready.v1"
 private const val INTERRUPT_RPC = "voice.interrupt"
+private const val TEST_TRACE_ID = "VA123456-0000000000000000"

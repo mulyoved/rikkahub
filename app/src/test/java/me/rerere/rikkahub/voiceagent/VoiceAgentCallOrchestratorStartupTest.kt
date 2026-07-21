@@ -19,6 +19,34 @@ import org.junit.Test
 
 class VoiceAgentCallOrchestratorStartupTest {
     @Test
+    fun `active identity publishes conversation and transport as one value`() = runTest {
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val appJob = SupervisorJob()
+        val route = OrchestratorFakeRoute()
+        val session = OrchestratorFakeSession(routeMetadata = route.lease.metadata)
+        val orchestrator = VoiceAgentCallOrchestrator(
+            factory = OrchestratorFakeFactory { _, _, _ ->
+                VoiceAgentSessionCreationResult.Created(session)
+            },
+            resolveRoute = { route.lease },
+            appScope = CoroutineScope(appJob + dispatcher),
+        )
+        val request = orchestratorRequest("typed-active-identity").copy(
+            transport = VoiceAgentTransport.LiveKitExperimental,
+        )
+
+        val result = async { orchestrator.start(request) }
+        runCurrent()
+
+        assertTrue(result.await() is VoiceAgentCallStartResult.Active)
+        assertEquals(
+            ActiveVoiceAgentIdentity(request.conversationId, request.transport),
+            orchestrator.activeIdentity.value,
+        )
+        appJob.cancel()
+    }
+
+    @Test
     fun `operation admission creates no child and repeated start attaches one worker outside admission`() = runTest {
         val dispatcher = StandardTestDispatcher(testScheduler)
         val appJob = SupervisorJob()
@@ -137,7 +165,10 @@ class VoiceAgentCallOrchestratorStartupTest {
 
         assertEquals(VoiceAgentCallStartResult.Active(lease.metadata), result.await())
         assertEquals(VoiceAgentCallLifecycle.Active(request.conversationId), orchestrator.lifecycle.value)
-        assertEquals(request.conversationId, orchestrator.activeConversationId.value)
+        assertEquals(
+            ActiveVoiceAgentIdentity(request.conversationId, request.transport),
+            orchestrator.activeIdentity.value,
+        )
         assertEquals(initialState.copy(call = VoiceCallStatus.BackgroundCapable), orchestrator.state.value)
         assertEquals(1, routeCalls)
         assertEquals(1, factory.calls)
@@ -146,6 +177,30 @@ class VoiceAgentCallOrchestratorStartupTest {
         assertEquals(1, session.collectorCount())
         assertEquals(0, route.retirementCalls)
 
+        appJob.cancel()
+    }
+
+    @Test
+    fun `orchestrator supplies its drain timeout to owned session creation`() = runTest {
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val appJob = SupervisorJob()
+        val route = OrchestratorFakeRoute()
+        val session = OrchestratorFakeSession(routeMetadata = route.lease.metadata)
+        val factory = OrchestratorFakeFactory { _, _, _ ->
+            VoiceAgentSessionCreationResult.Created(session)
+        }
+        val orchestrator = VoiceAgentCallOrchestrator(
+            factory = factory,
+            resolveRoute = { route.lease },
+            appScope = CoroutineScope(appJob + dispatcher),
+            endDrainTimeoutMillis = 37,
+        )
+
+        val result = async { orchestrator.start(orchestratorRequest("configured-drain-timeout")) }
+        runCurrent()
+
+        assertTrue(result.await() is VoiceAgentCallStartResult.Active)
+        assertEquals(listOf(37L), factory.endDrainTimeouts)
         appJob.cancel()
     }
 
@@ -219,7 +274,7 @@ class VoiceAgentCallOrchestratorStartupTest {
 
         assertSame(routeError, (result.await() as VoiceAgentCallStartResult.Failed).error)
         assertEquals(VoiceAgentCallLifecycle.Idle, orchestrator.lifecycle.value)
-        assertEquals(null, orchestrator.activeConversationId.value)
+        assertEquals(null, orchestrator.activeIdentity.value)
         assertEquals(0, factory.calls)
         assertEquals(0, appJob.children.count())
     }
@@ -329,12 +384,19 @@ class VoiceAgentCallOrchestratorStartupTest {
             appScope = CoroutineScope(appJob + dispatcher),
         )
 
-        val result = async { orchestrator.start(orchestratorRequest("resource-cancel-dirty")) }
+        val failure = CompletableDeferred<Throwable>()
+        launch {
+            try {
+                orchestrator.start(orchestratorRequest("resource-cancel-dirty"))
+            } catch (error: Throwable) {
+                failure.complete(error)
+            }
+        }
         runCurrent()
 
-        val failure = (result.await() as VoiceAgentCallStartResult.Failed).error
-        assertSame(cancellation, failure)
-        assertEquals(listOf(cleanupError), failure.suppressed.toList())
+        val thrown = failure.await()
+        assertSame(cancellation, thrown)
+        assertEquals(listOf(cleanupError), thrown.suppressed.toList())
         assertEquals(VoiceAgentCallLifecycle.CleanupFailed(cancellation), orchestrator.lifecycle.value)
         assertEquals(listOf(VoiceAgentCleanupMode.Immediate), cleanup.modes)
         assertEquals(0, appJob.children.count())
@@ -421,11 +483,17 @@ class VoiceAgentCallOrchestratorStartupTest {
             appScope = CoroutineScope(appJob + dispatcher),
         )
 
-        val result = async { orchestrator.start(orchestratorRequest("pre-collector-resource-cancel")) }
+        val failure = CompletableDeferred<Throwable>()
+        launch {
+            try {
+                orchestrator.start(orchestratorRequest("pre-collector-resource-cancel"))
+            } catch (error: Throwable) {
+                failure.complete(error)
+            }
+        }
         runCurrent()
 
-        val failure = (result.await() as VoiceAgentCallStartResult.Failed).error
-        assertSame(cancellation, failure)
+        assertSame(cancellation, failure.await())
         assertEquals(listOf(VoiceAgentCleanupMode.Immediate), cleanup.modes)
         assertEquals(0, session.collectorCount())
         assertEquals(VoiceAgentCallLifecycle.Idle, orchestrator.lifecycle.value)
@@ -770,7 +838,7 @@ class VoiceAgentCallOrchestratorStartupTest {
         assertTrue(finished.await().first is VoiceAgentCallStartResult.Active)
         assertEquals(VoiceAgentCallEndResult.Completed, finished.await().second)
         assertEquals(VoiceAgentCallLifecycle.Idle, orchestrator.lifecycle.value)
-        assertEquals(null, orchestrator.activeConversationId.value)
+        assertEquals(null, orchestrator.activeIdentity.value)
         assertEquals(VoiceAgentUiState(), orchestrator.state.value)
         assertEquals(0, session.collectorCount())
         assertTrue(appJob.children.none())

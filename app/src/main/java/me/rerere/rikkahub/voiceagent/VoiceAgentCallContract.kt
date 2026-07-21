@@ -10,6 +10,7 @@ object VoiceAgentCallContract {
     const val EXTRA_CONVERSATION_ID = "conversationId"
     const val EXTRA_TRANSPORT = "transport"
     const val EXTRA_ROUTE_VOICE_AGENT_CONVERSATION_ID = "voiceAgentConversationId"
+    const val EXTRA_ROUTE_VOICE_AGENT_TRANSPORT = "voiceAgentTransport"
     const val NOTIFICATION_ID = 2401
 }
 
@@ -39,6 +40,16 @@ internal data class EncodedVoiceAgentCallStartFields(
     val transportWireName: String,
 )
 
+internal data class VoiceAgentNotificationRouteFields(
+    val conversationId: Uuid,
+    val transport: VoiceAgentTransport,
+)
+
+internal data class EncodedVoiceAgentNotificationRouteFields(
+    val conversationId: String,
+    val transportWireName: String,
+)
+
 internal fun encodeVoiceAgentCallStartFields(
     conversationId: String,
     transport: VoiceAgentTransport,
@@ -55,4 +66,26 @@ internal fun decodeVoiceAgentCallStartFields(
         ?: return null
     val transport = VoiceAgentTransport.fromWireName(transportWireName) ?: return null
     return VoiceAgentCallStartFields(parsedConversationId, transport)
+}
+
+internal fun encodeVoiceAgentNotificationRouteFields(
+    conversationId: String,
+    transport: VoiceAgentTransport,
+): EncodedVoiceAgentNotificationRouteFields = EncodedVoiceAgentNotificationRouteFields(
+    conversationId = conversationId,
+    transportWireName = transport.wireName,
+)
+
+internal fun decodeVoiceAgentNotificationRouteFields(
+    conversationId: String?,
+    transportWireName: String?,
+): VoiceAgentNotificationRouteFields? {
+    val parsedConversationId = conversationId?.let { runCatching { Uuid.parse(it) }.getOrNull() }
+        ?: return null
+    val transport = if (transportWireName == null) {
+        VoiceAgentTransport.DirectGemini
+    } else {
+        VoiceAgentTransport.fromWireName(transportWireName) ?: return null
+    }
+    return VoiceAgentNotificationRouteFields(parsedConversationId, transport)
 }

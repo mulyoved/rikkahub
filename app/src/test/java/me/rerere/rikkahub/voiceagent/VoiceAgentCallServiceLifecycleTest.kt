@@ -20,10 +20,27 @@ import kotlin.uuid.Uuid
 @OptIn(ExperimentalCoroutinesApi::class)
 class VoiceAgentCallServiceLifecycleTest {
     @Test
+    fun `foreground notification receives requested LiveKit transport`() = runTest {
+        val conversationId = Uuid.random()
+        val host = RecordingLifecycleHost()
+        val scope = CoroutineScope(coroutineContext + SupervisorJob())
+        val lifecycle = VoiceAgentCallServiceLifecycle(RecordingServiceController(), scope, host)
+        try {
+            lifecycle.beginStart(conversationId, VoiceAgentTransport.LiveKitExperimental)
+
+            assertEquals(listOf(VoiceAgentTransport.LiveKitExperimental), host.foregroundTransports)
+        } finally {
+            scope.cancel()
+        }
+    }
+
+    @Test
     fun `matching degraded call keeps degraded notification during configuration`() = runTest {
         val conversationId = Uuid.random()
         val degraded = VoiceAgentUiState(call = VoiceCallStatus.Degraded("existing failure"))
-        val controller = RecordingServiceController(activeConversation = conversationId)
+        val controller = RecordingServiceController(
+            activeIdentity = ActiveVoiceAgentIdentity(conversationId, VoiceAgentTransport.DirectGemini),
+        )
         controller.state.value = degraded
         val host = RecordingLifecycleHost()
         val scope = CoroutineScope(coroutineContext + SupervisorJob())
@@ -149,6 +166,7 @@ class VoiceAgentCallServiceLifecycleTest {
 
             assertEquals(0, controller.startCancellations)
             assertEquals(listOf(request, request), controller.requests)
+            controller.activeIdentity.value = ActiveVoiceAgentIdentity(request.conversationId, request.transport)
             controller.lifecycle.value = VoiceAgentCallLifecycle.Active(request.conversationId)
             secondResult.complete(activeServiceStartResult())
             firstResult.complete(VoiceAgentCallStartResult.Superseded)
@@ -184,6 +202,10 @@ class VoiceAgentCallServiceLifecycleTest {
 
             assertEquals(0, controller.startCancellations)
             assertEquals(listOf(first, replacement), controller.requests)
+            controller.activeIdentity.value = ActiveVoiceAgentIdentity(
+                replacement.conversationId,
+                replacement.transport,
+            )
             controller.lifecycle.value = VoiceAgentCallLifecycle.Active(replacement.conversationId)
             secondResult.complete(activeServiceStartResult())
             firstResult.complete(VoiceAgentCallStartResult.Superseded)
@@ -198,9 +220,89 @@ class VoiceAgentCallServiceLifecycleTest {
     }
 
     @Test
+    fun `stale active completion cannot replace hosted notification transport`() = runTest {
+        val firstResult = CompletableDeferred<VoiceAgentCallStartResult>()
+        val secondResult = CompletableDeferred<VoiceAgentCallStartResult>()
+        val controller = RecordingServiceController(
+            startResults = ArrayDeque(listOf(firstResult, secondResult)),
+        )
+        val host = RecordingLifecycleHost()
+        val scope = CoroutineScope(coroutineContext + SupervisorJob())
+        val lifecycle = VoiceAgentCallServiceLifecycle(controller, scope, host)
+        val conversationId = Uuid.random()
+        val direct = serviceRequest(conversationId)
+        val liveKit = direct.copy(transport = VoiceAgentTransport.LiveKitExperimental)
+        try {
+            val firstGeneration = lifecycle.beginStart(conversationId, direct.transport)
+            lifecycle.launchStartConfiguration(firstGeneration, conversationId) { direct }
+            runCurrent()
+
+            val secondGeneration = lifecycle.beginStart(conversationId, liveKit.transport)
+            lifecycle.launchStartConfiguration(secondGeneration, conversationId) { liveKit }
+            runCurrent()
+
+            controller.activeIdentity.value = ActiveVoiceAgentIdentity(conversationId, liveKit.transport)
+            controller.lifecycle.value = VoiceAgentCallLifecycle.Active(conversationId)
+            secondResult.complete(activeServiceStartResult())
+            runCurrent()
+            firstResult.complete(activeServiceStartResult())
+            runCurrent()
+
+            lifecycle.endCall()
+
+            assertEquals(VoiceAgentTransport.LiveKitExperimental, host.foregroundTransports.last())
+        } finally {
+            firstResult.complete(VoiceAgentCallStartResult.Superseded)
+            secondResult.complete(VoiceAgentCallStartResult.Superseded)
+            scope.cancel()
+        }
+    }
+
+    @Test
+    fun `newer configuration failure keeps older active transport for observation and end`() = runTest {
+        val firstResult = CompletableDeferred<VoiceAgentCallStartResult>()
+        val conversationId = Uuid.random()
+        val direct = serviceRequest(conversationId)
+        val liveKit = direct.copy(transport = VoiceAgentTransport.LiveKitExperimental)
+        val controller = RecordingServiceController(
+            startResults = ArrayDeque(listOf(firstResult)),
+            activeIdentity = ActiveVoiceAgentIdentity(conversationId, direct.transport),
+        )
+        val host = RecordingLifecycleHost()
+        val scope = CoroutineScope(coroutineContext + SupervisorJob())
+        val lifecycle = VoiceAgentCallServiceLifecycle(controller, scope, host)
+        try {
+            val firstGeneration = lifecycle.beginStart(conversationId, direct.transport)
+            lifecycle.launchStartConfiguration(firstGeneration, conversationId) { direct }
+            runCurrent()
+
+            val secondGeneration = lifecycle.beginStart(conversationId, liveKit.transport)
+            controller.lifecycle.value = VoiceAgentCallLifecycle.Active(conversationId)
+            firstResult.complete(activeServiceStartResult())
+            runCurrent()
+
+            lifecycle.launchStartConfiguration(secondGeneration, conversationId) {
+                throw VoiceAgentCallConfigurationException("LiveKit configuration failed")
+            }
+            runCurrent()
+
+            assertEquals(VoiceAgentTransport.DirectGemini, host.foregroundTransports.last())
+
+            lifecycle.endCall()
+
+            assertEquals(VoiceAgentTransport.DirectGemini, host.foregroundTransports.last())
+        } finally {
+            firstResult.complete(VoiceAgentCallStartResult.Superseded)
+            scope.cancel()
+        }
+    }
+
+    @Test
     fun `configuration failure preserves hosted controller through host stop lifecycle`() = runTest {
         val activeConversation = Uuid.random()
-        val controller = RecordingServiceController(activeConversation = activeConversation)
+        val controller = RecordingServiceController(
+            activeIdentity = ActiveVoiceAgentIdentity(activeConversation, VoiceAgentTransport.DirectGemini),
+        )
         controller.lifecycle.value = VoiceAgentCallLifecycle.Active(activeConversation)
         val scope = CoroutineScope(coroutineContext + SupervisorJob())
         lateinit var lifecycle: VoiceAgentCallServiceLifecycle
@@ -226,9 +328,35 @@ class VoiceAgentCallServiceLifecycleTest {
     }
 
     @Test
+    fun `configuration failure while cleanup is retained keeps destroy cleanup retry enabled`() = runTest {
+        val retainedFailure = IllegalStateException("cleanup retained")
+        val controller = RecordingServiceController().apply {
+            lifecycle.value = VoiceAgentCallLifecycle.CleanupFailed(retainedFailure)
+        }
+        val scope = CoroutineScope(coroutineContext + SupervisorJob())
+        lateinit var lifecycle: VoiceAgentCallServiceLifecycle
+        val host = RecordingLifecycleHost(onStopSelf = { lifecycle.destroy() })
+        lifecycle = VoiceAgentCallServiceLifecycle(controller, scope, host)
+        val conversationId = Uuid.random()
+        val generation = lifecycle.beginStart(conversationId)
+
+        lifecycle.launchStartConfiguration(generation, conversationId) {
+            throw VoiceAgentCallConfigurationException("invalid voice configuration")
+        }
+        runCurrent()
+
+        assertEquals(1, host.stopSelfCalls)
+        assertEquals(1, host.destroyBaseCalls)
+        assertEquals(1, controller.closeNowCalls)
+        assertTrue(controller.requests.isEmpty())
+    }
+
+    @Test
     fun `malformed intent rejection preserves hosted controller through host stop lifecycle`() = runTest {
         val activeConversation = Uuid.random()
-        val controller = RecordingServiceController(activeConversation = activeConversation)
+        val controller = RecordingServiceController(
+            activeIdentity = ActiveVoiceAgentIdentity(activeConversation, VoiceAgentTransport.DirectGemini),
+        )
         controller.lifecycle.value = VoiceAgentCallLifecycle.Active(activeConversation)
         val scope = CoroutineScope(coroutineContext + SupervisorJob())
         lateinit var lifecycle: VoiceAgentCallServiceLifecycle
@@ -245,6 +373,27 @@ class VoiceAgentCallServiceLifecycleTest {
         } finally {
             scope.cancel()
         }
+    }
+
+    @Test
+    fun `invalid start while cleanup is retained keeps destroy cleanup retry enabled`() = runTest {
+        val retainedFailure = IllegalStateException("cleanup retained")
+        val controller = RecordingServiceController().apply {
+            lifecycle.value = VoiceAgentCallLifecycle.CleanupFailed(retainedFailure)
+        }
+        val scope = CoroutineScope(coroutineContext + SupervisorJob())
+        lateinit var lifecycle: VoiceAgentCallServiceLifecycle
+        val host = RecordingLifecycleHost(onStopSelf = { lifecycle.destroy() })
+        lifecycle = VoiceAgentCallServiceLifecycle(controller, scope, host)
+
+        lifecycle.rejectInvalidStart(
+            VoiceAgentCallConfigurationException("invalid conversation id"),
+        )
+
+        assertEquals(1, host.stopSelfCalls)
+        assertEquals(1, host.destroyBaseCalls)
+        assertEquals(1, controller.closeNowCalls)
+        assertTrue(controller.requests.isEmpty())
     }
 
     @Test
@@ -370,6 +519,7 @@ class VoiceAgentCallServiceLifecycleTest {
             val generation = lifecycle.beginStart(request.conversationId)
             lifecycle.launchStartConfiguration(generation, request.conversationId) { request }
             runCurrent()
+            controller.activeIdentity.value = ActiveVoiceAgentIdentity(request.conversationId, request.transport)
             controller.lifecycle.value = VoiceAgentCallLifecycle.Active(request.conversationId)
             startResult.complete(
                 VoiceAgentCallStartResult.Active(
@@ -415,6 +565,7 @@ class VoiceAgentCallServiceLifecycleTest {
     fun `cleanup failed lifecycle reports exact error before autonomous stop`() = runTest {
         val request = serviceRequest()
         val controller = RecordingServiceController()
+        controller.activeIdentity.value = ActiveVoiceAgentIdentity(request.conversationId, request.transport)
         controller.lifecycle.value = VoiceAgentCallLifecycle.Active(request.conversationId)
         val host = RecordingLifecycleHost()
         val scope = CoroutineScope(coroutineContext + SupervisorJob())
@@ -442,7 +593,7 @@ class VoiceAgentCallServiceLifecycleTest {
         val endResult = CompletableDeferred<VoiceAgentCallEndResult>()
         val oldConversation = Uuid.random()
         val controller = RecordingServiceController(
-            activeConversation = oldConversation,
+            activeIdentity = ActiveVoiceAgentIdentity(oldConversation, VoiceAgentTransport.DirectGemini),
             endResults = ArrayDeque(listOf(endResult)),
         )
         val host = RecordingLifecycleHost()
@@ -471,7 +622,7 @@ class VoiceAgentCallServiceLifecycleTest {
     fun `end failure reports exact error then stops matching generation`() = runTest {
         val failure = IllegalStateException("cleanup token=secret")
         val controller = RecordingServiceController(
-            activeConversation = Uuid.random(),
+            activeIdentity = ActiveVoiceAgentIdentity(Uuid.random(), VoiceAgentTransport.DirectGemini),
             endResults = ArrayDeque(listOf(CompletableDeferred(VoiceAgentCallEndResult.Failed(failure)))),
         )
         val host = RecordingLifecycleHost()
@@ -540,12 +691,12 @@ class VoiceAgentCallServiceLifecycleTest {
 }
 
 internal class RecordingServiceController(
-    activeConversation: Uuid? = null,
+    activeIdentity: ActiveVoiceAgentIdentity? = null,
     val startResults: ArrayDeque<CompletableDeferred<VoiceAgentCallStartResult>> = ArrayDeque(),
     val endResults: ArrayDeque<CompletableDeferred<VoiceAgentCallEndResult>> = ArrayDeque(),
     private val events: MutableList<String>? = null,
 ) : VoiceAgentCallServiceController {
-    override val activeConversationId = MutableStateFlow(activeConversation)
+    override val activeIdentity = MutableStateFlow(activeIdentity)
     override val lifecycle = MutableStateFlow<VoiceAgentCallLifecycle>(VoiceAgentCallLifecycle.Idle)
     override val state = MutableStateFlow(VoiceAgentUiState())
     val requests = mutableListOf<VoiceAgentCallRequest>()
@@ -593,6 +744,7 @@ internal class RecordingLifecycleHost(
     val reportedFailures = mutableListOf<Throwable>()
     val foregroundStates = mutableListOf<VoiceAgentUiState>()
     val foregroundConversationIds = mutableListOf<String>()
+    val foregroundTransports = mutableListOf<VoiceAgentTransport>()
     val completedConversationIds = mutableListOf<Uuid?>()
     var stopForegroundCalls = 0
     var stopSelfCalls = 0
@@ -603,9 +755,14 @@ internal class RecordingLifecycleHost(
         events += "cancelNotification"
     }
 
-    override fun startForeground(conversationId: String, state: VoiceAgentUiState) {
+    override fun startForeground(
+        conversationId: String,
+        transport: VoiceAgentTransport,
+        state: VoiceAgentUiState,
+    ) {
         events += "startForeground"
         foregroundConversationIds += conversationId
+        foregroundTransports += transport
         foregroundStates += state
     }
 

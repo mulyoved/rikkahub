@@ -28,8 +28,12 @@ class VoiceAgentCallService : Service() {
             host = object : VoiceAgentCallServiceLifecycleHost {
                 override fun cancelNotification() = Unit
 
-                override fun startForeground(conversationId: String, state: VoiceAgentUiState) {
-                    startForegroundFor(conversationId, state)
+                override fun startForeground(
+                    conversationId: String,
+                    transport: VoiceAgentTransport,
+                    state: VoiceAgentUiState,
+                ) {
+                    startForegroundFor(conversationId, transport, state)
                 }
 
                 override fun endCompleted(conversationId: Uuid?) {
@@ -76,7 +80,7 @@ class VoiceAgentCallService : Service() {
         val fields = parseStartFields(intent) ?: return
         val conversationId = fields.conversationId
         VoiceAgentLog.d(TAG, "start requested conversationId=$conversationId")
-        val generation = lifecycle.beginStart(conversationId)
+        val generation = lifecycle.beginStart(conversationId, fields.transport)
         lifecycle.launchStartConfiguration(generation, conversationId) {
             VoiceAgentLog.d(TAG, "loading settings and conversation")
             val settings = settingsStore.settingsFlow.first()
@@ -113,8 +117,16 @@ class VoiceAgentCallService : Service() {
         return fields
     }
 
-    private fun startForegroundFor(conversationId: String, state: VoiceAgentUiState) {
-        val notification = notificationFactory.activeNotification(conversationId = conversationId, state = state)
+    private fun startForegroundFor(
+        conversationId: String,
+        transport: VoiceAgentTransport,
+        state: VoiceAgentUiState,
+    ) {
+        val notification = notificationFactory.activeNotification(
+            conversationId = conversationId,
+            transport = transport,
+            state = state,
+        )
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             ServiceCompat.startForeground(
                 this,

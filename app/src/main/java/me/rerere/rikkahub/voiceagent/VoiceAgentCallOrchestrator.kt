@@ -11,10 +11,9 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import kotlin.uuid.Uuid
 
 internal interface VoiceAgentCallServiceController {
-    val activeConversationId: StateFlow<Uuid?>
+    val activeIdentity: StateFlow<ActiveVoiceAgentIdentity?>
     val lifecycle: StateFlow<VoiceAgentCallLifecycle>
     val state: StateFlow<VoiceAgentUiState>
 
@@ -32,11 +31,11 @@ internal class VoiceAgentCallOrchestrator(
 ) : VoiceAgentCallServiceController {
     private val lock = Any()
     private var callState: VoiceAgentCallState = VoiceAgentCallState.Idle
-    private val _activeConversationId = MutableStateFlow<Uuid?>(null)
+    private val _activeIdentity = MutableStateFlow<ActiveVoiceAgentIdentity?>(null)
     private val _lifecycle = MutableStateFlow<VoiceAgentCallLifecycle>(VoiceAgentCallLifecycle.Idle)
     private val _state = MutableStateFlow(VoiceAgentUiState())
 
-    override val activeConversationId: StateFlow<Uuid?> = _activeConversationId.asStateFlow()
+    override val activeIdentity: StateFlow<ActiveVoiceAgentIdentity?> = _activeIdentity.asStateFlow()
     override val lifecycle: StateFlow<VoiceAgentCallLifecycle> = _lifecycle.asStateFlow()
     override val state: StateFlow<VoiceAgentUiState> = _state.asStateFlow()
 
@@ -149,6 +148,7 @@ internal class VoiceAgentCallOrchestrator(
             request = pending.request,
             appScope = appScope,
             factory = factory,
+            endDrainTimeoutMillis = endDrainTimeoutMillis,
             resolveRoute = resolveRoute,
             onFinished = { operation, outcome ->
                 dispatch(VoiceAgentCallEvent.StartFinished(operation, outcome))
@@ -162,7 +162,7 @@ internal class VoiceAgentCallOrchestrator(
     private fun publishTransitionLocked(next: VoiceAgentCallState) {
         val previous = callState
         callState = next
-        _activeConversationId.value = next.activeConversationId
+        _activeIdentity.value = next.activeIdentity
         _lifecycle.value = next.lifecycle
         when {
             next is VoiceAgentCallState.Active &&
@@ -192,6 +192,9 @@ internal class VoiceAgentCallOrchestrator(
                 dispatch(VoiceAgentCallEvent.CleanupFinished(effect.cleanup, result))
             }
             is VoiceAgentCallEffect.CompleteStarts -> effect.replies.forEach { it.complete(effect.result) }
+            is VoiceAgentCallEffect.CompleteStartsWithCancellation -> effect.replies.forEach {
+                it.completeExceptionally(effect.error)
+            }
             is VoiceAgentCallEffect.CompleteEnds -> effect.replies.forEach { it.complete(effect.result) }
             is VoiceAgentCallEffect.CompleteCancellations -> effect.cancellations.forEach {
                 it.completion.complete(effect.cleanupFailure)

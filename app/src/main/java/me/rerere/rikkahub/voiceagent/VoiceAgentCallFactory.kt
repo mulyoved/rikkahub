@@ -20,8 +20,6 @@ import me.rerere.rikkahub.voiceagent.hermesvoice.HermesVoiceApi
 import me.rerere.rikkahub.voiceagent.hermesvoice.HermesVoiceTraceHeaders
 import okhttp3.OkHttpClient
 import java.io.File
-import java.util.Collections
-import java.util.IdentityHashMap
 import kotlin.uuid.Uuid
 
 interface ManagedVoiceCallSession {
@@ -41,20 +39,35 @@ internal interface VoiceAgentCallFactory {
         request: VoiceAgentCallRequest,
         routeLease: VoiceAgentRouteLease,
         scope: CoroutineScope,
+        endDrainTimeoutMillis: Long = VOICE_AGENT_END_DRAIN_TIMEOUT_MS,
     ): VoiceAgentSessionCreationResult
 }
 
 internal class TransportSelectingVoiceAgentCallFactory(
     private val directFactoryProvider: () -> VoiceAgentCallFactory,
     private val liveKitFactoryProvider: () -> VoiceAgentCallFactory,
+    private val liveKitEnabled: Boolean,
 ) : VoiceAgentCallFactory {
     override suspend fun createOwned(
         request: VoiceAgentCallRequest,
         routeLease: VoiceAgentRouteLease,
         scope: CoroutineScope,
+        endDrainTimeoutMillis: Long,
     ): VoiceAgentSessionCreationResult = when (request.transport) {
-        VoiceAgentTransport.DirectGemini -> directFactoryProvider().createOwned(request, routeLease, scope)
-        VoiceAgentTransport.LiveKitExperimental -> liveKitFactoryProvider().createOwned(request, routeLease, scope)
+        VoiceAgentTransport.DirectGemini -> directFactoryProvider().createOwned(
+            request,
+            routeLease,
+            scope,
+            endDrainTimeoutMillis,
+        )
+        VoiceAgentTransport.LiveKitExperimental -> if (liveKitEnabled) {
+            liveKitFactoryProvider().createOwned(request, routeLease, scope, endDrainTimeoutMillis)
+        } else {
+            finishFailedOwnedVoiceSessionCreation(
+                creationError = IllegalStateException("LiveKit experimental voice transport is disabled"),
+                cleanup = voiceAgentRouteCleanupOperation(routeLease),
+            )
+        }
     }
 }
 
@@ -122,6 +135,7 @@ internal class DefaultVoiceAgentCallFactory internal constructor(
         request: VoiceAgentCallRequest,
         routeLease: VoiceAgentRouteLease,
         scope: CoroutineScope,
+        endDrainTimeoutMillis: Long,
     ): VoiceAgentSessionCreationResult {
         val cleanup = voiceAgentRouteCleanupOperation(routeLease)
         return try {
@@ -132,6 +146,7 @@ internal class DefaultVoiceAgentCallFactory internal constructor(
                         request.config,
                         routeLease,
                         scope,
+                        endDrainTimeoutMillis,
                     )
                     VoiceAgentTransport.LiveKitExperimental -> {
                         throw VoiceAgentCallConfigurationException(
@@ -150,6 +165,7 @@ internal class DefaultVoiceAgentCallFactory internal constructor(
         config: VoiceAgentLaunchConfig,
         routeLease: VoiceAgentRouteLease,
         scope: CoroutineScope,
+        endDrainTimeoutMillis: Long,
     ): RouteOwnedManagedVoiceCallSession {
         val route = routeLease.metadata
         val baseTraceContext = newVoiceTraceContext()
@@ -206,7 +222,7 @@ internal class DefaultVoiceAgentCallFactory internal constructor(
             }
             throw throwable
         }
-        return RouteOwnedVoiceCallSession(coreSession, routeLease)
+        return RouteOwnedVoiceCallSession(coreSession, routeLease, endDrainTimeoutMillis)
     }
 
 }
@@ -218,45 +234,28 @@ internal suspend fun finishFailedOwnedVoiceSessionCreation(
     val cleanupResult = try {
         cleanup.run(VoiceAgentCleanupMode.Immediate)
     } catch (cleanupCancellation: CancellationException) {
-        val canonical = cleanupCancellation.canonicalFactoryCancellation()
-        canonical.addSuppressedDistinct(creationError.canonicalIfCancellation())
+        val canonical = cleanupCancellation.canonicalVoiceAgentCancellation()
+        canonical.addVoiceAgentSuppressedDistinct(creationError.canonicalIfCancellation())
         throw canonical
     }
     if (creationError is CancellationException) {
-        val canonical = creationError.canonicalFactoryCancellation()
+        val canonical = creationError.canonicalVoiceAgentCancellation()
         if (cleanupResult is VoiceAgentCleanupResult.Failed) {
-            canonical.addSuppressedDistinct(cleanupResult.error)
+            canonical.addVoiceAgentSuppressedDistinct(cleanupResult.error)
         }
         throw canonical
     }
     return when (cleanupResult) {
         VoiceAgentCleanupResult.Completed -> VoiceAgentSessionCreationResult.FailedClean(creationError)
         is VoiceAgentCleanupResult.Failed -> {
-            creationError.addSuppressedDistinct(cleanupResult.error)
+            creationError.addVoiceAgentSuppressedDistinct(cleanupResult.error)
             VoiceAgentSessionCreationResult.FailedDirty(creationError, cleanup)
         }
     }
 }
 
 private fun Throwable.canonicalIfCancellation(): Throwable =
-    (this as? CancellationException)?.canonicalFactoryCancellation() ?: this
-
-private fun Throwable.addSuppressedDistinct(error: Throwable) {
-    if (error !== this && error !in suppressed) addSuppressed(error)
-}
-
-private fun CancellationException.canonicalFactoryCancellation(): CancellationException {
-    var canonical = this
-    val visited = Collections.newSetFromMap(
-        IdentityHashMap<CancellationException, Boolean>(),
-    )
-    visited += canonical
-    while (true) {
-        val original = canonical.cause as? CancellationException ?: return canonical
-        if (original.message != canonical.message || !visited.add(original)) return canonical
-        canonical = original
-    }
-}
+    (this as? CancellationException)?.canonicalVoiceAgentCancellation() ?: this
 
 internal fun buildDefaultVoiceE2ESessionMetadata(
     traceContext: VoiceTraceContext,

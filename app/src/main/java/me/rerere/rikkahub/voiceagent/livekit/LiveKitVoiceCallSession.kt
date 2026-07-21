@@ -2,14 +2,14 @@ package me.rerere.rikkahub.voiceagent.livekit
 
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.channels.Channel
-import kotlinx.coroutines.currentCoroutineContext
-import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -19,6 +19,9 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
+import me.rerere.rikkahub.voiceagent.CleanupAttemptFailures
+import me.rerere.rikkahub.voiceagent.CleanupAttemptOutcome
+import me.rerere.rikkahub.voiceagent.JoinedCleanupOperation
 import me.rerere.rikkahub.voiceagent.RouteOwnedManagedVoiceCallSession
 import me.rerere.rikkahub.voiceagent.VoiceAgentCleanupMode
 import me.rerere.rikkahub.voiceagent.VoiceAgentCleanupOperation
@@ -29,8 +32,6 @@ import me.rerere.rikkahub.voiceagent.VoiceAudioStatus
 import me.rerere.rikkahub.voiceagent.VoiceDiagnosticLine
 import me.rerere.rikkahub.voiceagent.VoiceSessionStatus
 import java.time.Instant
-import java.util.Collections
-import java.util.IdentityHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 
 internal const val LIVEKIT_READY_TOPIC = "voice.ready.v1"
@@ -38,15 +39,17 @@ internal const val LIVEKIT_INTERRUPT_RPC = "voice.interrupt"
 
 internal class LiveKitVoiceCallSession(
     private val details: LiveKitSessionDetails,
+    traceId: String,
     private val room: LiveKitRoomFacade,
     private val routeLease: VoiceAgentRouteLease,
     private val scope: CoroutineScope,
     private val rpcMethods: Map<String, suspend (LiveKitRpcInvocation) -> String> = emptyMap(),
     private val connectTimeoutMillis: Long = DEFAULT_LIVEKIT_CONNECT_TIMEOUT_MS,
     private val readyTimeoutMillis: Long = DEFAULT_LIVEKIT_READY_TIMEOUT_MS,
+    private val cleanupDispatcher: CoroutineDispatcher = Dispatchers.Default,
     private val json: Json = Json,
 ) : RouteOwnedManagedVoiceCallSession {
-    private val mutableState = MutableStateFlow(VoiceAgentUiState())
+    private val mutableState = MutableStateFlow(VoiceAgentUiState(traceId = traceId))
     private val started = AtomicBoolean(false)
     private val closed = AtomicBoolean(false)
     private val lifecycleLock = Any()
@@ -69,7 +72,7 @@ internal class LiveKitVoiceCallSession(
     override val state: StateFlow<VoiceAgentUiState> = mutableState.asStateFlow()
     override val routeMetadata = routeLease.metadata
     override val isRouteUsable: Boolean
-        get() = routeLease.isUsable
+        get() = !closed.get() && routeLease.isUsable
     override val cleanupOperation: VoiceAgentCleanupOperation = LiveKitCleanupOperation(
         routeLease = routeLease,
         requestClose = { requestCloseForCleanup() },
@@ -162,12 +165,17 @@ internal class LiveKitVoiceCallSession(
             while (true) {
                 val requested = synchronized(microphoneStateLock) { desiredMicrophoneEnabled }
                 try {
-                    room.setMicrophoneEnabled(requested)
+                    if (!room.setMicrophoneEnabled(requested)) {
+                        appendDiagnostic("livekit_microphone_failed", "publication_rejected")
+                        failExperimental("LiveKit experimental microphone control failed")
+                        return
+                    }
                 } catch (cancellation: CancellationException) {
                     throw cancellation
                 } catch (error: Throwable) {
                     appendDiagnostic("livekit_microphone_failed", error::class.simpleName ?: "unknown")
-                    break
+                    failExperimental("LiveKit experimental microphone control failed")
+                    return
                 }
                 while (microphoneCommands.tryReceive().isSuccess) {
                     // Requests are represented by desiredMicrophoneEnabled; discard stale wakeups.
@@ -227,7 +235,7 @@ internal class LiveKitVoiceCallSession(
                 error = message,
             )
         }
-        scope.launch {
+        scope.launch(cleanupDispatcher) {
             when (val result = cleanupOperation.run(VoiceAgentCleanupMode.Immediate)) {
                 VoiceAgentCleanupResult.Completed -> appendDiagnostic("livekit_call_ended", "experimental_failure")
                 is VoiceAgentCleanupResult.Failed -> appendDiagnostic(
@@ -274,11 +282,7 @@ private class LiveKitCleanupOperation(
     private val rpcAdmission: LiveKitRpcAdmission,
     rpcMethods: Set<String>,
     private val room: LiveKitRoomFacade,
-) : VoiceAgentCleanupOperation {
-    override val token: Any = Any()
-
-    private val lock = Any()
-    private var state: LiveKitCleanupAttemptState = LiveKitCleanupAttemptState.Ready
+) : JoinedCleanupOperation() {
     private var routeCompleted = false
     private var connectionJobCompleted = false
     private var eventJobCompleted = false
@@ -288,51 +292,8 @@ private class LiveKitCleanupOperation(
     private var disconnectCompleted = false
     private var closeCompleted = false
 
-    override suspend fun run(mode: VoiceAgentCleanupMode): VoiceAgentCleanupResult {
-        val decision = synchronized(lock) {
-            when (val current = state) {
-                LiveKitCleanupAttemptState.Completed -> LiveKitCleanupAttemptDecision.Completed
-                LiveKitCleanupAttemptState.Ready -> {
-                    val completion = CompletableDeferred<LiveKitCleanupAttemptOutcome>()
-                    state = LiveKitCleanupAttemptState.Running(completion)
-                    LiveKitCleanupAttemptDecision.Execute(completion)
-                }
-                is LiveKitCleanupAttemptState.Running -> LiveKitCleanupAttemptDecision.Join(current.completion)
-            }
-        }
-        return when (decision) {
-            LiveKitCleanupAttemptDecision.Completed -> VoiceAgentCleanupResult.Completed
-            is LiveKitCleanupAttemptDecision.Join -> decision.completion.await().deliver()
-            is LiveKitCleanupAttemptDecision.Execute -> executeAndPublish(decision.completion).deliver()
-        }
-    }
-
-    private suspend fun executeAndPublish(
-        completion: CompletableDeferred<LiveKitCleanupAttemptOutcome>,
-    ): LiveKitCleanupAttemptOutcome {
-        val outcome = try {
-            executeAttempt()
-        } catch (cancellation: CancellationException) {
-            LiveKitCleanupAttemptOutcome.Cancelled(cancellation.canonicalLiveKitCleanupCancellation())
-        } catch (error: Throwable) {
-            LiveKitCleanupAttemptOutcome.Returned(VoiceAgentCleanupResult.Failed(error))
-        }
-        synchronized(lock) {
-            check((state as? LiveKitCleanupAttemptState.Running)?.completion === completion) {
-                "LiveKit cleanup attempt ownership changed before publication"
-            }
-            state = if (hasUnfinishedStages()) {
-                LiveKitCleanupAttemptState.Ready
-            } else {
-                LiveKitCleanupAttemptState.Completed
-            }
-            check(completion.complete(outcome)) { "LiveKit cleanup attempt was already completed" }
-        }
-        return outcome
-    }
-
-    private suspend fun executeAttempt(): LiveKitCleanupAttemptOutcome {
-        val failures = LiveKitCleanupFailures()
+    override suspend fun executeAttempt(mode: VoiceAgentCleanupMode): CleanupAttemptOutcome {
+        val failures = CleanupAttemptFailures()
         failures.captureCallerCancellation()
         requestClose()
         try {
@@ -352,7 +313,7 @@ private class LiveKitCleanupOperation(
         return failures.outcome()
     }
 
-    private fun retireRoute(failures: LiveKitCleanupFailures) {
+    private fun retireRoute(failures: CleanupAttemptFailures) {
         if (routeCompleted) return
         try {
             routeLease.retire()
@@ -365,7 +326,7 @@ private class LiveKitCleanupOperation(
     private suspend fun cleanJob(
         job: Job?,
         completed: Boolean,
-        failures: LiveKitCleanupFailures,
+        failures: CleanupAttemptFailures,
     ): Boolean {
         if (completed) return true
         return try {
@@ -378,7 +339,7 @@ private class LiveKitCleanupOperation(
         }
     }
 
-    private fun unregisterRpcMethods(failures: LiveKitCleanupFailures) {
+    private fun unregisterRpcMethods(failures: CleanupAttemptFailures) {
         pendingRpcMethods.toList().forEach { method ->
             try {
                 room.unregisterRpcMethod(method)
@@ -391,7 +352,7 @@ private class LiveKitCleanupOperation(
 
     private suspend fun cleanRpcWork(
         completed: Boolean,
-        failures: LiveKitCleanupFailures,
+        failures: CleanupAttemptFailures,
     ): Boolean {
         if (completed) return true
         return try {
@@ -403,7 +364,7 @@ private class LiveKitCleanupOperation(
         }
     }
 
-    private fun disconnectRoom(failures: LiveKitCleanupFailures) {
+    private fun disconnectRoom(failures: CleanupAttemptFailures) {
         if (
             disconnectCompleted ||
             !jobsCompleted() ||
@@ -418,7 +379,7 @@ private class LiveKitCleanupOperation(
         }
     }
 
-    private fun closeRoom(failures: LiveKitCleanupFailures) {
+    private fun closeRoom(failures: CleanupAttemptFailures) {
         if (closeCompleted || !disconnectCompleted) return
         try {
             room.close()
@@ -431,7 +392,7 @@ private class LiveKitCleanupOperation(
     private fun jobsCompleted(): Boolean =
         connectionJobCompleted && eventJobCompleted && microphoneJobCompleted
 
-    private fun hasUnfinishedStages(): Boolean =
+    override fun hasUnfinishedStages(): Boolean =
         !routeCompleted ||
             !jobsCompleted() ||
             !rpcWorkCompleted ||
@@ -526,95 +487,6 @@ private sealed interface LiveKitRpcWork {
 
 private class LiveKitRpcAdmissionClosedException :
     IllegalStateException("LiveKit RPC admission is closed")
-
-private sealed interface LiveKitCleanupAttemptState {
-    data object Ready : LiveKitCleanupAttemptState
-    data class Running(
-        val completion: CompletableDeferred<LiveKitCleanupAttemptOutcome>,
-    ) : LiveKitCleanupAttemptState
-    data object Completed : LiveKitCleanupAttemptState
-}
-
-private sealed interface LiveKitCleanupAttemptDecision {
-    data object Completed : LiveKitCleanupAttemptDecision
-    data class Execute(
-        val completion: CompletableDeferred<LiveKitCleanupAttemptOutcome>,
-    ) : LiveKitCleanupAttemptDecision
-    data class Join(
-        val completion: CompletableDeferred<LiveKitCleanupAttemptOutcome>,
-    ) : LiveKitCleanupAttemptDecision
-}
-
-private sealed interface LiveKitCleanupAttemptOutcome {
-    data class Returned(val result: VoiceAgentCleanupResult) : LiveKitCleanupAttemptOutcome
-    data class Cancelled(val error: CancellationException) : LiveKitCleanupAttemptOutcome
-}
-
-private class LiveKitCleanupFailures {
-    private val failures = mutableListOf<Throwable>()
-    private var cancellation: CancellationException? = null
-
-    suspend fun captureCallerCancellation() {
-        try {
-            currentCoroutineContext().ensureActive()
-        } catch (error: CancellationException) {
-            add(error)
-        }
-    }
-
-    fun add(error: Throwable) {
-        if (error is CancellationException) {
-            val canonical = error.canonicalLiveKitCleanupCancellation()
-            val current = cancellation
-            if (current == null) {
-                cancellation = canonical
-            } else if (current !== canonical && canonical !in failures) {
-                failures += canonical
-            }
-        } else if (error !in failures) {
-            failures += error
-        }
-    }
-
-    suspend fun outcome(): LiveKitCleanupAttemptOutcome {
-        captureCallerCancellation()
-        cancellation?.let { canonical ->
-            failures.forEach { failure ->
-                if (failure !== canonical && failure !in canonical.suppressed) {
-                    canonical.addSuppressed(failure)
-                }
-            }
-            return LiveKitCleanupAttemptOutcome.Cancelled(canonical)
-        }
-        val primary = failures.firstOrNull() ?: return LiveKitCleanupAttemptOutcome.Returned(
-            VoiceAgentCleanupResult.Completed,
-        )
-        failures.drop(1).forEach { failure ->
-            if (failure !== primary && failure !in primary.suppressed) {
-                primary.addSuppressed(failure)
-            }
-        }
-        return LiveKitCleanupAttemptOutcome.Returned(VoiceAgentCleanupResult.Failed(primary))
-    }
-}
-
-private fun LiveKitCleanupAttemptOutcome.deliver(): VoiceAgentCleanupResult = when (this) {
-    is LiveKitCleanupAttemptOutcome.Returned -> result
-    is LiveKitCleanupAttemptOutcome.Cancelled -> throw error
-}
-
-private fun CancellationException.canonicalLiveKitCleanupCancellation(): CancellationException {
-    var canonical = this
-    val visited = Collections.newSetFromMap(
-        IdentityHashMap<CancellationException, Boolean>(),
-    )
-    visited += canonical
-    while (true) {
-        val original = canonical.cause as? CancellationException ?: return canonical
-        if (original.message != canonical.message || !visited.add(original)) return canonical
-        canonical = original
-    }
-}
 
 @Serializable
 private data class LiveKitReadyMessage(

@@ -151,16 +151,19 @@ internal class OrchestratorFakeFactory(
     val requests = mutableListOf<VoiceAgentCallRequest>()
     val leases = mutableListOf<VoiceAgentRouteLease>()
     val scopes = mutableListOf<CoroutineScope>()
+    val endDrainTimeouts = mutableListOf<Long>()
 
     override suspend fun createOwned(
         request: VoiceAgentCallRequest,
         routeLease: VoiceAgentRouteLease,
         scope: CoroutineScope,
+        endDrainTimeoutMillis: Long,
     ): VoiceAgentSessionCreationResult {
         calls += 1
         requests += request
         leases += routeLease
         scopes += scope
+        endDrainTimeouts += endDrainTimeoutMillis
         return createResult(request, routeLease, scope)
     }
 }

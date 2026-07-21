@@ -22,6 +22,35 @@ import java.util.concurrent.atomic.AtomicReference
 @OptIn(ExperimentalCoroutinesApi::class)
 class VoiceAgentCleanupOperationTest {
     @Test
+    fun `reusable joined cleanup primitive shares one in-flight attempt`() = runTest {
+        val entered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        var attempts = 0
+        var unfinished = true
+        val cleanup = object : JoinedCleanupOperation() {
+            override suspend fun executeAttempt(mode: VoiceAgentCleanupMode): CleanupAttemptOutcome {
+                attempts += 1
+                entered.complete(Unit)
+                release.await()
+                unfinished = false
+                return CleanupAttemptFailures().outcome()
+            }
+
+            override fun hasUnfinishedStages(): Boolean = unfinished
+        }
+        val first = async { cleanup.run(VoiceAgentCleanupMode.Immediate) }
+        entered.await()
+        val second = async { cleanup.run(VoiceAgentCleanupMode.GracefulEnd) }
+        runCurrent()
+
+        release.complete(Unit)
+
+        assertSame(VoiceAgentCleanupResult.Completed, first.await())
+        assertSame(VoiceAgentCleanupResult.Completed, second.await())
+        assertEquals(1, attempts)
+    }
+
+    @Test
     fun `failed route retries without repeating successful delegate`() = runTest {
         val events = mutableListOf<String>()
         val routeFailure = IllegalStateException("route retirement failed")
@@ -52,10 +81,10 @@ class VoiceAgentCleanupOperationTest {
     }
 
     @Test
-    fun `failed delegate retries immediate close without repeating route`() = runTest {
+    fun `failed replacement drain force closes and leaves completed retry as no-op`() = runTest {
         val events = mutableListOf<String>()
         val endFailure = IllegalStateException("session end failed")
-        val delegate = RecordingCleanupSession(events, endFailure = endFailure)
+        val delegate = RecordingCleanupSession(events, drainFailure = endFailure)
         val cleanup = voiceAgentSessionCleanupOperation(
             delegate = delegate,
             routeLease = recordingCleanupRouteLease(events),
@@ -65,13 +94,44 @@ class VoiceAgentCleanupOperationTest {
         val first = cleanup.run(VoiceAgentCleanupMode.Replacement)
 
         assertTrue(first is VoiceAgentCleanupResult.Failed)
-        assertSame(endFailure, (first as VoiceAgentCleanupResult.Failed).error)
-        assertEquals(listOf("route-retire", "session-end"), events)
+        assertEquals(endFailure.message, (first as VoiceAgentCleanupResult.Failed).error.message)
+        assertEquals(listOf("route-retire", "session-end-and-drain", "session-close-now"), events)
 
         events.clear()
 
         assertSame(VoiceAgentCleanupResult.Completed, cleanup.run(VoiceAgentCleanupMode.Replacement))
-        assertEquals(listOf("session-close-now"), events)
+        assertTrue(events.isEmpty())
+    }
+
+    @Test
+    fun `replacement drains the session before cancelling its call job`() = runTest {
+        val events = mutableListOf<String>()
+        val releaseDrain = CompletableDeferred<Unit>()
+        val collector = Job().apply { invokeOnCompletion { events += "collector" } }
+        val callJob = Job().apply { invokeOnCompletion { events += "call-job" } }
+        val cleanup = activeVoiceAgentCallCleanupOperation(
+            collector = collector,
+            callJob = callJob,
+            sessionCleanup = voiceAgentSessionCleanupOperation(
+                delegate = RecordingCleanupSession(events, onDrain = { releaseDrain.await() }),
+                routeLease = recordingCleanupRouteLease(events),
+                endDrainTimeoutMillis = 1_000,
+            ),
+        )
+
+        val result = async { cleanup.run(VoiceAgentCleanupMode.Replacement) }
+        runCurrent()
+
+        assertEquals(listOf("route-retire", "session-end-and-drain"), events)
+        assertTrue(result.isActive)
+        assertTrue(callJob.isActive)
+
+        releaseDrain.complete(Unit)
+        assertSame(VoiceAgentCleanupResult.Completed, result.await())
+        assertEquals(
+            listOf("route-retire", "session-end-and-drain", "collector", "call-job"),
+            events,
+        )
     }
 
     @Test

@@ -13,6 +13,11 @@ internal data class VoiceAgentCallRequest(
     val transport: VoiceAgentTransport,
 )
 
+internal data class ActiveVoiceAgentIdentity(
+    val conversationId: Uuid,
+    val transport: VoiceAgentTransport,
+)
+
 internal sealed interface VoiceAgentCallStartResult {
     data class Active(val route: VoiceAgentRouteMetadata) : VoiceAgentCallStartResult
     data object Superseded : VoiceAgentCallStartResult
@@ -84,6 +89,13 @@ internal sealed interface VoiceAgentStartOutcome {
 
     data class FailedDirty(
         val error: Throwable,
+        val cleanup: VoiceAgentCleanupOperation,
+    ) : VoiceAgentStartOutcome
+
+    data class CancelledClean(val error: CancellationException) : VoiceAgentStartOutcome
+
+    data class CancelledDirty(
+        val error: CancellationException,
         val cleanup: VoiceAgentCleanupOperation,
     ) : VoiceAgentStartOutcome
 
@@ -177,8 +189,10 @@ internal val VoiceAgentCallState.lifecycle: VoiceAgentCallLifecycle
         is VoiceAgentCallState.CleanupFailed -> VoiceAgentCallLifecycle.CleanupFailed(error)
     }
 
-internal val VoiceAgentCallState.activeConversationId: Uuid?
-    get() = (this as? VoiceAgentCallState.Active)?.call?.request?.conversationId
+internal val VoiceAgentCallState.activeIdentity: ActiveVoiceAgentIdentity?
+    get() = (this as? VoiceAgentCallState.Active)?.call?.request?.let { request ->
+        ActiveVoiceAgentIdentity(request.conversationId, request.transport)
+    }
 
 internal sealed interface VoiceAgentCallEvent {
     data class StartRequested(val pending: PendingVoiceAgentStart) : VoiceAgentCallEvent
@@ -229,6 +243,11 @@ internal sealed interface VoiceAgentCallEffect {
     data class CompleteStarts(
         val replies: List<CompletableDeferred<VoiceAgentCallStartResult>>,
         val result: VoiceAgentCallStartResult,
+    ) : VoiceAgentCallEffect
+
+    data class CompleteStartsWithCancellation(
+        val replies: List<CompletableDeferred<VoiceAgentCallStartResult>>,
+        val error: CancellationException,
     ) : VoiceAgentCallEffect
 
     data class CompleteEnds(
@@ -607,7 +626,7 @@ private fun reduceStartFinished(
     return when (val outcome = event.outcome) {
         is VoiceAgentStartOutcome.Ready -> VoiceAgentCallTransition(
             VoiceAgentCallState.Active(outcome.call, outcome.sessionState),
-            activePublicationEffects(state.pending.replies, outcome.call),
+            activePublicationEffects(state.pending.replies, outcome.call, outcome.sessionState),
         )
         is VoiceAgentStartOutcome.FailedClean -> transition(
             VoiceAgentCallState.Idle,
@@ -623,6 +642,14 @@ private fun reduceStartFinished(
                 VoiceAgentCallStartResult.Failed(outcome.error),
             ),
         )
+        is VoiceAgentStartOutcome.CancelledClean -> transition(
+            VoiceAgentCallState.Idle,
+            VoiceAgentCallEffect.CompleteStartsWithCancellation(state.pending.replies, outcome.error),
+        )
+        is VoiceAgentStartOutcome.CancelledDirty -> transition(
+            VoiceAgentCallState.CleanupFailed(outcome.cleanup, outcome.error),
+            VoiceAgentCallEffect.CompleteStartsWithCancellation(state.pending.replies, outcome.error),
+        )
         VoiceAgentStartOutcome.Cancelled -> transition(
             VoiceAgentCallState.Idle,
             VoiceAgentCallEffect.CompleteStarts(
@@ -636,6 +663,7 @@ private fun reduceStartFinished(
 private fun activePublicationEffects(
     replies: List<CompletableDeferred<VoiceAgentCallStartResult>>,
     call: ActiveVoiceAgentCall,
+    sessionState: VoiceAgentUiState,
 ): List<VoiceAgentCallEffect> = buildList {
     add(VoiceAgentCallEffect.CompleteStarts(replies, VoiceAgentCallStartResult.Active(call.route)))
     val routeFailure = call.route.failure
@@ -644,6 +672,10 @@ private fun activePublicationEffects(
         add(VoiceAgentCallEffect.ApplyCallStatus(call, VoiceCallStatus.Degraded(routeFailure.detail)))
     } else if (call.route.owner == VoiceAudioRouteOwner.Telecom) {
         add(VoiceAgentCallEffect.ApplyCallStatus(call, VoiceCallStatus.BackgroundCapable))
+    }
+    val sessionError = sessionState.session as? VoiceSessionStatus.Error
+    if (sessionError != null && call.session.isRouteUsable) {
+        add(VoiceAgentCallEffect.RecordDiagnostic(call, "voice_call_start_failed", sessionError.message))
     }
 }
 
@@ -659,7 +691,12 @@ private fun reduceStaleStartFinished(
         state,
         VoiceAgentCallEffect.RunCleanup(outcome.cleanup, VoiceAgentCleanupMode.Immediate),
     )
+    is VoiceAgentStartOutcome.CancelledDirty -> transition(
+        state,
+        VoiceAgentCallEffect.RunCleanup(outcome.cleanup, VoiceAgentCleanupMode.Immediate),
+    )
     is VoiceAgentStartOutcome.FailedClean,
+    is VoiceAgentStartOutcome.CancelledClean,
     VoiceAgentStartOutcome.Cancelled,
     -> transition(state)
 }
@@ -748,18 +785,24 @@ private fun reduceSessionStateChanged(
     return when (val status = event.state.session) {
         is VoiceSessionStatus.Error -> {
             if (event.routeUsable) {
-                transition(
-                    state.copy(sessionState = event.state),
-                    VoiceAgentCallEffect.RecordDiagnostic(
-                        state.call,
-                        "voice_call_start_failed",
-                        status.message,
-                    ),
-                    VoiceAgentCallEffect.ApplySessionState(
-                        state.call,
-                        event.state.copy(call = VoiceCallStatus.Degraded(status.message)),
-                    ),
-                )
+                val effects = buildList {
+                    if (state.sessionState.session != status) {
+                        add(
+                            VoiceAgentCallEffect.RecordDiagnostic(
+                                state.call,
+                                "voice_call_start_failed",
+                                status.message,
+                            ),
+                        )
+                    }
+                    add(
+                        VoiceAgentCallEffect.ApplySessionState(
+                            state.call,
+                            event.state.copy(call = VoiceCallStatus.Degraded(status.message)),
+                        ),
+                    )
+                }
+                VoiceAgentCallTransition(state.copy(sessionState = event.state), effects)
             } else {
                 detachForImmediateCleanup(state.call)
             }

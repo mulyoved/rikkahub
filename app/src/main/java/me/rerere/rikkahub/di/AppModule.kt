@@ -133,6 +133,7 @@ val appModule = module {
         TransportSelectingVoiceAgentCallFactory(
             directFactoryProvider = { get<DefaultVoiceAgentCallFactory>() },
             liveKitFactoryProvider = { get<LiveKitVoiceCallFactory>() },
+            liveKitEnabled = BuildConfig.VOICE_AGENT_LIVEKIT_EXPERIMENT_ENABLED,
         )
     }
 

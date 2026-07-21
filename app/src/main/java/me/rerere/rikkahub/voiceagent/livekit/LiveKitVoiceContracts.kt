@@ -1,6 +1,7 @@
 package me.rerere.rikkahub.voiceagent.livekit
 
 import kotlinx.serialization.Serializable
+import java.net.URI
 
 private val LIVEKIT_IDENTIFIER = Regex("^[A-Za-z0-9_-]{1,128}$")
 
@@ -27,7 +28,7 @@ data class LiveKitSessionDetails(
     val expiresAt: String,
 ) {
     init {
-        require(livekitUrl.isNotBlank()) { "LiveKit URL is invalid" }
+        require(livekitUrl.isSecureLiveKitUrl()) { "LiveKit URL is invalid" }
         require(participantToken.isNotBlank()) { "LiveKit participant token is invalid" }
         require(roomName.isLiveKitIdentifier()) { "LiveKit room identifier is invalid" }
         require(voiceSessionId.isLiveKitIdentifier()) { "LiveKit voice session identifier is invalid" }
@@ -55,3 +56,13 @@ data class LiveKitSessionDetails(
 }
 
 private fun String.isLiveKitIdentifier(): Boolean = LIVEKIT_IDENTIFIER.matches(this)
+
+private fun String.isSecureLiveKitUrl(): Boolean {
+    val uri = runCatching { URI(this) }.getOrNull() ?: return false
+    return uri.scheme.equals("wss", ignoreCase = true) &&
+        !uri.host.isNullOrBlank() &&
+        uri.rawUserInfo == null &&
+        (uri.rawPath.isEmpty() || uri.rawPath == "/") &&
+        uri.rawQuery == null &&
+        uri.rawFragment == null
+}

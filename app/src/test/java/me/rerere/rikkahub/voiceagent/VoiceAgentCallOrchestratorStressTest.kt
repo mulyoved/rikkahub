@@ -306,6 +306,9 @@ private class StressHarness(seed: Long) {
         effects.forEach { effect ->
             when (effect) {
                 is VoiceAgentCallEffect.CompleteStarts -> effect.replies.forEach { it.complete(effect.result) }
+                is VoiceAgentCallEffect.CompleteStartsWithCancellation -> {
+                    effect.replies.forEach { it.completeExceptionally(effect.error) }
+                }
                 is VoiceAgentCallEffect.CompleteEnds -> effect.replies.forEach { it.complete(effect.result) }
                 is VoiceAgentCallEffect.CompleteCancellations -> {
                     effect.cancellations.forEach { it.completion.complete(effect.cleanupFailure) }
@@ -451,7 +454,11 @@ private class StressHarness(seed: Long) {
                     is VoiceAgentStartOutcome.FailedDirty -> {
                         assertTrue("unregistered dirty cleanup", isRegistered(outcome.cleanup))
                     }
+                    is VoiceAgentStartOutcome.CancelledDirty -> {
+                        assertTrue("unregistered cancelled cleanup", isRegistered(outcome.cleanup))
+                    }
                     is VoiceAgentStartOutcome.FailedClean,
+                    is VoiceAgentStartOutcome.CancelledClean,
                     VoiceAgentStartOutcome.Cancelled,
                     -> Unit
                 }

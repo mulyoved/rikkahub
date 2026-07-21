@@ -7,10 +7,11 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import me.rerere.rikkahub.voiceagent.audio.VoiceAudioRouteOwner
 import me.rerere.rikkahub.voiceagent.hermesvoice.HermesVoiceCredentials
+import me.rerere.rikkahub.decodeVoiceAgentTransport
+import me.rerere.rikkahub.voiceAgentIntentScreen
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertSame
-import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.util.Collections
@@ -18,6 +19,36 @@ import java.util.IdentityHashMap
 import kotlin.uuid.Uuid
 
 class VoiceAgentCallStateMachineTest {
+    @Test
+    fun `LiveKit notification round trip completes active start without replacement cleanup`() {
+        val activeRequest = request("notification").copy(
+            transport = VoiceAgentTransport.LiveKitExperimental,
+        )
+        val routeFields = encodeVoiceAgentNotificationRouteFields(
+            conversationId = activeRequest.conversationId.toString(),
+            transport = activeRequest.transport,
+        )
+        val screen = requireNotNull(
+            voiceAgentIntentScreen(
+                conversationId = routeFields.conversationId,
+                transportWireName = routeFields.transportWireName,
+            ),
+        )
+        val reopenedRequest = activeRequest.copy(
+            transport = decodeVoiceAgentTransport(screen.transportWireName),
+        )
+        val state = activeState(activeCall(activeRequest))
+
+        val transition = reduceVoiceAgentCallState(
+            state,
+            VoiceAgentCallEvent.StartRequested(pending(reopenedRequest)),
+        )
+
+        assertSame(state, transition.state)
+        assertType<VoiceAgentCallEffect.CompleteStarts>(transition.effects.single())
+        assertFalse(transition.effects.any { it is VoiceAgentCallEffect.RunCleanup })
+    }
+
     @Test
     fun `idle handles every legal event without acquiring hidden ownership`() {
         val request = request("idle")
@@ -728,128 +759,6 @@ class VoiceAgentCallStateMachineTest {
         }
     }
 
-    @Test
-    fun `projections expose only exact active identity`() {
-        val request = request("projection")
-        val pending = pending(request)
-        val operation = FakeStartOperation(request)
-        val active = activeCall(request)
-        val cleanup = FakeCleanupOperation()
-        val failure = IllegalStateException("cleanup")
-
-        val cases = listOf(
-            VoiceAgentCallState.Idle to VoiceAgentCallLifecycle.Idle,
-            VoiceAgentCallState.Starting.Admitting(pending) to
-                VoiceAgentCallLifecycle.Starting(request.conversationId),
-            VoiceAgentCallState.Starting.Running(pending, operation) to
-                VoiceAgentCallLifecycle.Starting(request.conversationId),
-            activeState(active) to VoiceAgentCallLifecycle.Active(request.conversationId),
-            VoiceAgentCallState.Stopping.ForReplacement(
-                cleanup,
-                pending,
-                emptyList(),
-                emptyList(),
-                emptyList(),
-            ) to VoiceAgentCallLifecycle.Stopping(request.conversationId),
-            VoiceAgentCallState.Stopping.ForEnd(
-                cleanup,
-                emptyList(),
-                emptyList(),
-                emptyList(),
-            ) to VoiceAgentCallLifecycle.Stopping(null),
-            VoiceAgentCallState.CleanupFailed(cleanup, failure) to VoiceAgentCallLifecycle.CleanupFailed(failure),
-        )
-
-        cases.forEach { (state, lifecycle) ->
-            assertEquals(lifecycle, state.lifecycle)
-            assertEquals(
-                (state as? VoiceAgentCallState.Active)?.call?.request?.conversationId,
-                state.activeConversationId,
-            )
-        }
-    }
-
-    @Test
-    fun `pending start rejects empty waiter groups`() {
-        assertThrows(IllegalArgumentException::class.java) {
-            PendingVoiceAgentStart(Any(), request("empty"), emptyList())
-        }
-    }
-
-    @Test
-    fun `normal transitions retain zero or one logical resource owner`() {
-        val first = request("owner-first")
-        val second = request("owner-second")
-        val pending = pending(first)
-        val operation = FakeStartOperation(first)
-        val admitted = reduceVoiceAgentCallState(
-            VoiceAgentCallState.Idle,
-            VoiceAgentCallEvent.StartRequested(pending),
-        )
-        assertLogicalOwnerCount(admitted, 0)
-
-        val running = reduceVoiceAgentCallState(
-            admitted.state,
-            VoiceAgentCallEvent.StartAdmitted(pending.token, operation),
-        )
-        assertLogicalOwnerCount(running, 1)
-
-        val replacingStartup = reduceVoiceAgentCallState(
-            running.state,
-            VoiceAgentCallEvent.StartRequested(pending(second)),
-        )
-        assertLogicalOwnerCount(replacingStartup, 1)
-
-        val cleanupComplete = reduceVoiceAgentCallState(
-            replacingStartup.state,
-            VoiceAgentCallEvent.CleanupFinished(operation.cleanup, VoiceAgentCleanupResult.Completed),
-        )
-        assertLogicalOwnerCount(cleanupComplete, 0)
-
-        val active = activeCall(first)
-        val replacingActive = reduceVoiceAgentCallState(
-            activeState(active),
-            VoiceAgentCallEvent.StartRequested(pending(second)),
-        )
-        assertLogicalOwnerCount(replacingActive, 1)
-
-        val failure = reduceVoiceAgentCallState(
-            replacingActive.state,
-            VoiceAgentCallEvent.CleanupFinished(
-                active.cleanup,
-                VoiceAgentCleanupResult.Failed(IllegalStateException("cleanup")),
-            ),
-        )
-        assertLogicalOwnerCount(failure, 1)
-    }
-
-    @Test
-    fun `reducer never invokes operation session cleanup jobs or deferreds`() {
-        val request = request("pure")
-        val operation = FakeStartOperation(request)
-        val active = activeCall(request)
-        val startReply = startReply()
-        val endReply = endReply()
-        val pending = PendingVoiceAgentStart(Any(), request, listOf(startReply))
-
-        reduceVoiceAgentCallState(VoiceAgentCallState.Idle, VoiceAgentCallEvent.StartRequested(pending))
-        reduceVoiceAgentCallState(
-            VoiceAgentCallState.Starting.Running(pending, operation),
-            VoiceAgentCallEvent.EndRequested(endReply),
-        )
-        reduceVoiceAgentCallState(
-            activeState(active),
-            VoiceAgentCallEvent.StartRequested(pending(request("different"))),
-        )
-
-        assertEquals(0, operation.startCalls)
-        assertEquals(0, operation.cancelCalls)
-        assertEquals(0, operation.cleanup.runCalls)
-        assertEquals(0, active.testSession.resourceCalls)
-        assertFalse(startReply.isCompleted)
-        assertFalse(endReply.isCompleted)
-    }
-
     private data class TransitionCase(
         val name: String,
         val verify: () -> Unit,
@@ -862,7 +771,7 @@ class VoiceAgentCallStateMachineTest {
     )
 }
 
-private class FakeStartOperation(
+internal class FakeStartOperation(
     override val request: VoiceAgentCallRequest,
     phaseFactory: (
         VoiceAgentCallRequest,
@@ -888,7 +797,7 @@ private class FakeStartOperation(
     }
 }
 
-private class FakeCleanupOperation : VoiceAgentCleanupOperation {
+internal class FakeCleanupOperation : VoiceAgentCleanupOperation {
     override val token: Any = Any()
     var runCalls = 0
 
@@ -898,7 +807,7 @@ private class FakeCleanupOperation : VoiceAgentCleanupOperation {
     }
 }
 
-private class InertRouteOwnedSession(
+internal class InertRouteOwnedSession(
     initialStatus: VoiceSessionStatus,
     override val cleanupOperation: VoiceAgentCleanupOperation,
 ) : RouteOwnedManagedVoiceCallSession {
@@ -929,10 +838,10 @@ private class InertRouteOwnedSession(
 
 }
 
-private val ActiveVoiceAgentCall.testSession: InertRouteOwnedSession
+internal val ActiveVoiceAgentCall.testSession: InertRouteOwnedSession
     get() = session as InertRouteOwnedSession
 
-private fun activeCall(
+internal fun activeCall(
     request: VoiceAgentCallRequest,
     sessionStatus: VoiceSessionStatus = VoiceSessionStatus.Connected,
 ): ActiveVoiceAgentCall {
@@ -951,26 +860,26 @@ private fun activeCall(
     )
 }
 
-private fun activeState(
+internal fun activeState(
     call: ActiveVoiceAgentCall,
     sessionState: VoiceAgentUiState = VoiceAgentUiState(session = VoiceSessionStatus.Connected),
 ): VoiceAgentCallState.Active = VoiceAgentCallState.Active(call, sessionState)
 
-private fun pending(request: VoiceAgentCallRequest): PendingVoiceAgentStart =
+internal fun pending(request: VoiceAgentCallRequest): PendingVoiceAgentStart =
     PendingVoiceAgentStart(Any(), request, listOf(startReply()))
 
-private fun pendingCancellation(): PendingVoiceAgentCancellation = PendingVoiceAgentCancellation(
+internal fun pendingCancellation(): PendingVoiceAgentCancellation = PendingVoiceAgentCancellation(
     error = CancellationException("caller cancelled"),
     completion = CompletableDeferred(),
 )
 
-private fun startReply() = CompletableDeferred<VoiceAgentCallStartResult>()
+internal fun startReply() = CompletableDeferred<VoiceAgentCallStartResult>()
 
-private fun endReply() = CompletableDeferred<VoiceAgentCallEndResult>()
+internal fun endReply() = CompletableDeferred<VoiceAgentCallEndResult>()
 
-private fun completedJob(): Job = CompletableDeferred<Unit>().apply { complete(Unit) }
+internal fun completedJob(): Job = CompletableDeferred<Unit>().apply { complete(Unit) }
 
-private fun request(label: String): VoiceAgentCallRequest = VoiceAgentCallRequest(
+internal fun request(label: String): VoiceAgentCallRequest = VoiceAgentCallRequest(
     conversationId = Uuid.random(),
     transport = VoiceAgentTransport.DirectGemini,
     config = VoiceAgentLaunchConfig(
@@ -982,12 +891,12 @@ private fun request(label: String): VoiceAgentCallRequest = VoiceAgentCallReques
     ),
 )
 
-private inline fun <reified T> assertType(value: Any?): T {
+internal inline fun <reified T> assertType(value: Any?): T {
     assertTrue("Expected ${T::class.java.simpleName}, got ${value?.javaClass?.simpleName}", value is T)
     return value as T
 }
 
-private fun assertLogicalOwnerCount(
+internal fun assertLogicalOwnerCount(
     transition: VoiceAgentCallTransition,
     expected: Int,
 ) {
@@ -1012,6 +921,7 @@ private fun assertLogicalOwnerCount(
             is VoiceAgentCallEffect.CompleteCancellations,
             is VoiceAgentCallEffect.CompleteEnds,
             is VoiceAgentCallEffect.CompleteStarts,
+            is VoiceAgentCallEffect.CompleteStartsWithCancellation,
             is VoiceAgentCallEffect.Reconnect,
             is VoiceAgentCallEffect.RecordDiagnostic,
             -> Unit

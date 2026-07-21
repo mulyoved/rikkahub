@@ -90,6 +90,23 @@ class LiveKitVoiceContractsTest {
     }
 
     @Test
+    fun `LiveKit session details require a secure websocket URL`() {
+        listOf(
+            "https://project.livekit.cloud",
+            "ws://project.livekit.cloud",
+            "project.livekit.cloud",
+            "wss://user:secret@project.livekit.cloud",
+            "wss://project.livekit.cloud/room",
+            "wss://project.livekit.cloud?region=test",
+            "wss://project.livekit.cloud#fragment",
+        ).forEach { url ->
+            assertThrows(IllegalArgumentException::class.java) {
+                validDetails().copy(livekitUrl = url)
+            }
+        }
+    }
+
+    @Test
     fun `invalid LiveKit response is rejected without revealing URL or token`() {
         val api = HermesVoiceApi(
             baseUrl = "https://hermes-voice.example.test",

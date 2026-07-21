@@ -73,4 +73,18 @@ class VoiceAgentLaunchActionsTest {
         assertEquals(screen, decoded)
         assertTrue(encoded.contains("\"transportWireName\":\"livekit_experimental\""))
     }
+
+    @Test
+    fun `legacy voice agent navigation defaults to direct Gemini`() {
+        val decoded = Json.decodeFromString<Screen.VoiceAgent>(
+            """{"conversationId":"legacy-conversation"}""",
+        )
+
+        assertEquals("legacy-conversation", decoded.conversationId)
+        assertEquals(VoiceAgentTransport.DirectGemini.wireName, decoded.transportWireName)
+        assertEquals(
+            VoiceAgentTransport.DirectGemini,
+            decodeVoiceAgentTransport(decoded.transportWireName),
+        )
+    }
 }

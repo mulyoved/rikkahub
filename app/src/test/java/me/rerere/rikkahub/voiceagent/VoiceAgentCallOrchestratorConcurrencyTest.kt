@@ -165,12 +165,18 @@ class VoiceAgentCallOrchestratorConcurrencyTest {
         assertEquals(listOf(VoiceAgentCleanupMode.Replacement), cleanup.modes)
         assertEquals(2, routeCalls)
         assertEquals(2, created)
-        assertEquals(requestC.conversationId, orchestrator.activeConversationId.value)
+        assertEquals(
+            ActiveVoiceAgentIdentity(requestC.conversationId, requestC.transport),
+            orchestrator.activeIdentity.value,
+        )
 
         val currentState = orchestrator.state.value
         sessions[0].emit(VoiceAgentUiState(session = VoiceSessionStatus.Error("stale A")))
         runCurrent()
-        assertEquals(requestC.conversationId, orchestrator.activeConversationId.value)
+        assertEquals(
+            ActiveVoiceAgentIdentity(requestC.conversationId, requestC.transport),
+            orchestrator.activeIdentity.value,
+        )
         assertEquals(currentState, orchestrator.state.value)
         appJob.cancel()
     }
@@ -230,7 +236,7 @@ class VoiceAgentCallOrchestratorConcurrencyTest {
         assertEquals(VoiceAgentCallStartResult.Superseded, displaced.await())
         assertSame(failure, (rejected.await() as VoiceAgentCallStartResult.Failed).error)
         assertEquals(VoiceAgentCallLifecycle.CleanupFailed(failure), orchestrator.lifecycle.value)
-        assertNull(orchestrator.activeConversationId.value)
+        assertNull(orchestrator.activeIdentity.value)
         assertEquals(1, routeCalls)
         assertEquals(1, created)
         assertEquals(listOf(VoiceAgentCleanupMode.Replacement), cleanup.modes)
@@ -251,7 +257,10 @@ class VoiceAgentCallOrchestratorConcurrencyTest {
         )
         assertEquals(2, routeCalls)
         assertEquals(2, created)
-        assertEquals(retryRequest.conversationId, orchestrator.activeConversationId.value)
+        assertEquals(
+            ActiveVoiceAgentIdentity(retryRequest.conversationId, retryRequest.transport),
+            orchestrator.activeIdentity.value,
+        )
         appJob.cancel()
     }
 
@@ -387,7 +396,8 @@ class VoiceAgentCallOrchestratorConcurrencyTest {
 
         assertSame(routeFailure, rejectedFailure)
         assertEquals(1, cleanupRoute.retirementCalls)
-        assertEquals(1, delegate.endCalls)
+        assertEquals(0, delegate.endCalls)
+        assertEquals(1, delegate.drainCalls)
         assertEquals(0, delegate.closeCalls)
         assertEquals(1, routeCalls)
         assertEquals(1, created)
@@ -397,7 +407,8 @@ class VoiceAgentCallOrchestratorConcurrencyTest {
         assertTrue(retry.await() is VoiceAgentCallStartResult.Active)
 
         assertEquals(2, cleanupRoute.retirementCalls)
-        assertEquals(1, delegate.endCalls)
+        assertEquals(0, delegate.endCalls)
+        assertEquals(1, delegate.drainCalls)
         assertEquals(0, delegate.closeCalls)
         assertEquals(2, routeCalls)
         assertEquals(2, created)
@@ -405,12 +416,12 @@ class VoiceAgentCallOrchestratorConcurrencyTest {
     }
 
     @Test
-    fun `delegate cleanup failure retries immediate close without repeating retired route`() = runTest {
+    fun `delegate drain failure force closes without repeating retired route`() = runTest {
         val dispatcher = StandardTestDispatcher(testScheduler)
         val appJob = SupervisorJob()
-        val delegateFailure = IllegalStateException("delegate end failed")
+        val delegateFailure = IllegalStateException("delegate drain failed")
         val cleanupRoute = OrchestratorFakeRoute()
-        val delegate = OrchestratorCleanupDelegate().apply { endFailure = delegateFailure }
+        val delegate = OrchestratorCleanupDelegate().apply { drainFailure = delegateFailure }
         val ownedCleanup = voiceAgentSessionCleanupOperation(
             delegate,
             cleanupRoute.lease,
@@ -438,18 +449,20 @@ class VoiceAgentCallOrchestratorConcurrencyTest {
         val rejected = async { orchestrator.start(orchestratorRequest("blocked-by-delegate")) }
         val rejectedFailure = (rejected.await() as VoiceAgentCallStartResult.Failed).error
 
-        assertSame(delegateFailure, rejectedFailure)
+        assertSame(delegateFailure, rejectedFailure.cause)
         assertEquals(1, cleanupRoute.retirementCalls)
-        assertEquals(1, delegate.endCalls)
-        assertEquals(0, delegate.closeCalls)
+        assertEquals(0, delegate.endCalls)
+        assertEquals(1, delegate.drainCalls)
+        assertEquals(1, delegate.closeCalls)
         assertEquals(1, routeCalls)
 
-        delegate.endFailure = null
+        delegate.drainFailure = null
         val retry = async { orchestrator.start(orchestratorRequest("after-delegate-retry")) }
         assertTrue(retry.await() is VoiceAgentCallStartResult.Active)
 
         assertEquals(1, cleanupRoute.retirementCalls)
-        assertEquals(1, delegate.endCalls)
+        assertEquals(0, delegate.endCalls)
+        assertEquals(1, delegate.drainCalls)
         assertEquals(1, delegate.closeCalls)
         assertEquals(2, routeCalls)
         assertEquals(2, created)

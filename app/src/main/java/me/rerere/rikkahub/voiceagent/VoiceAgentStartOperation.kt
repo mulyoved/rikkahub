@@ -20,6 +20,7 @@ internal fun voiceAgentStartOperation(
     request: VoiceAgentCallRequest,
     appScope: CoroutineScope,
     factory: VoiceAgentCallFactory,
+    endDrainTimeoutMillis: Long = VOICE_AGENT_END_DRAIN_TIMEOUT_MS,
     resolveRoute: suspend () -> VoiceAgentRouteLease,
     onFinished: (VoiceAgentStartOperation, VoiceAgentStartOutcome) -> Unit,
     onSessionState: (ActiveVoiceAgentCall, VoiceAgentUiState, Boolean) -> Unit,
@@ -27,6 +28,7 @@ internal fun voiceAgentStartOperation(
     request = request,
     appScope = appScope,
     factory = factory,
+    endDrainTimeoutMillis = endDrainTimeoutMillis,
     resolveRoute = resolveRoute,
     onFinished = onFinished,
     onSessionState = onSessionState,
@@ -36,6 +38,7 @@ private class DefaultVoiceAgentStartOperation(
     override val request: VoiceAgentCallRequest,
     private val appScope: CoroutineScope,
     private val factory: VoiceAgentCallFactory,
+    private val endDrainTimeoutMillis: Long,
     private val resolveRoute: suspend () -> VoiceAgentRouteLease,
     private val onFinished: (VoiceAgentStartOperation, VoiceAgentStartOutcome) -> Unit,
     private val onSessionState: (ActiveVoiceAgentCall, VoiceAgentUiState, Boolean) -> Unit,
@@ -82,7 +85,12 @@ private class DefaultVoiceAgentStartOperation(
             updatePhase(VoiceAgentStartPhase.CreatingSession(request, callScope, callJob))
             yield()
             currentCoroutineContext().ensureActive()
-            when (val creation = factory.createOwned(request, routeLease, callScope)) {
+            when (val creation = factory.createOwned(
+                request,
+                routeLease,
+                callScope,
+                endDrainTimeoutMillis,
+            )) {
                 is VoiceAgentSessionCreationResult.Created -> startSession(creation.session, callScope, callJob)
                 is VoiceAgentSessionCreationResult.FailedClean -> {
                     startupCleanup.clearDelegate()
@@ -95,7 +103,7 @@ private class DefaultVoiceAgentStartOperation(
             }
         } catch (cancellation: CancellationException) {
             val canonical = cancellation.canonicalVoiceAgentCancellation()
-            finishFailure(canonical)
+            finishCancellation(canonical)
         } catch (error: Throwable) {
             finishFailure(error)
         }
@@ -152,6 +160,37 @@ private class DefaultVoiceAgentStartOperation(
             StartupLocalCleanupDecision.Clean -> VoiceAgentStartOutcome.FailedClean(error)
             StartupLocalCleanupDecision.External -> VoiceAgentStartOutcome.Cancelled
             is StartupLocalCleanupDecision.Execute -> finishClaimedFailure(error, claim)
+        }
+    }
+
+    private suspend fun finishCancellation(error: CancellationException): VoiceAgentStartOutcome {
+        return when (val claim = startupCleanup.claimLocalCleanup()) {
+            StartupLocalCleanupDecision.Clean -> VoiceAgentStartOutcome.CancelledClean(error)
+            StartupLocalCleanupDecision.External -> VoiceAgentStartOutcome.Cancelled
+            is StartupLocalCleanupDecision.Execute -> finishClaimedCancellation(error, claim)
+        }
+    }
+
+    private suspend fun finishClaimedCancellation(
+        error: CancellationException,
+        claim: StartupLocalCleanupDecision.Execute,
+    ): VoiceAgentStartOutcome {
+        val result = withContext(NonCancellable) {
+            try {
+                claim.cleanup.run(VoiceAgentCleanupMode.Immediate)
+            } catch (cleanupError: Throwable) {
+                VoiceAgentCleanupResult.Failed(cleanupError)
+            }
+        }
+        if (startupCleanup.completeLocalCleanup(claim, result)) {
+            return VoiceAgentStartOutcome.Cancelled
+        }
+        return when (result) {
+            VoiceAgentCleanupResult.Completed -> VoiceAgentStartOutcome.CancelledClean(error)
+            is VoiceAgentCleanupResult.Failed -> {
+                error.addVoiceAgentSuppressedDistinct(result.error)
+                VoiceAgentStartOutcome.CancelledDirty(error, startupCleanup)
+            }
         }
     }
 

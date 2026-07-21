@@ -1,77 +1,91 @@
 package me.rerere.rikkahub.voiceagent.livekit
 
 import android.content.Context
-import io.livekit.android.AudioOptions
-import io.livekit.android.LiveKit
-import io.livekit.android.LiveKitOverrides
-import io.livekit.android.audio.NoAudioHandler
-import io.livekit.android.events.RoomEvent as SdkRoomEvent
-import io.livekit.android.room.Room
-import io.livekit.android.room.participant.Participant
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.mapNotNull
 
+internal sealed interface LiveKitSdkRoomEvent {
+    data object Connected : LiveKitSdkRoomEvent
+    data object Reconnecting : LiveKitSdkRoomEvent
+    data object Reconnected : LiveKitSdkRoomEvent
+    data class Disconnected(val error: Throwable?) : LiveKitSdkRoomEvent
+    data class FailedToConnect(val error: Throwable) : LiveKitSdkRoomEvent
+    data class ParticipantDisconnected(val participantIdentity: String?) : LiveKitSdkRoomEvent
+    data class DataReceived(
+        val participantIdentity: String?,
+        val topic: String?,
+        val data: ByteArray,
+    ) : LiveKitSdkRoomEvent
+}
+
+internal data class LiveKitSdkRpcInvocation(
+    val callerIdentity: String,
+    val payload: String,
+)
+
+internal interface LiveKitRoomSdkAdapter {
+    val events: Flow<LiveKitSdkRoomEvent>
+    suspend fun connect(url: String, token: String)
+    suspend fun setMicrophoneEnabled(enabled: Boolean): Boolean
+    suspend fun performRpc(destination: String, method: String, payload: String): String
+    fun registerRpcMethod(method: String, handler: suspend (LiveKitSdkRpcInvocation) -> String)
+    fun unregisterRpcMethod(method: String)
+    fun disconnect()
+    fun release()
+}
+
 internal class AndroidLiveKitRoomFacade(
-    context: Context,
-    private val room: Room = LiveKit.create(
-        appContext = context,
-        overrides = LiveKitOverrides(
-            audioOptions = AudioOptions(audioHandler = NoAudioHandler()),
-        ),
-    ),
+    private val sdk: LiveKitRoomSdkAdapter,
 ) : LiveKitRoomFacade {
-    override val events: Flow<LiveKitRoomEvent> = room.events.events.mapNotNull(::toFacadeEvent)
+    constructor(context: Context) : this(createLiveKitRoomSdkAdapter(context))
+
+    override val events: Flow<LiveKitRoomEvent> = sdk.events.mapNotNull(::toFacadeEvent)
 
     override suspend fun connect(url: String, token: String) {
-        room.connect(url, token)
+        sdk.connect(url, token)
     }
 
     override suspend fun setMicrophoneEnabled(enabled: Boolean): Boolean =
-        room.localParticipant.setMicrophoneEnabled(enabled)
+        sdk.setMicrophoneEnabled(enabled)
 
     override suspend fun performRpc(destination: String, method: String, payload: String): String =
-        room.performRpc(Participant.Identity(destination), method, payload)
+        sdk.performRpc(destination, method, payload)
 
     override fun registerRpcMethod(
         method: String,
         handler: suspend (LiveKitRpcInvocation) -> String,
     ) {
-        room.registerRpcMethod(method) { invocation ->
-            handler(
-                LiveKitRpcInvocation(
-                    callerIdentity = invocation.callerIdentity.value,
-                    payload = invocation.payload,
-                ),
-            )
+        sdk.registerRpcMethod(method) { invocation ->
+            handler(LiveKitRpcInvocation(invocation.callerIdentity, invocation.payload))
         }
     }
 
     override fun unregisterRpcMethod(method: String) {
-        room.unregisterRpcMethod(method)
+        sdk.unregisterRpcMethod(method)
     }
 
     override fun disconnect() {
-        room.disconnect()
+        sdk.disconnect()
     }
 
     override fun close() {
-        room.release()
+        sdk.release()
     }
 
-    private fun toFacadeEvent(event: SdkRoomEvent): LiveKitRoomEvent? = when (event) {
-        is SdkRoomEvent.Connected -> LiveKitRoomEvent.Connected
-        is SdkRoomEvent.Reconnecting -> LiveKitRoomEvent.Reconnecting
-        is SdkRoomEvent.Reconnected -> LiveKitRoomEvent.Reconnected
-        is SdkRoomEvent.Disconnected -> LiveKitRoomEvent.Disconnected(event.error)
-        is SdkRoomEvent.FailedToConnect -> LiveKitRoomEvent.Failed(event.error)
-        is SdkRoomEvent.ParticipantDisconnected -> LiveKitRoomEvent.ParticipantDisconnected(
-            event.participant.identity?.value ?: return null,
+    private fun toFacadeEvent(event: LiveKitSdkRoomEvent): LiveKitRoomEvent? = when (event) {
+        LiveKitSdkRoomEvent.Connected -> LiveKitRoomEvent.Connected
+        LiveKitSdkRoomEvent.Reconnecting -> LiveKitRoomEvent.Reconnecting
+        LiveKitSdkRoomEvent.Reconnected -> LiveKitRoomEvent.Reconnected
+        is LiveKitSdkRoomEvent.Disconnected -> LiveKitRoomEvent.Disconnected(event.error)
+        is LiveKitSdkRoomEvent.FailedToConnect -> LiveKitRoomEvent.Failed(event.error)
+        is LiveKitSdkRoomEvent.ParticipantDisconnected -> LiveKitRoomEvent.ParticipantDisconnected(
+            event.participantIdentity ?: return null,
         )
-        is SdkRoomEvent.DataReceived -> LiveKitRoomEvent.Data(
-            participantIdentity = event.participant?.identity?.value ?: return null,
+        is LiveKitSdkRoomEvent.DataReceived -> LiveKitRoomEvent.Data(
+            participantIdentity = event.participantIdentity ?: return null,
             topic = event.topic ?: return null,
             payload = event.data.decodeToString(),
         )
-        else -> null
     }
+
 }

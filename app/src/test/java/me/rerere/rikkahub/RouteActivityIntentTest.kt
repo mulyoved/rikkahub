@@ -47,6 +47,24 @@ class RouteActivityIntentTest {
     }
 
     @Test
+    fun `voice agent notification route preserves LiveKit transport`() {
+        val conversationId = "0e822879-5558-45c9-b3dd-8637db28ce17"
+
+        val screen = voiceAgentIntentScreen(
+            conversationId = conversationId,
+            transportWireName = VoiceAgentTransport.LiveKitExperimental.wireName,
+        )
+
+        assertEquals(
+            Screen.VoiceAgent(
+                conversationId = conversationId,
+                transportWireName = VoiceAgentTransport.LiveKitExperimental.wireName,
+            ),
+            screen,
+        )
+    }
+
+    @Test
     fun `incoming intent falls back to chat when only conversation id is present`() {
         val conversationId = "0e822879-5558-45c9-b3dd-8637db28ce17"
         val backStack = mutableListOf<NavKey>(directVoiceAgentScreen(conversationId))

@@ -8,8 +8,6 @@ import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
-import java.util.Collections
-import java.util.IdentityHashMap
 
 internal enum class VoiceAgentCleanupMode {
     Replacement,
@@ -58,7 +56,7 @@ private sealed interface CleanupAttemptDecision {
     data class Join(val completion: CompletableDeferred<CleanupAttemptOutcome>) : CleanupAttemptDecision
 }
 
-private sealed interface CleanupAttemptOutcome {
+internal sealed interface CleanupAttemptOutcome {
     data class Returned(val result: VoiceAgentCleanupResult) : CleanupAttemptOutcome
     data class Cancelled(val error: CancellationException) : CleanupAttemptOutcome
 }
@@ -68,7 +66,7 @@ private enum class CleanupStageProgress {
     Completed,
 }
 
-private abstract class JoinedCleanupOperation : VoiceAgentCleanupOperation {
+internal abstract class JoinedCleanupOperation : VoiceAgentCleanupOperation {
     final override val token: Any = Any()
 
     private val lock = Any()
@@ -104,7 +102,7 @@ private abstract class JoinedCleanupOperation : VoiceAgentCleanupOperation {
         val outcome = try {
             executeAttempt(mode)
         } catch (cancellation: CancellationException) {
-            CleanupAttemptOutcome.Cancelled(cancellation.canonicalCancellation())
+            CleanupAttemptOutcome.Cancelled(cancellation.canonicalVoiceAgentCancellation())
         } catch (error: Throwable) {
             CleanupAttemptOutcome.Returned(VoiceAgentCleanupResult.Failed(error))
         }
@@ -184,20 +182,10 @@ private class SessionCleanupOperation(
             DelegateCleanupProgress.Completed -> Unit
             DelegateCleanupProgress.Immediate -> closeDelegate(failures)
             DelegateCleanupProgress.Initial -> when (mode) {
-                VoiceAgentCleanupMode.Replacement -> endDelegate(failures)
+                VoiceAgentCleanupMode.Replacement -> drainDelegate(failures)
                 VoiceAgentCleanupMode.GracefulEnd -> drainDelegate(failures)
                 VoiceAgentCleanupMode.Immediate -> closeDelegate(failures)
             }
-        }
-    }
-
-    private fun endDelegate(failures: CleanupAttemptFailures) {
-        try {
-            delegate.end()
-            delegateProgress = DelegateCleanupProgress.Completed
-        } catch (error: Throwable) {
-            delegateProgress = DelegateCleanupProgress.Immediate
-            failures.add(error)
         }
     }
 
@@ -302,7 +290,7 @@ private class ActiveCallCleanupOperation(
     }
 }
 
-private class CleanupAttemptFailures {
+internal class CleanupAttemptFailures {
     private val failures = mutableListOf<Throwable>()
     private var cancellation: CancellationException? = null
 
@@ -319,7 +307,7 @@ private class CleanupAttemptFailures {
 
     fun add(error: Throwable) {
         if (error is CancellationException) {
-            val canonical = error.canonicalCancellation()
+            val canonical = error.canonicalVoiceAgentCancellation()
             val current = cancellation
             if (current == null) {
                 cancellation = canonical
@@ -335,9 +323,7 @@ private class CleanupAttemptFailures {
         captureCallerCancellation()
         cancellation?.let { canonical ->
             failures.forEach { failure ->
-                if (failure !== canonical && failure !in canonical.suppressed) {
-                    canonical.addSuppressed(failure)
-                }
+                canonical.addVoiceAgentSuppressedDistinct(failure)
             }
             return CleanupAttemptOutcome.Cancelled(canonical)
         }
@@ -345,9 +331,7 @@ private class CleanupAttemptFailures {
             VoiceAgentCleanupResult.Completed,
         )
         failures.drop(1).forEach { failure ->
-            if (failure !== primary && failure !in primary.suppressed) {
-                primary.addSuppressed(failure)
-            }
+            primary.addVoiceAgentSuppressedDistinct(failure)
         }
         return CleanupAttemptOutcome.Returned(VoiceAgentCleanupResult.Failed(primary))
     }
@@ -361,16 +345,3 @@ private fun CleanupAttemptOutcome.deliver(): VoiceAgentCleanupResult = when (thi
 internal class VoiceAgentEndDrainTimeoutException(
     timeoutMillis: Long,
 ) : RuntimeException("Voice Agent end drain timed out after ${timeoutMillis}ms")
-
-private fun CancellationException.canonicalCancellation(): CancellationException {
-    var canonical = this
-    val visited = Collections.newSetFromMap(
-        IdentityHashMap<CancellationException, Boolean>(),
-    )
-    visited += canonical
-    while (true) {
-        val original = canonical.cause as? CancellationException ?: return canonical
-        if (original.message != canonical.message || !visited.add(original)) return canonical
-        canonical = original
-    }
-}

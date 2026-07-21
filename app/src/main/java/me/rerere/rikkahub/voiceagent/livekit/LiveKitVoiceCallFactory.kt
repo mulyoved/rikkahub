@@ -41,6 +41,7 @@ internal class LiveKitVoiceCallFactory internal constructor(
         request: VoiceAgentCallRequest,
         routeLease: VoiceAgentRouteLease,
         scope: CoroutineScope,
+        endDrainTimeoutMillis: Long,
     ): VoiceAgentSessionCreationResult {
         val cleanup = voiceAgentRouteCleanupOperation(routeLease)
         return try {
@@ -51,6 +52,7 @@ internal class LiveKitVoiceCallFactory internal constructor(
             VoiceAgentSessionCreationResult.Created(
                 LiveKitVoiceCallSession(
                     details = details,
+                    traceId = trace.traceId,
                     room = roomFactory(),
                     routeLease = routeLease,
                     scope = scope,

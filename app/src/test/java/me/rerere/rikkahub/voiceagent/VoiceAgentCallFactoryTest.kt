@@ -35,6 +35,37 @@ import kotlin.uuid.Uuid
 
 class VoiceAgentCallFactoryTest {
     @Test
+    fun `disabled LiveKit transport is rejected below UI and retires the owned route`() = runTest {
+        var directConstructions = 0
+        var liveKitConstructions = 0
+        val route = OrchestratorFakeRoute()
+        val selectingFactory = TransportSelectingVoiceAgentCallFactory(
+            directFactoryProvider = {
+                directConstructions += 1
+                error("Direct factory must not be constructed")
+            },
+            liveKitFactoryProvider = {
+                liveKitConstructions += 1
+                error("LiveKit factory must not be constructed")
+            },
+            liveKitEnabled = false,
+        )
+
+        val result = selectingFactory.createOwned(
+            request = orchestratorRequest("disabled-livekit").copy(
+                transport = VoiceAgentTransport.LiveKitExperimental,
+            ),
+            routeLease = route.lease,
+            scope = this,
+        )
+
+        assertTrue(result is VoiceAgentSessionCreationResult.FailedClean)
+        assertEquals(1, route.retirementCalls)
+        assertEquals(0, directConstructions)
+        assertEquals(0, liveKitConstructions)
+    }
+
+    @Test
     fun `LiveKit transport bypasses direct factory`() = runTest {
         val directSession = OrchestratorFakeSession()
         val liveKitSession = OrchestratorFakeSession()
@@ -55,6 +86,7 @@ class VoiceAgentCallFactoryTest {
                     VoiceAgentSessionCreationResult.Created(liveKitSession)
                 }.also { liveKitFactory = it }
             },
+            liveKitEnabled = true,
         )
         val request = VoiceAgentCallRequest(
             conversationId = Uuid.random(),
@@ -95,6 +127,7 @@ class VoiceAgentCallFactoryTest {
                     error("LiveKit factory must not run")
                 }.also { liveKitFactory = it }
             },
+            liveKitEnabled = true,
         )
 
         val result = selectingFactory.createOwned(

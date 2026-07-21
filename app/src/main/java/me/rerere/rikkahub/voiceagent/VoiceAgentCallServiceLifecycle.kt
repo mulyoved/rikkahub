@@ -14,7 +14,11 @@ internal const val VOICE_AGENT_END_DRAIN_TIMEOUT_MS = 15_000L
 
 internal interface VoiceAgentCallServiceLifecycleHost {
     fun cancelNotification()
-    fun startForeground(conversationId: String, state: VoiceAgentUiState)
+    fun startForeground(
+        conversationId: String,
+        transport: VoiceAgentTransport,
+        state: VoiceAgentUiState,
+    )
     fun endCompleted(conversationId: Uuid?)
     fun stopForeground()
     fun stopSelf()
@@ -32,12 +36,17 @@ internal class VoiceAgentCallServiceLifecycle(
     private var configurationToken: Any? = null
     private var notificationJob: Job? = null
     private var closeControllerOnDestroy = true
+    private var notificationTransport = VoiceAgentTransport.DirectGemini
 
     var currentGeneration: Long = 0L
         private set
 
-    fun beginStart(conversationId: Uuid): Long {
+    fun beginStart(
+        conversationId: Uuid,
+        transport: VoiceAgentTransport = VoiceAgentTransport.DirectGemini,
+    ): Long {
         currentGeneration += 1
+        notificationTransport = transport
         closeControllerOnDestroy = true
         configurationJob?.cancel()
         configurationJob = null
@@ -47,8 +56,9 @@ internal class VoiceAgentCallServiceLifecycle(
         notificationJob = null
         host.cancelNotification()
         val currentState = controller.state.value
+        val activeIdentity = controller.activeIdentity.value
         val foregroundState = if (
-            controller.activeConversationId.value == conversationId &&
+            activeIdentity?.conversationId == conversationId &&
             currentState.call is VoiceCallStatus.Degraded
         ) {
             currentState
@@ -57,6 +67,7 @@ internal class VoiceAgentCallServiceLifecycle(
         }
         host.startForeground(
             conversationId.toString(),
+            notificationTransport,
             foregroundState,
         )
         return currentGeneration
@@ -79,8 +90,15 @@ internal class VoiceAgentCallServiceLifecycle(
                 if (!isCurrent(generation)) return@launch
                 clearConfigurationTracking(token)
                 submitted = true
-                when (val result = controller.start(request)) {
-                    is VoiceAgentCallStartResult.Active -> observeActiveCall(generation, conversationId)
+                val result = controller.start(request)
+                if (!isCurrent(generation)) return@launch
+                when (result) {
+                    is VoiceAgentCallStartResult.Active -> {
+                        observeActiveCall(
+                            generation,
+                            activeResultIdentity(request),
+                        )
+                    }
                     VoiceAgentCallStartResult.Superseded -> Unit
                     is VoiceAgentCallStartResult.Failed -> stopFailedStartIfCurrent(
                         generation = generation,
@@ -111,7 +129,9 @@ internal class VoiceAgentCallServiceLifecycle(
             configurationJob?.cancel()
             configurationJob = null
             configurationToken = null
-            closeControllerOnDestroy = false
+            if (controller.lifecycle.value == VoiceAgentCallLifecycle.Idle) {
+                closeControllerOnDestroy = false
+            }
             runCatching {
                 runVoiceAgentCleanupStages(
                     { host.reportFailure(error) },
@@ -130,9 +150,10 @@ internal class VoiceAgentCallServiceLifecycle(
         notificationJob?.cancel()
         notificationJob = null
         host.cancelNotification()
-        val endingConversationId = controller.activeConversationId.value
+        val endingIdentity = controller.activeIdentity.value
         host.startForeground(
-            endingConversationId?.toString() ?: FALLBACK_END_NOTIFICATION_CONVERSATION_ID,
+            endingIdentity?.conversationId?.toString() ?: FALLBACK_END_NOTIFICATION_CONVERSATION_ID,
+            endingIdentity?.transport ?: notificationTransport,
             controller.state.value.copy(call = VoiceCallStatus.Ending),
         )
         currentGeneration += 1
@@ -145,7 +166,7 @@ internal class VoiceAgentCallServiceLifecycle(
             }
             val hostFailure = runCatching {
                 runVoiceAgentCleanupStages(
-                    { host.endCompleted(endingConversationId) },
+                    { host.endCompleted(endingIdentity?.conversationId) },
                     host::stopForeground,
                     host::stopSelf,
                 )
@@ -175,15 +196,19 @@ internal class VoiceAgentCallServiceLifecycle(
         skipControllerCloseOnDestroy: Boolean = false,
     ) {
         if (!isCurrent(generation)) return
-        if (hasHostedCall()) {
+        val hostedIdentity = hostedIdentityOrNull(conversationId)
+        if (hostedIdentity != null) {
             reportFailureSafely(error)
             observeActiveCall(
                 generation = generation,
-                conversationId = hostedConversationId(conversationId),
+                identity = hostedIdentity,
             )
             return
         }
-        if (skipControllerCloseOnDestroy) {
+        if (
+            skipControllerCloseOnDestroy &&
+            controller.lifecycle.value == VoiceAgentCallLifecycle.Idle
+        ) {
             closeControllerOnDestroy = false
         }
         val detail = error.toVoiceAgentLogDetail()
@@ -193,6 +218,7 @@ internal class VoiceAgentCallServiceLifecycle(
                 {
                     host.startForeground(
                         conversationId.toString(),
+                        notificationTransport,
                         controller.state.value.copy(
                             call = VoiceCallStatus.Degraded("Voice call startup failed: $detail"),
                         ),
@@ -208,7 +234,10 @@ internal class VoiceAgentCallServiceLifecycle(
         }
     }
 
-    private fun observeActiveCall(generation: Long, conversationId: Uuid) {
+    private fun observeActiveCall(
+        generation: Long,
+        identity: ActiveVoiceAgentIdentity,
+    ) {
         if (!isCurrent(generation)) return
         notificationJob?.cancel()
         notificationJob = serviceScope.launch {
@@ -216,7 +245,7 @@ internal class VoiceAgentCallServiceLifecycle(
                 launch {
                     controller.state.collect { state ->
                         if (isCurrent(generation)) {
-                            host.startForeground(conversationId.toString(), state)
+                            host.startForeground(identity.conversationId.toString(), identity.transport, state)
                         }
                     }
                 }
@@ -262,7 +291,7 @@ internal class VoiceAgentCallServiceLifecycle(
     }
 
     private fun hasHostedCall(): Boolean =
-        controller.activeConversationId.value != null || when (controller.lifecycle.value) {
+        controller.activeIdentity.value != null || when (controller.lifecycle.value) {
             is VoiceAgentCallLifecycle.Starting,
             is VoiceAgentCallLifecycle.Active,
             is VoiceAgentCallLifecycle.Stopping,
@@ -272,15 +301,26 @@ internal class VoiceAgentCallServiceLifecycle(
             -> false
         }
 
-    private fun hostedConversationId(fallback: Uuid): Uuid =
-        controller.activeConversationId.value ?: when (val lifecycle = controller.lifecycle.value) {
+    private fun activeResultIdentity(request: VoiceAgentCallRequest): ActiveVoiceAgentIdentity {
+        controller.activeIdentity.value?.let { return it }
+        check(controller.lifecycle.value !is VoiceAgentCallLifecycle.Active) {
+            "Active Voice Agent lifecycle must expose its complete identity"
+        }
+        return ActiveVoiceAgentIdentity(request.conversationId, request.transport)
+    }
+
+    private fun hostedIdentityOrNull(fallbackConversationId: Uuid): ActiveVoiceAgentIdentity? {
+        controller.activeIdentity.value?.let { return it }
+        val conversationId = when (val lifecycle = controller.lifecycle.value) {
             is VoiceAgentCallLifecycle.Starting -> lifecycle.conversationId
-            is VoiceAgentCallLifecycle.Active -> lifecycle.conversationId
-            is VoiceAgentCallLifecycle.Stopping -> lifecycle.conversationId ?: fallback
+            is VoiceAgentCallLifecycle.Active -> error("Active Voice Agent lifecycle must expose its complete identity")
+            is VoiceAgentCallLifecycle.Stopping -> lifecycle.conversationId ?: fallbackConversationId
             VoiceAgentCallLifecycle.Idle,
             is VoiceAgentCallLifecycle.CleanupFailed,
-            -> fallback
+            -> return null
         }
+        return ActiveVoiceAgentIdentity(conversationId, notificationTransport)
+    }
 
     private companion object {
         const val FALLBACK_END_NOTIFICATION_CONVERSATION_ID = "voice-agent"

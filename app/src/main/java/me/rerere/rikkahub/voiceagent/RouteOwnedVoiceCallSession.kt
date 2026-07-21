@@ -17,13 +17,14 @@ internal interface RouteOwnedManagedVoiceCallSession {
 internal class RouteOwnedVoiceCallSession(
     private val delegate: ManagedVoiceCallSession,
     private val routeLease: VoiceAgentRouteLease,
+    endDrainTimeoutMillis: Long = VOICE_AGENT_END_DRAIN_TIMEOUT_MS,
 ) : RouteOwnedManagedVoiceCallSession {
     override val state = delegate.state
     override val routeMetadata = routeLease.metadata
     override val cleanupOperation = voiceAgentSessionCleanupOperation(
         delegate = delegate,
         routeLease = routeLease,
-        endDrainTimeoutMillis = VOICE_AGENT_END_DRAIN_TIMEOUT_MS,
+        endDrainTimeoutMillis = endDrainTimeoutMillis,
     )
     override val isRouteUsable: Boolean
         get() = routeLease.isUsable

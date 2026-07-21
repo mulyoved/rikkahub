@@ -93,7 +93,10 @@ class VoiceAgentCallOrchestratorPolicyTest {
 
         assertTrue(matching.await() is VoiceAgentCallStartResult.Active)
         assertEquals(1, session.reconnectCalls)
-        assertEquals(request.conversationId, orchestrator.activeConversationId.value)
+        assertEquals(
+            ActiveVoiceAgentIdentity(request.conversationId, request.transport),
+            orchestrator.activeIdentity.value,
+        )
         appJob.cancel()
     }
 
@@ -127,7 +130,7 @@ class VoiceAgentCallOrchestratorPolicyTest {
             VoiceAgentCallLifecycle.Idle,
             orchestrator.lifecycle.first { it == VoiceAgentCallLifecycle.Idle },
         )
-        assertNull(orchestrator.activeConversationId.value)
+        assertNull(orchestrator.activeIdentity.value)
         assertEquals(listOf(VoiceAgentCleanupMode.Immediate), cleanup.modes)
         appJob.cancel()
     }
@@ -162,7 +165,7 @@ class VoiceAgentCallOrchestratorPolicyTest {
             VoiceAgentCallLifecycle.Idle,
             orchestrator.lifecycle.first { it == VoiceAgentCallLifecycle.Idle },
         )
-        assertNull(orchestrator.activeConversationId.value)
+        assertNull(orchestrator.activeIdentity.value)
         assertEquals(listOf(VoiceAgentCleanupMode.Immediate), cleanup.modes)
         appJob.cancel()
     }
@@ -187,7 +190,10 @@ class VoiceAgentCallOrchestratorPolicyTest {
         runCurrent()
 
         assertTrue(first.await() is VoiceAgentCallStartResult.Active)
-        assertEquals(request.conversationId, orchestrator.activeConversationId.value)
+        assertEquals(
+            ActiveVoiceAgentIdentity(request.conversationId, request.transport),
+            orchestrator.activeIdentity.value,
+        )
         assertEquals(VoiceCallStatus.Degraded("initial connection failure"), orchestrator.state.value.call)
         assertEquals(
             listOf("voice_call_start_failed" to "initial connection failure"),
@@ -221,7 +227,10 @@ class VoiceAgentCallOrchestratorPolicyTest {
         session.emit(VoiceAgentUiState(session = VoiceSessionStatus.Error("connection lost")))
         runCurrent()
 
-        assertEquals(request.conversationId, orchestrator.activeConversationId.value)
+        assertEquals(
+            ActiveVoiceAgentIdentity(request.conversationId, request.transport),
+            orchestrator.activeIdentity.value,
+        )
         assertEquals(VoiceCallStatus.Degraded("connection lost"), orchestrator.state.value.call)
         assertEquals(listOf("voice_call_start_failed" to "connection lost"), session.diagnostics)
         assertTrue(
@@ -233,6 +242,47 @@ class VoiceAgentCallOrchestratorPolicyTest {
         session.emit(VoiceAgentUiState(session = VoiceSessionStatus.Connected))
         runCurrent()
         assertEquals(VoiceCallStatus.Degraded("connection lost"), orchestrator.state.value.call)
+        appJob.cancel()
+    }
+
+    @Test
+    fun `recording an Error diagnostic does not recursively record the same Error`() = runTest {
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val appJob = SupervisorJob()
+        val route = OrchestratorFakeRoute()
+        val diagnosticLine = VoiceDiagnosticLine(
+            name = "voice_call_start_failed",
+            detail = "connection lost",
+            at = "test",
+        )
+        var stateMutationPublished = false
+        lateinit var session: OrchestratorFakeSession
+        session = OrchestratorFakeSession(
+            routeMetadata = route.lease.metadata,
+            onDiagnostic = { _, _ ->
+                if (!stateMutationPublished) {
+                    stateMutationPublished = true
+                    session.emit(session.state.value.copy(diagnostics = listOf(diagnosticLine)))
+                }
+            },
+        )
+        val orchestrator = VoiceAgentCallOrchestrator(
+            factory = OrchestratorFakeFactory { _, _, _ -> VoiceAgentSessionCreationResult.Created(session) },
+            resolveRoute = { route.lease },
+            appScope = CoroutineScope(appJob + dispatcher),
+        )
+        async { orchestrator.start(orchestratorRequest("error-diagnostic-feedback")) }
+            .also { runCurrent() }
+            .await()
+
+        session.emit(VoiceAgentUiState(session = VoiceSessionStatus.Error("connection lost")))
+        runCurrent()
+
+        assertEquals(
+            listOf("voice_call_start_failed" to "connection lost"),
+            session.diagnostics,
+        )
+        assertEquals(listOf(diagnosticLine), orchestrator.state.value.diagnostics)
         appJob.cancel()
     }
 
@@ -255,7 +305,7 @@ class VoiceAgentCallOrchestratorPolicyTest {
             session.emit(VoiceAgentUiState(session = terminal))
             runCurrent()
 
-            assertNull(orchestrator.activeConversationId.value)
+            assertNull(orchestrator.activeIdentity.value)
             assertEquals(VoiceAgentUiState(), orchestrator.state.value)
             assertEquals(
                 VoiceAgentCallLifecycle.Idle,
@@ -267,6 +317,46 @@ class VoiceAgentCallOrchestratorPolicyTest {
 
         exercise(VoiceSessionStatus.Error("route retired"), "unusable")
         exercise(VoiceSessionStatus.Ended, "ended")
+    }
+
+    @Test
+    fun `matching start after unusable Error creates a fresh session`() = runTest {
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val appJob = SupervisorJob()
+        val first = OrchestratorFakeSession()
+        val second = OrchestratorFakeSession()
+        val sessions = ArrayDeque(listOf(first, second))
+        val factory = OrchestratorFakeFactory { _, routeLease, _ ->
+            VoiceAgentSessionCreationResult.Created(
+                sessions.removeFirst().also { session ->
+                    check(session.routeMetadata.owner == routeLease.metadata.owner)
+                },
+            )
+        }
+        val request = orchestratorRequest("retry-after-unusable-error")
+        val orchestrator = VoiceAgentCallOrchestrator(
+            factory = factory,
+            resolveRoute = { OrchestratorFakeRoute().lease },
+            appScope = CoroutineScope(appJob + dispatcher),
+        )
+        async { orchestrator.start(request) }.also { runCurrent() }.await()
+        first.isRouteUsable = false
+
+        first.emit(VoiceAgentUiState(session = VoiceSessionStatus.Error("route retired")))
+        runCurrent()
+        orchestrator.lifecycle.first { it == VoiceAgentCallLifecycle.Idle }
+
+        val retry = async { orchestrator.start(request) }
+        runCurrent()
+
+        assertTrue(retry.await() is VoiceAgentCallStartResult.Active)
+        assertEquals(2, factory.calls)
+        assertEquals(
+            ActiveVoiceAgentIdentity(request.conversationId, request.transport),
+            orchestrator.activeIdentity.value,
+        )
+        assertEquals(1, second.collectorCount())
+        appJob.cancel()
     }
 
     @Test
@@ -335,7 +425,7 @@ class VoiceAgentCallOrchestratorPolicyTest {
         session.emit(VoiceAgentUiState(session = VoiceSessionStatus.Error("late error")))
         runCurrent()
 
-        assertNull(orchestrator.activeConversationId.value)
+        assertNull(orchestrator.activeIdentity.value)
         assertEquals(VoiceAgentUiState(), orchestrator.state.value)
         assertFalse(orchestrator.state.value.call is VoiceCallStatus.Degraded)
         assertEquals(
@@ -372,7 +462,7 @@ class VoiceAgentCallOrchestratorPolicyTest {
         runCurrent()
 
         assertTrue(result.await() is VoiceAgentCallStartResult.Active)
-        assertNull(orchestrator.activeConversationId.value)
+        assertNull(orchestrator.activeIdentity.value)
         assertEquals(VoiceAgentUiState(), orchestrator.state.value)
         assertFalse(orchestrator.state.value.call is VoiceCallStatus.Degraded)
         cleanupEntered.await()
