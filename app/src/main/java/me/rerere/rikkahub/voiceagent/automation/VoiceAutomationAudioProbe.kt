@@ -2,6 +2,8 @@ package me.rerere.rikkahub.voiceagent.automation
 
 import java.util.concurrent.ScheduledThreadPoolExecutor
 import java.util.concurrent.TimeUnit
+import me.rerere.rikkahub.voiceagent.VoiceAgentTransport
+import me.rerere.rikkahub.voiceagent.telemetry.sha256Hex
 import org.koin.core.context.GlobalContext
 
 internal fun interface VoiceAutomationScheduledTransition {
@@ -21,10 +23,22 @@ internal interface VoiceAutomationAudioProbe {
     fun onInjectionCompleted()
     fun onOutputQueued(byteCount: Int)
     fun onOutputWritten(byteCount: Int, nonSilent: Boolean)
+    fun captureLiveKitMediaOwner(): VoiceAutomationMediaOwner? = null
+    fun onLiveKitOutputWritten(
+        owner: VoiceAutomationMediaOwner,
+        byteCount: Int,
+        nonSilent: Boolean,
+    ) {
+        onOutputWritten(byteCount, nonSilent)
+    }
     fun onOutputDrained()
     fun onInterruptionStarted()
     fun onOutputSilenceConfirmed()
 }
+
+internal data class VoiceAutomationMediaOwner(
+    val runHash: String,
+)
 
 internal class DefaultVoiceAutomationAudioProbe(
     private val runtimeProvider: () -> VoiceAutomationRuntime?,
@@ -124,55 +138,46 @@ internal class DefaultVoiceAutomationAudioProbe(
     override fun onOutputWritten(byteCount: Int, nonSilent: Boolean) {
         if (byteCount <= 0) return
         withActiveRuntime { runtime ->
-            prepareOutputEpoch()
-            if (nonSilent) {
-                if (outputState == OutputState.Dropout) {
-                    playbackEpoch += 1
-                    record(
-                        runtime,
-                        VoiceAutomationEventInput(
-                            name = VoiceAutomationEventName.DROPOUT_ENDED,
-                            playbackEpoch = playbackEpoch,
-                        ),
-                    )
-                    outputState = OutputState.BeforeOutput
-                }
-                if (!firstNonSilentRecorded) {
-                    firstNonSilentRecorded = true
-                    record(
-                        runtime,
-                        VoiceAutomationEventInput(
-                            name = VoiceAutomationEventName.REMOTE_AUDIO_FIRST_NON_SILENT,
-                            playbackEpoch = playbackEpoch,
-                        ),
-                    )
-                }
-                if (
-                    outputState != OutputState.Active &&
-                    outputState != OutputState.Interrupted
-                ) {
-                    outputState = OutputState.Active
-                    record(
-                        runtime,
-                        VoiceAutomationEventInput(
-                            name = VoiceAutomationEventName.PLAYBACK_ACTIVE,
-                            playbackEpoch = playbackEpoch,
-                        ),
-                    )
-                }
-                lastNonSilentMs = monotonicMs()
-                if (outputState == OutputState.Active) {
-                    scheduleDropoutTransition()
-                }
+            recordOutputWritten(runtime, byteCount, nonSilent, mediaOwner = null)
+        }
+    }
+
+    @Synchronized
+    override fun captureLiveKitMediaOwner(): VoiceAutomationMediaOwner? {
+        val runtime = runtimeProvider() ?: return null
+        val status = runCatching(runtime::status).getOrNull() ?: return null
+        if (
+            status.state != VoiceAutomationRunState.Active ||
+            status.requestedTransport != VoiceAgentTransport.LiveKitExperimental
+        ) {
+            return null
+        }
+        val activeRunHash = status.runHash ?: return null
+        if (runCatching {
+                VoiceAutomationEventValidation.validateHash("runHash", activeRunHash)
+            }.isFailure
+        ) {
+            return null
+        }
+        return VoiceAutomationMediaOwner(activeRunHash)
+    }
+
+    @Synchronized
+    override fun onLiveKitOutputWritten(
+        owner: VoiceAutomationMediaOwner,
+        byteCount: Int,
+        nonSilent: Boolean,
+    ) {
+        if (byteCount <= 0) return
+        withActiveRuntime { runtime ->
+            val status = runCatching(runtime::status).getOrNull() ?: return@withActiveRuntime
+            if (
+                status.requestedTransport != VoiceAgentTransport.LiveKitExperimental ||
+                status.runHash != owner.runHash
+            ) {
+                return@withActiveRuntime
             }
-            record(
-                runtime,
-                VoiceAutomationEventInput(
-                    name = VoiceAutomationEventName.PLAYBACK_WRITTEN,
-                    playbackEpoch = playbackEpoch,
-                    byteCount = byteCount.toLong(),
-                ),
-            )
+            recordOutputWritten(runtime, byteCount, nonSilent, mediaOwner = owner)
         }
     }
 
@@ -289,6 +294,94 @@ internal class DefaultVoiceAutomationAudioProbe(
         }
     }
 
+    private fun recordOutputWritten(
+        runtime: VoiceAutomationRuntime,
+        byteCount: Int,
+        nonSilent: Boolean,
+        mediaOwner: VoiceAutomationMediaOwner?,
+    ) {
+        prepareOutputEpoch()
+        if (nonSilent) {
+            if (outputState == OutputState.Dropout) {
+                playbackEpoch += 1
+                record(
+                    runtime,
+                    VoiceAutomationEventInput(
+                        name = VoiceAutomationEventName.DROPOUT_ENDED,
+                        playbackEpoch = playbackEpoch,
+                    ),
+                    mediaOwner,
+                )
+                outputState = OutputState.BeforeOutput
+            }
+            if (!firstNonSilentRecorded) {
+                firstNonSilentRecorded = true
+                record(
+                    runtime,
+                    VoiceAutomationEventInput(
+                        name = VoiceAutomationEventName.REMOTE_AUDIO_FIRST_NON_SILENT,
+                        playbackEpoch = playbackEpoch,
+                    ),
+                    mediaOwner,
+                )
+            }
+            if (
+                outputState != OutputState.Active &&
+                outputState != OutputState.Interrupted
+            ) {
+                outputState = OutputState.Active
+                record(
+                    runtime,
+                    VoiceAutomationEventInput(
+                        name = VoiceAutomationEventName.PLAYBACK_ACTIVE,
+                        playbackEpoch = playbackEpoch,
+                        correlationKind = mediaOwner?.let {
+                            VoiceAutomationCorrelationKind.MEDIA_STATE
+                        },
+                        correlationHash = mediaOwner?.let {
+                            mediaStateHash(it.runHash, playbackEpoch)
+                        },
+                    ),
+                    mediaOwner,
+                )
+            }
+            lastNonSilentMs = monotonicMs()
+            if (outputState == OutputState.Active) {
+                scheduleDropoutTransition()
+            }
+        }
+        record(
+            runtime,
+            VoiceAutomationEventInput(
+                name = VoiceAutomationEventName.PLAYBACK_WRITTEN,
+                playbackEpoch = playbackEpoch,
+                byteCount = byteCount.toLong(),
+            ),
+            mediaOwner,
+        )
+    }
+
+    private fun record(
+        runtime: VoiceAutomationRuntime,
+        event: VoiceAutomationEventInput,
+        mediaOwner: VoiceAutomationMediaOwner?,
+    ) {
+        if (mediaOwner == null) {
+            record(runtime, event)
+            return
+        }
+        runCatching {
+            if (runtime.recordIfActiveRun(mediaOwner.runHash, event)) {
+                lastSeenEventCount = runtime.status().eventCount
+            }
+        }
+    }
+
+    private fun mediaStateHash(runHash: String, epoch: Long): String {
+        val value = "$MEDIA_STATE_HASH_DOMAIN|$runHash|$epoch|active"
+        return "sha256:${sha256Hex(value)}"
+    }
+
     private fun prepareOutputEpoch() {
         if (playbackEpoch == 0L) {
             playbackEpoch = 1L
@@ -342,6 +435,7 @@ internal class DefaultVoiceAutomationAudioProbe(
         const val NANOS_PER_MILLISECOND = 1_000_000L
         const val DROPOUT_THRESHOLD_MS = 250L
         const val INTERRUPTION_SILENCE_MS = 100L
+        const val MEDIA_STATE_HASH_DOMAIN = "voice-automation-media-state-v1"
     }
 }
 

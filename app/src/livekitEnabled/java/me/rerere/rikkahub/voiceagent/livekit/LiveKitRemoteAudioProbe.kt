@@ -4,6 +4,7 @@ import java.nio.ByteBuffer
 import livekit.org.webrtc.AudioTrackSink
 import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationAudioProbe
 import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationAudioProbes
+import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationMediaOwner
 
 internal class LiveKitRemoteAudioProbe(
     private val automationAudioProbe: VoiceAutomationAudioProbe = VoiceAutomationAudioProbes.shared,
@@ -14,6 +15,8 @@ internal class LiveKitRemoteAudioProbe(
     private var pendingBytes = 0
     private var lastNonSilent: Boolean? = null
     private var lastProgressMs: Long? = null
+    private var mediaOwner: VoiceAutomationMediaOwner? =
+        automationAudioProbe.captureLiveKitMediaOwner()
 
     override fun onData(
         audioData: ByteBuffer,
@@ -66,7 +69,14 @@ internal class LiveKitRemoteAudioProbe(
 
     private fun flushProgress(nonSilent: Boolean, nowMs: Long) {
         if (pendingBytes <= 0) return
-        automationAudioProbe.onOutputWritten(pendingBytes, nonSilent)
+        val owner = mediaOwner ?: automationAudioProbe.captureLiveKitMediaOwner()?.also {
+            mediaOwner = it
+        }
+        if (owner == null) {
+            automationAudioProbe.onOutputWritten(pendingBytes, nonSilent)
+        } else {
+            automationAudioProbe.onLiveKitOutputWritten(owner, pendingBytes, nonSilent)
+        }
         pendingBytes = 0
         lastProgressMs = nowMs
     }

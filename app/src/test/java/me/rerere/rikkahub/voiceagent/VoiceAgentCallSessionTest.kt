@@ -6,6 +6,7 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.jsonPrimitive
 import me.rerere.ai.ui.UIMessagePart
+import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationCorrelationKind
 import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationEventInput
 import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationEventName
 import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationRunBinding
@@ -55,6 +56,8 @@ class VoiceAgentCallSessionTest {
                 VoiceAutomationEventInput(
                     name = VoiceAutomationEventName.CALL_ACTIVE,
                     observedTransport = VoiceAgentTransport.DirectGemini,
+                    correlationKind = VoiceAutomationCorrelationKind.APP,
+                    correlationHash = AUTOMATION_RUN_HASH,
                 ),
             ),
             runtime.events,
@@ -926,6 +929,8 @@ private class SessionRecordingAutomationRuntime : VoiceAutomationRuntime {
 
     override fun status() = VoiceAutomationStatus(
         state = VoiceAutomationRunState.Active,
+        runHash = AUTOMATION_RUN_HASH,
+        comparisonHash = AUTOMATION_COMPARISON_HASH,
         requestedTransport = VoiceAgentTransport.DirectGemini,
     )
 
@@ -933,3 +938,8 @@ private class SessionRecordingAutomationRuntime : VoiceAutomationRuntime {
 
     override fun reset() = Unit
 }
+
+private const val AUTOMATION_RUN_HASH =
+    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+private const val AUTOMATION_COMPARISON_HASH =
+    "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"

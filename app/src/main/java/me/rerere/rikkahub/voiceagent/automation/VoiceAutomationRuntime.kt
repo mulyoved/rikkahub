@@ -13,6 +13,14 @@ internal interface VoiceAutomationClock {
 internal interface VoiceAutomationRuntime {
     fun prepare(binding: VoiceAutomationRunBinding)
     fun record(event: VoiceAutomationEventInput)
+    fun recordIfActiveRun(runHash: String, event: VoiceAutomationEventInput): Boolean {
+        val status = status()
+        if (status.state != VoiceAutomationRunState.Active || status.runHash != runHash) {
+            return false
+        }
+        record(event)
+        return true
+    }
     fun status(): VoiceAutomationStatus
     fun finalizeRun(): File
     fun reset()
@@ -76,6 +84,25 @@ internal class DefaultVoiceAutomationRuntime(
             }
             VoiceAutomationRunState.Finalized -> error("Automation run has already been finalized")
         }
+    }
+
+    @Synchronized
+    override fun recordIfActiveRun(
+        runHash: String,
+        event: VoiceAutomationEventInput,
+    ): Boolean {
+        if (
+            currentStatus.state != VoiceAutomationRunState.Active ||
+            binding?.runHash != runHash
+        ) {
+            return false
+        }
+        require(event.name !in setOf(
+            VoiceAutomationEventName.RUN_PREPARED,
+            VoiceAutomationEventName.RUN_FINALIZED,
+        )) { "Run lifecycle boundaries are reserved for the runtime" }
+        recordActive(event)
+        return true
     }
 
     @Synchronized

@@ -4,6 +4,7 @@ import java.nio.ByteBuffer
 import me.rerere.rikkahub.voiceagent.VoiceAgentTransport
 import me.rerere.rikkahub.voiceagent.automation.DefaultVoiceAutomationAudioProbe
 import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationAudioProbe
+import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationCorrelationKind
 import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationEventInput
 import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationEventName
 import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationRunBinding
@@ -76,6 +77,15 @@ class LiveKitRemoteAudioProbeTest {
         assertEquals(1, runtime.events.count { it.name == VoiceAutomationEventName.REMOTE_AUDIO_FIRST_NON_SILENT })
         assertEquals(1, runtime.events.count { it.name == VoiceAutomationEventName.DROPOUT_ENDED })
         assertEquals(2L, runtime.events.last().playbackEpoch)
+        assertEquals(
+            listOf(
+                MEDIA_STATE_EPOCH_1_HASH,
+                MEDIA_STATE_EPOCH_2_HASH,
+            ),
+            runtime.events
+                .filter { it.correlationKind == VoiceAutomationCorrelationKind.MEDIA_STATE }
+                .map(VoiceAutomationEventInput::correlationHash),
+        )
     }
 
     @Test
@@ -221,5 +231,9 @@ class LiveKitRemoteAudioProbeTest {
         const val RUN_HASH = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         const val COMPARISON_HASH =
             "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        const val MEDIA_STATE_EPOCH_1_HASH =
+            "sha256:86514ed998b71abd571da38b70a6e1e3708d725df54af09202793b529b783148"
+        const val MEDIA_STATE_EPOCH_2_HASH =
+            "sha256:dad4c9b5ee69ff80c451dffb8b56c298fab9a432faead88bb2aef88fa0072fd6"
     }
 }

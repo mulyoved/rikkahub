@@ -2,6 +2,7 @@ package me.rerere.rikkahub.voiceagent.automation
 
 import me.rerere.rikkahub.voiceagent.VoiceAgentTransport
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class VoiceAutomationAudioProbeTest {
@@ -30,6 +31,68 @@ class VoiceAutomationAudioProbeTest {
                 expected(VoiceAutomationEventName.PLAYBACK_DRAINED, epoch = 1),
             ),
             runtime.events,
+        )
+        assertTrue(runtime.events.all { it.correlationKind == null && it.correlationHash == null })
+    }
+
+    @Test
+    fun `first LiveKit non-silent playback carries deterministic media state evidence`() {
+        val runtime = RecordingRuntime(
+            requestedTransport = VoiceAgentTransport.LiveKitExperimental,
+        )
+        val probe = DefaultVoiceAutomationAudioProbe(
+            runtimeProvider = { runtime },
+            monotonicMs = { 1L },
+        )
+        val owner = checkNotNull(probe.captureLiveKitMediaOwner())
+
+        probe.onLiveKitOutputWritten(
+            owner = owner,
+            byteCount = 320,
+            nonSilent = true,
+        )
+
+        assertEquals(
+            VoiceAutomationEventInput(
+                name = VoiceAutomationEventName.PLAYBACK_ACTIVE,
+                playbackEpoch = 1,
+                correlationKind = VoiceAutomationCorrelationKind.MEDIA_STATE,
+                correlationHash = LIVEKIT_MEDIA_STATE_HASH,
+            ),
+            runtime.events.single { it.name == VoiceAutomationEventName.PLAYBACK_ACTIVE },
+        )
+        assertTrue(Regex("sha256:[0-9a-f]{64}").matches(LIVEKIT_MEDIA_STATE_HASH))
+    }
+
+    @Test
+    fun `stale LiveKit media owner cannot leak playback into a replacement run`() {
+        val runtime = RecordingRuntime(
+            requestedTransport = VoiceAgentTransport.LiveKitExperimental,
+        )
+        val probe = DefaultVoiceAutomationAudioProbe(
+            runtimeProvider = { runtime },
+            monotonicMs = { 1L },
+        )
+        val staleOwner = checkNotNull(probe.captureLiveKitMediaOwner())
+        runtime.runHash = RUN_HASH_B
+        val currentOwner = checkNotNull(probe.captureLiveKitMediaOwner())
+
+        probe.onLiveKitOutputWritten(
+            owner = staleOwner,
+            byteCount = 320,
+            nonSilent = true,
+        )
+        assertEquals(emptyList<VoiceAutomationEventInput>(), runtime.events)
+
+        probe.onLiveKitOutputWritten(
+            owner = currentOwner,
+            byteCount = 320,
+            nonSilent = true,
+        )
+
+        assertEquals(
+            LIVEKIT_MEDIA_STATE_HASH_B,
+            runtime.events.single { it.name == VoiceAutomationEventName.PLAYBACK_ACTIVE }.correlationHash,
         )
     }
 
@@ -229,7 +292,10 @@ class VoiceAutomationAudioProbeTest {
         )
     }
 
-    private class RecordingRuntime : VoiceAutomationRuntime {
+    private class RecordingRuntime(
+        var runHash: String = RUN_HASH,
+        var requestedTransport: VoiceAgentTransport = VoiceAgentTransport.DirectGemini,
+    ) : VoiceAutomationRuntime {
         val events = mutableListOf<VoiceAutomationEventInput>()
 
         override fun prepare(binding: VoiceAutomationRunBinding) = Unit
@@ -240,9 +306,9 @@ class VoiceAutomationAudioProbeTest {
 
         override fun status() = VoiceAutomationStatus(
             state = VoiceAutomationRunState.Active,
-            runHash = RUN_HASH,
+            runHash = runHash,
             comparisonHash = COMPARISON_HASH,
-            requestedTransport = VoiceAgentTransport.DirectGemini,
+            requestedTransport = requestedTransport,
             eventCount = events.size.toLong() + 1,
         )
 
@@ -253,6 +319,11 @@ class VoiceAutomationAudioProbeTest {
 
     private companion object {
         const val RUN_HASH = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        const val RUN_HASH_B = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
         const val COMPARISON_HASH = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        const val LIVEKIT_MEDIA_STATE_HASH =
+            "sha256:86514ed998b71abd571da38b70a6e1e3708d725df54af09202793b529b783148"
+        const val LIVEKIT_MEDIA_STATE_HASH_B =
+            "sha256:ea5fdefb769f7970f4bbacef5b1ac3651d1e1d0e4dbbd3ec7febf9e1d6c851a3"
     }
 }

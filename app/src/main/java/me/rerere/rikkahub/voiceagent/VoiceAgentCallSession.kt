@@ -13,6 +13,7 @@ import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import me.rerere.rikkahub.voiceagent.audio.VoiceAudioEngine
+import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationCorrelationKind
 import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationEventInput
 import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationEventName
 import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationRunState
@@ -558,11 +559,15 @@ class VoiceAgentCallSession internal constructor(
         ) {
             return
         }
+        val appHash = status.runHash ?: return
         runCatching {
-            runtime.record(
-                VoiceAutomationEventInput(
+            runtime.recordIfActiveRun(
+                runHash = appHash,
+                event = VoiceAutomationEventInput(
                     name = VoiceAutomationEventName.CALL_ACTIVE,
                     observedTransport = VoiceAgentTransport.DirectGemini,
+                    correlationKind = VoiceAutomationCorrelationKind.APP,
+                    correlationHash = appHash,
                 ),
             )
         }
