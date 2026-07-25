@@ -221,9 +221,15 @@ read_android_network() {
   local connectivity
   local active_id
   local active_block
-  connectivity="$(adb_command shell dumpsys connectivity)" || fail "Android connectivity readback failed"
+  connectivity="$(adb_command shell dumpsys connectivity)" || {
+    fail "Android connectivity readback failed"
+    return 1
+  }
   active_id="$(printf '%s\n' "$connectivity" | awk '/Active default network:/ { print $4; exit }')"
-  [[ "$active_id" =~ ^[0-9]+$ ]] || fail "Android has no numeric active default network"
+  [[ "$active_id" =~ ^[0-9]+$ ]] || {
+    fail "Android has no numeric active default network"
+    return 1
+  }
   active_block="$(printf '%s\n' "$connectivity" | awk -v id="$active_id" '
     /NetworkAgentInfo\{network\{/ {
       if (found) exit
@@ -231,9 +237,14 @@ read_android_network() {
     }
     found { print }
   ')"
-  [[ -n "$active_block" ]] || fail "active default network details were not found"
-  [[ "$active_block" =~ (^|[^A-Z0-9_])VALIDATED([^A-Z0-9_]|$) ]] ||
+  [[ -n "$active_block" ]] || {
+    fail "active default network details were not found"
+    return 1
+  }
+  [[ "$active_block" =~ (^|[^A-Z0-9_])VALIDATED([^A-Z0-9_]|$) ]] || {
     fail "active default network is not validated"
+    return 1
+  }
   local has_wifi=0
   local has_cellular=0
   [[ "$active_block" =~ (^|[^A-Z0-9_])WIFI([^A-Z0-9_]|$) ]] && has_wifi=1
@@ -244,6 +255,7 @@ read_android_network() {
     printf 'cellular'
   else
     fail "active default network transport is ambiguous"
+    return 1
   fi
 }
 
@@ -466,6 +478,44 @@ latest_event_monotonic_ms() {
     <<< "$lines"
 }
 
+latest_run_event_monotonic_ms() {
+  local lines
+  lines="$(adb_command exec-out run-as "$VOICE_STAGE1_PACKAGE" \
+    grep -F '"schemaVersion":1' "$AUTOMATION_EVENT_PATH")" ||
+    fail "automation run has no event boundary"
+  python3 -c '
+import json, sys
+run_hash, comparison_hash, transport = sys.argv[1:]
+events = [json.loads(line) for line in sys.stdin if line.strip()]
+if not events or any(event.get("runHash") != run_hash or
+                     event.get("comparisonHash") != comparison_hash or
+                     event.get("requestedTransport") != transport for event in events):
+    raise SystemExit(1)
+print(max(event["monotonicMs"] for event in events))
+' "$VOICE_STAGE1_RUN_HASH" "$VOICE_STAGE1_COMPARISON_HASH" "$VOICE_STAGE1_TRANSPORT" <<< "$lines" ||
+    fail "automation event boundary identity mismatch"
+}
+
+read_android_app_state() {
+  local activities
+  local resumed
+  activities="$(adb_command shell dumpsys activity activities)" || {
+    fail "Android activity state readback failed"
+    return 1
+  }
+  resumed="$(printf '%s\n' "$activities" |
+    awk '/mResumedActivity:|topResumedActivity=|ResumedActivity:/ { print; exit }')"
+  if [[ -z "$resumed" ]]; then
+    fail "Android resumed activity was not found"
+    return 1
+  fi
+  if [[ "$resumed" == *"$VOICE_STAGE1_PACKAGE/"* ]]; then
+    printf 'foreground'
+  else
+    printf 'background'
+  fi
+}
+
 event_exists_after() {
   local event_name="$1"
   local boundary_ms="$2"
@@ -518,8 +568,9 @@ request_route() {
 import json, sys
 boundary, expected = int(sys.argv[1]), sys.argv[2]
 events = [json.loads(line) for line in sys.stdin if line.strip()]
-requested = next((event for event in events if event["name"] == "route_requested" and
-                  event["monotonicMs"] > boundary and event["route"] == expected), None)
+matching_requests = [event for event in events if event["name"] == "route_requested" and
+                     event["monotonicMs"] > boundary and event["route"] == expected]
+requested = max(matching_requests, key=lambda event: event["monotonicMs"], default=None)
 if requested is None:
     raise SystemExit(1)
 observed = [event for event in events if event["name"] == "route_observed" and
@@ -546,6 +597,7 @@ wait_lifecycle() {
   local boundary_ms="$2"
   local lines
   local evidence_status
+  local android_state
   begin_wait "fresh lifecycle_observed"
   while true; do
     if lines="$(adb_command exec-out run-as "$VOICE_STAGE1_PACKAGE" \
@@ -560,6 +612,11 @@ if any(event["lifecycle"] != expected for event in events):
     raise SystemExit(2)
 raise SystemExit(0 if any(event["lifecycle"] == expected for event in events) else 1)
 ' "$boundary_ms" "$expected" <<< "$lines"; then
+        android_state="$(read_android_app_state)" || return 1
+        if [[ "$android_state" != "$expected" ]]; then
+          fail "lifecycle activity readback mismatch: Android=$android_state expected=$expected"
+          return 1
+        fi
         return 0
       else
         evidence_status=$?
@@ -719,8 +776,9 @@ for required in ("run_prepared", "call_active", "route_requested", "route_observ
 if not any(event.get("name") == "call_active" and event.get("observedTransport") == transport
            for event in events):
     raise SystemExit("observed transport mismatch")
-route_requested_index = next((index for index, event in enumerate(events)
-                              if event.get("name") == "route_requested" and event.get("route") == route), -1)
+route_requested_index = next((index for index in range(len(events) - 1, -1, -1)
+                              if events[index].get("name") == "route_requested" and
+                              events[index].get("route") == route), -1)
 if route_requested_index < 0:
     raise SystemExit("route request mismatch")
 route_observations = [(index, event) for index, event in enumerate(events)
@@ -938,7 +996,7 @@ run_scenario() {
   wait_event CALL_ACTIVE 1
   request_route
 
-  lifecycle_boundary_ms="$(latest_event_monotonic_ms ROUTE_OBSERVED)"
+  lifecycle_boundary_ms="$(latest_run_event_monotonic_ms)"
   if [[ "$VOICE_STAGE1_APP_STATE" == "background" ]]; then
     adb_command shell input keyevent HOME >/dev/null
   else

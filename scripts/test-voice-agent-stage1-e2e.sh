@@ -181,6 +181,8 @@ elif tail == ["shell", "svc", "wifi", "disable"]:
         sys.exit(73)
 elif tail == ["shell", "svc", "wifi", "enable"]:
     state["network"] = "wifi"
+    if os.environ.get("FAKE_ADB_UNVALIDATED_AFTER_RESTORE") == "1" and state.get("run_state") == "finalized":
+        state["unvalidated"] = True
     if state.get("handover_started"):
         state["recovery_ready"] = True
     save()
@@ -193,7 +195,12 @@ elif tail == ["shell", "dumpsys", "connectivity"]:
     active_transport = state["network"].upper()
     print(f"Active default network: {active_id}")
     print(f"  NetworkAgentInfo{{network{{{inactive_id}}} nc{{[ Transports: {inactive_transport} Capabilities: VALIDATED&INTERNET ]}}}}")
-    print(f"  NetworkAgentInfo{{network{{{active_id}}} nc{{[ Transports: {active_transport} Capabilities: VALIDATED&INTERNET ]}}}}")
+    active_capabilities = "INTERNET" if state.get("unvalidated") else "VALIDATED&INTERNET"
+    print(f"  NetworkAgentInfo{{network{{{active_id}}} nc{{[ Transports: {active_transport} Capabilities: {active_capabilities} ]}}}}")
+elif tail == ["shell", "dumpsys", "activity", "activities"]:
+    resumed = ("me.rerere.rikkahub.debug/me.rerere.rikkahub.RouteActivity"
+               if state.get("app_foreground") else "com.android.launcher/.Launcher")
+    print(f"mResumedActivity: ActivityRecord{{test u0 {resumed} t1}}")
 elif tail[:4] == ["shell", "run-as", "me.rerere.rikkahub.debug", "mkdir"]:
     pass
 elif tail[:4] == ["shell", "run-as", "me.rerere.rikkahub.debug", "test"]:
@@ -221,19 +228,28 @@ elif tail[:5] == ["exec-in", "run-as", "me.rerere.rikkahub.debug", "sh", "-c"]:
         sys.exit(75)
 elif tail[:3] == ["shell", "am", "start"]:
     if "android.intent.category.HOME" in tail:
-        state["app_foreground"] = False
-        if state["run_state"] == "active" and os.environ.get("FAKE_ADB_LIFECYCLE_MODE") != "stale":
+        if state["run_state"] == "active" and os.environ.get("FAKE_ADB_LIFECYCLE_MODE") == "preaction_race":
             emit("lifecycle_observed", lifecycle="background")
+        else:
+            state["app_foreground"] = False
+            if state["run_state"] == "active" and os.environ.get("FAKE_ADB_LIFECYCLE_MODE") != "stale":
+                emit("lifecycle_observed", lifecycle="background")
     else:
-        state["app_foreground"] = True
-        if state["run_state"] == "active" and os.environ.get("FAKE_ADB_LIFECYCLE_MODE") != "stale":
+        if state["run_state"] == "active" and os.environ.get("FAKE_ADB_LIFECYCLE_MODE") == "preaction_race":
             emit("lifecycle_observed", lifecycle="foreground")
+        else:
+            state["app_foreground"] = True
+            if state["run_state"] == "active" and os.environ.get("FAKE_ADB_LIFECYCLE_MODE") != "stale":
+                emit("lifecycle_observed", lifecycle="foreground")
     save()
     print("Status: ok")
 elif tail == ["shell", "input", "keyevent", "HOME"]:
-    state["app_foreground"] = False
-    if state["run_state"] == "active" and os.environ.get("FAKE_ADB_LIFECYCLE_MODE") != "stale":
+    if state["run_state"] == "active" and os.environ.get("FAKE_ADB_LIFECYCLE_MODE") == "preaction_race":
         emit("lifecycle_observed", lifecycle="background")
+    else:
+        state["app_foreground"] = False
+        if state["run_state"] == "active" and os.environ.get("FAKE_ADB_LIFECYCLE_MODE") != "stale":
+            emit("lifecycle_observed", lifecycle="background")
     save()
 elif tail[:4] == ["shell", "am", "start-foreground-service", "-n"]:
     action = tail[tail.index("-a") + 1]
@@ -304,9 +320,12 @@ elif tail[:3] == ["shell", "am", "broadcast"]:
         ]))
     elif action.endswith(".ROUTE"):
         route = values["route"]
+        route_mode = os.environ.get("FAKE_ADB_ROUTE_MODE", "immediate")
+        if route_mode == "precommand_pair":
+            emit("route_requested", route=route.capitalize())
+            emit("route_observed", route=route.capitalize())
         emit("route_requested", route=route.capitalize())
         accepted = os.environ.get("FAKE_ADB_FAIL_MODE") != "route_rejected"
-        route_mode = os.environ.get("FAKE_ADB_ROUTE_MODE", "immediate")
         if accepted and route_mode == "immediate":
             emit("route_observed", route=route.capitalize())
         elif accepted and route_mode in {"delayed", "conflicting"}:
@@ -407,6 +426,7 @@ reset_fake() {
   unset FAKE_ADB_DEVICES_MODE FAKE_ADB_FAIL_MODE FAKE_ADB_OBSERVED_TRANSPORT
   unset FAKE_ADB_APP_NETWORK FAKE_ADB_SUPPRESS_EVENT FAKE_ADB_EMULATOR
   unset FAKE_ADB_ROUTE_MODE FAKE_ADB_LIFECYCLE_MODE FAKE_CLOCK_MODE FAKE_ADB_INITIAL_RUN
+  unset FAKE_ADB_UNVALIDATED_AFTER_RESTORE
 }
 
 command_lines() {
@@ -666,6 +686,7 @@ foreign_active_status=$?
 set -e
 [[ "$foreign_active_status" -ne 0 ]] || fail "runner accepted a foreign active run"
 [[ "$(command_count "automation.FINALIZE")" == "0" ]] || fail "cleanup finalized a foreign active run"
+[[ "$(command_count "action.END")" == "0" ]] || fail "cleanup ended a call this invocation did not start"
 unset FAKE_ADB_INITIAL_RUN
 
 ROWS=(
@@ -742,6 +763,19 @@ separator=$'\x1f'
 unset FAKE_ADB_ROUTE_MODE
 
 reset_fake
+export FAKE_ADB_ROUTE_MODE=precommand_pair
+set +e
+precommand_route_output="$(run_scenario direct_gemini stable_wifi speaker background steady 20 2>&1)"
+precommand_route_status=$?
+set -e
+[[ "$precommand_route_status" -ne 0 ]] || fail "pre-command route pair satisfied the current ROUTE request"
+assert_contains "$precommand_route_output" "timed out waiting for fresh route_observed"
+separator=$'\x1f'
+[[ "$(command_count "shell${separator}input${separator}keyevent${separator}HOME")" == "0" ]] ||
+  fail "background transition ran without a callback for the current ROUTE request"
+unset FAKE_ADB_ROUTE_MODE
+
+reset_fake
 export FAKE_ADB_ROUTE_MODE=conflicting
 set +e
 conflicting_route_output="$(run_scenario direct_gemini stable_wifi speaker foreground steady 20 2>&1)"
@@ -759,6 +793,16 @@ stale_lifecycle_status=$?
 set -e
 [[ "$stale_lifecycle_status" -ne 0 ]] || fail "stale pre-action lifecycle observation was accepted"
 assert_contains "$stale_lifecycle_output" "timed out waiting for fresh lifecycle_observed"
+unset FAKE_ADB_LIFECYCLE_MODE
+
+reset_fake
+export FAKE_ADB_LIFECYCLE_MODE=preaction_race
+set +e
+preaction_lifecycle_output="$(run_scenario direct_gemini stable_wifi speaker foreground steady 20 2>&1)"
+preaction_lifecycle_status=$?
+set -e
+[[ "$preaction_lifecycle_status" -ne 0 ]] || fail "pre-action lifecycle event passed without Android state transition"
+assert_contains "$preaction_lifecycle_output" "lifecycle activity readback mismatch"
 unset FAKE_ADB_LIFECYCLE_MODE
 
 reset_fake
@@ -815,6 +859,7 @@ set -e
 [[ "$prepare_foreign_status" -ne 0 ]] || fail "foreign ambiguous prepare unexpectedly succeeded"
 [[ "$(command_count "automation.PREPARE")" == "1" ]] || fail "foreign ambiguous prepare was retried"
 [[ "$(command_count "automation.FINALIZE")" == "0" ]] || fail "cleanup finalized foreign ambiguous run"
+[[ "$(command_count "action.END")" == "0" ]] || fail "foreign ambiguous prepare ended an unowned call"
 unset FAKE_ADB_FAIL_MODE
 
 reset_fake
@@ -864,6 +909,17 @@ set -e
 [[ "$restore_status" -ne 0 ]] || fail "ambiguous Wi-Fi restore unexpectedly succeeded"
 [[ "$(count_wifi_enables_after_last_disable)" == "1" ]] || fail "ambiguous Wi-Fi restore was retried"
 unset FAKE_ADB_FAIL_MODE
+
+reset_fake
+export FAKE_ADB_UNVALIDATED_AFTER_RESTORE=1
+set +e
+unvalidated_restore_output="$(run_scenario direct_gemini cellular speaker foreground steady 20 2>&1)"
+unvalidated_restore_status=$?
+set -e
+[[ "$unvalidated_restore_status" -ne 0 ]] || fail "unvalidated Wi-Fi cleanup was marked proven"
+assert_not_contains "$unvalidated_restore_output" "stage1.run=complete"
+[[ "$(count_wifi_enables_after_last_disable)" == "1" ]] || fail "unvalidated cleanup retried Wi-Fi restore"
+unset FAKE_ADB_UNVALIDATED_AFTER_RESTORE
 
 reset_fake
 export FAKE_ADB_SUPPRESS_EVENT=playback_written
