@@ -1,5 +1,8 @@
 package me.rerere.rikkahub.voiceagent.audio
 
+import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationAudioProbe
+import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationAudioProbes
+
 object VoiceAudioDebugInjector {
     const val ACTION_INJECT_PCM = "me.rerere.rikkahub.debug.voiceagent.INJECT_PCM"
     const val EXTRA_PATH = "path"
@@ -73,6 +76,24 @@ object VoiceAudioDebugInjector {
         leadingSilenceMs: Long = DEFAULT_LEADING_SILENCE_MS,
         trailingSilenceMs: Long = DEFAULT_TRAILING_SILENCE_MS,
         sleep: (Long) -> Unit = { Thread.sleep(it) },
+    ): Result = injectPcm16(
+        pcm16 = pcm16,
+        chunkBytes = chunkBytes,
+        chunkDelayMs = chunkDelayMs,
+        leadingSilenceMs = leadingSilenceMs,
+        trailingSilenceMs = trailingSilenceMs,
+        sleep = sleep,
+        automationAudioProbe = VoiceAutomationAudioProbes.shared,
+    )
+
+    internal fun injectPcm16(
+        pcm16: ByteArray,
+        chunkBytes: Int,
+        chunkDelayMs: Long,
+        leadingSilenceMs: Long,
+        trailingSilenceMs: Long,
+        sleep: (Long) -> Unit,
+        automationAudioProbe: VoiceAutomationAudioProbe,
     ): Result {
         val capture = synchronized(lock) { activeCapture }
             ?: return Result(
@@ -97,11 +118,13 @@ object VoiceAudioDebugInjector {
             normalizedPcm16.copyInto(output, destinationOffset = silenceBytes(leadingSilenceMs))
         }
         val safeChunkBytes = alignPcm16ByteCount(chunkBytes.takeIf { it > 0 } ?: DEFAULT_CHUNK_BYTES)
+        automationAudioProbe.onInjectionStarted(preparedPcm16.size.toLong())
         var offset = 0
         var chunkCount = 0
         while (offset < preparedPcm16.size && synchronized(lock) { activeCapture === capture }) {
             val end = (offset + safeChunkBytes).coerceAtMost(preparedPcm16.size)
             capture.onPcm16(preparedPcm16.copyOfRange(offset, end))
+            automationAudioProbe.onInjectionChunk(end - offset)
             chunkCount += 1
             offset = end
             if (offset < preparedPcm16.size && chunkDelayMs > 0) {
@@ -109,6 +132,7 @@ object VoiceAudioDebugInjector {
             }
         }
         if (chunkCount > 0 && synchronized(lock) { activeCapture === capture }) {
+            automationAudioProbe.onInjectionCompleted()
             capture.onInjectionComplete()
         }
 

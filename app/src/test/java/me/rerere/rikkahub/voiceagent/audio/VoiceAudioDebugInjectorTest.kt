@@ -1,5 +1,6 @@
 package me.rerere.rikkahub.voiceagent.audio
 
+import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationAudioProbe
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -9,6 +10,58 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
 
 class VoiceAudioDebugInjectorTest {
+    @Test
+    fun `default injection reports exact chunks before completion`() {
+        VoiceAudioDebugInjector.clearForTest()
+        val callbacks = mutableListOf<String>()
+        val sleeps = mutableListOf<Long>()
+        val probe = object : VoiceAutomationAudioProbe {
+            override fun onInjectionStarted(totalBytes: Long) {
+                callbacks += "started:$totalBytes"
+            }
+
+            override fun onInjectionChunk(byteCount: Int) {
+                callbacks += "chunk:$byteCount"
+            }
+
+            override fun onInjectionCompleted() {
+                callbacks += "completed"
+            }
+
+            override fun onOutputQueued(byteCount: Int) = Unit
+            override fun onOutputWritten(byteCount: Int, nonSilent: Boolean) = Unit
+            override fun onOutputDrained() = Unit
+            override fun onInterruptionStarted() = Unit
+            override fun onOutputSilenceConfirmed() = Unit
+        }
+        val registration = VoiceAudioDebugInjector.registerCapture(onPcm16 = {})
+
+        val result = VoiceAudioDebugInjector.injectPcm16(
+            pcm16 = ByteArray(6_402) { 1 },
+            chunkBytes = VoiceAudioDebugInjector.DEFAULT_CHUNK_BYTES,
+            chunkDelayMs = VoiceAudioDebugInjector.DEFAULT_CHUNK_DELAY_MS,
+            leadingSilenceMs = 0,
+            trailingSilenceMs = 0,
+            sleep = sleeps::add,
+            automationAudioProbe = probe,
+        )
+
+        assertTrue(result.delivered)
+        assertEquals(3, result.chunkCount)
+        assertEquals(
+            listOf(
+                "started:6402",
+                "chunk:3200",
+                "chunk:3200",
+                "chunk:2",
+                "completed",
+            ),
+            callbacks,
+        )
+        assertEquals(listOf(100L, 100L), sleeps)
+        registration.close()
+    }
+
     @Test
     fun `stale delayed registration cannot replace newer active capture`() {
         VoiceAudioDebugInjector.clearForTest()

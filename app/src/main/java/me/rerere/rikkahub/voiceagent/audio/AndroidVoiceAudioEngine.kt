@@ -9,6 +9,8 @@ import android.media.MediaRecorder
 import android.util.Log
 import androidx.annotation.RequiresPermission
 import androidx.core.content.ContextCompat
+import java.util.ArrayDeque
+import java.util.Base64
 import java.util.Collections
 import java.util.IdentityHashMap
 import java.util.concurrent.atomic.AtomicReference
@@ -26,6 +28,8 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import me.rerere.rikkahub.voiceagent.runVoiceAgentCleanupStages
+import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationAudioProbe
+import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationAudioProbes
 
 private fun VoicePlaybackDiagnostic.audioErrorMessageOrNull(): String? = when (this) {
     is VoicePlaybackDiagnostic.MalformedChunk -> "Malformed playback chunk: $message"
@@ -255,6 +259,9 @@ class AndroidVoiceAudioEngine(
         onAssistantPlaybackError = ::notifyAudioError,
     )
     private val playbackEventOwner = VoicePlaybackEventOwner()
+    private val automationAudioProbe = VoiceAutomationAudioProbes.shared
+    private val outputMetadataLock = Any()
+    private val pendingOutputMetadata = ArrayDeque<OutputMetadata>()
     private val playbackWriter = VoicePlaybackWriter(
         scope = scope,
         createSink = playbackTracks::createAssistantSinkOrNull,
@@ -391,7 +398,19 @@ class AndroidVoiceAudioEngine(
     }
 
     override fun playPcm16(base64Pcm16: String, sessionId: Long?): Boolean {
-        return playbackWriter.playBase64(base64Pcm16 = base64Pcm16, sessionId = sessionId)
+        val metadata = VoiceAutomationAudioProbes.activeSharedOrNull()?.let { probe ->
+            decodeOutputMetadataOrNull(base64Pcm16, probe)
+        }
+        if (metadata != null) {
+            synchronized(outputMetadataLock) {
+                pendingOutputMetadata.addLast(metadata)
+            }
+        }
+        val accepted = playbackWriter.playBase64(base64Pcm16 = base64Pcm16, sessionId = sessionId)
+        if (!accepted && metadata != null) {
+            removePendingOutputMetadata(metadata)
+        }
+        return accepted
     }
 
     override fun activatePlaybackSession(sessionId: Long) {
@@ -522,6 +541,9 @@ class AndroidVoiceAudioEngine(
             is VoicePlaybackEvent.Drained ->
                 Log.d(TAG, "Voice playback drained: playbackEpoch=${event.playbackEpoch.value}")
         }
+        if (event is VoicePlaybackEvent.Drained) {
+            automationAudioProbe.onOutputDrained()
+        }
         playbackEventOwner.notify(event)
     }
 
@@ -540,6 +562,15 @@ class AndroidVoiceAudioEngine(
     private fun handlePlaybackDiagnostic(diagnostic: VoicePlaybackDiagnostic) {
         when (diagnostic) {
             is VoicePlaybackDiagnostic.ChunkQueued -> {
+                markOutputQueued(diagnostic.bytes)?.let { metadata ->
+                    metadata.probe.onOutputQueued(diagnostic.bytes)
+                    if (metadata.written) {
+                        metadata.probe.onOutputWritten(
+                            byteCount = diagnostic.bytes,
+                            nonSilent = metadata.nonSilent,
+                        )
+                    }
+                }
                 Log.d(
                     TAG,
                     "Voice playback queued: bytes=${diagnostic.bytes} " +
@@ -547,6 +578,12 @@ class AndroidVoiceAudioEngine(
                 )
             }
             is VoicePlaybackDiagnostic.ChunkWritten -> {
+                markOutputWritten(diagnostic.bytes)?.let { completedWrite ->
+                    completedWrite.probe.onOutputWritten(
+                        byteCount = diagnostic.bytes,
+                        nonSilent = completedWrite.nonSilent,
+                    )
+                }
                 Log.d(
                     TAG,
                     "Voice playback wrote: bytes=${diagnostic.bytes} " +
@@ -554,6 +591,9 @@ class AndroidVoiceAudioEngine(
                 )
             }
             is VoicePlaybackDiagnostic.StaleChunkRejected -> {
+                if (diagnostic.rejectedSessionId == null) {
+                    discardFirstPendingOutputMetadata()
+                }
                 Log.d(
                     TAG,
                     "Voice playback stale chunk rejected: " +
@@ -568,18 +608,22 @@ class AndroidVoiceAudioEngine(
                 diagnostic.audioErrorMessageOrNull()?.let(::notifyAudioError)
             }
             is VoicePlaybackDiagnostic.SinkStartFailed -> {
+                discardFirstPendingOutputMetadata()
                 Log.w(TAG, "Voice playback start failed: ${diagnostic.message}")
                 diagnostic.audioErrorMessageOrNull()?.let(::notifyAudioError)
             }
             is VoicePlaybackDiagnostic.SinkWriteFailed -> {
+                discardFirstPendingOutputMetadata()
                 Log.w(TAG, "Voice playback write failed: ${diagnostic.message}")
                 diagnostic.audioErrorMessageOrNull()?.let(::notifyAudioError)
             }
             is VoicePlaybackDiagnostic.SinkDrainFailed -> {
+                clearPendingOutputMetadata()
                 Log.w(TAG, "AudioTrack drain failed: ${diagnostic.message}")
                 diagnostic.audioErrorMessageOrNull()?.let(::notifyAudioError)
             }
             is VoicePlaybackDiagnostic.SinkRetirementFailed -> {
+                clearPendingOutputMetadata()
                 Log.w(TAG, "AudioTrack retirement failed: ${diagnostic.message}")
                 diagnostic.audioErrorMessageOrNull()?.let(::notifyAudioError)
             }
@@ -591,15 +635,91 @@ class AndroidVoiceAudioEngine(
                 )
             }
             is VoicePlaybackDiagnostic.PlaybackSuppressed -> {
+                clearPendingOutputMetadata()
                 Log.d(
                     TAG,
                     "Voice playback suppressed: writerGeneration=${diagnostic.writerGeneration.value}",
                 )
             }
             VoicePlaybackDiagnostic.Released -> {
+                clearPendingOutputMetadata()
                 Log.d(TAG, "Voice playback released")
             }
         }
+    }
+
+    private fun decodeOutputMetadataOrNull(
+        base64Pcm16: String,
+        probe: VoiceAutomationAudioProbe,
+    ): OutputMetadata? =
+        runCatching { Base64.getDecoder().decode(base64Pcm16) }
+            .getOrNull()
+            ?.takeIf(ByteArray::isNotEmpty)
+            ?.let { pcm16 ->
+                OutputMetadata(
+                    byteCount = pcm16.size,
+                    nonSilent = pcm16.any { it != 0.toByte() },
+                    probe = probe,
+                )
+            }
+
+    private fun markOutputQueued(byteCount: Int): OutputMetadata? =
+        synchronized(outputMetadataLock) {
+            val matching = pendingOutputMetadata.firstOrNull {
+                it.byteCount == byteCount && !it.queued
+            } ?: return@synchronized null
+            matching.queued = true
+            if (matching.written) {
+                pendingOutputMetadata.remove(matching)
+            }
+            matching
+        }
+
+    private fun markOutputWritten(byteCount: Int): OutputMetadata? =
+        synchronized(outputMetadataLock) {
+            val matching = pendingOutputMetadata.firstOrNull {
+                it.byteCount == byteCount && !it.written
+            } ?: return@synchronized null
+            matching.written = true
+            if (matching.queued) {
+                pendingOutputMetadata.remove(matching)
+                matching
+            } else {
+                null
+            }
+        }
+
+    private fun removePendingOutputMetadata(metadata: OutputMetadata) {
+        synchronized(outputMetadataLock) {
+            val iterator = pendingOutputMetadata.iterator()
+            while (iterator.hasNext()) {
+                if (iterator.next() === metadata) {
+                    iterator.remove()
+                    return
+                }
+            }
+        }
+    }
+
+    private fun discardFirstPendingOutputMetadata() {
+        synchronized(outputMetadataLock) {
+            pendingOutputMetadata.pollFirst()
+        }
+    }
+
+    private fun clearPendingOutputMetadata() {
+        synchronized(outputMetadataLock) {
+            pendingOutputMetadata.clear()
+        }
+    }
+
+    private class OutputMetadata(
+        val byteCount: Int,
+        val nonSilent: Boolean,
+        val probe: VoiceAutomationAudioProbe,
+    ) {
+        var queued = false
+        var written = false
     }
 
     private fun AudioRecord.stopSafely() {
