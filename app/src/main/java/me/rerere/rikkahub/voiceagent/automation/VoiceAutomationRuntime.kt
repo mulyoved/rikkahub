@@ -49,6 +49,7 @@ internal class DefaultVoiceAutomationRuntime(
     private var writer: VoiceAutomationEventWriter? = null
     private var currentStatus = VoiceAutomationStatus(VoiceAutomationRunState.Idle)
     private var lastEmittedMonotonicMs: Long? = null
+    private var directAppCorrelationRecorded = false
 
     @Synchronized
     override fun prepare(binding: VoiceAutomationRunBinding) {
@@ -68,6 +69,7 @@ internal class DefaultVoiceAutomationRuntime(
         this.binding = binding
         writer = candidateWriter
         lastEmittedMonotonicMs = monotonicMs
+        directAppCorrelationRecorded = false
         currentStatus = activeStatus(binding, eventCount = 1)
     }
 
@@ -101,7 +103,20 @@ internal class DefaultVoiceAutomationRuntime(
             VoiceAutomationEventName.RUN_PREPARED,
             VoiceAutomationEventName.RUN_FINALIZED,
         )) { "Run lifecycle boundaries are reserved for the runtime" }
-        recordActive(event)
+        val isDirectAppCorrelation =
+            binding?.requestedTransport == VoiceAgentTransport.DirectGemini &&
+                event.name == VoiceAutomationEventName.CALL_ACTIVE &&
+                event.observedTransport == VoiceAgentTransport.DirectGemini &&
+                event.correlationKind == VoiceAutomationCorrelationKind.APP &&
+                event.correlationHash == runHash
+        recordActive(
+            if (isDirectAppCorrelation && directAppCorrelationRecorded) {
+                event.copy(correlationKind = null, correlationHash = null)
+            } else {
+                event
+            },
+        )
+        if (isDirectAppCorrelation) directAppCorrelationRecorded = true
         return true
     }
 
@@ -122,6 +137,7 @@ internal class DefaultVoiceAutomationRuntime(
     override fun reset() {
         binding = null
         writer = null
+        directAppCorrelationRecorded = false
         currentStatus = VoiceAutomationStatus(VoiceAutomationRunState.Idle)
     }
 

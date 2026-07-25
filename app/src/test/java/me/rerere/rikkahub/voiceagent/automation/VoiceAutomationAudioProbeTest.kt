@@ -97,6 +97,31 @@ class VoiceAutomationAudioProbeTest {
     }
 
     @Test
+    fun `scheduled LiveKit dropout cannot append after atomic run replacement`() {
+        val runtime = RecordingRuntime(
+            requestedTransport = VoiceAgentTransport.LiveKitExperimental,
+        )
+        val clock = FakeProbeClock()
+        val scheduler = FakeProbeScheduler(clock)
+        val probe = DefaultVoiceAutomationAudioProbe(
+            runtimeProvider = { runtime },
+            monotonicMs = clock::nowMs,
+            scheduler = scheduler,
+        )
+        val owner = checkNotNull(probe.captureLiveKitMediaOwner())
+        probe.onLiveKitOutputWritten(owner, byteCount = 320, nonSilent = true)
+        runtime.beforeOwnedRecord = { event ->
+            if (event.name == VoiceAutomationEventName.DROPOUT_STARTED) {
+                runtime.runHash = RUN_HASH_B
+            }
+        }
+
+        scheduler.advanceBy(250)
+
+        assertEquals(0, runtime.events.count { it.name == VoiceAutomationEventName.DROPOUT_STARTED })
+    }
+
+    @Test
     fun `a 249 millisecond output gap is not a dropout`() {
         val runtime = RecordingRuntime()
         val clock = FakeProbeClock()
@@ -297,11 +322,22 @@ class VoiceAutomationAudioProbeTest {
         var requestedTransport: VoiceAgentTransport = VoiceAgentTransport.DirectGemini,
     ) : VoiceAutomationRuntime {
         val events = mutableListOf<VoiceAutomationEventInput>()
+        var beforeOwnedRecord: ((VoiceAutomationEventInput) -> Unit)? = null
 
         override fun prepare(binding: VoiceAutomationRunBinding) = Unit
 
         override fun record(event: VoiceAutomationEventInput) {
             events += event
+        }
+
+        override fun recordIfActiveRun(
+            runHash: String,
+            event: VoiceAutomationEventInput,
+        ): Boolean {
+            beforeOwnedRecord?.invoke(event)
+            if (status().runHash != runHash) return false
+            events += event
+            return true
         }
 
         override fun status() = VoiceAutomationStatus(

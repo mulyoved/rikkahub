@@ -7,6 +7,7 @@ import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationAudioProbe
 import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationCorrelationKind
 import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationEventInput
 import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationEventName
+import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationMediaOwner
 import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationRunBinding
 import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationRunState
 import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationRuntime
@@ -114,6 +115,50 @@ class LiveKitRemoteAudioProbeTest {
     }
 
     @Test
+    fun `stale remote silence and close cannot stop or drain replacement run playback`() {
+        val runtime = RecordingRuntime()
+        val clock = FakeClock()
+        val sharedProbe = DefaultVoiceAutomationAudioProbe(
+            runtimeProvider = { runtime },
+            monotonicMs = clock::nowMs,
+        )
+        val staleProbe = LiveKitRemoteAudioProbe(sharedProbe, clock::nowMs)
+        staleProbe.onData(ByteBuffer.wrap(byteArrayOf(1, 0)), 16, 48_000, 1, 1, 1)
+
+        runtime.runHash = RUN_HASH_B
+        val currentProbe = LiveKitRemoteAudioProbe(sharedProbe, clock::nowMs)
+        currentProbe.onData(ByteBuffer.wrap(byteArrayOf(2, 0)), 16, 48_000, 1, 1, 2)
+        sharedProbe.onInterruptionStarted()
+        val replacementEventCount = runtime.events.size
+
+        clock.advanceBy(100)
+        staleProbe.onData(ByteBuffer.wrap(byteArrayOf(0, 0)), 16, 48_000, 1, 1, 3)
+        staleProbe.close()
+
+        assertEquals(replacementEventCount, runtime.events.size)
+        assertEquals(0, runtime.events.count { it.name == VoiceAutomationEventName.PLAYBACK_STOPPED })
+        assertEquals(0, runtime.events.count { it.name == VoiceAutomationEventName.PLAYBACK_DRAINED })
+    }
+
+    @Test
+    fun `ownerless LiveKit callbacks cannot mutate a Direct automation run`() {
+        val runtime = RecordingRuntime(
+            requestedTransport = VoiceAgentTransport.DirectGemini,
+        )
+        val sharedProbe = DefaultVoiceAutomationAudioProbe(
+            runtimeProvider = { runtime },
+            monotonicMs = { 1L },
+        )
+        val probe = LiveKitRemoteAudioProbe(sharedProbe, monotonicMs = { 1L })
+
+        probe.onData(ByteBuffer.wrap(byteArrayOf(1, 0)), 16, 48_000, 1, 1, 1)
+        probe.onData(ByteBuffer.wrap(byteArrayOf(0, 0)), 16, 48_000, 1, 1, 2)
+        probe.close()
+
+        assertEquals(emptyList<VoiceAutomationEventInput>(), runtime.events)
+    }
+
+    @Test
     fun `close drains once and rejects every later remote frame`() {
         val recording = RecordingAudioProbe()
         val probe = LiveKitRemoteAudioProbe(recording, monotonicMs = { 1L })
@@ -142,6 +187,7 @@ class LiveKitRemoteAudioProbeTest {
         override fun onInjectionChunk(byteCount: Int) = Unit
         override fun onInjectionCompleted() = Unit
         override fun onOutputQueued(byteCount: Int) = Unit
+        override fun captureLiveKitMediaOwner() = VoiceAutomationMediaOwner(RUN_HASH)
 
         override fun onOutputWritten(byteCount: Int, nonSilent: Boolean) {
             written += Written(byteCount, nonSilent)
@@ -205,7 +251,10 @@ class LiveKitRemoteAudioProbeTest {
         )
     }
 
-    private class RecordingRuntime : VoiceAutomationRuntime {
+    private class RecordingRuntime(
+        var runHash: String = RUN_HASH,
+        var requestedTransport: VoiceAgentTransport = VoiceAgentTransport.LiveKitExperimental,
+    ) : VoiceAutomationRuntime {
         val events = mutableListOf<VoiceAutomationEventInput>()
 
         override fun prepare(binding: VoiceAutomationRunBinding) = Unit
@@ -216,9 +265,9 @@ class LiveKitRemoteAudioProbeTest {
 
         override fun status() = VoiceAutomationStatus(
             state = VoiceAutomationRunState.Active,
-            runHash = RUN_HASH,
+            runHash = runHash,
             comparisonHash = COMPARISON_HASH,
-            requestedTransport = VoiceAgentTransport.LiveKitExperimental,
+            requestedTransport = requestedTransport,
             eventCount = events.size.toLong() + 1,
         )
 
@@ -229,6 +278,7 @@ class LiveKitRemoteAudioProbeTest {
 
     private companion object {
         const val RUN_HASH = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        const val RUN_HASH_B = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
         const val COMPARISON_HASH =
             "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
         const val MEDIA_STATE_EPOCH_1_HASH =

@@ -31,6 +31,12 @@ internal interface VoiceAutomationAudioProbe {
     ) {
         onOutputWritten(byteCount, nonSilent)
     }
+    fun onLiveKitOutputDrained(owner: VoiceAutomationMediaOwner) {
+        onOutputDrained()
+    }
+    fun onLiveKitOutputSilenceConfirmed(owner: VoiceAutomationMediaOwner) {
+        onOutputSilenceConfirmed()
+    }
     fun onOutputDrained()
     fun onInterruptionStarted()
     fun onOutputSilenceConfirmed()
@@ -169,14 +175,7 @@ internal class DefaultVoiceAutomationAudioProbe(
         nonSilent: Boolean,
     ) {
         if (byteCount <= 0) return
-        withActiveRuntime { runtime ->
-            val status = runCatching(runtime::status).getOrNull() ?: return@withActiveRuntime
-            if (
-                status.requestedTransport != VoiceAgentTransport.LiveKitExperimental ||
-                status.runHash != owner.runHash
-            ) {
-                return@withActiveRuntime
-            }
+        withActiveLiveKitOwner(owner) { runtime ->
             recordOutputWritten(runtime, byteCount, nonSilent, mediaOwner = owner)
         }
     }
@@ -184,23 +183,14 @@ internal class DefaultVoiceAutomationAudioProbe(
     @Synchronized
     override fun onOutputDrained() {
         withActiveRuntime { runtime ->
-            if (playbackEpoch == 0L) return@withActiveRuntime
-            cancelDropoutTransition()
-            record(
-                runtime,
-                VoiceAutomationEventInput(
-                    name = VoiceAutomationEventName.PLAYBACK_DRAINED,
-                    playbackEpoch = playbackEpoch,
-                ),
-            )
-            if (
-                outputState != OutputState.Interrupted &&
-                outputState != OutputState.Dropout &&
-                outputState != OutputState.Stopped
-            ) {
-                outputState = OutputState.Drained
-                lastNonSilentMs = null
-            }
+            recordOutputDrained(runtime, mediaOwner = null)
+        }
+    }
+
+    @Synchronized
+    override fun onLiveKitOutputDrained(owner: VoiceAutomationMediaOwner) {
+        withActiveLiveKitOwner(owner) { runtime ->
+            recordOutputDrained(runtime, mediaOwner = owner)
         }
     }
 
@@ -225,42 +215,43 @@ internal class DefaultVoiceAutomationAudioProbe(
     @Synchronized
     override fun onOutputSilenceConfirmed() {
         withActiveRuntime { runtime ->
-            val lastOutputMs = lastNonSilentMs ?: return@withActiveRuntime
-            if (
-                outputState != OutputState.Interrupted ||
-                monotonicMs() - lastOutputMs < INTERRUPTION_SILENCE_MS
-            ) {
-                return@withActiveRuntime
-            }
-            record(
-                runtime,
-                VoiceAutomationEventInput(
-                    name = VoiceAutomationEventName.PLAYBACK_STOPPED,
-                    playbackEpoch = playbackEpoch,
-                ),
-            )
-            cancelDropoutTransition()
-            outputState = OutputState.Stopped
-            lastNonSilentMs = null
+            confirmOutputSilence(runtime, mediaOwner = null)
         }
     }
 
     @Synchronized
-    private fun onDropoutThresholdReached(token: Long) {
+    override fun onLiveKitOutputSilenceConfirmed(owner: VoiceAutomationMediaOwner) {
+        withActiveLiveKitOwner(owner) { runtime ->
+            confirmOutputSilence(runtime, mediaOwner = owner)
+        }
+    }
+
+    @Synchronized
+    private fun onDropoutThresholdReached(
+        token: Long,
+        mediaOwner: VoiceAutomationMediaOwner?,
+    ) {
         if (token != scheduledDropoutToken) return
         scheduledDropout = null
+        if (mediaOwner == null) {
+            withActiveRuntime { runtime -> recordDropout(runtime, mediaOwner = null) }
+        } else {
+            withActiveLiveKitOwner(mediaOwner) { runtime -> recordDropout(runtime, mediaOwner) }
+        }
+    }
+
+    private inline fun withActiveLiveKitOwner(
+        owner: VoiceAutomationMediaOwner,
+        block: (VoiceAutomationRuntime) -> Unit,
+    ) {
         withActiveRuntime { runtime ->
-            if (outputState != OutputState.Active || lastNonSilentMs == null) {
-                return@withActiveRuntime
+            val status = runCatching(runtime::status).getOrNull() ?: return@withActiveRuntime
+            if (
+                status.requestedTransport == VoiceAgentTransport.LiveKitExperimental &&
+                status.runHash == owner.runHash
+            ) {
+                block(runtime)
             }
-            outputState = OutputState.Dropout
-            record(
-                runtime,
-                VoiceAutomationEventInput(
-                    name = VoiceAutomationEventName.DROPOUT_STARTED,
-                    playbackEpoch = playbackEpoch,
-                ),
-            )
         }
     }
 
@@ -285,14 +276,16 @@ internal class DefaultVoiceAutomationAudioProbe(
         block(runtime)
     }
 
-    private fun record(runtime: VoiceAutomationRuntime, event: VoiceAutomationEventInput) {
+    private fun record(runtime: VoiceAutomationRuntime, event: VoiceAutomationEventInput): Boolean =
         runCatching {
             if (runtime.status().state == VoiceAutomationRunState.Active) {
                 runtime.record(event)
                 lastSeenEventCount = runtime.status().eventCount
+                true
+            } else {
+                false
             }
-        }
-    }
+        }.getOrDefault(false)
 
     private fun recordOutputWritten(
         runtime: VoiceAutomationRuntime,
@@ -347,7 +340,7 @@ internal class DefaultVoiceAutomationAudioProbe(
             }
             lastNonSilentMs = monotonicMs()
             if (outputState == OutputState.Active) {
-                scheduleDropoutTransition()
+                scheduleDropoutTransition(mediaOwner)
             }
         }
         record(
@@ -365,15 +358,83 @@ internal class DefaultVoiceAutomationAudioProbe(
         runtime: VoiceAutomationRuntime,
         event: VoiceAutomationEventInput,
         mediaOwner: VoiceAutomationMediaOwner?,
-    ) {
+    ): Boolean {
         if (mediaOwner == null) {
-            record(runtime, event)
-            return
+            return record(runtime, event)
         }
-        runCatching {
+        return runCatching {
             if (runtime.recordIfActiveRun(mediaOwner.runHash, event)) {
                 lastSeenEventCount = runtime.status().eventCount
+                true
+            } else {
+                false
             }
+        }.getOrDefault(false)
+    }
+
+    private fun recordOutputDrained(
+        runtime: VoiceAutomationRuntime,
+        mediaOwner: VoiceAutomationMediaOwner?,
+    ) {
+        if (playbackEpoch == 0L) return
+        if (!record(
+                runtime,
+                VoiceAutomationEventInput(
+                    name = VoiceAutomationEventName.PLAYBACK_DRAINED,
+                    playbackEpoch = playbackEpoch,
+                ),
+                mediaOwner,
+            )
+        ) return
+        cancelDropoutTransition()
+        if (
+            outputState != OutputState.Interrupted &&
+            outputState != OutputState.Dropout &&
+            outputState != OutputState.Stopped
+        ) {
+            outputState = OutputState.Drained
+            lastNonSilentMs = null
+        }
+    }
+
+    private fun confirmOutputSilence(
+        runtime: VoiceAutomationRuntime,
+        mediaOwner: VoiceAutomationMediaOwner?,
+    ) {
+        val lastOutputMs = lastNonSilentMs ?: return
+        if (
+            outputState != OutputState.Interrupted ||
+            monotonicMs() - lastOutputMs < INTERRUPTION_SILENCE_MS
+        ) return
+        if (!record(
+                runtime,
+                VoiceAutomationEventInput(
+                    name = VoiceAutomationEventName.PLAYBACK_STOPPED,
+                    playbackEpoch = playbackEpoch,
+                ),
+                mediaOwner,
+            )
+        ) return
+        cancelDropoutTransition()
+        outputState = OutputState.Stopped
+        lastNonSilentMs = null
+    }
+
+    private fun recordDropout(
+        runtime: VoiceAutomationRuntime,
+        mediaOwner: VoiceAutomationMediaOwner?,
+    ) {
+        if (outputState != OutputState.Active || lastNonSilentMs == null) return
+        if (record(
+                runtime,
+                VoiceAutomationEventInput(
+                    name = VoiceAutomationEventName.DROPOUT_STARTED,
+                    playbackEpoch = playbackEpoch,
+                ),
+                mediaOwner,
+            )
+        ) {
+            outputState = OutputState.Dropout
         }
     }
 
@@ -394,11 +455,11 @@ internal class DefaultVoiceAutomationAudioProbe(
         }
     }
 
-    private fun scheduleDropoutTransition() {
+    private fun scheduleDropoutTransition(mediaOwner: VoiceAutomationMediaOwner?) {
         cancelDropoutTransition()
         val token = scheduledDropoutToken
         scheduledDropout = scheduler.schedule(DROPOUT_THRESHOLD_MS) {
-            onDropoutThresholdReached(token)
+            onDropoutThresholdReached(token, mediaOwner)
         }
     }
 

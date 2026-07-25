@@ -34,6 +34,7 @@ import kotlinx.coroutines.test.runTest
 import livekit.LivekitModels
 import livekit.org.webrtc.AudioTrackSink
 import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationAudioProbe
+import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationMediaOwner
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
@@ -345,6 +346,9 @@ class AndroidLiveKitRoomSdkAdapterTest {
         override fun onInjectionChunk(byteCount: Int) = Unit
         override fun onInjectionCompleted() = Unit
         override fun onOutputQueued(byteCount: Int) = Unit
+        override fun captureLiveKitMediaOwner() = VoiceAutomationMediaOwner(
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
 
         override fun onOutputWritten(byteCount: Int, nonSilent: Boolean) {
             nonSilentWrites += nonSilent

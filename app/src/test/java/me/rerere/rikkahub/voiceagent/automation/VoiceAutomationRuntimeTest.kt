@@ -44,6 +44,31 @@ class VoiceAutomationRuntimeTest {
     }
 
     @Test
+    fun `direct reconnect keeps call active evidence but emits app correlation once per run`() {
+        val root = Files.createTempDirectory("voice-automation-runtime-direct-reconnect").toFile()
+        val runtime = DefaultVoiceAutomationRuntime(root, FakeClock())
+        runtime.prepare(
+            VoiceAutomationRunBinding(RUN_HASH, COMPARISON_HASH, VoiceAgentTransport.DirectGemini),
+        )
+        val callActive = VoiceAutomationEventInput(
+            name = VoiceAutomationEventName.CALL_ACTIVE,
+            observedTransport = VoiceAgentTransport.DirectGemini,
+            correlationKind = VoiceAutomationCorrelationKind.APP,
+            correlationHash = RUN_HASH,
+        )
+
+        assertTrue(runtime.recordIfActiveRun(RUN_HASH, callActive))
+        assertTrue(runtime.recordIfActiveRun(RUN_HASH, callActive))
+        val artifact = runtime.finalizeRun()
+        val callActiveLines = artifact.readLines().filter { "\"name\":\"call_active\"" in it }
+
+        assertEquals(2, callActiveLines.size)
+        assertTrue(callActiveLines.all { "\"observedTransport\":\"direct_gemini\"" in it })
+        assertEquals(1, callActiveLines.count { "\"correlationKind\":\"app\"" in it })
+        assertEquals(1, callActiveLines.count { "\"correlationKind\":null" in it })
+    }
+
+    @Test
     fun `finalized runtime transactionally prepares a fresh run`() {
         val root = Files.createTempDirectory("voice-automation-runtime-next").toFile()
         val runtime = DefaultVoiceAutomationRuntime(root, FakeClock())

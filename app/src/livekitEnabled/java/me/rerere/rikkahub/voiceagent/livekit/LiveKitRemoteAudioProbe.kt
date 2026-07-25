@@ -32,12 +32,15 @@ internal class LiveKitRemoteAudioProbe(
         val nowMs = monotonicMs()
         synchronized(lock) {
             if (closed) return
+            val owner = mediaOwner ?: automationAudioProbe.captureLiveKitMediaOwner()?.also {
+                mediaOwner = it
+            } ?: return
             val previousState = lastNonSilent
             if (previousState != null && previousState != nonSilent) {
-                flushProgress(previousState, nowMs)
+                flushProgress(owner, previousState, nowMs)
             }
             if (pendingBytes > Int.MAX_VALUE - byteCount) {
-                flushProgress(previousState ?: nonSilent, nowMs)
+                flushProgress(owner, previousState ?: nonSilent, nowMs)
             }
             pendingBytes += byteCount
             val stateChanged = previousState == null || previousState != nonSilent
@@ -47,10 +50,10 @@ internal class LiveKitRemoteAudioProbe(
                 lastProgressMs == null ||
                 nowMs - checkNotNull(lastProgressMs) >= PROGRESS_INTERVAL_MS
             ) {
-                flushProgress(nonSilent, nowMs)
+                flushProgress(owner, nonSilent, nowMs)
             }
             if (!nonSilent) {
-                automationAudioProbe.onOutputSilenceConfirmed()
+                automationAudioProbe.onLiveKitOutputSilenceConfirmed(owner)
             }
         }
     }
@@ -60,23 +63,21 @@ internal class LiveKitRemoteAudioProbe(
         synchronized(lock) {
             if (closed) return
             closed = true
+            val owner = mediaOwner ?: return
             lastNonSilent?.let { state ->
-                flushProgress(state, nowMs)
+                flushProgress(owner, state, nowMs)
             }
-            automationAudioProbe.onOutputDrained()
+            automationAudioProbe.onLiveKitOutputDrained(owner)
         }
     }
 
-    private fun flushProgress(nonSilent: Boolean, nowMs: Long) {
+    private fun flushProgress(
+        owner: VoiceAutomationMediaOwner,
+        nonSilent: Boolean,
+        nowMs: Long,
+    ) {
         if (pendingBytes <= 0) return
-        val owner = mediaOwner ?: automationAudioProbe.captureLiveKitMediaOwner()?.also {
-            mediaOwner = it
-        }
-        if (owner == null) {
-            automationAudioProbe.onOutputWritten(pendingBytes, nonSilent)
-        } else {
-            automationAudioProbe.onLiveKitOutputWritten(owner, pendingBytes, nonSilent)
-        }
+        automationAudioProbe.onLiveKitOutputWritten(owner, pendingBytes, nonSilent)
         pendingBytes = 0
         lastProgressMs = nowMs
     }
