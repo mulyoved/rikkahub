@@ -37,14 +37,17 @@ class VoiceAutomationAudioProbeTest {
     fun `a 249 millisecond output gap is not a dropout`() {
         val runtime = RecordingRuntime()
         val clock = FakeProbeClock()
+        val scheduler = FakeProbeScheduler(clock)
         val probe = DefaultVoiceAutomationAudioProbe(
             runtimeProvider = { runtime },
             monotonicMs = clock::nowMs,
+            scheduler = scheduler,
         )
         probe.onOutputWritten(byteCount = 320, nonSilent = true)
 
-        clock.advanceBy(249)
+        scheduler.advanceBy(249)
         probe.onOutputWritten(byteCount = 320, nonSilent = true)
+        scheduler.advanceBy(1)
 
         assertEquals(
             listOf(
@@ -62,15 +65,21 @@ class VoiceAutomationAudioProbeTest {
     fun `a 250 millisecond output gap records a dropout and resumes in a new epoch`() {
         val runtime = RecordingRuntime()
         val clock = FakeProbeClock()
+        val scheduler = FakeProbeScheduler(clock)
         val probe = DefaultVoiceAutomationAudioProbe(
             runtimeProvider = { runtime },
             monotonicMs = clock::nowMs,
+            scheduler = scheduler,
         )
         probe.onOutputWritten(byteCount = 320, nonSilent = true)
 
-        clock.advanceBy(250)
-        probe.onOutputWritten(byteCount = 320, nonSilent = false)
-        clock.advanceBy(1)
+        scheduler.advanceBy(249)
+        assertEquals(0, runtime.events.count { it.name == VoiceAutomationEventName.DROPOUT_STARTED })
+        scheduler.advanceBy(1)
+        assertEquals(
+            expected(VoiceAutomationEventName.DROPOUT_STARTED, epoch = 1),
+            runtime.events.last(),
+        )
         probe.onOutputWritten(byteCount = 320, nonSilent = true)
 
         assertEquals(
@@ -79,7 +88,6 @@ class VoiceAutomationAudioProbeTest {
                 expected(VoiceAutomationEventName.PLAYBACK_ACTIVE, epoch = 1),
                 expected(VoiceAutomationEventName.PLAYBACK_WRITTEN, epoch = 1, bytes = 320),
                 expected(VoiceAutomationEventName.DROPOUT_STARTED, epoch = 1),
-                expected(VoiceAutomationEventName.PLAYBACK_WRITTEN, epoch = 1, bytes = 320),
                 expected(VoiceAutomationEventName.DROPOUT_ENDED, epoch = 2),
                 expected(VoiceAutomationEventName.PLAYBACK_ACTIVE, epoch = 2),
                 expected(VoiceAutomationEventName.PLAYBACK_WRITTEN, epoch = 2, bytes = 320),
@@ -92,16 +100,20 @@ class VoiceAutomationAudioProbeTest {
     fun `interruption after output records stop only after 100 milliseconds confirmed silence`() {
         val runtime = RecordingRuntime()
         val clock = FakeProbeClock()
+        val scheduler = FakeProbeScheduler(clock)
         val probe = DefaultVoiceAutomationAudioProbe(
             runtimeProvider = { runtime },
             monotonicMs = clock::nowMs,
+            scheduler = scheduler,
         )
         probe.onOutputWritten(byteCount = 320, nonSilent = true)
         probe.onInterruptionStarted()
+        probe.onOutputDrained()
 
         clock.advanceBy(99)
         probe.onOutputSilenceConfirmed()
         clock.advanceBy(1)
+        probe.onOutputSilenceConfirmed()
         probe.onOutputSilenceConfirmed()
 
         assertEquals(
@@ -110,11 +122,13 @@ class VoiceAutomationAudioProbeTest {
                 VoiceAutomationEventName.PLAYBACK_ACTIVE,
                 VoiceAutomationEventName.PLAYBACK_WRITTEN,
                 VoiceAutomationEventName.INTERRUPT_STARTED,
+                VoiceAutomationEventName.PLAYBACK_DRAINED,
                 VoiceAutomationEventName.PLAYBACK_STOPPED,
             ),
             runtime.events.map(VoiceAutomationEventInput::name),
         )
         assertEquals(1L, runtime.events.last().playbackEpoch)
+        assertEquals(1, runtime.events.count { it.name == VoiceAutomationEventName.PLAYBACK_STOPPED })
     }
 
     @Test
@@ -175,6 +189,44 @@ class VoiceAutomationAudioProbeTest {
         fun advanceBy(durationMs: Long) {
             currentMs += durationMs
         }
+    }
+
+    private class FakeProbeScheduler(
+        private val clock: FakeProbeClock,
+    ) : VoiceAutomationTransitionScheduler {
+        private val tasks = mutableListOf<ScheduledTask>()
+
+        override fun schedule(
+            delayMs: Long,
+            transition: () -> Unit,
+        ): VoiceAutomationScheduledTransition {
+            val task = ScheduledTask(
+                deadlineMs = clock.nowMs() + delayMs,
+                transition = transition,
+            )
+            tasks += task
+            return VoiceAutomationScheduledTransition {
+                task.cancelled = true
+            }
+        }
+
+        fun advanceBy(durationMs: Long) {
+            clock.advanceBy(durationMs)
+            while (true) {
+                val due = tasks
+                    .filter { !it.cancelled && it.deadlineMs <= clock.nowMs() }
+                    .minByOrNull(ScheduledTask::deadlineMs)
+                    ?: return
+                due.cancelled = true
+                due.transition()
+            }
+        }
+
+        private class ScheduledTask(
+            val deadlineMs: Long,
+            val transition: () -> Unit,
+            var cancelled: Boolean = false,
+        )
     }
 
     private class RecordingRuntime : VoiceAutomationRuntime {

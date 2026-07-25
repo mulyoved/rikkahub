@@ -4,19 +4,35 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.launch
 import java.util.Base64
+import java.util.concurrent.atomic.AtomicLong
 
 internal sealed interface VoicePlaybackDiagnostic {
-    data class ChunkQueued(val bytes: Int, val writerGeneration: WriterGeneration) : VoicePlaybackDiagnostic
-    data class ChunkWritten(val bytes: Int, val writerGeneration: WriterGeneration) : VoicePlaybackDiagnostic
+    data class ChunkQueued(
+        val commandId: PlaybackCommandId,
+        val bytes: Int,
+        val writerGeneration: WriterGeneration,
+    ) : VoicePlaybackDiagnostic
+    data class ChunkWritten(
+        val commandId: PlaybackCommandId,
+        val bytes: Int,
+        val writerGeneration: WriterGeneration,
+    ) : VoicePlaybackDiagnostic
     data class StaleChunkRejected(
+        val commandId: PlaybackCommandId,
         val writerGeneration: WriterGeneration,
         val activeWriterGeneration: WriterGeneration,
         val rejectedSessionId: Long? = null,
         val activeSessionId: Long? = null,
     ) : VoicePlaybackDiagnostic
     data class MalformedChunk(val message: String) : VoicePlaybackDiagnostic
-    data class SinkStartFailed(val message: String) : VoicePlaybackDiagnostic
-    data class SinkWriteFailed(val message: String) : VoicePlaybackDiagnostic
+    data class SinkStartFailed(
+        val commandId: PlaybackCommandId,
+        val message: String,
+    ) : VoicePlaybackDiagnostic
+    data class SinkWriteFailed(
+        val commandId: PlaybackCommandId,
+        val message: String,
+    ) : VoicePlaybackDiagnostic
     data class SinkDrainFailed(val message: String) : VoicePlaybackDiagnostic
     data class SinkRetirementFailed(val message: String) : VoicePlaybackDiagnostic
     data class PlaybackEventHandlerFailed(
@@ -35,6 +51,7 @@ internal class VoicePlaybackWriter(
 ) {
     private val lock = Any()
     private val retirementLock = Any()
+    private val nextCommandId = AtomicLong()
     private val commands = Channel<PlaybackCommand>(Channel.UNLIMITED)
     private val playbackEvents = PlaybackEventDispatcher(
         onEvent = onPlaybackEvent,
@@ -66,7 +83,13 @@ internal class VoicePlaybackWriter(
     private var retirementInProgress = false
     private var playbackRetirementFailed = false
 
-    fun playBase64(base64Pcm16: String, sessionId: Long?): Boolean {
+    fun reserveCommandId(): PlaybackCommandId = PlaybackCommandId(nextCommandId.incrementAndGet())
+
+    fun playBase64(
+        base64Pcm16: String,
+        sessionId: Long?,
+        commandId: PlaybackCommandId = reserveCommandId(),
+    ): Boolean {
         val pcm16 = try {
             Base64.getDecoder().decode(base64Pcm16)
         } catch (e: IllegalArgumentException) {
@@ -95,6 +118,7 @@ internal class VoicePlaybackWriter(
                     epochWriterGenerations[epoch] = writerGeneration
                 }
                 val command = PlaybackCommand.Play(
+                    commandId = commandId,
                     pcm16 = pcm16,
                     writerGeneration = writerGeneration,
                 )
@@ -117,6 +141,7 @@ internal class VoicePlaybackWriter(
             staleActiveWriterGeneration?.let { activeWriterGeneration ->
                 onDiagnostic(
                     VoicePlaybackDiagnostic.StaleChunkRejected(
+                        commandId = commandId,
                         writerGeneration = activeWriterGeneration,
                         activeWriterGeneration = activeWriterGeneration,
                         rejectedSessionId = sessionId,
@@ -129,6 +154,7 @@ internal class VoicePlaybackWriter(
 
         onDiagnostic(
             VoicePlaybackDiagnostic.ChunkQueued(
+                commandId = enqueued.commandId,
                 bytes = pcm16.size,
                 writerGeneration = enqueued.writerGeneration,
             ),
@@ -185,13 +211,13 @@ internal class VoicePlaybackWriter(
 
     private fun playCommand(command: PlaybackCommand.Play) {
         if (!isCurrent(command.writerGeneration)) {
-            emitStale(command.writerGeneration)
+            emitStale(command)
             return
         }
 
-        val sink = getOrCreateSink(command.writerGeneration) ?: return
+        val sink = getOrCreateSink(command) ?: return
         if (!isCurrentSink(command.writerGeneration, sink)) {
-            emitStale(command.writerGeneration)
+            emitStale(command)
             return
         }
 
@@ -200,21 +226,27 @@ internal class VoicePlaybackWriter(
                 if (isCurrentSink(command.writerGeneration, sink)) {
                     onDiagnostic(
                         VoicePlaybackDiagnostic.ChunkWritten(
+                            commandId = command.commandId,
                             bytes = result.bytes,
                             writerGeneration = command.writerGeneration,
                         ),
                     )
                 } else {
-                    emitStale(command.writerGeneration)
+                    emitStale(command)
                 }
             }
             is VoicePcm16Sink.WriteResult.Failed -> {
                 retireWriterGenerationAfterFlush(command.writerGeneration, sink)
-                onDiagnostic(VoicePlaybackDiagnostic.SinkWriteFailed(result.message))
+                onDiagnostic(
+                    VoicePlaybackDiagnostic.SinkWriteFailed(
+                        commandId = command.commandId,
+                        message = result.message,
+                    ),
+                )
             }
             VoicePcm16Sink.WriteResult.Interrupted -> {
                 retireWriterGenerationAfterFlush(command.writerGeneration, sink)
-                emitStale(command.writerGeneration)
+                emitStale(command)
             }
         }
     }
@@ -254,11 +286,11 @@ internal class VoicePlaybackWriter(
         }
     }
 
-    private fun getOrCreateSink(commandWriterGeneration: WriterGeneration): VoicePcm16Sink? {
+    private fun getOrCreateSink(command: PlaybackCommand.Play): VoicePcm16Sink? {
         var staleActiveWriterGeneration: WriterGeneration? = null
         val currentSink = synchronized(lock) {
             if (released || retirementInProgress || playbackRetirementFailed ||
-                writerGeneration != commandWriterGeneration
+                writerGeneration != command.writerGeneration
             ) {
                 staleActiveWriterGeneration = writerGeneration
                 null
@@ -267,7 +299,7 @@ internal class VoicePlaybackWriter(
             }
         }
         if (staleActiveWriterGeneration != null) {
-            emitStale(commandWriterGeneration)
+            emitStale(command)
             return null
         }
         if (currentSink != null) return currentSink
@@ -280,8 +312,13 @@ internal class VoicePlaybackWriter(
         ) {
             is VoicePcm16SinkLifecycle.StartOutcome.Started -> outcome.sink
             is VoicePcm16SinkLifecycle.StartOutcome.Failed -> {
-                retireWriterGenerationAfterFlush(commandWriterGeneration, outcome.sinkRequiringRetirement)
-                onDiagnostic(VoicePlaybackDiagnostic.SinkStartFailed(outcome.message))
+                retireWriterGenerationAfterFlush(command.writerGeneration, outcome.sinkRequiringRetirement)
+                onDiagnostic(
+                    VoicePlaybackDiagnostic.SinkStartFailed(
+                        commandId = command.commandId,
+                        message = outcome.message,
+                    ),
+                )
                 return null
             }
         }
@@ -289,7 +326,7 @@ internal class VoicePlaybackWriter(
         var staleWriterGeneration: WriterGeneration? = null
         val selectedSink = synchronized(lock) {
             if (released || retirementInProgress || playbackRetirementFailed ||
-                writerGeneration != commandWriterGeneration
+                writerGeneration != command.writerGeneration
             ) {
                 staleWriterGeneration = writerGeneration
                 null
@@ -302,7 +339,8 @@ internal class VoicePlaybackWriter(
             retireDetachedSink(newSink)
             onDiagnostic(
                 VoicePlaybackDiagnostic.StaleChunkRejected(
-                    writerGeneration = commandWriterGeneration,
+                    commandId = command.commandId,
+                    writerGeneration = command.writerGeneration,
                     activeWriterGeneration = staleWriterGeneration ?: currentWriterGeneration(),
                 ),
             )
@@ -410,10 +448,11 @@ internal class VoicePlaybackWriter(
             writerGeneration == commandWriterGeneration && activeSink === sink
     }
 
-    private fun emitStale(commandWriterGeneration: WriterGeneration) {
+    private fun emitStale(command: PlaybackCommand.Play) {
         onDiagnostic(
             VoicePlaybackDiagnostic.StaleChunkRejected(
-                writerGeneration = commandWriterGeneration,
+                commandId = command.commandId,
+                writerGeneration = command.writerGeneration,
                 activeWriterGeneration = currentWriterGeneration(),
             ),
         )
@@ -423,6 +462,7 @@ internal class VoicePlaybackWriter(
 
     private sealed interface PlaybackCommand {
         data class Play(
+            val commandId: PlaybackCommandId,
             val pcm16: ByteArray,
             val writerGeneration: WriterGeneration,
         ) : PlaybackCommand

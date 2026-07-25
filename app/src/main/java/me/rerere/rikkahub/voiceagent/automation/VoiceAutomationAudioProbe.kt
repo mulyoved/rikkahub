@@ -1,6 +1,19 @@
 package me.rerere.rikkahub.voiceagent.automation
 
+import java.util.concurrent.ScheduledThreadPoolExecutor
+import java.util.concurrent.TimeUnit
 import org.koin.core.context.GlobalContext
+
+internal fun interface VoiceAutomationScheduledTransition {
+    fun cancel()
+}
+
+internal fun interface VoiceAutomationTransitionScheduler {
+    fun schedule(
+        delayMs: Long,
+        transition: () -> Unit,
+    ): VoiceAutomationScheduledTransition
+}
 
 internal interface VoiceAutomationAudioProbe {
     fun onInjectionStarted(totalBytes: Long)
@@ -16,6 +29,7 @@ internal interface VoiceAutomationAudioProbe {
 internal class DefaultVoiceAutomationAudioProbe(
     private val runtimeProvider: () -> VoiceAutomationRuntime?,
     private val monotonicMs: () -> Long = { System.nanoTime() / NANOS_PER_MILLISECOND },
+    private val scheduler: VoiceAutomationTransitionScheduler = SystemVoiceAutomationTransitionScheduler,
 ) : VoiceAutomationAudioProbe {
     private var runHash: String? = null
     private var lastSeenEventCount = 0L
@@ -25,11 +39,10 @@ internal class DefaultVoiceAutomationAudioProbe(
     private var injectionCompleted = false
     private var playbackEpoch = 0L
     private var firstNonSilentRecorded = false
-    private var outputActive = false
+    private var outputState = OutputState.BeforeOutput
     private var lastNonSilentMs: Long? = null
-    private var dropoutActive = false
-    private var interruptionActive = false
-    private var incrementEpochOnNextOutput = false
+    private var scheduledDropout: VoiceAutomationScheduledTransition? = null
+    private var scheduledDropoutToken = 0L
 
     @Synchronized
     override fun onInjectionStarted(totalBytes: Long) {
@@ -112,28 +125,8 @@ internal class DefaultVoiceAutomationAudioProbe(
         if (byteCount <= 0) return
         withActiveRuntime { runtime ->
             prepareOutputEpoch()
-            val nowMs = monotonicMs()
-            val silenceDurationMs = lastNonSilentMs?.let { nowMs - it }
-            if (
-                firstNonSilentRecorded &&
-                !dropoutActive &&
-                !interruptionActive &&
-                silenceDurationMs != null &&
-                silenceDurationMs >= DROPOUT_THRESHOLD_MS
-            ) {
-                dropoutActive = true
-                outputActive = false
-                record(
-                    runtime,
-                    VoiceAutomationEventInput(
-                        name = VoiceAutomationEventName.DROPOUT_STARTED,
-                        playbackEpoch = playbackEpoch,
-                    ),
-                )
-            }
             if (nonSilent) {
-                if (dropoutActive) {
-                    dropoutActive = false
+                if (outputState == OutputState.Dropout) {
                     playbackEpoch += 1
                     record(
                         runtime,
@@ -142,6 +135,7 @@ internal class DefaultVoiceAutomationAudioProbe(
                             playbackEpoch = playbackEpoch,
                         ),
                     )
+                    outputState = OutputState.BeforeOutput
                 }
                 if (!firstNonSilentRecorded) {
                     firstNonSilentRecorded = true
@@ -153,8 +147,11 @@ internal class DefaultVoiceAutomationAudioProbe(
                         ),
                     )
                 }
-                if (!outputActive) {
-                    outputActive = true
+                if (
+                    outputState != OutputState.Active &&
+                    outputState != OutputState.Interrupted
+                ) {
+                    outputState = OutputState.Active
                     record(
                         runtime,
                         VoiceAutomationEventInput(
@@ -163,7 +160,10 @@ internal class DefaultVoiceAutomationAudioProbe(
                         ),
                     )
                 }
-                lastNonSilentMs = nowMs
+                lastNonSilentMs = monotonicMs()
+                if (outputState == OutputState.Active) {
+                    scheduleDropoutTransition()
+                }
             }
             record(
                 runtime,
@@ -180,6 +180,7 @@ internal class DefaultVoiceAutomationAudioProbe(
     override fun onOutputDrained() {
         withActiveRuntime { runtime ->
             if (playbackEpoch == 0L) return@withActiveRuntime
+            cancelDropoutTransition()
             record(
                 runtime,
                 VoiceAutomationEventInput(
@@ -187,21 +188,25 @@ internal class DefaultVoiceAutomationAudioProbe(
                     playbackEpoch = playbackEpoch,
                 ),
             )
-            outputActive = false
-            dropoutActive = false
-            interruptionActive = false
-            lastNonSilentMs = null
-            incrementEpochOnNextOutput = firstNonSilentRecorded
+            if (
+                outputState != OutputState.Interrupted &&
+                outputState != OutputState.Dropout &&
+                outputState != OutputState.Stopped
+            ) {
+                outputState = OutputState.Drained
+                lastNonSilentMs = null
+            }
         }
     }
 
     @Synchronized
     override fun onInterruptionStarted() {
         withActiveRuntime { runtime ->
-            if (!outputActive || lastNonSilentMs == null || interruptionActive) {
+            if (outputState != OutputState.Active || lastNonSilentMs == null) {
                 return@withActiveRuntime
             }
-            interruptionActive = true
+            cancelDropoutTransition()
+            outputState = OutputState.Interrupted
             record(
                 runtime,
                 VoiceAutomationEventInput(
@@ -217,7 +222,7 @@ internal class DefaultVoiceAutomationAudioProbe(
         withActiveRuntime { runtime ->
             val lastOutputMs = lastNonSilentMs ?: return@withActiveRuntime
             if (
-                !interruptionActive ||
+                outputState != OutputState.Interrupted ||
                 monotonicMs() - lastOutputMs < INTERRUPTION_SILENCE_MS
             ) {
                 return@withActiveRuntime
@@ -229,11 +234,28 @@ internal class DefaultVoiceAutomationAudioProbe(
                     playbackEpoch = playbackEpoch,
                 ),
             )
-            outputActive = false
-            dropoutActive = false
-            interruptionActive = false
+            cancelDropoutTransition()
+            outputState = OutputState.Stopped
             lastNonSilentMs = null
-            incrementEpochOnNextOutput = true
+        }
+    }
+
+    @Synchronized
+    private fun onDropoutThresholdReached(token: Long) {
+        if (token != scheduledDropoutToken) return
+        scheduledDropout = null
+        withActiveRuntime { runtime ->
+            if (outputState != OutputState.Active || lastNonSilentMs == null) {
+                return@withActiveRuntime
+            }
+            outputState = OutputState.Dropout
+            record(
+                runtime,
+                VoiceAutomationEventInput(
+                    name = VoiceAutomationEventName.DROPOUT_STARTED,
+                    playbackEpoch = playbackEpoch,
+                ),
+            )
         }
     }
 
@@ -270,13 +292,31 @@ internal class DefaultVoiceAutomationAudioProbe(
     private fun prepareOutputEpoch() {
         if (playbackEpoch == 0L) {
             playbackEpoch = 1L
-        } else if (incrementEpochOnNextOutput) {
+        } else if (
+            outputState == OutputState.Drained ||
+            outputState == OutputState.Stopped
+        ) {
             playbackEpoch += 1
-            incrementEpochOnNextOutput = false
+            outputState = OutputState.BeforeOutput
         }
     }
 
+    private fun scheduleDropoutTransition() {
+        cancelDropoutTransition()
+        val token = scheduledDropoutToken
+        scheduledDropout = scheduler.schedule(DROPOUT_THRESHOLD_MS) {
+            onDropoutThresholdReached(token)
+        }
+    }
+
+    private fun cancelDropoutTransition() {
+        scheduledDropoutToken += 1
+        scheduledDropout?.cancel()
+        scheduledDropout = null
+    }
+
     private fun resetState() {
+        cancelDropoutTransition()
         runHash = null
         lastSeenEventCount = 0L
         injectionTotalBytes = null
@@ -285,17 +325,43 @@ internal class DefaultVoiceAutomationAudioProbe(
         injectionCompleted = false
         playbackEpoch = 0L
         firstNonSilentRecorded = false
-        outputActive = false
+        outputState = OutputState.BeforeOutput
         lastNonSilentMs = null
-        dropoutActive = false
-        interruptionActive = false
-        incrementEpochOnNextOutput = false
+    }
+
+    private enum class OutputState {
+        BeforeOutput,
+        Active,
+        Dropout,
+        Interrupted,
+        Stopped,
+        Drained,
     }
 
     private companion object {
         const val NANOS_PER_MILLISECOND = 1_000_000L
         const val DROPOUT_THRESHOLD_MS = 250L
         const val INTERRUPTION_SILENCE_MS = 100L
+    }
+}
+
+private object SystemVoiceAutomationTransitionScheduler : VoiceAutomationTransitionScheduler {
+    private val executor = ScheduledThreadPoolExecutor(1) { task ->
+        Thread(task, "voice-automation-audio-probe").apply {
+            isDaemon = true
+        }
+    }.apply {
+        removeOnCancelPolicy = true
+    }
+
+    override fun schedule(
+        delayMs: Long,
+        transition: () -> Unit,
+    ): VoiceAutomationScheduledTransition {
+        val future = executor.schedule(transition, delayMs, TimeUnit.MILLISECONDS)
+        return VoiceAutomationScheduledTransition {
+            future.cancel(false)
+        }
     }
 }
 
