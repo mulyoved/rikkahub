@@ -38,10 +38,10 @@ object VoiceAudioDebugInjector {
         onPcm16: (ByteArray) -> Unit,
         onInjectionComplete: () -> Unit,
     ): Registration = requireNotNull(
-        registerCaptureIfCurrent(
+        registerCapture(
             onPcm16 = onPcm16,
             onInjectionComplete = onInjectionComplete,
-            isCurrent = { true },
+            isCurrent = null,
         ),
     )
 
@@ -49,15 +49,29 @@ object VoiceAudioDebugInjector {
         onPcm16: (ByteArray) -> Unit,
         onInjectionComplete: () -> Unit,
         isCurrent: () -> Boolean,
+    ): Registration? = registerCapture(
+        onPcm16 = onPcm16,
+        onInjectionComplete = onInjectionComplete,
+        isCurrent = isCurrent,
+    )
+
+    private fun registerCapture(
+        onPcm16: (ByteArray) -> Unit,
+        onInjectionComplete: () -> Unit,
+        isCurrent: (() -> Boolean)?,
     ): Registration? {
         val registration = synchronized(lock) {
-            if (!isCurrent()) return@synchronized null
-            if (activeCapture != null) return@synchronized null
+            if (isCurrent?.invoke() == false) return@synchronized null
+            val incumbent = activeCapture
+            if (incumbent != null && incumbent.isCurrent?.invoke() != false) {
+                return@synchronized null
+            }
             nextRegistrationId += 1
             CaptureRegistration(
                 id = nextRegistrationId,
                 onPcm16 = onPcm16,
                 onInjectionComplete = onInjectionComplete,
+                isCurrent = isCurrent,
             ).also {
                 activeCapture = it
             }
@@ -181,6 +195,7 @@ object VoiceAudioDebugInjector {
         val id: Long,
         val onPcm16: (ByteArray) -> Unit,
         val onInjectionComplete: () -> Unit,
+        val isCurrent: (() -> Boolean)?,
     )
 
     private fun ByteArray.withPcm16Alignment(): ByteArray =

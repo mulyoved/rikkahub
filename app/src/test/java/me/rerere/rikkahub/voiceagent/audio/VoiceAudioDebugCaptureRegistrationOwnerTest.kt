@@ -5,6 +5,7 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.util.concurrent.atomic.AtomicBoolean
 
 class VoiceAudioDebugCaptureRegistrationOwnerTest {
     @Test
@@ -112,9 +113,23 @@ class VoiceAudioDebugCaptureRegistrationOwnerTest {
         val currentRecorder = Any()
         val staleChunks = mutableListOf<ByteArray>()
         val currentChunks = mutableListOf<ByteArray>()
-        val staleRegistration = VoiceAudioDebugInjector.registerCapture(staleChunks::add)
+        val staleCurrent = AtomicBoolean(true)
+        val staleRegistration = requireNotNull(
+            VoiceAudioDebugInjector.registerCaptureIfCurrent(
+                onPcm16 = staleChunks::add,
+                onInjectionComplete = {},
+                isCurrent = staleCurrent::get,
+            ),
+        )
         assertTrue(owner.publish(staleToken, staleRecorder, staleRegistration) { true })
-        val currentRegistration = VoiceAudioDebugInjector.registerCapture(currentChunks::add)
+        staleCurrent.set(false)
+        val currentRegistration = requireNotNull(
+            VoiceAudioDebugInjector.registerCaptureIfCurrent(
+                onPcm16 = currentChunks::add,
+                onInjectionComplete = {},
+                isCurrent = { true },
+            ),
+        )
         assertTrue(owner.publish(currentToken, currentRecorder, currentRegistration) { true })
 
         assertFalse(owner.unregister(staleToken, staleRecorder))

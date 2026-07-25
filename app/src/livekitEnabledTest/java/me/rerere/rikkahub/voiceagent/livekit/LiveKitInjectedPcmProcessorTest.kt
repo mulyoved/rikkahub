@@ -231,6 +231,44 @@ class LiveKitInjectedPcmProcessorTest {
         }
     }
 
+    @Test
+    fun `global injector lease rolls from stale run A to usable run B`() {
+        VoiceAudioDebugInjector.clearForTest()
+        var status = liveKitStatus()
+        val sourceA = LiveKitAutomationPcmSource(
+            automationStatus = { status },
+            captureRegistrar = GlobalInjectorCaptureRegistrar,
+        )
+        val sourceB = LiveKitAutomationPcmSource(
+            automationStatus = { status },
+            captureRegistrar = GlobalInjectorCaptureRegistrar,
+        )
+        val activationA = sourceA.activate(RUN_HASH)
+        var activationB: AutoCloseable? = null
+        try {
+            status = liveKitStatus(runHash = RUN_HASH_B)
+
+            activationB = sourceB.activate(RUN_HASH_B)
+            activationA.close()
+            val injection = VoiceAudioDebugInjector.injectPcm16(
+                pcm16 = byteArrayOf(7, 8),
+                chunkBytes = 2,
+                chunkDelayMs = 0,
+            )
+
+            assertTrue(injection.delivered)
+            assertFalse(sourceA.isActive)
+            assertArrayEquals(
+                byteArrayOf(7, 8),
+                process(LiveKitInjectedPcmProcessor(sourceB), size = 2),
+            )
+        } finally {
+            activationB?.close()
+            activationA.close()
+            VoiceAudioDebugInjector.clearForTest()
+        }
+    }
+
     private fun activeSource(capture: FakeLiveKitCaptureRegistrar) =
         LiveKitAutomationPcmSource(
             automationStatus = { liveKitStatus() },

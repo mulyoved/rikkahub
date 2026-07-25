@@ -8,10 +8,95 @@ import org.junit.Test
 import java.util.Collections
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 
 class VoiceAudioDebugInjectorTest {
+    @Test
+    fun `second current capture registration is rejected and incumbent remains usable`() {
+        VoiceAudioDebugInjector.clearForTest()
+        val incumbentChunks = mutableListOf<ByteArray>()
+        val contenderChunks = mutableListOf<ByteArray>()
+        val incumbent = VoiceAudioDebugInjector.registerCaptureIfCurrent(
+            onPcm16 = incumbentChunks::add,
+            onInjectionComplete = {},
+            isCurrent = { true },
+        )
+
+        val contender = VoiceAudioDebugInjector.registerCaptureIfCurrent(
+            onPcm16 = contenderChunks::add,
+            onInjectionComplete = {},
+            isCurrent = { true },
+        )
+        val injection = VoiceAudioDebugInjector.injectPcm16(
+            pcm16 = byteArrayOf(1, 2),
+            chunkBytes = 2,
+            chunkDelayMs = 0L,
+        )
+
+        assertTrue(incumbent != null)
+        assertEquals(null, contender)
+        assertTrue(injection.delivered)
+        assertEquals(listOf(byteArrayOf(1, 2).toList()), incumbentChunks.map(ByteArray::toList))
+        assertEquals(emptyList<ByteArray>(), contenderChunks)
+        incumbent?.close()
+    }
+
+    @Test
+    fun `stale capture is replaced and stale close cannot remove usable successor`() {
+        VoiceAudioDebugInjector.clearForTest()
+        val incumbentCurrent = AtomicBoolean(true)
+        val incumbentChunks = mutableListOf<ByteArray>()
+        val successorChunks = mutableListOf<ByteArray>()
+        val incumbent = VoiceAudioDebugInjector.registerCaptureIfCurrent(
+            onPcm16 = incumbentChunks::add,
+            onInjectionComplete = {},
+            isCurrent = incumbentCurrent::get,
+        )
+        incumbentCurrent.set(false)
+
+        val successor = VoiceAudioDebugInjector.registerCaptureIfCurrent(
+            onPcm16 = successorChunks::add,
+            onInjectionComplete = {},
+            isCurrent = { true },
+        )
+        incumbent?.close()
+        val injection = VoiceAudioDebugInjector.injectPcm16(
+            pcm16 = byteArrayOf(3, 4),
+            chunkBytes = 2,
+            chunkDelayMs = 0L,
+        )
+
+        assertTrue(successor != null)
+        assertTrue(injection.delivered)
+        assertEquals(emptyList<ByteArray>(), incumbentChunks)
+        assertEquals(listOf(byteArrayOf(3, 4).toList()), successorChunks.map(ByteArray::toList))
+        successor?.close()
+    }
+
+    @Test
+    fun `capture without currency predicate remains incumbent until explicitly closed`() {
+        VoiceAudioDebugInjector.clearForTest()
+        val incumbent = VoiceAudioDebugInjector.registerCapture(onPcm16 = {})
+
+        val blocked = VoiceAudioDebugInjector.registerCaptureIfCurrent(
+            onPcm16 = {},
+            onInjectionComplete = {},
+            isCurrent = { true },
+        )
+
+        assertEquals(null, blocked)
+        incumbent.close()
+        val admitted = VoiceAudioDebugInjector.registerCaptureIfCurrent(
+            onPcm16 = {},
+            onInjectionComplete = {},
+            isCurrent = { true },
+        )
+        assertTrue(admitted != null)
+        admitted?.close()
+    }
+
     @Test
     fun `default injection reports exact chunks before completion`() {
         VoiceAudioDebugInjector.clearForTest()
