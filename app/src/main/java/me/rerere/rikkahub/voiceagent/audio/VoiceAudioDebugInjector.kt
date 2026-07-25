@@ -16,6 +16,7 @@ object VoiceAudioDebugInjector {
     const val DEFAULT_TRAILING_SILENCE_MS = 0L
 
     private val lock = Any()
+    private val producerLock = Any()
     private var activeCapture: CaptureRegistration? = null
     private var nextRegistrationId = 0L
 
@@ -51,6 +52,7 @@ object VoiceAudioDebugInjector {
     ): Registration? {
         val registration = synchronized(lock) {
             if (!isCurrent()) return@synchronized null
+            if (activeCapture != null) return@synchronized null
             nextRegistrationId += 1
             CaptureRegistration(
                 id = nextRegistrationId,
@@ -87,6 +89,26 @@ object VoiceAudioDebugInjector {
     )
 
     internal fun injectPcm16(
+        pcm16: ByteArray,
+        chunkBytes: Int,
+        chunkDelayMs: Long,
+        leadingSilenceMs: Long,
+        trailingSilenceMs: Long,
+        sleep: (Long) -> Unit,
+        automationAudioProbe: VoiceAutomationAudioProbe,
+    ): Result = synchronized(producerLock) {
+        injectPcm16Serialized(
+            pcm16 = pcm16,
+            chunkBytes = chunkBytes,
+            chunkDelayMs = chunkDelayMs,
+            leadingSilenceMs = leadingSilenceMs,
+            trailingSilenceMs = trailingSilenceMs,
+            sleep = sleep,
+            automationAudioProbe = automationAudioProbe,
+        )
+    }
+
+    private fun injectPcm16Serialized(
         pcm16: ByteArray,
         chunkBytes: Int,
         chunkDelayMs: Long,

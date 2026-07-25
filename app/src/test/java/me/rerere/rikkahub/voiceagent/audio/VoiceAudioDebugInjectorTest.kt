@@ -5,8 +5,10 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.util.Collections
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 
 class VoiceAudioDebugInjectorTest {
@@ -227,5 +229,112 @@ class VoiceAudioDebugInjectorTest {
         assertEquals(2, result.chunkCount)
         assertEquals(listOf(listOf<Byte>(1, 2), listOf<Byte>(3, 0)), chunks)
         registration.close()
+    }
+
+    @Test
+    fun `concurrent producers serialize complete sessions at the injector boundary`() {
+        VoiceAudioDebugInjector.clearForTest()
+        val events = Collections.synchronizedList(mutableListOf<String>())
+        val firstPaused = CountDownLatch(1)
+        val releaseFirst = CountDownLatch(1)
+        val secondStarted = CountDownLatch(1)
+        val completionCount = AtomicInteger()
+        val firstFailure = AtomicReference<Throwable?>()
+        val secondFailure = AtomicReference<Throwable?>()
+        val registration = VoiceAudioDebugInjector.registerCapture(
+            onPcm16 = { chunk -> events += "capture:${chunk.first()}" },
+            onInjectionComplete = {
+                events += "capture-complete:${completionCount.incrementAndGet()}"
+            },
+        )
+        val firstThread = Thread {
+            try {
+                VoiceAudioDebugInjector.injectPcm16(
+                    pcm16 = byteArrayOf(1, 1, 2, 2),
+                    chunkBytes = 2,
+                    chunkDelayMs = 1,
+                    leadingSilenceMs = 0,
+                    trailingSilenceMs = 0,
+                    sleep = {
+                        firstPaused.countDown()
+                        check(releaseFirst.await(5, TimeUnit.SECONDS)) {
+                            "first producer release timed out"
+                        }
+                    },
+                    automationAudioProbe = RecordingInjectionProbe("first", events),
+                )
+            } catch (error: Throwable) {
+                firstFailure.set(error)
+            }
+        }
+        val secondThread = Thread {
+            try {
+                VoiceAudioDebugInjector.injectPcm16(
+                    pcm16 = byteArrayOf(3, 3),
+                    chunkBytes = 2,
+                    chunkDelayMs = 0,
+                    leadingSilenceMs = 0,
+                    trailingSilenceMs = 0,
+                    sleep = {},
+                    automationAudioProbe = RecordingInjectionProbe(
+                        label = "second",
+                        events = events,
+                        onStarted = secondStarted::countDown,
+                    ),
+                )
+            } catch (error: Throwable) {
+                secondFailure.set(error)
+            }
+        }
+        try {
+            firstThread.start()
+            assertTrue(firstPaused.await(5, TimeUnit.SECONDS))
+            secondThread.start()
+
+            assertFalse(secondStarted.await(200, TimeUnit.MILLISECONDS))
+
+            releaseFirst.countDown()
+            firstThread.join(5_000)
+            secondThread.join(5_000)
+
+            assertFalse(firstThread.isAlive)
+            assertFalse(secondThread.isAlive)
+            assertEquals(null, firstFailure.get())
+            assertEquals(null, secondFailure.get())
+            assertTrue(events.indexOf("first-complete") < events.indexOf("second-start"))
+            assertTrue(events.indexOf("capture-complete:1") < events.indexOf("second-start"))
+            assertEquals(2, completionCount.get())
+        } finally {
+            releaseFirst.countDown()
+            firstThread.join(5_000)
+            secondThread.join(5_000)
+            registration.close()
+            VoiceAudioDebugInjector.clearForTest()
+        }
+    }
+
+    private class RecordingInjectionProbe(
+        private val label: String,
+        private val events: MutableList<String>,
+        private val onStarted: () -> Unit = {},
+    ) : VoiceAutomationAudioProbe {
+        override fun onInjectionStarted(totalBytes: Long) {
+            events += "$label-start"
+            onStarted()
+        }
+
+        override fun onInjectionChunk(byteCount: Int) {
+            events += "$label-chunk"
+        }
+
+        override fun onInjectionCompleted() {
+            events += "$label-complete"
+        }
+
+        override fun onOutputQueued(byteCount: Int) = Unit
+        override fun onOutputWritten(byteCount: Int, nonSilent: Boolean) = Unit
+        override fun onOutputDrained() = Unit
+        override fun onInterruptionStarted() = Unit
+        override fun onOutputSilenceConfirmed() = Unit
     }
 }

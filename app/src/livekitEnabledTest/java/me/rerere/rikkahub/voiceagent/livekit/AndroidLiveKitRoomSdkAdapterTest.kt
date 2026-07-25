@@ -10,6 +10,7 @@ import io.livekit.android.room.participant.RemoteParticipant
 import io.livekit.android.room.participant.RpcHandler
 import io.livekit.android.room.participant.RpcInvocationData
 import io.livekit.android.room.track.RemoteAudioTrack
+import io.livekit.android.room.track.Track
 import io.livekit.android.room.track.TrackPublication
 import io.mockk.Runs
 import io.mockk.coEvery
@@ -31,9 +32,13 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import livekit.LivekitModels
+import livekit.org.webrtc.AudioTrackSink
+import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationAudioProbe
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.nio.ByteBuffer
 
 class AndroidLiveKitRoomSdkAdapterTest {
     @Test
@@ -140,6 +145,8 @@ class AndroidLiveKitRoomSdkAdapterTest {
         val roomEvents = MutableSharedFlow<RoomEvent>()
         val tracks = List(4) { mockk<RemoteAudioTrack>() }
         val probes = List(4) { mockk<LiveKitRemoteAudioProbe>() }
+        every { participant.identity } returns Participant.Identity("agent")
+        every { publication.source } returns Track.Source.MICROPHONE
         tracks.forEach { track ->
             every { track.addSink(any()) } just Runs
             every { track.removeSink(any()) } just Runs
@@ -155,6 +162,7 @@ class AndroidLiveKitRoomSdkAdapterTest {
             sdkEvents = roomEvents,
             remoteAudioProbeFactory = { pendingProbes.removeFirst() },
         )
+        adapter.selectRemoteAudioParticipant("agent")
         val collection = backgroundScope.launch {
             adapter.events.collect { }
         }
@@ -183,5 +191,173 @@ class AndroidLiveKitRoomSdkAdapterTest {
         }
         verify(exactly = 1) { room.disconnect() }
         verify(exactly = 1) { room.release() }
+    }
+
+    @Test
+    fun `failed sink removal stays owned and blocks disconnect until retry succeeds`() = runTest {
+        val room = mockk<Room>()
+        val participant = mockk<RemoteParticipant>()
+        val publication = mockk<TrackPublication>()
+        val track = mockk<RemoteAudioTrack>()
+        val probe = mockk<LiveKitRemoteAudioProbe>()
+        val roomEvents = MutableSharedFlow<RoomEvent>()
+        var removalAttempts = 0
+        every { participant.identity } returns Participant.Identity("agent")
+        every { publication.source } returns Track.Source.MICROPHONE
+        every { track.addSink(probe) } just Runs
+        every { track.removeSink(probe) } answers {
+            removalAttempts += 1
+            if (removalAttempts == 1) {
+                throw IllegalStateException("remove failed once")
+            }
+        }
+        every { probe.close() } just Runs
+        every { room.disconnect() } just Runs
+        val adapter = AndroidLiveKitRoomSdkAdapter(
+            room = room,
+            sdkEvents = roomEvents,
+            remoteAudioProbeFactory = { probe },
+        )
+        adapter.selectRemoteAudioParticipant("agent")
+        val collection = backgroundScope.launch {
+            adapter.events.collect { }
+        }
+        runCurrent()
+        roomEvents.emit(RoomEvent.TrackSubscribed(room, track, publication, participant))
+
+        val firstFailure = runCatching { adapter.disconnect() }.exceptionOrNull()
+
+        assertTrue(firstFailure is IllegalStateException)
+        assertEquals(1, removalAttempts)
+        verify(exactly = 0) { room.disconnect() }
+
+        adapter.disconnect()
+        collection.cancel()
+
+        assertEquals(2, removalAttempts)
+        verify(exactly = 1) { probe.close() }
+        verify(exactly = 1) { room.disconnect() }
+    }
+
+    @Test
+    fun `only expected agent microphone can drive or drain shared remote audio state`() = runTest {
+        val room = mockk<Room>()
+        val expectedParticipant = mockk<RemoteParticipant>()
+        val irrelevantParticipant = mockk<RemoteParticipant>()
+        val expectedPublication = mockk<TrackPublication>()
+        val irrelevantPublication = mockk<TrackPublication>()
+        val expectedTrack = mockk<RemoteAudioTrack>()
+        val irrelevantTrack = mockk<RemoteAudioTrack>()
+        val expectedSink = slot<AudioTrackSink>()
+        val roomEvents = MutableSharedFlow<RoomEvent>()
+        val recording = AdapterRecordingAudioProbe()
+        every { expectedParticipant.identity } returns Participant.Identity("expected-agent")
+        every { irrelevantParticipant.identity } returns Participant.Identity("other-agent")
+        every { expectedPublication.source } returns Track.Source.MICROPHONE
+        every { irrelevantPublication.source } returns Track.Source.MICROPHONE
+        every { expectedTrack.addSink(capture(expectedSink)) } just Runs
+        every { expectedTrack.removeSink(any()) } just Runs
+        every { irrelevantTrack.addSink(any()) } just Runs
+        every { irrelevantTrack.removeSink(any()) } just Runs
+        val adapter = AndroidLiveKitRoomSdkAdapter(
+            room = room,
+            sdkEvents = roomEvents,
+            remoteAudioProbeFactory = {
+                LiveKitRemoteAudioProbe(
+                    automationAudioProbe = recording,
+                    monotonicMs = { 1L },
+                )
+            },
+        )
+        adapter.selectRemoteAudioParticipant("expected-agent")
+        val collection = backgroundScope.launch {
+            adapter.events.collect { }
+        }
+        runCurrent()
+
+        roomEvents.emit(
+            RoomEvent.TrackSubscribed(
+                room,
+                expectedTrack,
+                expectedPublication,
+                expectedParticipant,
+            ),
+        )
+        roomEvents.emit(
+            RoomEvent.TrackSubscribed(
+                room,
+                irrelevantTrack,
+                irrelevantPublication,
+                irrelevantParticipant,
+            ),
+        )
+        expectedSink.captured.onData(
+            ByteBuffer.wrap(byteArrayOf(1, 0)),
+            16,
+            48_000,
+            1,
+            1,
+            1,
+        )
+        roomEvents.emit(
+            RoomEvent.TrackUnsubscribed(
+                room,
+                irrelevantTrack,
+                irrelevantPublication,
+                irrelevantParticipant,
+            ),
+        )
+
+        assertEquals(listOf(true), recording.nonSilentWrites)
+        assertEquals(0, recording.drained)
+        verify(exactly = 0) { irrelevantTrack.addSink(any()) }
+        verify(exactly = 0) { irrelevantTrack.removeSink(any()) }
+
+        expectedSink.captured.onData(
+            ByteBuffer.wrap(byteArrayOf(0, 0)),
+            16,
+            48_000,
+            1,
+            1,
+            2,
+        )
+        roomEvents.emit(
+            RoomEvent.TrackUnsubscribed(
+                room,
+                expectedTrack,
+                expectedPublication,
+                expectedParticipant,
+            ),
+        )
+        collection.cancel()
+
+        assertEquals(1, recording.silenceConfirmations)
+        assertEquals(1, recording.drained)
+        verify(exactly = 1) { expectedTrack.removeSink(any()) }
+    }
+
+    private class AdapterRecordingAudioProbe : VoiceAutomationAudioProbe {
+        val nonSilentWrites = mutableListOf<Boolean>()
+        var silenceConfirmations = 0
+        var drained = 0
+
+        override fun onInjectionStarted(totalBytes: Long) = Unit
+        override fun onInjectionChunk(byteCount: Int) = Unit
+        override fun onInjectionCompleted() = Unit
+        override fun onOutputQueued(byteCount: Int) = Unit
+
+        override fun onOutputWritten(byteCount: Int, nonSilent: Boolean) {
+            nonSilentWrites += nonSilent
+        }
+
+        override fun onOutputDrained() {
+            drained += 1
+        }
+
+        override fun onInterruptionStarted() = Unit
+
+        override fun onOutputSilenceConfirmed() {
+            silenceConfirmations += 1
+        }
     }
 }

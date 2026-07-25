@@ -28,6 +28,7 @@ internal interface LiveKitRoomSdkAdapter {
     val automationAudio: LiveKitAutomationAudioBinding
         get() = UnavailableLiveKitAutomationAudioBinding
 
+    fun selectRemoteAudioParticipant(participantIdentity: String)
     suspend fun connect(url: String, token: String)
     suspend fun setMicrophoneEnabled(enabled: Boolean): Boolean
     suspend fun performRpc(destination: String, method: String, payload: String): String
@@ -44,6 +45,10 @@ internal class AndroidLiveKitRoomFacade(
 
     override val events: Flow<LiveKitRoomEvent> = sdk.events.mapNotNull(::toFacadeEvent)
     override val automationAudio: LiveKitAutomationAudioBinding = sdk.automationAudio
+
+    override fun selectRemoteAudioParticipant(participantIdentity: String) {
+        sdk.selectRemoteAudioParticipant(participantIdentity)
+    }
 
     override suspend fun connect(url: String, token: String) {
         sdk.connect(url, token)

@@ -48,6 +48,7 @@ class AndroidLiveKitRoomFacadeTest {
         var invocation: LiveKitRpcInvocation? = null
 
         assertSame(sdk.automationAudio, facade.automationAudio)
+        facade.selectRemoteAudioParticipant("agent")
         facade.connect("wss://voice.test", "token")
         assertTrue(facade.setMicrophoneEnabled(false))
         assertEquals("rpc-result", facade.performRpc("agent", "interrupt", "payload"))
@@ -65,6 +66,7 @@ class AndroidLiveKitRoomFacadeTest {
 
         assertEquals(
             listOf(
+                "remote-audio:agent",
                 "connect:wss://voice.test:token",
                 "microphone:false",
                 "rpc:agent:interrupt:payload",
@@ -92,6 +94,10 @@ private class FakeLiveKitRoomSdkAdapter : LiveKitRoomSdkAdapter {
 
     suspend fun invoke(method: String, invocation: LiveKitSdkRpcInvocation): String =
         requireNotNull(handlers[method])(invocation)
+
+    override fun selectRemoteAudioParticipant(participantIdentity: String) {
+        operations += "remote-audio:$participantIdentity"
+    }
 
     override suspend fun connect(url: String, token: String) {
         operations += "connect:$url:$token"

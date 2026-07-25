@@ -26,12 +26,25 @@ internal class LiveKitAutomationPcmSource(
     private val lock = Any()
     private val queuedPcm = ArrayDeque<QueuedPcm>()
     private var nextGeneration = 0L
-    private var activeGeneration: Long? = null
+    private var activeOwner: ActiveOwner? = null
     private var captureRegistration: AutoCloseable? = null
     private var injectionEnded = false
 
     val isActive: Boolean
-        get() = synchronized(lock) { activeGeneration != null }
+        get() {
+            var staleRegistration: AutoCloseable? = null
+            val active = synchronized(lock) {
+                val owner = activeOwner ?: return@synchronized false
+                if (owner.matchesCurrentStatus()) {
+                    true
+                } else {
+                    staleRegistration = clearOwnerLocked(owner.generation)
+                    false
+                }
+            }
+            staleRegistration?.close()
+            return active
+        }
 
     override fun activate(runHash: String): AutoCloseable {
         val status = checkNotNull(automationStatus()) {
@@ -47,39 +60,40 @@ internal class LiveKitAutomationPcmSource(
             "LiveKit automation run hash does not match the active run"
         }
 
-        val generation = synchronized(lock) {
-            check(activeGeneration == null) {
+        val owner = synchronized(lock) {
+            check(activeOwner == null) {
                 "LiveKit automation audio already has an active owner"
             }
             check(nextGeneration < Long.MAX_VALUE) {
                 "LiveKit automation audio generation exhausted"
             }
-            (nextGeneration + 1).also { next ->
-                nextGeneration = next
-                activeGeneration = next
+            ActiveOwner(nextGeneration + 1, runHash).also { next ->
+                nextGeneration = next.generation
+                activeOwner = next
                 queuedPcm.clear()
                 injectionEnded = false
             }
         }
         val registration = try {
             captureRegistrar.register(
-                onPcm16 = ::enqueuePcm16,
-                onInjectionComplete = ::markInjectionEnded,
-                isCurrent = { isGenerationActive(generation) },
+                onPcm16 = { pcm16 -> enqueuePcm16(owner.generation, pcm16) },
+                onInjectionComplete = { markInjectionEnded(owner.generation) },
+                isCurrent = { isGenerationActive(owner.generation) },
             )
         } catch (error: Throwable) {
-            deactivate(generation)
+            deactivate(owner.generation)
             throw error
         }
         if (registration == null) {
-            deactivate(generation)
+            deactivate(owner.generation)
             error("LiveKit automation audio registration was rejected")
         }
         val published = synchronized(lock) {
-            if (activeGeneration == generation) {
+            if (activeOwner == owner && owner.matchesCurrentStatus()) {
                 captureRegistration = registration
                 true
             } else {
+                clearOwnerLocked(owner.generation)
                 false
             }
         }
@@ -88,26 +102,57 @@ internal class LiveKitAutomationPcmSource(
             error("LiveKit automation audio activation became stale")
         }
         return AutoCloseable {
-            deactivate(generation)
+            deactivate(owner.generation)
         }
     }
 
     override fun enqueuePcm16(pcm16: ByteArray) {
-        if (pcm16.isEmpty()) return
+        enqueuePcm16(expectedGeneration = null, pcm16 = pcm16)
+    }
+
+    private fun enqueuePcm16(
+        expectedGeneration: Long?,
+        pcm16: ByteArray,
+    ) {
+        var staleRegistration: AutoCloseable? = null
         synchronized(lock) {
-            if (activeGeneration == null) return
+            val owner = activeOwner ?: return@synchronized
+            if (expectedGeneration != null && owner.generation != expectedGeneration) {
+                return@synchronized
+            }
+            if (!owner.matchesCurrentStatus()) {
+                staleRegistration = clearOwnerLocked(owner.generation)
+                return@synchronized
+            }
+            if (pcm16.isEmpty()) return@synchronized
             queuedPcm.addLast(QueuedPcm(pcm16.copyOf()))
             injectionEnded = false
         }
+        staleRegistration?.close()
     }
 
-    override fun injectionComplete(): Boolean = synchronized(lock) {
-        activeGeneration != null && injectionEnded && queuedPcm.isEmpty()
+    override fun injectionComplete(): Boolean {
+        var staleRegistration: AutoCloseable? = null
+        val complete = synchronized(lock) {
+            val owner = activeOwner ?: return@synchronized false
+            if (!owner.matchesCurrentStatus()) {
+                staleRegistration = clearOwnerLocked(owner.generation)
+                return@synchronized false
+            }
+            injectionEnded && queuedPcm.isEmpty()
+        }
+        staleRegistration?.close()
+        return complete
     }
 
     fun replaceOrZero(buffer: ByteBuffer) {
+        var staleRegistration: AutoCloseable? = null
         synchronized(lock) {
-            if (activeGeneration == null) return
+            val owner = activeOwner ?: return@synchronized
+            if (!owner.matchesCurrentStatus()) {
+                staleRegistration = clearOwnerLocked(owner.generation)
+                return@synchronized
+            }
             while (buffer.hasRemaining()) {
                 val queued = queuedPcm.peekFirst()
                 if (queued == null) {
@@ -122,31 +167,69 @@ internal class LiveKitAutomationPcmSource(
                 }
             }
         }
+        staleRegistration?.close()
     }
 
-    private fun markInjectionEnded() {
+    private fun markInjectionEnded(expectedGeneration: Long) {
+        var staleRegistration: AutoCloseable? = null
         synchronized(lock) {
-            if (activeGeneration != null) {
-                injectionEnded = true
+            val owner = activeOwner ?: return@synchronized
+            if (owner.generation != expectedGeneration) return@synchronized
+            if (!owner.matchesCurrentStatus()) {
+                staleRegistration = clearOwnerLocked(owner.generation)
+                return@synchronized
             }
+            injectionEnded = true
         }
+        staleRegistration?.close()
     }
 
-    private fun isGenerationActive(generation: Long): Boolean =
-        synchronized(lock) { activeGeneration == generation }
+    private fun isGenerationActive(generation: Long): Boolean {
+        var staleRegistration: AutoCloseable? = null
+        val active = synchronized(lock) {
+            val owner = activeOwner ?: return@synchronized false
+            if (owner.generation != generation) return@synchronized false
+            if (!owner.matchesCurrentStatus()) {
+                staleRegistration = clearOwnerLocked(owner.generation)
+                return@synchronized false
+            }
+            true
+        }
+        staleRegistration?.close()
+        return active
+    }
 
     private fun deactivate(generation: Long) {
         val registration = synchronized(lock) {
-            if (activeGeneration != generation) return
-            activeGeneration = null
-            queuedPcm.clear()
-            injectionEnded = false
-            captureRegistration.also {
-                captureRegistration = null
-            }
+            clearOwnerLocked(generation)
         }
         registration?.close()
     }
+
+    private fun clearOwnerLocked(generation: Long): AutoCloseable? {
+        if (activeOwner?.generation != generation) return null
+        activeOwner = null
+        queuedPcm.clear()
+        injectionEnded = false
+        return captureRegistration.also {
+            captureRegistration = null
+        }
+    }
+
+    private fun ActiveOwner.matchesCurrentStatus(): Boolean =
+        runCatching { automationStatus() }
+            .getOrNull()
+            ?.let { status ->
+                status.state == VoiceAutomationRunState.Active &&
+                    status.runHash == runHash &&
+                    status.requestedTransport == VoiceAgentTransport.LiveKitExperimental
+            }
+            ?: false
+
+    private data class ActiveOwner(
+        val generation: Long,
+        val runHash: String,
+    )
 
     private class QueuedPcm(
         val bytes: ByteArray,

@@ -10,6 +10,7 @@ import io.livekit.android.events.RoomEvent as SdkRoomEvent
 import io.livekit.android.room.Room
 import io.livekit.android.room.participant.Participant
 import io.livekit.android.room.track.RemoteAudioTrack
+import io.livekit.android.room.track.Track
 import java.util.IdentityHashMap
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.mapNotNull
@@ -49,10 +50,26 @@ internal class AndroidLiveKitRoomSdkAdapter(
     },
 ) : LiveKitRoomSdkAdapter {
     private val remoteAudioLock = Any()
-    private val remoteAudioProbes = IdentityHashMap<RemoteAudioTrack, LiveKitRemoteAudioProbe>()
+    private val remoteAudioProbes = IdentityHashMap<RemoteAudioTrack, RemoteAudioAttachment>()
     private var remoteAudioClosed = false
+    private var expectedRemoteParticipantIdentity: String? = null
 
     override val events: Flow<LiveKitSdkRoomEvent> = sdkEvents.mapNotNull(::toSdkEvent)
+
+    override fun selectRemoteAudioParticipant(participantIdentity: String) {
+        require(participantIdentity.isNotBlank()) {
+            "Expected LiveKit remote audio participant is blank"
+        }
+        synchronized(remoteAudioLock) {
+            check(!remoteAudioClosed) {
+                "LiveKit remote audio is closed"
+            }
+            check(remoteAudioProbes.isEmpty()) {
+                "LiveKit remote audio participant cannot change while a sink is attached"
+            }
+            expectedRemoteParticipantIdentity = participantIdentity
+        }
+    }
 
     override suspend fun connect(url: String, token: String) {
         room.connect(url, token)
@@ -110,7 +127,13 @@ internal class AndroidLiveKitRoomSdkAdapter(
             data = event.data,
         )
         is SdkRoomEvent.TrackSubscribed -> {
-            (event.track as? RemoteAudioTrack)?.let(::attachRemoteAudio)
+            (event.track as? RemoteAudioTrack)?.let { track ->
+                attachRemoteAudio(
+                    track = track,
+                    participantIdentity = event.participant.identity?.value,
+                    source = event.publication.source,
+                )
+            }
             null
         }
         is SdkRoomEvent.TrackUnsubscribed -> {
@@ -120,13 +143,24 @@ internal class AndroidLiveKitRoomSdkAdapter(
         else -> null
     }
 
-    private fun attachRemoteAudio(track: RemoteAudioTrack) {
+    private fun attachRemoteAudio(
+        track: RemoteAudioTrack,
+        participantIdentity: String?,
+        source: Track.Source,
+    ) {
         synchronized(remoteAudioLock) {
-            if (remoteAudioClosed || remoteAudioProbes.containsKey(track)) return
+            if (
+                remoteAudioClosed ||
+                participantIdentity != expectedRemoteParticipantIdentity ||
+                source != Track.Source.MICROPHONE ||
+                remoteAudioProbes.isNotEmpty()
+            ) {
+                return
+            }
             val probe = remoteAudioProbeFactory()
             try {
                 track.addSink(probe)
-                remoteAudioProbes[track] = probe
+                remoteAudioProbes[track] = RemoteAudioAttachment(probe)
             } catch (error: Throwable) {
                 probe.close()
                 throw error
@@ -135,37 +169,50 @@ internal class AndroidLiveKitRoomSdkAdapter(
     }
 
     private fun detachRemoteAudio(track: RemoteAudioTrack) {
-        val probe = synchronized(remoteAudioLock) {
+        synchronized(remoteAudioLock) {
+            val attachment = remoteAudioProbes[track] ?: return
+            attachment.closeProbe()
+            track.removeSink(attachment.probe)
             remoteAudioProbes.remove(track)
-        } ?: return
-        try {
-            track.removeSink(probe)
-        } finally {
-            probe.close()
         }
     }
 
     private fun detachAllRemoteAudio(close: Boolean = false) {
-        val owned = synchronized(remoteAudioLock) {
+        val firstFailure = synchronized(remoteAudioLock) {
             if (close) remoteAudioClosed = true
-            remoteAudioProbes.entries.map { it.key to it.value }.also {
-                remoteAudioProbes.clear()
-            }
-        }
-        var firstFailure: Throwable? = null
-        owned.forEach { (track, probe) ->
-            try {
+            var failure: Throwable? = null
+            val iterator = remoteAudioProbes.entries.iterator()
+            while (iterator.hasNext()) {
+                val (track, attachment) = iterator.next()
                 try {
-                    track.removeSink(probe)
-                } finally {
-                    probe.close()
+                    attachment.closeProbe()
+                } catch (error: Throwable) {
+                    failure = failure.withFailure(error)
                 }
-            } catch (error: Throwable) {
-                firstFailure?.addSuppressed(error) ?: run {
-                    firstFailure = error
+                try {
+                    track.removeSink(attachment.probe)
+                    iterator.remove()
+                } catch (error: Throwable) {
+                    failure = failure.withFailure(error)
                 }
             }
+            failure
         }
         firstFailure?.let { throw it }
+    }
+
+    private fun Throwable?.withFailure(error: Throwable): Throwable =
+        this?.also { it.addSuppressed(error) } ?: error
+
+    private class RemoteAudioAttachment(
+        val probe: LiveKitRemoteAudioProbe,
+    ) {
+        private var closed = false
+
+        fun closeProbe() {
+            if (closed) return
+            closed = true
+            probe.close()
+        }
     }
 }

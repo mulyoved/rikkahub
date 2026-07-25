@@ -102,6 +102,7 @@ internal class LiveKitVoiceCallSession(
         synchronized(lifecycleLock) {
             if (!started.compareAndSet(false, true) || closed.get()) return
             try {
+                room.selectRemoteAudioParticipant(details.agentParticipantIdentity)
                 activateAutomationAudioIfRequested()
             } catch (error: Throwable) {
                 appendDiagnostic(

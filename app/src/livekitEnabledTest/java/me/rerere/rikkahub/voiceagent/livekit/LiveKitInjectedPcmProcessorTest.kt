@@ -3,6 +3,7 @@ package me.rerere.rikkahub.voiceagent.livekit
 import java.nio.ByteBuffer
 import io.livekit.android.audio.NoAudioHandler
 import me.rerere.rikkahub.voiceagent.VoiceAgentTransport
+import me.rerere.rikkahub.voiceagent.audio.VoiceAudioDebugInjector
 import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationRunState
 import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationStatus
 import org.junit.Assert.assertArrayEquals
@@ -135,15 +136,110 @@ class LiveKitInjectedPcmProcessorTest {
         assertFalse(source.injectionComplete())
     }
 
+    @Test
+    fun `source from run A rejects callbacks and capture after runtime rolls to run B`() {
+        listOf(
+            liveKitStatus(runHash = RUN_HASH_B),
+            liveKitStatus(runHash = RUN_HASH_B).copy(
+                requestedTransport = VoiceAgentTransport.DirectGemini,
+            ),
+        ).forEach { replacementStatus ->
+            var status = liveKitStatus()
+            val capture = FakeLiveKitCaptureRegistrar()
+            val source = LiveKitAutomationPcmSource(
+                automationStatus = { status },
+                captureRegistrar = capture,
+            )
+            val processor = LiveKitInjectedPcmProcessor(source)
+            val activation = source.activate(RUN_HASH)
+            capture.deliver(byteArrayOf(1, 2))
+
+            status = status.copy(state = VoiceAutomationRunState.Finalized)
+            status = replacementStatus
+            source.enqueuePcm16(byteArrayOf())
+            assertEquals(1, capture.closeCount)
+            source.enqueuePcm16(byteArrayOf(3, 4))
+            capture.deliver(byteArrayOf(5, 6))
+            capture.complete()
+            val hardware = byteArrayOf(91, 92, 93, 94)
+            val buffer = ByteBuffer.wrap(hardware)
+
+            assertFalse(processor.isEnabled())
+            processor.processAudio(numBands = 1, numFrames = 2, buffer = buffer)
+
+            assertArrayEquals(byteArrayOf(91, 92, 93, 94), hardware)
+            assertEquals(0, buffer.position())
+            assertFalse(source.injectionComplete())
+            activation.close()
+        }
+    }
+
+    @Test
+    fun `global injector lease prevents LiveKit and Direct capture coexistence`() {
+        VoiceAudioDebugInjector.clearForTest()
+        val first = LiveKitAutomationPcmSource(
+            automationStatus = { liveKitStatus() },
+            captureRegistrar = GlobalInjectorCaptureRegistrar,
+        )
+        val second = LiveKitAutomationPcmSource(
+            automationStatus = { liveKitStatus() },
+            captureRegistrar = GlobalInjectorCaptureRegistrar,
+        )
+        val firstActivation = first.activate(RUN_HASH)
+        var unexpectedSecondActivation: AutoCloseable? = null
+        var directRegistration: VoiceAudioDebugInjector.Registration? = null
+        var finalSecondActivation: AutoCloseable? = null
+        try {
+            val secondAttempt = runCatching { second.activate(RUN_HASH) }
+            unexpectedSecondActivation = secondAttempt.getOrNull()
+            assertTrue(secondAttempt.exceptionOrNull() is IllegalStateException)
+
+            directRegistration = VoiceAudioDebugInjector.registerCaptureIfCurrent(
+                onPcm16 = {},
+                onInjectionComplete = {},
+                isCurrent = { true },
+            )
+            assertEquals(null, directRegistration)
+
+            firstActivation.close()
+            directRegistration = VoiceAudioDebugInjector.registerCapture(onPcm16 = {})
+            val blockedByDirect = runCatching { second.activate(RUN_HASH) }
+            assertTrue(blockedByDirect.exceptionOrNull() is IllegalStateException)
+            blockedByDirect.getOrNull()?.close()
+
+            directRegistration.close()
+            directRegistration = null
+            finalSecondActivation = second.activate(RUN_HASH)
+            firstActivation.close()
+            val result = VoiceAudioDebugInjector.injectPcm16(
+                pcm16 = byteArrayOf(7, 8),
+                chunkBytes = 2,
+                chunkDelayMs = 0,
+            )
+
+            assertTrue(result.delivered)
+            assertArrayEquals(
+                byteArrayOf(7, 8),
+                process(LiveKitInjectedPcmProcessor(second), size = 2),
+            )
+        } finally {
+            finalSecondActivation?.close()
+            directRegistration?.close()
+            unexpectedSecondActivation?.close()
+            firstActivation.close()
+            VoiceAudioDebugInjector.clearForTest()
+        }
+    }
+
     private fun activeSource(capture: FakeLiveKitCaptureRegistrar) =
         LiveKitAutomationPcmSource(
             automationStatus = { liveKitStatus() },
             captureRegistrar = capture,
         )
 
-    private fun liveKitStatus() = VoiceAutomationStatus(
+    private fun liveKitStatus(runHash: String = RUN_HASH) = VoiceAutomationStatus(
         state = VoiceAutomationRunState.Active,
-        runHash = RUN_HASH,
+        runHash = runHash,
         comparisonHash = COMPARISON_HASH,
         requestedTransport = VoiceAgentTransport.LiveKitExperimental,
     )
@@ -167,6 +263,8 @@ class LiveKitInjectedPcmProcessorTest {
         private var isCurrent: (() -> Boolean)? = null
         var registrationCount = 0
             private set
+        var closeCount = 0
+            private set
 
         override fun register(
             onPcm16: (ByteArray) -> Unit,
@@ -178,6 +276,7 @@ class LiveKitInjectedPcmProcessorTest {
             this.onInjectionComplete = onInjectionComplete
             this.isCurrent = isCurrent
             return AutoCloseable {
+                closeCount += 1
                 this.onPcm16 = null
                 this.onInjectionComplete = null
                 this.isCurrent = null
@@ -193,8 +292,24 @@ class LiveKitInjectedPcmProcessorTest {
         }
     }
 
+    private object GlobalInjectorCaptureRegistrar : LiveKitAutomationCaptureRegistrar {
+        override fun register(
+            onPcm16: (ByteArray) -> Unit,
+            onInjectionComplete: () -> Unit,
+            isCurrent: () -> Boolean,
+        ): AutoCloseable? =
+            VoiceAudioDebugInjector.registerCaptureIfCurrent(
+                onPcm16 = onPcm16,
+                onInjectionComplete = onInjectionComplete,
+                isCurrent = isCurrent,
+            )?.let { registration ->
+                AutoCloseable(registration::close)
+            }
+    }
+
     private companion object {
         const val RUN_HASH = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        const val RUN_HASH_B = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
         const val COMPARISON_HASH =
             "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
     }

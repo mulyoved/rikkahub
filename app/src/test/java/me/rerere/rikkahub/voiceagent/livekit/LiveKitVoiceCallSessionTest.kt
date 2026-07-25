@@ -147,6 +147,11 @@ class LiveKitVoiceCallSessionTest {
         runCurrent()
 
         assertTrue(fixture.session.state.value.session is VoiceSessionStatus.Connected)
+        assertEquals(listOf(AGENT_IDENTITY), fixture.room.remoteAudioParticipants)
+        assertTrue(
+            fixture.room.lifecycle.indexOf("remote-audio:$AGENT_IDENTITY") <
+                fixture.room.lifecycle.indexOf("connect"),
+        )
         assertEquals(listOf(LIVEKIT_URL to PARTICIPANT_TOKEN), fixture.room.connections)
         assertEquals(listOf(true), fixture.room.microphoneValues)
     }
@@ -736,6 +741,7 @@ private class FakeLiveKitRoomFacade(
         }
     }
     val connections = mutableListOf<Pair<String, String>>()
+    val remoteAudioParticipants = mutableListOf<String>()
     val microphoneValues = mutableListOf<Boolean>()
     val rpcCalls = mutableListOf<Triple<String, String, String>>()
     private val handlers = mutableMapOf<String, suspend (LiveKitRpcInvocation) -> String>()
@@ -764,6 +770,11 @@ private class FakeLiveKitRoomFacade(
 
     fun captureHandler(method: String): suspend (LiveKitRpcInvocation) -> String =
         requireNotNull(handlers[method])
+
+    override fun selectRemoteAudioParticipant(participantIdentity: String) {
+        lifecycle += "remote-audio:$participantIdentity"
+        remoteAudioParticipants += participantIdentity
+    }
 
     override suspend fun connect(url: String, token: String) {
         connectAttempts += 1

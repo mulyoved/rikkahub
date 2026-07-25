@@ -41,6 +41,7 @@ internal interface LiveKitRoomFacade {
     val automationAudio: LiveKitAutomationAudioBinding
         get() = UnavailableLiveKitAutomationAudioBinding
 
+    fun selectRemoteAudioParticipant(participantIdentity: String) = Unit
     suspend fun connect(url: String, token: String)
     suspend fun setMicrophoneEnabled(enabled: Boolean): Boolean
     suspend fun performRpc(destination: String, method: String, payload: String): String
