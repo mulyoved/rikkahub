@@ -13,3 +13,8 @@ internal value class WriterGeneration(val value: Long) : Comparable<WriterGenera
 
 @JvmInline
 internal value class PlaybackCommandId(val value: Long)
+
+internal data class PlaybackCommandReservation(
+    val commandId: PlaybackCommandId,
+    val writerGeneration: WriterGeneration,
+)

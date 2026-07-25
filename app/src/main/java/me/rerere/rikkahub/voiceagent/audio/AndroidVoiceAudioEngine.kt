@@ -241,12 +241,14 @@ internal class VoiceAutomationOutputTracker {
 
     fun register(
         commandId: PlaybackCommandId,
+        writerGeneration: WriterGeneration,
         byteCount: Int,
         nonSilent: Boolean,
         probe: VoiceAutomationAudioProbe,
     ) {
         synchronized(lock) {
             metadataByCommand[commandId] = OutputMetadata(
+                writerGeneration = writerGeneration,
                 byteCount = byteCount,
                 nonSilent = nonSilent,
                 probe = probe,
@@ -300,9 +302,11 @@ internal class VoiceAutomationOutputTracker {
     private fun markQueued(diagnostic: VoicePlaybackDiagnostic.ChunkQueued): OutputMetadata? =
         synchronized(lock) {
             val metadata = metadataByCommand[diagnostic.commandId]
-                ?.takeIf { it.byteCount == diagnostic.bytes }
+                ?.takeIf {
+                    it.byteCount == diagnostic.bytes &&
+                        it.writerGeneration == diagnostic.writerGeneration
+                }
                 ?: return@synchronized null
-            metadata.writerGeneration = diagnostic.writerGeneration
             metadata.queued = true
             if (metadata.written) {
                 metadataByCommand.remove(diagnostic.commandId)
@@ -313,8 +317,7 @@ internal class VoiceAutomationOutputTracker {
     private fun removeBeforeGeneration(activeWriterGeneration: WriterGeneration) {
         synchronized(lock) {
             metadataByCommand.entries.removeAll { (_, metadata) ->
-                val writerGeneration = metadata.writerGeneration
-                writerGeneration == null || writerGeneration < activeWriterGeneration
+                metadata.writerGeneration < activeWriterGeneration
             }
         }
     }
@@ -322,7 +325,10 @@ internal class VoiceAutomationOutputTracker {
     private fun markWritten(diagnostic: VoicePlaybackDiagnostic.ChunkWritten): OutputMetadata? =
         synchronized(lock) {
             val metadata = metadataByCommand[diagnostic.commandId]
-                ?.takeIf { it.byteCount == diagnostic.bytes }
+                ?.takeIf {
+                    it.byteCount == diagnostic.bytes &&
+                        it.writerGeneration == diagnostic.writerGeneration
+                }
                 ?: return@synchronized null
             metadata.written = true
             if (metadata.queued) {
@@ -340,11 +346,11 @@ internal class VoiceAutomationOutputTracker {
     }
 
     private class OutputMetadata(
+        val writerGeneration: WriterGeneration,
         val byteCount: Int,
         val nonSilent: Boolean,
         val probe: VoiceAutomationAudioProbe,
     ) {
-        var writerGeneration: WriterGeneration? = null
         var queued = false
         var written = false
     }
@@ -514,28 +520,29 @@ class AndroidVoiceAudioEngine(
         val metadata = VoiceAutomationAudioProbes.activeSharedOrNull()?.let { probe ->
             decodeOutputMetadataOrNull(base64Pcm16, probe)
         }
-        val commandId = metadata?.let {
-            playbackWriter.reserveCommandId()
+        val commandReservation = metadata?.let {
+            playbackWriter.reserveCommand()
         }
         if (metadata != null) {
             automationOutputTracker.register(
-                commandId = checkNotNull(commandId),
+                commandId = checkNotNull(commandReservation).commandId,
+                writerGeneration = commandReservation.writerGeneration,
                 byteCount = metadata.byteCount,
                 nonSilent = metadata.nonSilent,
                 probe = metadata.probe,
             )
         }
-        val accepted = if (commandId == null) {
+        val accepted = if (commandReservation == null) {
             playbackWriter.playBase64(base64Pcm16 = base64Pcm16, sessionId = sessionId)
         } else {
             playbackWriter.playBase64(
                 base64Pcm16 = base64Pcm16,
                 sessionId = sessionId,
-                commandId = commandId,
+                commandReservation = commandReservation,
             )
         }
-        if (!accepted && commandId != null) {
-            automationOutputTracker.remove(commandId)
+        if (!accepted && commandReservation != null) {
+            automationOutputTracker.remove(commandReservation.commandId)
         }
         return accepted
     }

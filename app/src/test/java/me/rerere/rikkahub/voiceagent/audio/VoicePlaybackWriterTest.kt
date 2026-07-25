@@ -18,6 +18,43 @@ import kotlin.concurrent.thread
 
 class VoicePlaybackWriterTest {
     @Test
+    fun `delayed suppression preserves replacement registered before its queued diagnostic`() {
+        val callbacks = mutableListOf<String>()
+        val tracker = VoiceAutomationOutputTracker()
+        val probe = recordingAutomationProbe(callbacks)
+        val replacementCommandId = PlaybackCommandId(2L)
+
+        tracker.register(
+            commandId = replacementCommandId,
+            writerGeneration = WriterGeneration(2L),
+            byteCount = 2,
+            nonSilent = true,
+            probe = probe,
+        )
+        tracker.onDiagnostic(
+            VoicePlaybackDiagnostic.PlaybackSuppressed(
+                writerGeneration = WriterGeneration(2L),
+            ),
+        )
+        tracker.onDiagnostic(
+            VoicePlaybackDiagnostic.ChunkQueued(
+                commandId = replacementCommandId,
+                bytes = 2,
+                writerGeneration = WriterGeneration(2L),
+            ),
+        )
+        tracker.onDiagnostic(
+            VoicePlaybackDiagnostic.ChunkWritten(
+                commandId = replacementCommandId,
+                bytes = 2,
+                writerGeneration = WriterGeneration(2L),
+            ),
+        )
+
+        assertEquals(listOf("queued:2", "written:2:true"), callbacks)
+    }
+
+    @Test
     fun `stale old command cannot consume equal sized replacement automation metadata`() {
         val scope = testScope()
         val diagnostics = CopyOnWriteArrayList<VoicePlaybackDiagnostic>()
@@ -38,9 +75,11 @@ class VoicePlaybackWriterTest {
             },
         )
         writer.activateSession(100L)
-        val oldCommandId = writer.reserveCommandId()
+        val oldCommandReservation = writer.reserveCommand()
+        val oldCommandId = oldCommandReservation.commandId
         tracker.register(
             commandId = oldCommandId,
+            writerGeneration = oldCommandReservation.writerGeneration,
             byteCount = 2,
             nonSilent = true,
             probe = probe,
@@ -49,16 +88,18 @@ class VoicePlaybackWriterTest {
             writer.playBase64(
                 base64Pcm16 = "AQE=",
                 sessionId = 100L,
-                commandId = oldCommandId,
+                commandReservation = oldCommandReservation,
             ),
         )
         assertTrue(oldSink.awaitWriteStarted())
 
         writer.suppress()
         callbacks.clear()
-        val replacementCommandId = writer.reserveCommandId()
+        val replacementCommandReservation = writer.reserveCommand()
+        val replacementCommandId = replacementCommandReservation.commandId
         tracker.register(
             commandId = replacementCommandId,
+            writerGeneration = replacementCommandReservation.writerGeneration,
             byteCount = 2,
             nonSilent = true,
             probe = probe,
@@ -67,7 +108,7 @@ class VoicePlaybackWriterTest {
             writer.playBase64(
                 base64Pcm16 = "AgI=",
                 sessionId = 100L,
-                commandId = replacementCommandId,
+                commandReservation = replacementCommandReservation,
             ),
         )
 

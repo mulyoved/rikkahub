@@ -83,12 +83,17 @@ internal class VoicePlaybackWriter(
     private var retirementInProgress = false
     private var playbackRetirementFailed = false
 
-    fun reserveCommandId(): PlaybackCommandId = PlaybackCommandId(nextCommandId.incrementAndGet())
+    fun reserveCommand(): PlaybackCommandReservation = synchronized(lock) {
+        PlaybackCommandReservation(
+            commandId = PlaybackCommandId(nextCommandId.incrementAndGet()),
+            writerGeneration = writerGeneration,
+        )
+    }
 
     fun playBase64(
         base64Pcm16: String,
         sessionId: Long?,
-        commandId: PlaybackCommandId = reserveCommandId(),
+        commandReservation: PlaybackCommandReservation? = null,
     ): Boolean {
         val pcm16 = try {
             Base64.getDecoder().decode(base64Pcm16)
@@ -100,11 +105,16 @@ internal class VoicePlaybackWriter(
             onDiagnostic(VoicePlaybackDiagnostic.MalformedChunk("Empty playback chunk"))
             return false
         }
+        val reservation = commandReservation ?: reserveCommand()
 
         var staleActiveWriterGeneration: WriterGeneration? = null
         var staleActiveSessionId: Long? = null
         val enqueued = synchronized(lock) {
             if (released || retirementInProgress || playbackRetirementFailed) {
+                null
+            } else if (reservation.writerGeneration != writerGeneration) {
+                staleActiveWriterGeneration = writerGeneration
+                staleActiveSessionId = activeSessionId
                 null
             } else if (sessionId != null && activeSessionId != sessionId) {
                 staleActiveWriterGeneration = writerGeneration
@@ -118,9 +128,9 @@ internal class VoicePlaybackWriter(
                     epochWriterGenerations[epoch] = writerGeneration
                 }
                 val command = PlaybackCommand.Play(
-                    commandId = commandId,
+                    commandId = reservation.commandId,
                     pcm16 = pcm16,
-                    writerGeneration = writerGeneration,
+                    writerGeneration = reservation.writerGeneration,
                 )
                 if (!commands.trySend(command).isSuccess) {
                     if (existingEpoch == null) {
@@ -141,8 +151,8 @@ internal class VoicePlaybackWriter(
             staleActiveWriterGeneration?.let { activeWriterGeneration ->
                 onDiagnostic(
                     VoicePlaybackDiagnostic.StaleChunkRejected(
-                        commandId = commandId,
-                        writerGeneration = activeWriterGeneration,
+                        commandId = reservation.commandId,
+                        writerGeneration = reservation.writerGeneration,
                         activeWriterGeneration = activeWriterGeneration,
                         rejectedSessionId = sessionId,
                         activeSessionId = staleActiveSessionId,
