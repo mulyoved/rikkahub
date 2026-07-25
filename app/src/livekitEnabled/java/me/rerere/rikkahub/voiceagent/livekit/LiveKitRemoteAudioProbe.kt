@@ -15,7 +15,7 @@ internal class LiveKitRemoteAudioProbe(
     private var pendingBytes = 0
     private var lastNonSilent: Boolean? = null
     private var lastProgressMs: Long? = null
-    private var mediaOwner: VoiceAutomationMediaOwner? =
+    private val mediaOwner: VoiceAutomationMediaOwner? =
         automationAudioProbe.captureLiveKitMediaOwner()
 
     override fun onData(
@@ -32,9 +32,7 @@ internal class LiveKitRemoteAudioProbe(
         val nowMs = monotonicMs()
         synchronized(lock) {
             if (closed) return
-            val owner = mediaOwner ?: automationAudioProbe.captureLiveKitMediaOwner()?.also {
-                mediaOwner = it
-            } ?: return
+            val owner = mediaOwner ?: return
             val previousState = lastNonSilent
             if (previousState != null && previousState != nonSilent) {
                 flushProgress(owner, previousState, nowMs)

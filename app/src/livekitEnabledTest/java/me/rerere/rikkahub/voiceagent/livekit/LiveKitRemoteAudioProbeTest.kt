@@ -159,6 +159,26 @@ class LiveKitRemoteAudioProbeTest {
     }
 
     @Test
+    fun `ownerless probe stays inert after a replacement LiveKit run becomes active`() {
+        val runtime = RecordingRuntime(
+            requestedTransport = VoiceAgentTransport.DirectGemini,
+        )
+        val sharedProbe = DefaultVoiceAutomationAudioProbe(
+            runtimeProvider = { runtime },
+            monotonicMs = { 1L },
+        )
+        val probe = LiveKitRemoteAudioProbe(sharedProbe, monotonicMs = { 1L })
+        runtime.runHash = RUN_HASH_B
+        runtime.requestedTransport = VoiceAgentTransport.LiveKitExperimental
+
+        probe.onData(ByteBuffer.wrap(byteArrayOf(1, 0)), 16, 48_000, 1, 1, 1)
+        probe.onData(ByteBuffer.wrap(byteArrayOf(0, 0)), 16, 48_000, 1, 1, 2)
+        probe.close()
+
+        assertEquals(emptyList<VoiceAutomationEventInput>(), runtime.events)
+    }
+
+    @Test
     fun `close drains once and rejects every later remote frame`() {
         val recording = RecordingAudioProbe()
         val probe = LiveKitRemoteAudioProbe(recording, monotonicMs = { 1L })
