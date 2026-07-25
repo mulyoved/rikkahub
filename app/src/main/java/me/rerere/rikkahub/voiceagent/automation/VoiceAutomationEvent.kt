@@ -1,0 +1,131 @@
+package me.rerere.rikkahub.voiceagent.automation
+
+import kotlinx.serialization.SerialName
+import kotlinx.serialization.Serializable
+import me.rerere.rikkahub.voiceagent.VoiceAgentCallEndpointType
+import me.rerere.rikkahub.voiceagent.VoiceAgentTransport
+
+@Serializable
+internal enum class VoiceAutomationEventName(val wireName: String) {
+    @SerialName("run_prepared") RUN_PREPARED("run_prepared"),
+    @SerialName("call_start_requested") CALL_START_REQUESTED("call_start_requested"),
+    @SerialName("call_active") CALL_ACTIVE("call_active"),
+    @SerialName("call_stopped") CALL_STOPPED("call_stopped"),
+    @SerialName("run_finalized") RUN_FINALIZED("run_finalized"),
+    @SerialName("injection_started") INJECTION_STARTED("injection_started"),
+    @SerialName("injection_first_chunk") INJECTION_FIRST_CHUNK("injection_first_chunk"),
+    @SerialName("injection_completed") INJECTION_COMPLETED("injection_completed"),
+    @SerialName("prompt_ended") PROMPT_ENDED("prompt_ended"),
+    @SerialName("remote_audio_first_non_silent") REMOTE_AUDIO_FIRST_NON_SILENT("remote_audio_first_non_silent"),
+    @SerialName("playback_queued") PLAYBACK_QUEUED("playback_queued"),
+    @SerialName("playback_active") PLAYBACK_ACTIVE("playback_active"),
+    @SerialName("playback_stopped") PLAYBACK_STOPPED("playback_stopped"),
+    @SerialName("playback_written") PLAYBACK_WRITTEN("playback_written"),
+    @SerialName("playback_drained") PLAYBACK_DRAINED("playback_drained"),
+    @SerialName("route_requested") ROUTE_REQUESTED("route_requested"),
+    @SerialName("route_observed") ROUTE_OBSERVED("route_observed"),
+    @SerialName("lifecycle_requested") LIFECYCLE_REQUESTED("lifecycle_requested"),
+    @SerialName("lifecycle_observed") LIFECYCLE_OBSERVED("lifecycle_observed"),
+    @SerialName("network_observed") NETWORK_OBSERVED("network_observed"),
+    @SerialName("interrupt_started") INTERRUPT_STARTED("interrupt_started"),
+    @SerialName("reconnect_started") RECONNECT_STARTED("reconnect_started"),
+    @SerialName("reconnect_media_restored") RECONNECT_MEDIA_RESTORED("reconnect_media_restored"),
+    @SerialName("handover_started") HANDOVER_STARTED("handover_started"),
+    @SerialName("handover_cellular_observed") HANDOVER_CELLULAR_OBSERVED("handover_cellular_observed"),
+    @SerialName("handover_wifi_restored") HANDOVER_WIFI_RESTORED("handover_wifi_restored"),
+    @SerialName("handover_media_restored") HANDOVER_MEDIA_RESTORED("handover_media_restored"),
+    @SerialName("dropout_started") DROPOUT_STARTED("dropout_started"),
+    @SerialName("dropout_ended") DROPOUT_ENDED("dropout_ended"),
+    @SerialName("failure") FAILURE("failure"),
+}
+
+@Serializable
+internal enum class VoiceAutomationNetwork(val wireName: String) {
+    @SerialName("wifi") WIFI("wifi"),
+    @SerialName("cellular") CELLULAR("cellular"),
+    @SerialName("none") NONE("none"),
+}
+
+@Serializable
+internal enum class VoiceAutomationLifecycle(val wireName: String) {
+    @SerialName("foreground") FOREGROUND("foreground"),
+    @SerialName("background") BACKGROUND("background"),
+}
+
+@Serializable
+internal enum class VoiceAutomationCorrelationKind(val wireName: String) {
+    @SerialName("app") APP("app"),
+    @SerialName("session") SESSION("session"),
+    @SerialName("room") ROOM("room"),
+    @SerialName("participant") PARTICIPANT("participant"),
+    @SerialName("dispatch") DISPATCH("dispatch"),
+    @SerialName("worker_event") WORKER_EVENT("worker_event"),
+    @SerialName("media_state") MEDIA_STATE("media_state"),
+}
+
+internal data class VoiceAutomationEvent(
+    val schemaVersion: Int = 1,
+    val monotonicMs: Long,
+    val wallClockMs: Long,
+    val runHash: String,
+    val comparisonHash: String,
+    val requestedTransport: VoiceAgentTransport,
+    val observedTransport: VoiceAgentTransport?,
+    val name: VoiceAutomationEventName,
+    val route: VoiceAgentCallEndpointType? = null,
+    val network: VoiceAutomationNetwork? = null,
+    val lifecycle: VoiceAutomationLifecycle? = null,
+    val playbackEpoch: Long? = null,
+    val byteCount: Long? = null,
+    val succeeded: Boolean? = null,
+    val correlationKind: VoiceAutomationCorrelationKind? = null,
+    val correlationHash: String? = null,
+)
+
+internal data class VoiceAutomationRunBinding(
+    val runHash: String,
+    val comparisonHash: String,
+    val requestedTransport: VoiceAgentTransport,
+)
+
+internal data class VoiceAutomationEventInput(
+    val name: VoiceAutomationEventName,
+    val observedTransport: VoiceAgentTransport? = null,
+    val route: VoiceAgentCallEndpointType? = null,
+    val network: VoiceAutomationNetwork? = null,
+    val lifecycle: VoiceAutomationLifecycle? = null,
+    val playbackEpoch: Long? = null,
+    val byteCount: Long? = null,
+    val succeeded: Boolean? = null,
+    val correlationKind: VoiceAutomationCorrelationKind? = null,
+    val correlationHash: String? = null,
+)
+
+internal object VoiceAutomationEventValidation {
+    private val hashPattern = Regex("sha256:[0-9a-f]{64}")
+
+    fun validate(binding: VoiceAutomationRunBinding) {
+        validateHash("runHash", binding.runHash)
+        validateHash("comparisonHash", binding.comparisonHash)
+    }
+
+    fun validate(event: VoiceAutomationEvent) {
+        require(event.schemaVersion == 1) { "Unsupported automation event schema version" }
+        require(event.monotonicMs > 0) { "monotonicMs must be positive" }
+        require(event.wallClockMs > 0) { "wallClockMs must be positive" }
+        validateHash("runHash", event.runHash)
+        validateHash("comparisonHash", event.comparisonHash)
+        require(event.playbackEpoch == null || event.playbackEpoch > 0) {
+            "playbackEpoch must be positive"
+        }
+        require(event.byteCount == null || event.byteCount >= 0) { "byteCount must not be negative" }
+        require((event.correlationKind == null) == (event.correlationHash == null)) {
+            "correlation kind and hash must be supplied together"
+        }
+        event.correlationHash?.let { validateHash("correlationHash", it) }
+    }
+
+    fun validateHash(name: String, value: String) {
+        require(hashPattern.matches(value)) { "$name must be a SHA-256 hash" }
+    }
+}
