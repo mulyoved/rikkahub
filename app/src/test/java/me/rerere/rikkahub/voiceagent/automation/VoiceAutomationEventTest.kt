@@ -88,6 +88,16 @@ class VoiceAutomationEventTest {
         }
     }
 
+    @Test
+    fun `writer recreation rejects an existing non empty run artifact`() {
+        val root = Files.createTempDirectory("voice-automation-existing-run").toFile()
+        VoiceAutomationEventWriter.create(root, RUN_HASH).append(event())
+
+        assertFailsWith<IllegalStateException> {
+            VoiceAutomationEventWriter.create(root, RUN_HASH)
+        }
+    }
+
     private fun event(
         monotonicMs: Long = 10,
         wallClockMs: Long = 20,

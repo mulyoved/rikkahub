@@ -62,6 +62,45 @@ class VoiceAutomationRuntimeTest {
         }
     }
 
+    @Test
+    fun `reset cannot reprepare a finalized run hash`() {
+        val runtime = DefaultVoiceAutomationRuntime(
+            Files.createTempDirectory("voice-automation-runtime-reprepare").toFile(),
+            FakeClock(),
+        )
+        val binding = VoiceAutomationRunBinding(RUN_HASH, COMPARISON_HASH, VoiceAgentTransport.DirectGemini)
+        runtime.prepare(binding)
+        runtime.finalizeRun()
+        runtime.reset()
+
+        assertFailsWith<IllegalStateException> { runtime.prepare(binding) }
+    }
+
+    @Test
+    fun `record rejects forged run prepared boundary`() {
+        val runtime = preparedRuntime()
+
+        assertFailsWith<IllegalArgumentException> {
+            runtime.record(VoiceAutomationEventInput(VoiceAutomationEventName.RUN_PREPARED))
+        }
+    }
+
+    @Test
+    fun `record rejects forged run finalized boundary`() {
+        val runtime = preparedRuntime()
+
+        assertFailsWith<IllegalArgumentException> {
+            runtime.record(VoiceAutomationEventInput(VoiceAutomationEventName.RUN_FINALIZED))
+        }
+    }
+
+    private fun preparedRuntime(): DefaultVoiceAutomationRuntime = DefaultVoiceAutomationRuntime(
+        Files.createTempDirectory("voice-automation-runtime-boundary").toFile(),
+        FakeClock(),
+    ).also { runtime ->
+        runtime.prepare(VoiceAutomationRunBinding(RUN_HASH, COMPARISON_HASH, VoiceAgentTransport.DirectGemini))
+    }
+
     private class FakeClock : VoiceAutomationClock {
         private var tick = 0L
 

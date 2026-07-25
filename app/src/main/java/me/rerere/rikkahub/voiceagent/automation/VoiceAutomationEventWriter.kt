@@ -92,6 +92,9 @@ internal class VoiceAutomationEventWriter private constructor(
             val parent = checkNotNull(file.parentFile)
             check(parent.exists() || parent.mkdirs()) { "Unable to create automation artifact directory" }
             restrictToOwner(parent, directory = true)
+            check(!file.exists() || file.length() == 0L) {
+                "Automation event artifact already contains a run"
+            }
             if (!file.exists()) check(file.createNewFile()) { "Unable to create automation event artifact" }
             restrictToOwner(file, directory = false)
             return VoiceAutomationEventWriter(file, runHash)

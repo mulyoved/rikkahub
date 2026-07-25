@@ -57,7 +57,13 @@ internal class DefaultVoiceAutomationRuntime(
     override fun record(event: VoiceAutomationEventInput) {
         when (currentStatus.state) {
             VoiceAutomationRunState.Idle -> Unit
-            VoiceAutomationRunState.Active -> recordActive(event)
+            VoiceAutomationRunState.Active -> {
+                require(event.name !in setOf(
+                    VoiceAutomationEventName.RUN_PREPARED,
+                    VoiceAutomationEventName.RUN_FINALIZED,
+                )) { "Run lifecycle boundaries are reserved for the runtime" }
+                recordActive(event)
+            }
             VoiceAutomationRunState.Finalized -> error("Automation run has already been finalized")
         }
     }
