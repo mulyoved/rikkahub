@@ -1,11 +1,37 @@
 package me.rerere.rikkahub.voiceagent.livekit
 
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.decodeFromString
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
 import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationCorrelationKind
 import java.net.URI
 import java.security.MessageDigest
 
 private val LIVEKIT_IDENTIFIER = Regex("^[A-Za-z0-9_-]{1,128}$")
+private val LIVEKIT_HASH = Regex("sha256:[0-9a-f]{64}")
+
+@Serializable
+internal data class LiveKitReadyMessage(
+    val version: Int,
+    val voiceSessionId: String,
+    val kind: String,
+    val observedAt: String,
+    val eventIdHash: String,
+)
+
+internal fun parseLiveKitReadyMessage(payload: String): LiveKitReadyMessage? {
+    val message = runCatching {
+        Json.decodeFromString<LiveKitReadyMessage>(payload)
+    }.getOrNull() ?: return null
+    if (
+        message.version != 1 ||
+        message.kind != "ready" ||
+        !LIVEKIT_HASH.matches(message.eventIdHash)
+    ) return null
+    if (Json.encodeToString(message) != payload) return null
+    return message
+}
 
 @Serializable
 data class LiveKitSessionRequest(
@@ -85,6 +111,9 @@ internal fun LiveKitSessionDetails.automationCorrelations(): List<LiveKitAutomat
             dispatchId.liveKitAutomationHash(),
         ),
     )
+
+internal fun liveKitWorkerReadyHash(activeTraceId: String): String =
+    "$activeTraceId:worker_ready".liveKitAutomationHash()
 
 private fun String.liveKitAutomationHash(): String =
     "sha256:" + MessageDigest.getInstance("SHA-256")

@@ -17,8 +17,6 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
-import kotlinx.serialization.Serializable
-import kotlinx.serialization.json.Json
 import me.rerere.rikkahub.voiceagent.CleanupAttemptFailures
 import me.rerere.rikkahub.voiceagent.CleanupAttemptOutcome
 import me.rerere.rikkahub.voiceagent.JoinedCleanupOperation
@@ -34,6 +32,7 @@ import me.rerere.rikkahub.voiceagent.VoiceDiagnosticLine
 import me.rerere.rikkahub.voiceagent.VoiceSessionStatus
 import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationAudioProbe
 import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationAudioProbes
+import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationCorrelationKind
 import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationEventInput
 import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationEventName
 import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationRunState
@@ -55,13 +54,13 @@ internal class LiveKitVoiceCallSession(
     private val connectTimeoutMillis: Long = DEFAULT_LIVEKIT_CONNECT_TIMEOUT_MS,
     private val readyTimeoutMillis: Long = DEFAULT_LIVEKIT_READY_TIMEOUT_MS,
     private val cleanupDispatcher: CoroutineDispatcher = Dispatchers.Default,
-    private val json: Json = Json,
     private val automationRuntimeProvider: () -> VoiceAutomationRuntime? =
         ::liveKitAutomationRuntimeOrNull,
     private val automationAudioProbeProvider: () -> VoiceAutomationAudioProbe? =
         VoiceAutomationAudioProbes::activeSharedOrNull,
 ) : RouteOwnedManagedVoiceCallSession {
-    private val mutableState = MutableStateFlow(VoiceAgentUiState(traceId = traceId))
+    private val activeTraceId = traceId
+    private val mutableState = MutableStateFlow(VoiceAgentUiState(traceId = activeTraceId))
     private val started = AtomicBoolean(false)
     private val closed = AtomicBoolean(false)
     private val lifecycleLock = Any()
@@ -75,6 +74,7 @@ internal class LiveKitVoiceCallSession(
     private var eventJob: Job? = null
     private var connectionJob: Job? = null
     private var microphoneJob: Job? = null
+    private var automationRuntime: VoiceAutomationRuntime? = null
     private var automationAudioActivation: AutoCloseable? = null
 
     init {
@@ -209,6 +209,7 @@ internal class LiveKitVoiceCallSession(
                     ),
                 )
             }
+            automationRuntime = runtime
             automationAudioActivation = activation
         } catch (error: Throwable) {
             activation.close()
@@ -273,12 +274,19 @@ internal class LiveKitVoiceCallSession(
 
     private fun handleReady(event: LiveKitRoomEvent.Data) {
         if (event.participantIdentity != details.agentParticipantIdentity || event.topic != LIVEKIT_READY_TOPIC) return
-        val message = runCatching { json.decodeFromString<LiveKitReadyMessage>(event.payload) }.getOrNull() ?: return
+        val message = parseLiveKitReadyMessage(event.payload) ?: return
         if (
-            message.version != 1 ||
             message.voiceSessionId != details.voiceSessionId ||
-            message.kind != "ready"
+            message.eventIdHash != liveKitWorkerReadyHash(activeTraceId)
         ) return
+        automationRuntime?.record(
+            VoiceAutomationEventInput(
+                name = VoiceAutomationEventName.CALL_ACTIVE,
+                observedTransport = VoiceAgentTransport.LiveKitExperimental,
+                correlationKind = VoiceAutomationCorrelationKind.WORKER_EVENT,
+                correlationHash = message.eventIdHash,
+            ),
+        )
         wasReady = true
         ready.complete(Unit)
         mutableState.update { it.copy(session = VoiceSessionStatus.Connected, error = null) }
@@ -568,14 +576,6 @@ private sealed interface LiveKitRpcWork {
 
 private class LiveKitRpcAdmissionClosedException :
     IllegalStateException("LiveKit RPC admission is closed")
-
-@Serializable
-private data class LiveKitReadyMessage(
-    val version: Int,
-    val voiceSessionId: String,
-    val kind: String,
-    val observedAt: String,
-)
 
 private fun liveKitAutomationRuntimeOrNull(): VoiceAutomationRuntime? =
     runCatching {

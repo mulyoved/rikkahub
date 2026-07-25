@@ -171,6 +171,37 @@ class LiveKitVoiceCallSessionTest {
     }
 
     @Test
+    fun `ready records worker evidence only after its hash matches the active trace`() = runTest {
+        val runtime = SessionRecordingAutomationRuntime()
+        val fixture = fixture(automationRuntime = runtime)
+        fixture.session.start()
+        runCurrent()
+        fixture.room.emit(LiveKitRoomEvent.Connected)
+        fixture.room.emit(
+            LiveKitRoomEvent.Data(
+                AGENT_IDENTITY,
+                READY_TOPIC,
+                readyJson(eventIdHash = OTHER_WORKER_EVENT_HASH),
+            ),
+        )
+        runCurrent()
+
+        assertFalse(fixture.session.state.value.session is VoiceSessionStatus.Connected)
+        assertTrue(runtime.events.none { it.correlationKind == VoiceAutomationCorrelationKind.WORKER_EVENT })
+
+        fixture.room.emit(LiveKitRoomEvent.Data(AGENT_IDENTITY, READY_TOPIC, readyJson()))
+        runCurrent()
+
+        assertTrue(fixture.session.state.value.session is VoiceSessionStatus.Connected)
+        val workerEvent = runtime.events.single {
+            it.correlationKind == VoiceAutomationCorrelationKind.WORKER_EVENT
+        }
+        assertEquals(VoiceAutomationEventName.CALL_ACTIVE, workerEvent.name)
+        assertEquals(WORKER_EVENT_HASH, workerEvent.correlationHash)
+        assertFalse(workerEvent.correlationHash.orEmpty().contains(TEST_TRACE_ID))
+    }
+
+    @Test
     fun `mute and explicit interrupt use only LiveKit`() = runTest {
         val fixture = fixture()
         fixture.session.start()
@@ -908,8 +939,11 @@ private fun details() = LiveKitSessionDetails(
     expiresAt = "2026-07-20T02:00:00Z",
 )
 
-private fun readyJson(voiceSessionId: String = VOICE_SESSION_ID): String =
-    """{"version":1,"voiceSessionId":"$voiceSessionId","kind":"ready","observedAt":"2026-07-20T00:00:00Z"}"""
+private fun readyJson(
+    voiceSessionId: String = VOICE_SESSION_ID,
+    eventIdHash: String = WORKER_EVENT_HASH,
+): String =
+    """{"version":1,"voiceSessionId":"$voiceSessionId","kind":"ready","observedAt":"2026-07-20T00:00:00Z","eventIdHash":"$eventIdHash"}"""
 
 private const val LIVEKIT_URL = "wss://project.livekit.cloud"
 private const val PARTICIPANT_TOKEN = "participant-token"
@@ -918,6 +952,10 @@ private const val AGENT_IDENTITY = "agent_lvs_1"
 private const val READY_TOPIC = "voice.ready.v1"
 private const val INTERRUPT_RPC = "voice.interrupt"
 private const val TEST_TRACE_ID = "VA123456-0000000000000000"
+private const val WORKER_EVENT_HASH =
+    "sha256:3f564e83895a2b6b9ad5e32c6b2c14aea66bdca1c2dc29ddec41a6c0e52c142d"
+private const val OTHER_WORKER_EVENT_HASH =
+    "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
 private const val AUTOMATION_RUN_HASH =
     "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 private const val AUTOMATION_COMPARISON_HASH =

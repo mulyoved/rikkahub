@@ -10,11 +10,49 @@ import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class LiveKitVoiceContractsTest {
+    @Test
+    fun `worker ready parser accepts the exact canonical hashed contract`() {
+        val message = requireNotNull(parseLiveKitReadyMessage(CANONICAL_READY_JSON))
+
+        assertEquals(1, message.version)
+        assertEquals("voice-session-id", message.voiceSessionId)
+        assertEquals("ready", message.kind)
+        assertEquals("2026-07-25T00:00:00Z", message.observedAt)
+        assertEquals(WORKER_EVENT_HASH, message.eventIdHash)
+    }
+
+    @Test
+    fun `worker ready parser rejects duplicate missing extra uppercase and malformed fields`() {
+        listOf(
+            CANONICAL_READY_JSON.replace(
+                ",\"eventIdHash\":\"$WORKER_EVENT_HASH\"",
+                "",
+            ),
+            CANONICAL_READY_JSON.replace(
+                "\"eventIdHash\":",
+                "\"eventIdHash\":\"$WORKER_EVENT_HASH\",\"eventIdHash\":",
+            ),
+            CANONICAL_READY_JSON.replace(
+                "}",
+                ",\"extra\":true}",
+            ),
+            CANONICAL_READY_JSON.replace(WORKER_EVENT_HASH, "sha256:" + "A".repeat(64)),
+            CANONICAL_READY_JSON.replace(WORKER_EVENT_HASH, "sha256:abcd"),
+            "{\"version\":1,\"voiceSessionId\":\"voice-session-id\"," +
+                "\"observedAt\":\"2026-07-25T00:00:00Z\",\"kind\":\"ready\"," +
+                "\"eventIdHash\":\"$WORKER_EVENT_HASH\"}",
+            CANONICAL_READY_JSON.replace(",\"kind\":\"ready\"", " , \"kind\": \"ready\""),
+        ).forEach { payload ->
+            assertNull(payload, parseLiveKitReadyMessage(payload))
+        }
+    }
+
     @Test
     fun `create LiveKit session uses exact mobile request and parses response`() = runBlocking {
         var seenRequest: Request? = null
@@ -150,6 +188,12 @@ class LiveKitVoiceContractsTest {
         expiresAt = "2026-07-20T02:00:00Z",
     )
 }
+
+private const val WORKER_EVENT_HASH =
+    "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+private const val CANONICAL_READY_JSON =
+    "{\"version\":1,\"voiceSessionId\":\"voice-session-id\",\"kind\":\"ready\"," +
+        "\"observedAt\":\"2026-07-25T00:00:00Z\",\"eventIdHash\":\"$WORKER_EVENT_HASH\"}"
 
 private fun transportFor(handler: (Request) -> Response): HermesVoiceHttpTransport =
     HermesVoiceHttpTransport(handler)
