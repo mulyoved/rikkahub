@@ -631,12 +631,14 @@ if [[ "$MANUAL_REVIEW" == "1" ]]; then
   adb_cmd shell am start-foreground-service \
     -n "$SERVICE_COMPONENT" \
     -a "$CALL_START_ACTION" \
-    --es conversationId "$VOICE_AGENT_E2E_CONVERSATION_ID" >/dev/null
+    --es conversationId "$VOICE_AGENT_E2E_CONVERSATION_ID" \
+    --es transport direct_gemini >/dev/null
 else
   adb_cmd shell am start-foreground-service \
     -n "$SERVICE_COMPONENT" \
     -a "$CALL_START_ACTION" \
-    --es conversationId "$VOICE_AGENT_E2E_CONVERSATION_ID" >/dev/null
+    --es conversationId "$VOICE_AGENT_E2E_CONVERSATION_ID" \
+    --es transport direct_gemini >/dev/null
 fi
 CALL_STARTED=1
 

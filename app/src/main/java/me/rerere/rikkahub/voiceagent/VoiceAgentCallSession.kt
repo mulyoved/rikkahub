@@ -13,6 +13,10 @@ import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import me.rerere.rikkahub.voiceagent.audio.VoiceAudioEngine
+import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationEventInput
+import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationEventName
+import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationRunState
+import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationRuntime
 import me.rerere.rikkahub.voiceagent.gemini.GeminiContentTurn
 import me.rerere.rikkahub.voiceagent.gemini.GeminiLiveEvent
 import me.rerere.rikkahub.voiceagent.gemini.GeminiLiveVoiceClient
@@ -24,6 +28,7 @@ import me.rerere.rikkahub.voiceagent.telemetry.VoiceObservability
 import me.rerere.rikkahub.voiceagent.telemetry.VoiceDiagnostics
 import me.rerere.rikkahub.voiceagent.telemetry.VoiceTraceContext
 import me.rerere.rikkahub.voiceagent.telemetry.newVoiceTraceContext
+import org.koin.core.context.GlobalContext
 import java.util.Base64
 
 class VoiceAgentCallSession internal constructor(
@@ -44,6 +49,7 @@ class VoiceAgentCallSession internal constructor(
     private val metadataEpochNowMs: () -> Long = System::currentTimeMillis,
     hermesAnnouncementNowMs: () -> Long = System::currentTimeMillis,
     private val scope: CoroutineScope,
+    private val automationRuntimeProvider: () -> VoiceAutomationRuntime? = ::directAutomationRuntimeOrNull,
 ) : ManagedVoiceCallSession {
     constructor(
         modelId: String,
@@ -523,6 +529,7 @@ class VoiceAgentCallSession internal constructor(
             restoreReconnectingStatusIfAutomaticReconnectPending()
             return false
         }
+        recordDirectAutomationCallActive()
         completedReconnectAttempt?.let { attempt ->
             coordinator.recordDiagnostic(
                 name = "session_reconnect_connected",
@@ -540,6 +547,25 @@ class VoiceAgentCallSession internal constructor(
             ),
         )
         return true
+    }
+
+    private fun recordDirectAutomationCallActive() {
+        val runtime = automationRuntimeProvider() ?: return
+        val status = runCatching(runtime::status).getOrNull() ?: return
+        if (
+            status.state != VoiceAutomationRunState.Active ||
+            status.requestedTransport != VoiceAgentTransport.DirectGemini
+        ) {
+            return
+        }
+        runCatching {
+            runtime.record(
+                VoiceAutomationEventInput(
+                    name = VoiceAutomationEventName.CALL_ACTIVE,
+                    observedTransport = VoiceAgentTransport.DirectGemini,
+                ),
+            )
+        }
     }
 
     private fun reserveConnectedResourceActivation(sessionId: Long): Boolean = synchronized(sessionLock) {
@@ -1188,6 +1214,11 @@ class VoiceAgentCallSession internal constructor(
         const val TAG = "VoiceAgentCallSession"
     }
 }
+
+private fun directAutomationRuntimeOrNull(): VoiceAutomationRuntime? =
+    runCatching {
+        GlobalContext.get().get<VoiceAutomationRuntime>()
+    }.getOrNull()
 
 private fun completedSessionMetadataWrite(): Deferred<Unit> =
     CompletableDeferred(Unit)

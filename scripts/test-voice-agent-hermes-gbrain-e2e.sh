@@ -381,7 +381,7 @@ LOGS
     ;;
   "-s RZ shell run-as me.rerere.rikkahub.debug rm -f no_backup/voice-e2e/trace-gbrain/hermes-call.txt")
     ;;
-  "-s RZ shell am start-foreground-service -n me.rerere.rikkahub.debug/me.rerere.rikkahub.voiceagent.VoiceAgentCallService -a me.rerere.rikkahub.voiceagent.action.START --es conversationId conversation-1")
+  "-s RZ shell am start-foreground-service -n me.rerere.rikkahub.debug/me.rerere.rikkahub.voiceagent.VoiceAgentCallService -a me.rerere.rikkahub.voiceagent.action.START --es conversationId conversation-1 --es transport direct_gemini")
     rm -f "${FAKE_ADB_END_MARKER:?}"
     ;;
   "-s RZ shell am start-foreground-service -n me.rerere.rikkahub.debug/me.rerere.rikkahub.voiceagent.VoiceAgentCallService -a me.rerere.rikkahub.voiceagent.action.END")

@@ -6,6 +6,12 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.jsonPrimitive
 import me.rerere.ai.ui.UIMessagePart
+import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationEventInput
+import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationEventName
+import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationRunBinding
+import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationRunState
+import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationRuntime
+import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationStatus
 import me.rerere.rikkahub.voiceagent.gemini.GeminiContentTurn
 import me.rerere.rikkahub.voiceagent.gemini.GeminiLiveEvent
 import me.rerere.rikkahub.voiceagent.persistence.VoiceContext
@@ -16,9 +22,45 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.io.File
 import java.util.Base64
 
 class VoiceAgentCallSessionTest {
+    @Test
+    fun `connected direct session records its observed automation transport`() = runTest {
+        val runtime = SessionRecordingAutomationRuntime()
+        val session = VoiceAgentCallSession(
+            modelId = "gemini-flash",
+            sessionApi = FakeVoiceSessionApi(),
+            toolApi = FakeVoiceToolApi(),
+            gemini = FakeGeminiLiveVoiceClient(),
+            audio = FakeVoiceAudioEngine(),
+            conversationStore = FakeVoiceConversationStore(),
+            contextProvider = FakeVoiceAgentContextProvider(
+                VoiceContext(systemInstruction = "system", turns = emptyList()),
+            ),
+            scope = this,
+            automationRuntimeProvider = { runtime },
+        )
+
+        session.start()
+
+        withTimeout(500) {
+            while (runtime.events.isEmpty()) {
+                delay(10)
+            }
+        }
+        assertEquals(
+            listOf(
+                VoiceAutomationEventInput(
+                    name = VoiceAutomationEventName.CALL_ACTIVE,
+                    observedTransport = VoiceAgentTransport.DirectGemini,
+                ),
+            ),
+            runtime.events,
+        )
+    }
+
     @Test
     fun `session starts forwards capture audio and closes resources`() = runTest {
         val sessionApi = FakeVoiceSessionApi()
@@ -871,4 +913,23 @@ class VoiceAgentCallSessionTest {
     }
 
     private fun runTest(block: suspend CoroutineScope.() -> Unit) = runBlocking(block = block)
+}
+
+private class SessionRecordingAutomationRuntime : VoiceAutomationRuntime {
+    val events = mutableListOf<VoiceAutomationEventInput>()
+
+    override fun prepare(binding: VoiceAutomationRunBinding) = Unit
+
+    override fun record(event: VoiceAutomationEventInput) {
+        events += event
+    }
+
+    override fun status() = VoiceAutomationStatus(
+        state = VoiceAutomationRunState.Active,
+        requestedTransport = VoiceAgentTransport.DirectGemini,
+    )
+
+    override fun finalizeRun(): File = error("not used")
+
+    override fun reset() = Unit
 }
