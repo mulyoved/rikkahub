@@ -21,6 +21,36 @@ import org.junit.Test
 
 class VoiceAgentTelecomCallRegistryTest {
     @Test
+    fun `automation route returns false without an active routable connection`() {
+        val registry = VoiceAgentTelecomCallRegistry()
+
+        assertFalse(registry.requestActiveAudioRoute(VoiceAgentCallEndpointType.Speaker))
+
+        val attempt = registry.beginAttempt().requireAllocatedAttemptId()
+        assertTrue(registry.activate(attempt, FakeTelecomCall()))
+        assertFalse(registry.requestActiveAudioRoute(VoiceAgentCallEndpointType.Earpiece))
+    }
+
+    @Test
+    fun `automation route targets only the active routable connection`() {
+        val registry = VoiceAgentTelecomCallRegistry()
+        val requestedRoutes = mutableListOf<VoiceAgentCallEndpointType>()
+        val call = object : VoiceAgentTelecomCall, VoiceAgentAutomationRoutableCall {
+            override fun requestAutomationRoute(type: VoiceAgentCallEndpointType): Boolean {
+                requestedRoutes += type
+                return true
+            }
+
+            override fun disconnectFromApp() = Unit
+        }
+        val attempt = registry.beginAttempt().requireAllocatedAttemptId()
+
+        assertTrue(registry.activate(attempt, call))
+        assertTrue(registry.requestActiveAudioRoute(VoiceAgentCallEndpointType.Speaker))
+        assertEquals(listOf(VoiceAgentCallEndpointType.Speaker), requestedRoutes)
+    }
+
+    @Test
     fun `registry exposes only result aware retirement completion`() {
         assertFalse(
             VoiceAgentTelecomCallRegistry::class.java.declaredMethods.any { method ->

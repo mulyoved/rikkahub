@@ -11,15 +11,20 @@ import android.telecom.Connection
 import android.telecom.DisconnectCause
 import androidx.annotation.RequiresApi
 import java.util.concurrent.Executor
+import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationEventInput
+import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationEventName
+import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationRuntime
+import org.koin.core.context.GlobalContext
 
-class VoiceAgentTelecomConnection private constructor(
+internal class VoiceAgentTelecomConnection private constructor(
     private val onCallEndRequested: () -> Unit,
     private val endpointRequestExecutor: Executor,
+    private val automationRuntimeProvider: () -> VoiceAutomationRuntime?,
     onRetiring: (VoiceAgentTelecomConnection) -> Unit,
     private val retirementSetDisconnected: ((DisconnectCause) -> Unit)?,
     private val retirementDestroy: (() -> Unit)?,
     onRetired: (VoiceAgentTelecomConnection, Result<Unit>) -> Unit,
-) : Connection(), VoiceAgentTelecomCall {
+) : Connection(), VoiceAgentTelecomCall, VoiceAgentAutomationRoutableCall {
     constructor(
         context: Context,
         onRetiring: (VoiceAgentTelecomConnection) -> Unit,
@@ -27,6 +32,9 @@ class VoiceAgentTelecomConnection private constructor(
     ) : this(
         onCallEndRequested = { context.startService(voiceAgentCallEndIntent(context)) },
         endpointRequestExecutor = context.mainExecutor,
+        automationRuntimeProvider = {
+            runCatching { GlobalContext.get().get<VoiceAutomationRuntime>() }.getOrNull()
+        },
         onRetiring = onRetiring,
         retirementSetDisconnected = null,
         retirementDestroy = null,
@@ -42,6 +50,7 @@ class VoiceAgentTelecomConnection private constructor(
     ) : this(
         onCallEndRequested = onCallEndRequested,
         endpointRequestExecutor = Executor(Runnable::run),
+        automationRuntimeProvider = { null },
         onRetiring = { onRetiring() },
         retirementSetDisconnected = setDisconnected,
         retirementDestroy = destroy,
@@ -50,6 +59,7 @@ class VoiceAgentTelecomConnection private constructor(
 
     private var requestedBluetoothEndpointId: ParcelUuid? = null
     private var requestedLegacyBluetoothRoute = false
+    private var availableAutomationEndpoints: List<CallEndpoint> = emptyList()
     private val retirement = VoiceAgentTelecomRetirement<DisconnectCause>(
         onRetiring = { onRetiring(this) },
         setDisconnected = { cause ->
@@ -71,6 +81,7 @@ class VoiceAgentTelecomConnection private constructor(
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             return
         }
+        availableAutomationEndpoints = availableEndpoints
 
         val candidates = availableEndpoints.map { it.toCandidate() }
         VoiceAgentLog.d(
@@ -114,6 +125,7 @@ class VoiceAgentTelecomConnection private constructor(
         super.onCallEndpointChanged(callEndpoint)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             VoiceAgentLog.d(TAG, "call endpoint changed endpoint=${callEndpoint.safeLabel()}")
+            recordObservedAutomationRoute(callEndpoint.toCurrentEndpoint().type)
             if (callEndpoint.endpointType == CallEndpoint.TYPE_BLUETOOTH) {
                 requestedBluetoothEndpointId = null
             }
@@ -124,6 +136,15 @@ class VoiceAgentTelecomConnection private constructor(
     override fun onCallAudioStateChanged(state: CallAudioState) {
         super.onCallAudioStateChanged(state)
         VoiceAgentLog.d(TAG, "call audio state changed route=${state.route} supported=${state.supportedRouteMask}")
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            recordObservedAutomationRoute(
+                when (state.route) {
+                    CallAudioState.ROUTE_EARPIECE -> VoiceAgentCallEndpointType.Earpiece
+                    CallAudioState.ROUTE_SPEAKER -> VoiceAgentCallEndpointType.Speaker
+                    else -> null
+                },
+            )
+        }
         if (state.route == CallAudioState.ROUTE_BLUETOOTH) {
             requestedLegacyBluetoothRoute = false
         }
@@ -131,6 +152,62 @@ class VoiceAgentTelecomConnection private constructor(
 
     override fun disconnectFromApp() {
         retirement.retryFromRoute(cause = DisconnectCause(DisconnectCause.LOCAL))
+    }
+
+    override fun requestAutomationRoute(type: VoiceAgentCallEndpointType): Boolean {
+        val legacyRoute = when (type) {
+            VoiceAgentCallEndpointType.Speaker -> CallAudioState.ROUTE_SPEAKER
+            VoiceAgentCallEndpointType.Earpiece -> CallAudioState.ROUTE_EARPIECE
+            else -> return false
+        }
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            return runCatching {
+                @Suppress("DEPRECATION")
+                setAudioRoute(legacyRoute)
+            }.isSuccess
+        }
+
+        val endpoint = availableAutomationEndpoints.firstOrNull {
+            it.toCandidate().type == type
+        } ?: return false
+        return runCatching {
+            requestCallEndpointChange(
+                endpoint,
+                endpointRequestExecutor,
+                object : OutcomeReceiver<Void?, CallEndpointException> {
+                    override fun onResult(result: Void?) {
+                        VoiceAgentLog.d(
+                            TAG,
+                            "automation call endpoint request accepted endpoint=${endpoint.safeLabel()}",
+                        )
+                    }
+
+                    override fun onError(error: CallEndpointException) {
+                        VoiceAgentLog.w(
+                            TAG,
+                            "automation call endpoint request failed " +
+                                "endpoint=${endpoint.safeLabel()} code=${error.code}",
+                        )
+                    }
+                },
+            )
+        }.isSuccess
+    }
+
+    private fun recordObservedAutomationRoute(type: VoiceAgentCallEndpointType?) {
+        if (type !in setOf(VoiceAgentCallEndpointType.Speaker, VoiceAgentCallEndpointType.Earpiece)) {
+            return
+        }
+        val runtime = automationRuntimeProvider() ?: return
+        if (runtime.status().state != me.rerere.rikkahub.voiceagent.automation.VoiceAutomationRunState.Active) {
+            return
+        }
+        runtime.record(
+            VoiceAutomationEventInput(
+                name = VoiceAutomationEventName.ROUTE_OBSERVED,
+                route = type,
+            ),
+        )
     }
 
     @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)

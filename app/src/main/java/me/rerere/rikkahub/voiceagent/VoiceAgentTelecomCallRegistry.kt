@@ -1,5 +1,9 @@
 package me.rerere.rikkahub.voiceagent
 
+internal interface VoiceAgentAutomationRoutableCall {
+    fun requestAutomationRoute(type: VoiceAgentCallEndpointType): Boolean
+}
+
 class VoiceAgentTelecomCallRegistry internal constructor(
     private val probe: VoiceAgentTelecomRegistryProbe = NoOpVoiceAgentTelecomRegistryProbe,
 ) {
@@ -9,6 +13,15 @@ class VoiceAgentTelecomCallRegistry internal constructor(
     private val attempts = mutableMapOf<VoiceAgentTelecomAttemptId, AttemptRecord>()
     private var nextAttemptId = 0L
     private var currentAttemptId: VoiceAgentTelecomAttemptId? = null
+
+    internal fun requestActiveAudioRoute(type: VoiceAgentCallEndpointType): Boolean {
+        val routableCall = synchronized(lock) {
+            val current = currentAttemptId ?: return@synchronized null
+            val active = attempts[current]?.phase as? AttemptPhase.Active ?: return@synchronized null
+            active.connection as? VoiceAgentAutomationRoutableCall
+        } ?: return false
+        return routableCall.requestAutomationRoute(type)
+    }
 
     fun beginAttempt(): VoiceAgentTelecomAttemptStartResult {
         while (true) {

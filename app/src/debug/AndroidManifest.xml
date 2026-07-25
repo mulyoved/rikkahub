@@ -35,5 +35,18 @@
         <action android:name="me.rerere.rikkahub.debug.voiceagent.SEND_HERMES_TEXT" />
       </intent-filter>
     </receiver>
+    <receiver
+      android:name=".voiceagent.debug.VoiceAutomationControlReceiver"
+      android:exported="true"
+      android:permission="android.permission.DUMP">
+      <intent-filter>
+        <action android:name="me.rerere.rikkahub.voiceagent.automation.PREPARE" />
+        <action android:name="me.rerere.rikkahub.voiceagent.automation.STATUS" />
+        <action android:name="me.rerere.rikkahub.voiceagent.automation.MARK" />
+        <action android:name="me.rerere.rikkahub.voiceagent.automation.ROUTE" />
+        <action android:name="me.rerere.rikkahub.voiceagent.automation.FINALIZE" />
+        <action android:name="me.rerere.rikkahub.voiceagent.automation.DUMP" />
+      </intent-filter>
+    </receiver>
   </application>
 </manifest>
