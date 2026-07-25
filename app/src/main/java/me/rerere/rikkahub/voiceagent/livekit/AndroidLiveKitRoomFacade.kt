@@ -25,6 +25,9 @@ internal data class LiveKitSdkRpcInvocation(
 
 internal interface LiveKitRoomSdkAdapter {
     val events: Flow<LiveKitSdkRoomEvent>
+    val automationAudio: LiveKitAutomationAudioBinding
+        get() = UnavailableLiveKitAutomationAudioBinding
+
     suspend fun connect(url: String, token: String)
     suspend fun setMicrophoneEnabled(enabled: Boolean): Boolean
     suspend fun performRpc(destination: String, method: String, payload: String): String
@@ -40,6 +43,7 @@ internal class AndroidLiveKitRoomFacade(
     constructor(context: Context) : this(createLiveKitRoomSdkAdapter(context))
 
     override val events: Flow<LiveKitRoomEvent> = sdk.events.mapNotNull(::toFacadeEvent)
+    override val automationAudio: LiveKitAutomationAudioBinding = sdk.automationAudio
 
     override suspend fun connect(url: String, token: String) {
         sdk.connect(url, token)

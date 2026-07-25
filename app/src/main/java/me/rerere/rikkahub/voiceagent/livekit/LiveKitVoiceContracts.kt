@@ -1,7 +1,9 @@
 package me.rerere.rikkahub.voiceagent.livekit
 
 import kotlinx.serialization.Serializable
+import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationCorrelationKind
 import java.net.URI
+import java.security.MessageDigest
 
 private val LIVEKIT_IDENTIFIER = Regex("^[A-Za-z0-9_-]{1,128}$")
 
@@ -54,6 +56,42 @@ data class LiveKitSessionDetails(
             "expiresAt=$expiresAt" +
             ")"
 }
+
+internal data class LiveKitAutomationCorrelation(
+    val kind: VoiceAutomationCorrelationKind,
+    val hash: String,
+)
+
+internal fun LiveKitSessionDetails.automationCorrelations(): List<LiveKitAutomationCorrelation> =
+    listOf(
+        LiveKitAutomationCorrelation(
+            VoiceAutomationCorrelationKind.SESSION,
+            voiceSessionId.liveKitAutomationHash(),
+        ),
+        LiveKitAutomationCorrelation(
+            VoiceAutomationCorrelationKind.ROOM,
+            roomName.liveKitAutomationHash(),
+        ),
+        LiveKitAutomationCorrelation(
+            VoiceAutomationCorrelationKind.PARTICIPANT,
+            mobileParticipantIdentity.liveKitAutomationHash(),
+        ),
+        LiveKitAutomationCorrelation(
+            VoiceAutomationCorrelationKind.PARTICIPANT,
+            agentParticipantIdentity.liveKitAutomationHash(),
+        ),
+        LiveKitAutomationCorrelation(
+            VoiceAutomationCorrelationKind.DISPATCH,
+            dispatchId.liveKitAutomationHash(),
+        ),
+    )
+
+private fun String.liveKitAutomationHash(): String =
+    "sha256:" + MessageDigest.getInstance("SHA-256")
+        .digest(toByteArray(Charsets.UTF_8))
+        .joinToString(separator = "") { byte ->
+            byte.toInt().and(0xff).toString(radix = 16).padStart(length = 2, padChar = '0')
+        }
 
 private fun String.isLiveKitIdentifier(): Boolean = LIVEKIT_IDENTIFIER.matches(this)
 

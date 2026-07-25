@@ -21,8 +21,26 @@ internal data class LiveKitRpcInvocation(
     val payload: String,
 )
 
+internal interface LiveKitAutomationAudioBinding {
+    fun activate(runHash: String): AutoCloseable
+    fun enqueuePcm16(pcm16: ByteArray)
+    fun injectionComplete(): Boolean
+}
+
+internal object UnavailableLiveKitAutomationAudioBinding : LiveKitAutomationAudioBinding {
+    override fun activate(runHash: String): AutoCloseable =
+        error("LiveKit automation audio is unavailable")
+
+    override fun enqueuePcm16(pcm16: ByteArray) = Unit
+
+    override fun injectionComplete(): Boolean = false
+}
+
 internal interface LiveKitRoomFacade {
     val events: Flow<LiveKitRoomEvent>
+    val automationAudio: LiveKitAutomationAudioBinding
+        get() = UnavailableLiveKitAutomationAudioBinding
+
     suspend fun connect(url: String, token: String)
     suspend fun setMicrophoneEnabled(enabled: Boolean): Boolean
     suspend fun performRpc(destination: String, method: String, payload: String): String

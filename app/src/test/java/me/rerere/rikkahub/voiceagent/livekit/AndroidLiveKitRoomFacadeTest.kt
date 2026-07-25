@@ -47,6 +47,7 @@ class AndroidLiveKitRoomFacadeTest {
         val facade = AndroidLiveKitRoomFacade(sdk)
         var invocation: LiveKitRpcInvocation? = null
 
+        assertSame(sdk.automationAudio, facade.automationAudio)
         facade.connect("wss://voice.test", "token")
         assertTrue(facade.setMicrophoneEnabled(false))
         assertEquals("rpc-result", facade.performRpc("agent", "interrupt", "payload"))
@@ -83,6 +84,7 @@ private class FakeLiveKitRoomSdkAdapter : LiveKitRoomSdkAdapter {
     override val events: Flow<LiveKitSdkRoomEvent> = mutableEvents
     val operations = mutableListOf<String>()
     private val handlers = mutableMapOf<String, suspend (LiveKitSdkRpcInvocation) -> String>()
+    override val automationAudio = FakeLiveKitAutomationAudioBinding()
 
     suspend fun emit(event: LiveKitSdkRoomEvent) {
         mutableEvents.emit(event)
@@ -125,4 +127,12 @@ private class FakeLiveKitRoomSdkAdapter : LiveKitRoomSdkAdapter {
     override fun release() {
         operations += "release"
     }
+}
+
+private class FakeLiveKitAutomationAudioBinding : LiveKitAutomationAudioBinding {
+    override fun activate(runHash: String): AutoCloseable = AutoCloseable { }
+
+    override fun enqueuePcm16(pcm16: ByteArray) = Unit
+
+    override fun injectionComplete(): Boolean = false
 }

@@ -9,6 +9,8 @@ import io.livekit.android.room.participant.Participant
 import io.livekit.android.room.participant.RemoteParticipant
 import io.livekit.android.room.participant.RpcHandler
 import io.livekit.android.room.participant.RpcInvocationData
+import io.livekit.android.room.track.RemoteAudioTrack
+import io.livekit.android.room.track.TrackPublication
 import io.mockk.Runs
 import io.mockk.coEvery
 import io.mockk.coJustRun
@@ -21,9 +23,11 @@ import io.mockk.verify
 import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.take
 import kotlinx.coroutines.flow.toList
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import livekit.LivekitModels
@@ -124,6 +128,59 @@ class AndroidLiveKitRoomSdkAdapterTest {
         }
         verify(exactly = 1) { room.registerRpcMethod("method", any()) }
         verify(exactly = 1) { room.unregisterRpcMethod("method") }
+        verify(exactly = 1) { room.disconnect() }
+        verify(exactly = 1) { room.release() }
+    }
+
+    @Test
+    fun `remote audio sink follows subscribe unsubscribe disconnect and release ownership`() = runTest {
+        val room = mockk<Room>()
+        val participant = mockk<RemoteParticipant>()
+        val publication = mockk<TrackPublication>()
+        val roomEvents = MutableSharedFlow<RoomEvent>()
+        val tracks = List(4) { mockk<RemoteAudioTrack>() }
+        val probes = List(4) { mockk<LiveKitRemoteAudioProbe>() }
+        tracks.forEach { track ->
+            every { track.addSink(any()) } just Runs
+            every { track.removeSink(any()) } just Runs
+        }
+        probes.forEach { probe ->
+            every { probe.close() } just Runs
+        }
+        every { room.disconnect() } just Runs
+        every { room.release() } just Runs
+        val pendingProbes = ArrayDeque(probes)
+        val adapter = AndroidLiveKitRoomSdkAdapter(
+            room = room,
+            sdkEvents = roomEvents,
+            remoteAudioProbeFactory = { pendingProbes.removeFirst() },
+        )
+        val collection = backgroundScope.launch {
+            adapter.events.collect { }
+        }
+        runCurrent()
+
+        roomEvents.emit(RoomEvent.TrackSubscribed(room, tracks[0], publication, participant))
+        roomEvents.emit(RoomEvent.TrackUnsubscribed(room, tracks[0], publication, participant))
+        roomEvents.emit(RoomEvent.TrackSubscribed(room, tracks[1], publication, participant))
+        roomEvents.emit(
+            RoomEvent.Disconnected(
+                room,
+                IllegalStateException("network lost"),
+                DisconnectReason.CLIENT_INITIATED,
+            ),
+        )
+        roomEvents.emit(RoomEvent.TrackSubscribed(room, tracks[2], publication, participant))
+        adapter.disconnect()
+        roomEvents.emit(RoomEvent.TrackSubscribed(room, tracks[3], publication, participant))
+        adapter.release()
+        collection.cancel()
+
+        tracks.zip(probes).forEach { (track, probe) ->
+            verify(exactly = 1) { track.addSink(probe) }
+            verify(exactly = 1) { track.removeSink(probe) }
+            verify(exactly = 1) { probe.close() }
+        }
         verify(exactly = 1) { room.disconnect() }
         verify(exactly = 1) { room.release() }
     }

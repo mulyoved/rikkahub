@@ -29,12 +29,21 @@ import me.rerere.rikkahub.voiceagent.VoiceAgentCleanupResult
 import me.rerere.rikkahub.voiceagent.VoiceAudioStatus
 import me.rerere.rikkahub.voiceagent.VoiceSessionStatus
 import me.rerere.rikkahub.voiceagent.orchestratorRequest
+import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationAudioProbe
+import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationCorrelationKind
+import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationEventInput
+import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationEventName
+import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationRunBinding
+import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationRunState
+import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationRuntime
+import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationStatus
 import me.rerere.rikkahub.voiceagent.telemetry.VoiceTraceContext
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.io.File
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -174,6 +183,87 @@ class LiveKitVoiceCallSessionTest {
             listOf(Triple(AGENT_IDENTITY, INTERRUPT_RPC, "")),
             fixture.room.rpcCalls,
         )
+    }
+
+    @Test
+    fun `LiveKit automation activates one binding and emits only hashed session correlations`() = runTest {
+        val runtime = SessionRecordingAutomationRuntime()
+        val automationAudio = SessionAutomationAudioBinding()
+        val fixture = fixture(
+            automationRuntime = runtime,
+            automationAudio = automationAudio,
+        )
+
+        fixture.session.start()
+        runCurrent()
+
+        assertEquals(listOf(AUTOMATION_RUN_HASH), automationAudio.activations)
+        assertEquals(
+            listOf(
+                VoiceAutomationCorrelationKind.SESSION to
+                    "sha256:6dde1c43f223440f4bfba0ed05aa33cb837253ac01e0cadc1d223eff98914e06",
+                VoiceAutomationCorrelationKind.ROOM to
+                    "sha256:3991f60c5217aa9e5a07f65f0fcbdd77e67e3ad561e3b36a0bab7afcea93aeee",
+                VoiceAutomationCorrelationKind.PARTICIPANT to
+                    "sha256:74b422c6852d91b5711278847ec3328d8cbc5278dbd3714be0f152238d9181b3",
+                VoiceAutomationCorrelationKind.PARTICIPANT to
+                    "sha256:4020120a252b921edd22293a005a8d6e2f30a34547010be3227bbf916520088f",
+                VoiceAutomationCorrelationKind.DISPATCH to
+                    "sha256:a1d74bdb82dd482b0e06b213cef16f71eff7b25072ee144ddee0156900bfa335",
+            ),
+            runtime.events.map { it.correlationKind to it.correlationHash },
+        )
+        assertTrue(runtime.events.all { it.name == VoiceAutomationEventName.CALL_START_REQUESTED })
+        assertTrue(runtime.events.all { it.observedTransport == VoiceAgentTransport.LiveKitExperimental })
+        assertTrue(
+            runtime.events
+                .mapNotNull(VoiceAutomationEventInput::correlationHash)
+                .none { hash ->
+                    listOf(
+                        VOICE_SESSION_ID,
+                        "rikka_1",
+                        "mobile_lvs_1",
+                        AGENT_IDENTITY,
+                        "AD_1",
+                    ).any(hash::contains)
+                },
+        )
+
+        assertEquals(
+            VoiceAgentCleanupResult.Completed,
+            fixture.session.cleanupOperation.run(VoiceAgentCleanupMode.Immediate),
+        )
+        assertEquals(1, automationAudio.closeCalls)
+    }
+
+    @Test
+    fun `LiveKit interrupt marks shared output state before sending RPC`() = runTest {
+        lateinit var sessionFixture: SessionFixture
+        val automationProbe = SessionRecordingAudioProbe {
+            assertTrue(sessionFixture.room.rpcCalls.isEmpty())
+        }
+        sessionFixture = fixture(automationAudioProbe = automationProbe)
+        sessionFixture.session.start()
+        runCurrent()
+
+        sessionFixture.session.interrupt()
+        runCurrent()
+
+        assertEquals(1, automationProbe.interruptionStarts)
+        assertEquals(
+            listOf(Triple(AGENT_IDENTITY, INTERRUPT_RPC, "")),
+            sessionFixture.room.rpcCalls,
+        )
+
+        assertEquals(
+            VoiceAgentCleanupResult.Completed,
+            sessionFixture.session.cleanupOperation.run(VoiceAgentCleanupMode.Immediate),
+        )
+        sessionFixture.session.interrupt()
+        runCurrent()
+
+        assertEquals(1, automationProbe.interruptionStarts)
+        assertEquals(1, sessionFixture.room.rpcCalls.size)
     }
 
     @Test
@@ -597,8 +687,14 @@ class LiveKitVoiceCallSessionTest {
         route: OrchestratorFakeRoute = OrchestratorFakeRoute(),
         sessionScope: CoroutineScope = backgroundScope,
         cleanupDispatcher: CoroutineDispatcher = StandardTestDispatcher(testScheduler),
+        automationRuntime: VoiceAutomationRuntime? = null,
+        automationAudio: SessionAutomationAudioBinding = SessionAutomationAudioBinding(),
+        automationAudioProbe: VoiceAutomationAudioProbe? = null,
     ): SessionFixture {
-        val room = FakeLiveKitRoomFacade(connectFailure)
+        val room = FakeLiveKitRoomFacade(
+            connectFailure = connectFailure,
+            automationAudio = automationAudio,
+        )
         return SessionFixture(
             session = LiveKitVoiceCallSession(
                 details = details(),
@@ -610,6 +706,8 @@ class LiveKitVoiceCallSessionTest {
                 connectTimeoutMillis = 10_000,
                 readyTimeoutMillis = readyTimeoutMillis,
                 cleanupDispatcher = cleanupDispatcher,
+                automationRuntimeProvider = { automationRuntime },
+                automationAudioProbeProvider = { automationAudioProbe },
             ),
             room = room,
             route = route,
@@ -625,6 +723,7 @@ class LiveKitVoiceCallSessionTest {
 
 private class FakeLiveKitRoomFacade(
     private val connectFailure: Throwable? = null,
+    override val automationAudio: LiveKitAutomationAudioBinding = SessionAutomationAudioBinding(),
 ) : LiveKitRoomFacade {
     val lifecycle = mutableListOf<String>()
     private val mutableEvents = MutableSharedFlow<LiveKitRoomEvent>(extraBufferCapacity = 16)
@@ -728,6 +827,65 @@ private class FakeLiveKitRoomFacade(
     }
 }
 
+private class SessionAutomationAudioBinding : LiveKitAutomationAudioBinding {
+    val activations = mutableListOf<String>()
+    var closeCalls = 0
+        private set
+
+    override fun activate(runHash: String): AutoCloseable {
+        activations += runHash
+        return AutoCloseable {
+            closeCalls += 1
+        }
+    }
+
+    override fun enqueuePcm16(pcm16: ByteArray) = Unit
+
+    override fun injectionComplete(): Boolean = false
+}
+
+private class SessionRecordingAudioProbe(
+    private val interruptionCallback: () -> Unit = {},
+) : VoiceAutomationAudioProbe {
+    var interruptionStarts = 0
+
+    override fun onInjectionStarted(totalBytes: Long) = Unit
+    override fun onInjectionChunk(byteCount: Int) = Unit
+    override fun onInjectionCompleted() = Unit
+    override fun onOutputQueued(byteCount: Int) = Unit
+    override fun onOutputWritten(byteCount: Int, nonSilent: Boolean) = Unit
+    override fun onOutputDrained() = Unit
+
+    override fun onInterruptionStarted() {
+        interruptionCallback()
+        interruptionStarts += 1
+    }
+
+    override fun onOutputSilenceConfirmed() = Unit
+}
+
+private class SessionRecordingAutomationRuntime : VoiceAutomationRuntime {
+    val events = mutableListOf<VoiceAutomationEventInput>()
+
+    override fun prepare(binding: VoiceAutomationRunBinding) = Unit
+
+    override fun record(event: VoiceAutomationEventInput) {
+        events += event
+    }
+
+    override fun status() = VoiceAutomationStatus(
+        state = VoiceAutomationRunState.Active,
+        runHash = AUTOMATION_RUN_HASH,
+        comparisonHash = AUTOMATION_COMPARISON_HASH,
+        requestedTransport = VoiceAgentTransport.LiveKitExperimental,
+        eventCount = events.size.toLong() + 1,
+    )
+
+    override fun finalizeRun(): File = error("not used")
+
+    override fun reset() = Unit
+}
+
 private fun details() = LiveKitSessionDetails(
     livekitUrl = LIVEKIT_URL,
     participantToken = PARTICIPANT_TOKEN,
@@ -749,3 +907,7 @@ private const val AGENT_IDENTITY = "agent_lvs_1"
 private const val READY_TOPIC = "voice.ready.v1"
 private const val INTERRUPT_RPC = "voice.interrupt"
 private const val TEST_TRACE_ID = "VA123456-0000000000000000"
+private const val AUTOMATION_RUN_HASH =
+    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+private const val AUTOMATION_COMPARISON_HASH =
+    "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"

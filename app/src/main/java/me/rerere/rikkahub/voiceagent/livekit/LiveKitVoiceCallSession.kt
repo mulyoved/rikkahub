@@ -27,12 +27,20 @@ import me.rerere.rikkahub.voiceagent.VoiceAgentCleanupMode
 import me.rerere.rikkahub.voiceagent.VoiceAgentCleanupOperation
 import me.rerere.rikkahub.voiceagent.VoiceAgentCleanupResult
 import me.rerere.rikkahub.voiceagent.VoiceAgentRouteLease
+import me.rerere.rikkahub.voiceagent.VoiceAgentTransport
 import me.rerere.rikkahub.voiceagent.VoiceAgentUiState
 import me.rerere.rikkahub.voiceagent.VoiceAudioStatus
 import me.rerere.rikkahub.voiceagent.VoiceDiagnosticLine
 import me.rerere.rikkahub.voiceagent.VoiceSessionStatus
+import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationAudioProbe
+import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationAudioProbes
+import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationEventInput
+import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationEventName
+import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationRunState
+import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationRuntime
 import java.time.Instant
 import java.util.concurrent.atomic.AtomicBoolean
+import org.koin.core.context.GlobalContext
 
 internal const val LIVEKIT_READY_TOPIC = "voice.ready.v1"
 internal const val LIVEKIT_INTERRUPT_RPC = "voice.interrupt"
@@ -48,6 +56,10 @@ internal class LiveKitVoiceCallSession(
     private val readyTimeoutMillis: Long = DEFAULT_LIVEKIT_READY_TIMEOUT_MS,
     private val cleanupDispatcher: CoroutineDispatcher = Dispatchers.Default,
     private val json: Json = Json,
+    private val automationRuntimeProvider: () -> VoiceAutomationRuntime? =
+        ::liveKitAutomationRuntimeOrNull,
+    private val automationAudioProbeProvider: () -> VoiceAutomationAudioProbe? =
+        VoiceAutomationAudioProbes::activeSharedOrNull,
 ) : RouteOwnedManagedVoiceCallSession {
     private val mutableState = MutableStateFlow(VoiceAgentUiState(traceId = traceId))
     private val started = AtomicBoolean(false)
@@ -63,6 +75,7 @@ internal class LiveKitVoiceCallSession(
     private var eventJob: Job? = null
     private var connectionJob: Job? = null
     private var microphoneJob: Job? = null
+    private var automationAudioActivation: AutoCloseable? = null
 
     init {
         require(connectTimeoutMillis > 0) { "connectTimeoutMillis must be positive" }
@@ -82,11 +95,22 @@ internal class LiveKitVoiceCallSession(
         rpcAdmission = rpcAdmission,
         rpcMethods = rpcMethods.keys,
         room = room,
+        automationAudioActivation = { automationAudioActivation },
     )
 
     override fun start() {
         synchronized(lifecycleLock) {
             if (!started.compareAndSet(false, true) || closed.get()) return
+            try {
+                activateAutomationAudioIfRequested()
+            } catch (error: Throwable) {
+                appendDiagnostic(
+                    "livekit_automation_audio_failed",
+                    error::class.simpleName ?: "unknown",
+                )
+                failExperimental("LiveKit experimental automation audio failed")
+                return
+            }
             rpcMethods.forEach { (method, handler) ->
                 room.registerRpcMethod(method) { invocation ->
                     rpcAdmission.runInbound { handler(invocation) }
@@ -105,6 +129,7 @@ internal class LiveKitVoiceCallSession(
 
     override fun interrupt() {
         rpcAdmission.launchOutbound(scope) {
+            automationAudioProbeProvider()?.onInterruptionStarted()
             try {
                 room.performRpc(
                     destination = details.agentParticipantIdentity,
@@ -156,6 +181,37 @@ internal class LiveKitVoiceCallSession(
             } catch (_: Throwable) {
                 failExperimental("LiveKit experimental voice connection failed")
             }
+        }
+    }
+
+    private fun activateAutomationAudioIfRequested() {
+        val runtime = automationRuntimeProvider() ?: return
+        val status = runtime.status()
+        if (
+            status.state != VoiceAutomationRunState.Active ||
+            status.requestedTransport != VoiceAgentTransport.LiveKitExperimental
+        ) {
+            return
+        }
+        val runHash = checkNotNull(status.runHash) {
+            "Active LiveKit automation run has no run hash"
+        }
+        val activation = room.automationAudio.activate(runHash)
+        try {
+            details.automationCorrelations().forEach { correlation ->
+                runtime.record(
+                    VoiceAutomationEventInput(
+                        name = VoiceAutomationEventName.CALL_START_REQUESTED,
+                        observedTransport = VoiceAgentTransport.LiveKitExperimental,
+                        correlationKind = correlation.kind,
+                        correlationHash = correlation.hash,
+                    ),
+                )
+            }
+            automationAudioActivation = activation
+        } catch (error: Throwable) {
+            activation.close()
+            throw error
         }
     }
 
@@ -282,12 +338,14 @@ private class LiveKitCleanupOperation(
     private val rpcAdmission: LiveKitRpcAdmission,
     rpcMethods: Set<String>,
     private val room: LiveKitRoomFacade,
+    private val automationAudioActivation: () -> AutoCloseable?,
 ) : JoinedCleanupOperation() {
     private var routeCompleted = false
     private var connectionJobCompleted = false
     private var eventJobCompleted = false
     private var microphoneJobCompleted = false
     private var rpcWorkCompleted = false
+    private var automationAudioCompleted = false
     private val pendingRpcMethods = rpcMethods.toMutableSet()
     private var disconnectCompleted = false
     private var closeCompleted = false
@@ -298,6 +356,11 @@ private class LiveKitCleanupOperation(
         requestClose()
         try {
             withContext(NonCancellable) {
+                automationAudioCompleted = cleanAutomationAudio(
+                    automationAudioActivation(),
+                    automationAudioCompleted,
+                    failures,
+                )
                 retireRoute(failures)
                 unregisterRpcMethods(failures)
                 connectionJobCompleted = cleanJob(connectionJob(), connectionJobCompleted, failures)
@@ -320,6 +383,21 @@ private class LiveKitCleanupOperation(
             routeCompleted = true
         } catch (error: Throwable) {
             failures.add(error)
+        }
+    }
+
+    private fun cleanAutomationAudio(
+        activation: AutoCloseable?,
+        completed: Boolean,
+        failures: CleanupAttemptFailures,
+    ): Boolean {
+        if (completed) return true
+        return try {
+            activation?.close()
+            true
+        } catch (error: Throwable) {
+            failures.add(error)
+            false
         }
     }
 
@@ -367,6 +445,7 @@ private class LiveKitCleanupOperation(
     private fun disconnectRoom(failures: CleanupAttemptFailures) {
         if (
             disconnectCompleted ||
+            !automationAudioCompleted ||
             !jobsCompleted() ||
             !rpcWorkCompleted ||
             pendingRpcMethods.isNotEmpty()
@@ -393,7 +472,8 @@ private class LiveKitCleanupOperation(
         connectionJobCompleted && eventJobCompleted && microphoneJobCompleted
 
     override fun hasUnfinishedStages(): Boolean =
-        !routeCompleted ||
+        !automationAudioCompleted ||
+            !routeCompleted ||
             !jobsCompleted() ||
             !rpcWorkCompleted ||
             pendingRpcMethods.isNotEmpty() ||
@@ -495,3 +575,8 @@ private data class LiveKitReadyMessage(
     val kind: String,
     val observedAt: String,
 )
+
+private fun liveKitAutomationRuntimeOrNull(): VoiceAutomationRuntime? =
+    runCatching {
+        GlobalContext.get().get<VoiceAutomationRuntime>()
+    }.getOrNull()
