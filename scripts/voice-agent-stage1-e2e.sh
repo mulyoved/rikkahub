@@ -19,6 +19,7 @@ CONTROL_ACTION_PREFIX="me.rerere.rikkahub.voiceagent.automation"
 INJECTION_ACTION="me.rerere.rikkahub.debug.voiceagent.INJECT_PCM"
 CALL_START_ACTION="me.rerere.rikkahub.voiceagent.action.START"
 CALL_END_ACTION="me.rerere.rikkahub.voiceagent.action.END"
+EXPECTED_PHYSICAL_SERIAL="RZCX71NXRPB"
 APP_ARTIFACT_BASE_DIR="no_backup/voice-e2e"
 PRIVATE_FIXTURE_DIR="files/voice-stage1"
 PRIVATE_PROMPT_PATH="$PRIVATE_FIXTURE_DIR/prompt.pcm"
@@ -30,14 +31,18 @@ ADB_TIMEOUT_SECONDS="${VOICE_STAGE1_ADB_TIMEOUT_SECONDS:-10}"
 WAIT_TIMEOUT_SECONDS="${VOICE_STAGE1_WAIT_TIMEOUT_SECONDS:-120}"
 POLL_SECONDS="${VOICE_STAGE1_POLL_SECONDS:-1}"
 CLOCK_COMMAND="${VOICE_STAGE1_CLOCK_COMMAND:-}"
+MAX_WAIT_ATTEMPTS="${VOICE_STAGE1_MAX_WAIT_ATTEMPTS:-600}"
+LOCK_DIR="${VOICE_STAGE1_LOCK_DIR:-${TMPDIR:-/tmp}/rikkahub-voice-stage1-locks}"
 
 START_ATTEMPTED=0
 END_ATTEMPTED=0
 AUTOMATION_ACTIVE=0
 FINALIZE_ATTEMPTED=0
 FIXTURES_STAGED=0
-WIFI_DISABLED=0
+WIFI_RESTORE_STATE="proven"
 CLEANUP_RUNNING=0
+RUN_LOCK_FD=""
+PREFLIGHT_STAGE_STATE="not_attempted"
 CONTROL_DATA=""
 STATUS_RUN_STATE=""
 STATUS_RUN_HASH=""
@@ -80,7 +85,7 @@ adb_command() {
 clock_now() {
   local value
   if [[ -n "$CLOCK_COMMAND" ]]; then
-    value="$("$CLOCK_COMMAND")"
+    value="$(timeout "${ADB_TIMEOUT_SECONDS}s" "$CLOCK_COMMAND")" || fail "clock command failed"
   else
     value="$(date +%s)"
   fi
@@ -90,6 +95,23 @@ clock_now() {
 
 sleep_poll() {
   sleep "$POLL_SECONDS"
+}
+
+require_expected_serial() {
+  [[ "$VOICE_STAGE1_SERIAL" == "$EXPECTED_PHYSICAL_SERIAL" ]] ||
+    fail "Stage1 requires physical device $EXPECTED_PHYSICAL_SERIAL"
+}
+
+acquire_run_lock() {
+  local lock_path
+  [[ ! -L "$LOCK_DIR" ]] || fail "device lock directory must not be a symlink"
+  mkdir -p "$LOCK_DIR"
+  chmod 700 "$LOCK_DIR"
+  lock_path="$LOCK_DIR/voice-agent-stage1-$VOICE_STAGE1_SERIAL.lock"
+  [[ ! -L "$lock_path" ]] || fail "device lock path must not be a symlink"
+  exec {RUN_LOCK_FD}> "$lock_path"
+  chmod 600 "$lock_path"
+  flock -n "$RUN_LOCK_FD" || fail "another Stage1 runner owns $VOICE_STAGE1_SERIAL"
 }
 
 select_device() {
@@ -108,6 +130,19 @@ select_device() {
   VOICE_AGENT_E2E_SERIAL="$VOICE_STAGE1_SERIAL" \
     ADB_DEVICE_READY_TIMEOUT_SECONDS="$ADB_TIMEOUT_SECONDS" \
     "$ADB_READY_SCRIPT" "$VOICE_STAGE1_SERIAL" >/dev/null
+
+  local qemu
+  local hardware
+  qemu="$(adb_command shell getprop ro.kernel.qemu | tr -d '\r[:space:]')"
+  hardware="$(adb_command shell getprop ro.hardware | tr -d '\r[:space:]')"
+  hardware="${hardware,,}"
+  [[ "$qemu" == "" || "$qemu" == "0" || "$qemu" == "false" ]] ||
+    fail "physical device verification failed: qemu=$qemu"
+  case "$hardware" in
+    *ranchu*|*goldfish*|*cuttlefish*)
+      fail "physical device verification failed: emulator hardware"
+      ;;
+  esac
 }
 
 require_package() {
@@ -130,17 +165,23 @@ control_broadcast() {
   local completed_line
   local result_code
   local raw_data
-  output="$(adb_command shell am broadcast --user 0 \
+  if ! output="$(adb_command shell am broadcast --user 0 \
     -n "$VOICE_STAGE1_PACKAGE/$CONTROL_RECEIVER_CLASS" \
-    -a "$CONTROL_ACTION_PREFIX.$action" "$@")" ||
+    -a "$CONTROL_ACTION_PREFIX.$action" "$@")"; then
     fail "automation ${action,,} broadcast failed"
+    return 1
+  fi
   completed_line="$(printf '%s\n' "$output" | awk '/^Broadcast completed:/ { line = $0 } END { print line }')"
   if [[ ! "$completed_line" =~ ^Broadcast\ completed:\ result=([-0-9]+),\ data=\"(.*)\"$ ]]; then
     fail "automation ${action,,} returned malformed broadcast output"
+    return 1
   fi
   result_code="${BASH_REMATCH[1]}"
   raw_data="${BASH_REMATCH[2]}"
-  [[ "$result_code" == "0" ]] || fail "automation ${action,,} was rejected"
+  if [[ "$result_code" != "0" ]]; then
+    fail "automation ${action,,} was rejected"
+    return 1
+  fi
   CONTROL_DATA="$(decode_broadcast_data "$raw_data")"
 }
 
@@ -151,18 +192,18 @@ expect_control_data() {
 
 read_status() {
   local -a lines=()
-  control_broadcast STATUS
+  control_broadcast STATUS || return 1
   mapfile -t lines <<< "$CONTROL_DATA"
-  [[ "${#lines[@]}" == "9" ]] || fail "automation status field count mismatch"
-  [[ "${lines[0]}" == "status=ok" ]] || fail "automation status marker mismatch"
-  [[ "${lines[1]}" == "action=status" ]] || fail "automation status action mismatch"
-  [[ "${lines[2]}" == run_state=* ]] || fail "automation status run_state field mismatch"
-  [[ "${lines[3]}" == run_hash=* ]] || fail "automation status run_hash field mismatch"
-  [[ "${lines[4]}" == comparison_hash=* ]] || fail "automation status comparison_hash field mismatch"
-  [[ "${lines[5]}" == requested_transport=* ]] || fail "automation status transport field mismatch"
-  [[ "${lines[6]}" == event_count=* ]] || fail "automation status event_count field mismatch"
-  [[ "${lines[7]}" == network=* ]] || fail "automation status network field mismatch"
-  [[ "${lines[8]}" == validated=* ]] || fail "automation status validated field mismatch"
+  [[ "${#lines[@]}" == "9" ]] || { fail "automation status field count mismatch"; return 1; }
+  [[ "${lines[0]}" == "status=ok" ]] || { fail "automation status marker mismatch"; return 1; }
+  [[ "${lines[1]}" == "action=status" ]] || { fail "automation status action mismatch"; return 1; }
+  [[ "${lines[2]}" == run_state=* ]] || { fail "automation status run_state field mismatch"; return 1; }
+  [[ "${lines[3]}" == run_hash=* ]] || { fail "automation status run_hash field mismatch"; return 1; }
+  [[ "${lines[4]}" == comparison_hash=* ]] || { fail "automation status comparison_hash field mismatch"; return 1; }
+  [[ "${lines[5]}" == requested_transport=* ]] || { fail "automation status transport field mismatch"; return 1; }
+  [[ "${lines[6]}" == event_count=* ]] || { fail "automation status event_count field mismatch"; return 1; }
+  [[ "${lines[7]}" == network=* ]] || { fail "automation status network field mismatch"; return 1; }
+  [[ "${lines[8]}" == validated=* ]] || { fail "automation status validated field mismatch"; return 1; }
   STATUS_RUN_STATE="${lines[2]#run_state=}"
   STATUS_RUN_HASH="${lines[3]#run_hash=}"
   STATUS_COMPARISON_HASH="${lines[4]#comparison_hash=}"
@@ -170,10 +211,10 @@ read_status() {
   STATUS_EVENT_COUNT="${lines[6]#event_count=}"
   STATUS_NETWORK="${lines[7]#network=}"
   STATUS_VALIDATED="${lines[8]#validated=}"
-  [[ "$STATUS_RUN_STATE" =~ ^(idle|active|finalized)$ ]] || fail "automation status run_state value mismatch"
-  [[ "$STATUS_EVENT_COUNT" =~ ^[0-9]+$ ]] || fail "automation status event_count value mismatch"
-  [[ "$STATUS_NETWORK" =~ ^(wifi|cellular|none)$ ]] || fail "automation status network value mismatch"
-  [[ "$STATUS_VALIDATED" =~ ^(true|false)$ ]] || fail "automation status validated value mismatch"
+  [[ "$STATUS_RUN_STATE" =~ ^(idle|active|finalized)$ ]] || { fail "automation status run_state value mismatch"; return 1; }
+  [[ "$STATUS_EVENT_COUNT" =~ ^[0-9]+$ ]] || { fail "automation status event_count value mismatch"; return 1; }
+  [[ "$STATUS_NETWORK" =~ ^(wifi|cellular|none)$ ]] || { fail "automation status network value mismatch"; return 1; }
+  [[ "$STATUS_VALIDATED" =~ ^(true|false)$ ]] || { fail "automation status validated value mismatch"; return 1; }
 }
 
 read_android_network() {
@@ -206,22 +247,49 @@ read_android_network() {
   fi
 }
 
+WAIT_LABEL=""
+WAIT_STARTED=0
+WAIT_LAST=0
+WAIT_ATTEMPTS=0
+
+begin_wait() {
+  WAIT_LABEL="$1"
+  WAIT_STARTED="$(clock_now)"
+  WAIT_LAST="$WAIT_STARTED"
+  WAIT_ATTEMPTS=0
+}
+
+continue_wait() {
+  local timeout_seconds="$1"
+  local timeout_message="$2"
+  local now
+  WAIT_ATTEMPTS=$((WAIT_ATTEMPTS + 1))
+  if (( WAIT_ATTEMPTS >= MAX_WAIT_ATTEMPTS )); then
+    fail "wait attempt limit reached for $WAIT_LABEL"
+    return 1
+  fi
+  now="$(clock_now)"
+  if (( now < WAIT_LAST )); then
+    fail "clock moved backward while waiting for $WAIT_LABEL"
+    return 1
+  fi
+  WAIT_LAST="$now"
+  if (( now - WAIT_STARTED >= timeout_seconds )); then
+    fail "$timeout_message"
+    return 1
+  fi
+  sleep_poll
+}
+
 wait_android_network() {
   local expected="$1"
-  local started
-  local now
   local observed
-  started="$(clock_now)"
+  begin_wait "Android $expected network"
   while true; do
     if observed="$(read_android_network 2>/dev/null)" && [[ "$observed" == "$expected" ]]; then
       return 0
     fi
-    now="$(clock_now)"
-    if (( now - started >= WAIT_TIMEOUT_SECONDS )); then
-      fail "timed out waiting for Android $expected network"
-      return 1
-    fi
-    sleep_poll
+    continue_wait "$WAIT_TIMEOUT_SECONDS" "timed out waiting for Android $expected network" || return 1
   done
 }
 
@@ -286,16 +354,29 @@ cleanup_resources() {
   fi
   if (( AUTOMATION_ACTIVE == 1 && FINALIZE_ATTEMPTED == 0 )); then
     FINALIZE_ATTEMPTED=1
-    raw_cleanup_finalize || cleanup_status=1
+    if read_status &&
+      [[ "$STATUS_RUN_STATE" == "active" ]] &&
+      [[ "$STATUS_RUN_HASH" == "$VOICE_STAGE1_RUN_HASH" ]] &&
+      [[ "$STATUS_COMPARISON_HASH" == "$VOICE_STAGE1_COMPARISON_HASH" ]] &&
+      [[ "$STATUS_TRANSPORT" == "$VOICE_STAGE1_TRANSPORT" ]]; then
+      raw_cleanup_finalize || cleanup_status=1
+    fi
     AUTOMATION_ACTIVE=0
   fi
   if (( FIXTURES_STAGED == 1 )); then
     remove_private_fixtures || cleanup_status=1
     FIXTURES_STAGED=0
   fi
-  if (( WIFI_DISABLED == 1 )); then
-    adb_command shell svc wifi enable >/dev/null || cleanup_status=1
-    WIFI_DISABLED=0
+  if [[ "$WIFI_RESTORE_STATE" == "not_attempted" ]]; then
+    local restored_network
+    WIFI_RESTORE_STATE="pending"
+    if adb_command shell svc wifi enable >/dev/null &&
+      restored_network="$(read_android_network 2>/dev/null)" &&
+      [[ "$restored_network" == "wifi" ]]; then
+      WIFI_RESTORE_STATE="proven"
+    else
+      cleanup_status=1
+    fi
   fi
   set -e
   CLEANUP_RUNNING=0
@@ -307,6 +388,27 @@ on_exit() {
   local cleanup_status=0
   trap - EXIT
   cleanup_resources || cleanup_status=$?
+  if (( original_status == 0 && cleanup_status != 0 )); then
+    original_status=$cleanup_status
+  fi
+  exit "$original_status"
+}
+
+remove_preflight_fixture_once() {
+  [[ "$PREFLIGHT_STAGE_STATE" == "pending" ]] || return 0
+  PREFLIGHT_STAGE_STATE="remove_attempted"
+  if adb_command shell run-as "$VOICE_STAGE1_PACKAGE" rm -f "$PRIVATE_FIXTURE_DIR/.preflight" >/dev/null; then
+    PREFLIGHT_STAGE_STATE="removed"
+    return 0
+  fi
+  return 1
+}
+
+preflight_on_exit() {
+  local original_status=$?
+  local cleanup_status=0
+  trap - EXIT
+  remove_preflight_fixture_once || cleanup_status=$?
   if (( original_status == 0 && cleanup_status != 0 )); then
     original_status=$cleanup_status
   fi
@@ -339,23 +441,16 @@ validate_event_lines() {
 wait_event() {
   local event_name="${1,,}"
   local require_observed_transport="${2:-0}"
-  local started
-  local now
   local lines
   local event_pattern="\"name\":\"$event_name\""
-  started="$(clock_now)"
+  begin_wait "$event_name"
   while true; do
     if lines="$(adb_command exec-out run-as "$VOICE_STAGE1_PACKAGE" \
       grep -F "$event_pattern" "$AUTOMATION_EVENT_PATH" 2>/dev/null)"; then
       validate_event_lines "$event_name" "$require_observed_transport" "$lines"
       return 0
     fi
-    now="$(clock_now)"
-    if (( now - started >= WAIT_TIMEOUT_SECONDS )); then
-      fail "timed out waiting for $event_name"
-      return 1
-    fi
-    sleep_poll
+    continue_wait "$WAIT_TIMEOUT_SECONDS" "timed out waiting for $event_name" || return 1
   done
 }
 
@@ -386,23 +481,16 @@ raise SystemExit(0 if any(json.loads(line)["monotonicMs"] > boundary for line in
 wait_event_after() {
   local event_name="${1,,}"
   local boundary_ms="$2"
-  local started
-  local now
   local lines
   local event_pattern="\"name\":\"$event_name\""
-  started="$(clock_now)"
+  begin_wait "post-handover $event_name"
   while true; do
     if lines="$(adb_command exec-out run-as "$VOICE_STAGE1_PACKAGE" \
       grep -F "$event_pattern" "$AUTOMATION_EVENT_PATH" 2>/dev/null)" &&
       event_exists_after "$event_name" "$boundary_ms" "$lines"; then
       return 0
     fi
-    now="$(clock_now)"
-    if (( now - started >= WAIT_TIMEOUT_SECONDS )); then
-      fail "timed out waiting for post-handover $event_name"
-      return 1
-    fi
-    sleep_poll
+    continue_wait "$WAIT_TIMEOUT_SECONDS" "timed out waiting for post-handover $event_name" || return 1
   done
 }
 
@@ -413,18 +501,76 @@ mark_boundary() {
 }
 
 request_route() {
+  local boundary_ms
+  local lines
+  local evidence_status
+  local expected_route="${VOICE_STAGE1_ROUTE^}"
+  boundary_ms="$(latest_event_monotonic_ms CALL_ACTIVE)"
   control_broadcast ROUTE --es route "$VOICE_STAGE1_ROUTE"
   expect_control_data $'status=ok\naction=route\nroute='"$VOICE_STAGE1_ROUTE"$'\naccepted=true'
-  wait_event ROUTE_OBSERVED
+  begin_wait "fresh route_observed"
+  while true; do
+    if lines="$(adb_command exec-out run-as "$VOICE_STAGE1_PACKAGE" \
+      grep -F '"route":' "$AUTOMATION_EVENT_PATH" 2>/dev/null)"; then
+      validate_event_lines route_requested 0 "$lines"
+      validate_event_lines route_observed 0 "$lines"
+      if python3 -c '
+import json, sys
+boundary, expected = int(sys.argv[1]), sys.argv[2]
+events = [json.loads(line) for line in sys.stdin if line.strip()]
+requested = next((event for event in events if event["name"] == "route_requested" and
+                  event["monotonicMs"] > boundary and event["route"] == expected), None)
+if requested is None:
+    raise SystemExit(1)
+observed = [event for event in events if event["name"] == "route_observed" and
+            event["monotonicMs"] > requested["monotonicMs"]]
+if any(event["route"] != expected for event in observed):
+    raise SystemExit(2)
+raise SystemExit(0 if any(event["route"] == expected for event in observed) else 1)
+' "$boundary_ms" "$expected_route" <<< "$lines"; then
+        return 0
+      else
+        evidence_status=$?
+        if (( evidence_status == 2 )); then
+          fail "conflicting route observation"
+          return 1
+        fi
+      fi
+    fi
+    continue_wait "$WAIT_TIMEOUT_SECONDS" "timed out waiting for fresh route_observed" || return 1
+  done
 }
 
 wait_lifecycle() {
   local expected="$1"
+  local boundary_ms="$2"
   local lines
-  wait_event LIFECYCLE_OBSERVED
-  lines="$(adb_command exec-out run-as "$VOICE_STAGE1_PACKAGE" \
-    grep -F '"name":"lifecycle_observed"' "$AUTOMATION_EVENT_PATH")"
-  [[ "$lines" == *"\"lifecycle\":\"$expected\""* ]] || fail "lifecycle observation mismatch"
+  local evidence_status
+  begin_wait "fresh lifecycle_observed"
+  while true; do
+    if lines="$(adb_command exec-out run-as "$VOICE_STAGE1_PACKAGE" \
+      grep -F '"name":"lifecycle_observed"' "$AUTOMATION_EVENT_PATH" 2>/dev/null)"; then
+      validate_event_lines lifecycle_observed 0 "$lines"
+      if python3 -c '
+import json, sys
+boundary, expected = int(sys.argv[1]), sys.argv[2]
+events = [json.loads(line) for line in sys.stdin if line.strip() and
+          json.loads(line)["monotonicMs"] > boundary]
+if any(event["lifecycle"] != expected for event in events):
+    raise SystemExit(2)
+raise SystemExit(0 if any(event["lifecycle"] == expected for event in events) else 1)
+' "$boundary_ms" "$expected" <<< "$lines"; then
+        return 0
+      else
+        evidence_status=$?
+        if (( evidence_status == 2 )); then
+          fail "conflicting lifecycle observation"
+          return 1
+        fi
+      fi
+    fi
+    continue_wait "$WAIT_TIMEOUT_SECONDS" "timed out waiting for fresh lifecycle_observed" || return 1
+  done
 }
 
 inject_pcm() {
@@ -456,31 +602,38 @@ end_call() {
 }
 
 wait_call_stopped() {
-  local started
-  local now
   local services
-  started="$(clock_now)"
+  begin_wait "call service stop"
   while true; do
     services="$(adb_command shell dumpsys activity services "$VOICE_STAGE1_PACKAGE")"
     if [[ "$services" != *"$SERVICE_CLASS"* ]]; then
       return 0
     fi
-    now="$(clock_now)"
-    if (( now - started >= WAIT_TIMEOUT_SECONDS )); then
-      fail "timed out waiting for call service to stop"
-      return 1
-    fi
-    sleep_poll
+    continue_wait "$WAIT_TIMEOUT_SECONDS" "timed out waiting for call service to stop" || return 1
   done
 }
 
 wait_target_duration() {
   local started="$1"
   local now
+  WAIT_LABEL="target duration"
+  WAIT_STARTED="$started"
+  WAIT_LAST="$started"
+  WAIT_ATTEMPTS=0
   while true; do
     now="$(clock_now)"
+    if (( now < WAIT_LAST )); then
+      fail "clock moved backward while waiting for target duration"
+      return 1
+    fi
+    WAIT_LAST="$now"
     if (( now - started >= VOICE_STAGE1_TARGET_SECONDS )); then
       return 0
+    fi
+    WAIT_ATTEMPTS=$((WAIT_ATTEMPTS + 1))
+    if (( WAIT_ATTEMPTS >= MAX_WAIT_ATTEMPTS )); then
+      fail "wait attempt limit reached for target duration"
+      return 1
     fi
     sleep_poll
   done
@@ -490,14 +643,15 @@ perform_handover() {
   local wifi_restored_ms
   mark_boundary HANDOVER_STARTED
   adb_command shell svc data enable >/dev/null
-  WIFI_DISABLED=1
+  WIFI_RESTORE_STATE="not_attempted"
   adb_command shell svc wifi disable >/dev/null
   wait_android_network cellular
   cross_check_network cellular
+  WIFI_RESTORE_STATE="pending"
   adb_command shell svc wifi enable >/dev/null
-  WIFI_DISABLED=0
   wait_android_network wifi
   cross_check_network wifi
+  WIFI_RESTORE_STATE="proven"
   wifi_restored_ms="$(latest_event_monotonic_ms NETWORK_OBSERVED)"
   wait_event_after PLAYBACK_WRITTEN "$wifi_restored_ms"
 }
@@ -565,15 +719,25 @@ for required in ("run_prepared", "call_active", "route_requested", "route_observ
 if not any(event.get("name") == "call_active" and event.get("observedTransport") == transport
            for event in events):
     raise SystemExit("observed transport mismatch")
-if not any(event.get("name") == "route_requested" and event.get("route") == route for event in events):
+route_requested_index = next((index for index, event in enumerate(events)
+                              if event.get("name") == "route_requested" and event.get("route") == route), -1)
+if route_requested_index < 0:
     raise SystemExit("route request mismatch")
-if not any(event.get("name") == "route_observed" and event.get("route") == route for event in events):
+route_observations = [(index, event) for index, event in enumerate(events)
+                      if index > route_requested_index and event.get("name") == "route_observed"]
+if any(event.get("route") != route for _, event in route_observations):
+    raise SystemExit("conflicting route observation")
+route_observed_index = next((index for index, event in route_observations if event.get("route") == route), -1)
+if route_observed_index < 0:
     raise SystemExit("route observation mismatch")
 if not any(event.get("name") == "lifecycle_requested" and event.get("lifecycle") == app_state
            for event in events):
     raise SystemExit("lifecycle request mismatch")
-if not any(event.get("name") == "lifecycle_observed" and event.get("lifecycle") == app_state
-           for event in events):
+lifecycle_observations = [event for index, event in enumerate(events)
+                          if index > route_observed_index and event.get("name") == "lifecycle_observed"]
+if any(event.get("lifecycle") != app_state for event in lifecycle_observations):
+    raise SystemExit("conflicting lifecycle observation")
+if not any(event.get("lifecycle") == app_state for event in lifecycle_observations):
     raise SystemExit("lifecycle observation mismatch")
 
 observed_networks = [event.get("network") for event in events if event.get("name") == "network_observed"]
@@ -620,6 +784,7 @@ PY
 run_preflight() {
   require_env VOICE_STAGE1_SERIAL
   require_env VOICE_STAGE1_PACKAGE
+  require_expected_serial
   [[ "$VOICE_STAGE1_PACKAGE" =~ ^[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)+$ ]] || fail "invalid package name"
   validate_positive_integer VOICE_STAGE1_ADB_TIMEOUT_SECONDS "$ADB_TIMEOUT_SECONDS"
   require_command adb
@@ -644,10 +809,13 @@ run_preflight() {
   [[ "$STATUS_NETWORK" == "$android_network" && "$STATUS_VALIDATED" == "true" ]] ||
     fail "network observation mismatch: Android=$android_network app=$STATUS_NETWORK"
 
+  trap preflight_on_exit EXIT
+  PREFLIGHT_STAGE_STATE="pending"
   printf 'stage1-preflight\n' | stage_stream "$PRIVATE_FIXTURE_DIR/.preflight" >/dev/null
   adb_command shell run-as "$VOICE_STAGE1_PACKAGE" test -s "$PRIVATE_FIXTURE_DIR/.preflight" >/dev/null ||
     fail "private fixture staging verification failed"
-  adb_command shell run-as "$VOICE_STAGE1_PACKAGE" rm -f "$PRIVATE_FIXTURE_DIR/.preflight" >/dev/null
+  remove_preflight_fixture_once
+  trap - EXIT
 
   printf 'stage1.device=%s\n' "$VOICE_STAGE1_SERIAL"
   printf 'stage1.run_as=ready\n'
@@ -678,6 +846,7 @@ validate_normal_inputs() {
     require_env "$required"
   done
   [[ "$VOICE_STAGE1_PACKAGE" =~ ^[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)+$ ]] || fail "invalid package name"
+  require_expected_serial
   [[ "$VOICE_STAGE1_TRANSPORT" =~ ^(direct_gemini|livekit_experimental)$ ]] || fail "invalid transport"
   [[ "$VOICE_STAGE1_ROUTE" =~ ^(speaker|earpiece)$ ]] || fail "invalid route"
   [[ "$VOICE_STAGE1_APP_STATE" =~ ^(foreground|background)$ ]] || fail "invalid app state"
@@ -686,6 +855,7 @@ validate_normal_inputs() {
   validate_positive_integer VOICE_STAGE1_TARGET_SECONDS "$VOICE_STAGE1_TARGET_SECONDS"
   validate_positive_integer VOICE_STAGE1_ADB_TIMEOUT_SECONDS "$ADB_TIMEOUT_SECONDS"
   validate_positive_integer VOICE_STAGE1_WAIT_TIMEOUT_SECONDS "$WAIT_TIMEOUT_SECONDS"
+  validate_positive_integer VOICE_STAGE1_MAX_WAIT_ATTEMPTS "$MAX_WAIT_ATTEMPTS"
   validate_nonnegative_number VOICE_STAGE1_POLL_SECONDS "$POLL_SECONDS"
   [[ "$VOICE_STAGE1_RUN_HASH" =~ ^sha256:[0-9a-f]{64}$ ]] || fail "invalid run hash"
   [[ "$VOICE_STAGE1_COMPARISON_HASH" =~ ^sha256:[0-9a-f]{64}$ ]] || fail "invalid comparison hash"
@@ -705,6 +875,7 @@ validate_normal_inputs() {
   require_command python3
   require_command mktemp
   require_command sleep
+  require_command flock
   if [[ -n "$CLOCK_COMMAND" ]]; then
     [[ -x "$CLOCK_COMMAND" ]] || fail "VOICE_STAGE1_CLOCK_COMMAND must be executable"
   else
@@ -715,9 +886,11 @@ validate_normal_inputs() {
 run_scenario() {
   local initial_network
   local run_started_at
+  local lifecycle_boundary_ms
   AUTOMATION_EVENT_PATH="$(app_artifact_path \
     "$APP_ARTIFACT_BASE_DIR/${VOICE_STAGE1_RUN_HASH#sha256:}" automation-events.jsonl)"
 
+  acquire_run_lock
   select_device
   require_package
   trap on_exit EXIT
@@ -737,7 +910,7 @@ run_scenario() {
       ;;
     cellular)
       adb_command shell svc data enable >/dev/null
-      WIFI_DISABLED=1
+      WIFI_RESTORE_STATE="not_attempted"
       adb_command shell svc wifi disable >/dev/null
       initial_network=cellular
       ;;
@@ -760,20 +933,19 @@ run_scenario() {
   stage_file "$VOICE_STAGE1_PCM_PATH" "$PRIVATE_PROMPT_PATH"
   stage_file "$VOICE_STAGE1_INTERRUPT_PCM_PATH" "$PRIVATE_INTERRUPT_PATH"
 
-  if [[ "$VOICE_STAGE1_APP_STATE" == "foreground" ]]; then
-    adb_command shell am start -W \
-      -n "$VOICE_STAGE1_PACKAGE/$ROUTE_ACTIVITY_CLASS" >/dev/null
-  fi
-
   run_started_at="$(clock_now)"
   start_call
   wait_event CALL_ACTIVE 1
   request_route
 
+  lifecycle_boundary_ms="$(latest_event_monotonic_ms ROUTE_OBSERVED)"
   if [[ "$VOICE_STAGE1_APP_STATE" == "background" ]]; then
     adb_command shell input keyevent HOME >/dev/null
+  else
+    adb_command shell am start -W \
+      -n "$VOICE_STAGE1_PACKAGE/$ROUTE_ACTIVITY_CLASS" >/dev/null
   fi
-  wait_lifecycle "$VOICE_STAGE1_APP_STATE"
+  wait_lifecycle "$VOICE_STAGE1_APP_STATE" "$lifecycle_boundary_ms"
 
   inject_pcm "$INJECTION_PROMPT_PATH"
   wait_event PROMPT_ENDED

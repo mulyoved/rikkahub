@@ -8,6 +8,7 @@ BIN_DIR="$TMP_DIR/bin"
 STATE_DIR="$TMP_DIR/state"
 ADB_LOG="$TMP_DIR/adb-argv.bin"
 CLOCK_LOG="$TMP_DIR/clock-argv.bin"
+LOCK_DIR="$TMP_DIR/locks"
 PCM_PATH="$TMP_DIR/prompt.pcm"
 INTERRUPT_PCM_PATH="$TMP_DIR/interrupt.pcm"
 SERIAL="RZCX71NXRPB"
@@ -20,7 +21,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-mkdir -p "$BIN_DIR" "$STATE_DIR"
+mkdir -p "$BIN_DIR" "$STATE_DIR" "$LOCK_DIR"
 printf 'primary-pcm' > "$PCM_PATH"
 printf 'interrupt-pcm' > "$INTERRUPT_PCM_PATH"
 
@@ -85,6 +86,13 @@ else:
         "injections": 0,
         "staged": {},
     }
+    if os.environ.get("FAKE_ADB_INITIAL_RUN") == "foreign":
+        state.update({
+            "run_state": "active",
+            "run_hash": "sha256:" + "c" * 64,
+            "comparison_hash": "sha256:" + "d" * 64,
+            "transport": "livekit_experimental",
+        })
 
 def save():
     state_file.write_text(json.dumps(state, separators=(",", ":")))
@@ -151,6 +159,10 @@ elif tail == ["shell", "getprop", "ro.product.model"]:
     print("SM-S711B")
 elif tail == ["shell", "getprop", "ro.build.version.release"]:
     print("16")
+elif tail == ["shell", "getprop", "ro.kernel.qemu"]:
+    print("1" if os.environ.get("FAKE_ADB_EMULATOR") == "1" else "0")
+elif tail == ["shell", "getprop", "ro.hardware"]:
+    print("ranchu" if os.environ.get("FAKE_ADB_EMULATOR") == "1" else "qcom")
 elif tail == ["shell", "pm", "path", "me.rerere.rikkahub.debug"]:
     print("package:/data/app/test/base.apk")
 elif tail == ["shell", "run-as", "me.rerere.rikkahub.debug", "id"]:
@@ -172,6 +184,8 @@ elif tail == ["shell", "svc", "wifi", "enable"]:
     if state.get("handover_started"):
         state["recovery_ready"] = True
     save()
+    if os.environ.get("FAKE_ADB_FAIL_MODE") == "wifi_restore" and state.get("handover_started"):
+        sys.exit(78)
 elif tail == ["shell", "dumpsys", "connectivity"]:
     active_id = "101" if state["network"] == "wifi" else "202"
     inactive_id = "202" if active_id == "101" else "101"
@@ -195,26 +209,30 @@ elif tail[:4] == ["shell", "run-as", "me.rerere.rikkahub.debug", "rm"]:
     for value in tail[5:]:
         state["staged"].pop(value, None)
     save()
+    if os.environ.get("FAKE_ADB_FAIL_MODE") == "preflight_remove" and tail[-1].endswith(".preflight"):
+        sys.exit(79)
 elif tail[:5] == ["exec-in", "run-as", "me.rerere.rikkahub.debug", "sh", "-c"]:
     path = tail[-1]
     state["staged"][path] = len(sys.stdin.buffer.read())
     save()
+    if os.environ.get("FAKE_ADB_FAIL_MODE") == "preflight_stage" and path.endswith(".preflight"):
+        sys.exit(80)
     if os.environ.get("FAKE_ADB_FAIL_MODE") == "stage_interrupt" and path.endswith("interrupt.pcm"):
         sys.exit(75)
 elif tail[:3] == ["shell", "am", "start"]:
     if "android.intent.category.HOME" in tail:
         state["app_foreground"] = False
-        if state["run_state"] == "active":
+        if state["run_state"] == "active" and os.environ.get("FAKE_ADB_LIFECYCLE_MODE") != "stale":
             emit("lifecycle_observed", lifecycle="background")
     else:
         state["app_foreground"] = True
-        if state["run_state"] == "active":
+        if state["run_state"] == "active" and os.environ.get("FAKE_ADB_LIFECYCLE_MODE") != "stale":
             emit("lifecycle_observed", lifecycle="foreground")
     save()
     print("Status: ok")
 elif tail == ["shell", "input", "keyevent", "HOME"]:
     state["app_foreground"] = False
-    if state["run_state"] == "active":
+    if state["run_state"] == "active" and os.environ.get("FAKE_ADB_LIFECYCLE_MODE") != "stale":
         emit("lifecycle_observed", lifecycle="background")
     save()
 elif tail[:4] == ["shell", "am", "start-foreground-service", "-n"]:
@@ -251,7 +269,20 @@ elif tail[:3] == ["shell", "am", "broadcast"]:
         })
         emit("run_prepared")
         emit("lifecycle_requested", lifecycle=state["lifecycle"])
+        if os.environ.get("FAKE_ADB_LIFECYCLE_MODE") == "stale":
+            emit("lifecycle_observed", lifecycle=state["lifecycle"])
+        if os.environ.get("FAKE_ADB_ROUTE_MODE") == "stale":
+            emit("route_observed", route=state["route"].capitalize())
         save()
+        if os.environ.get("FAKE_ADB_FAIL_MODE") == "prepare_foreign":
+            state.update({
+                "run_state": "active",
+                "run_hash": "sha256:" + "c" * 64,
+                "comparison_hash": "sha256:" + "d" * 64,
+                "transport": "livekit_experimental",
+            })
+            save()
+            sys.exit(81)
         if os.environ.get("FAKE_ADB_FAIL_MODE") == "prepare":
             sys.exit(76)
         completed(0, "status=ok\naction=prepare")
@@ -275,8 +306,12 @@ elif tail[:3] == ["shell", "am", "broadcast"]:
         route = values["route"]
         emit("route_requested", route=route.capitalize())
         accepted = os.environ.get("FAKE_ADB_FAIL_MODE") != "route_rejected"
-        if accepted:
+        route_mode = os.environ.get("FAKE_ADB_ROUTE_MODE", "immediate")
+        if accepted and route_mode == "immediate":
             emit("route_observed", route=route.capitalize())
+        elif accepted and route_mode in {"delayed", "conflicting"}:
+            state["route_pending"] = route_mode
+            state["route_requested_value"] = route
         save()
         completed(0, f"status=ok\naction=route\nroute={route}\naccepted={str(accepted).lower()}")
     elif action.endswith(".MARK"):
@@ -311,6 +346,14 @@ elif tail[:3] == ["shell", "am", "broadcast"]:
         sys.exit(91)
 elif tail[:5] == ["exec-out", "run-as", "me.rerere.rikkahub.debug", "grep", "-F"]:
     pattern = tail[5]
+    if '"route":' in pattern and state.get("route_pending"):
+        requested = state["route_requested_value"]
+        observed = requested if state["route_pending"] == "delayed" else (
+            "earpiece" if requested == "speaker" else "speaker"
+        )
+        emit("route_observed", route=observed.capitalize())
+        state.pop("route_pending", None)
+        save()
     if ("playback_written" in pattern and state.get("recovery_ready") and
             not state.get("recovery_emitted") and
             os.environ.get("FAKE_ADB_SUPPRESS_EVENT") != "playback_written"):
@@ -339,7 +382,16 @@ with log_file.open("ab") as handle:
     handle.write(b"clock\0__END__\0")
 counter = Path(os.environ["FAKE_CLOCK_COUNTER"])
 value = int(counter.read_text()) if counter.exists() else 0
-value += int(os.environ.get("FAKE_CLOCK_STEP", "30"))
+calls_file = Path(str(counter) + ".calls")
+calls = int(calls_file.read_text()) + 1 if calls_file.exists() else 1
+calls_file.write_text(str(calls))
+mode = os.environ.get("FAKE_CLOCK_MODE", "forward")
+if mode == "frozen":
+    value = 100 if calls <= 20 else 1000
+elif mode == "backward":
+    value = 110 - calls * 10 if calls <= 10 else 1000
+else:
+    value += int(os.environ.get("FAKE_CLOCK_STEP", "30"))
 counter.write_text(str(value))
 print(value)
 PY
@@ -350,9 +402,11 @@ reset_fake() {
   mkdir -p "$STATE_DIR"
   : > "$ADB_LOG"
   : > "$CLOCK_LOG"
-  rm -f "$TMP_DIR/clock-counter"
+  rm -f "$TMP_DIR/clock-counter" "$TMP_DIR/clock-counter.calls"
+  rm -f "$LOCK_DIR"/*
   unset FAKE_ADB_DEVICES_MODE FAKE_ADB_FAIL_MODE FAKE_ADB_OBSERVED_TRANSPORT
-  unset FAKE_ADB_APP_NETWORK FAKE_ADB_SUPPRESS_EVENT
+  unset FAKE_ADB_APP_NETWORK FAKE_ADB_SUPPRESS_EVENT FAKE_ADB_EMULATOR
+  unset FAKE_ADB_ROUTE_MODE FAKE_ADB_LIFECYCLE_MODE FAKE_CLOCK_MODE FAKE_ADB_INITIAL_RUN
 }
 
 command_lines() {
@@ -392,6 +446,38 @@ last_command_index() {
   command_lines | awk -v needle="$needle" 'index($0, needle) { found = NR } END { print found }'
 }
 
+assert_no_adb_mutations() {
+  local commands
+  local separator=$'\x1f'
+  commands="$(command_lines)"
+  assert_not_contains "$commands" "shell${separator}svc${separator}"
+  assert_not_contains "$commands" "shell${separator}am${separator}"
+  assert_not_contains "$commands" "exec-in${separator}"
+  assert_not_contains "$commands" "run-as${separator}${PACKAGE}${separator}mkdir"
+  assert_not_contains "$commands" "run-as${separator}${PACKAGE}${separator}rm"
+}
+
+assert_private_path_absent() {
+  local path="$1"
+  python3 - "$STATE_DIR/state.json" "$path" <<'PY'
+import json
+import sys
+state = json.load(open(sys.argv[1]))
+if sys.argv[2] in state.get("staged", {}):
+    raise SystemExit(f"private path still staged: {sys.argv[2]}")
+PY
+}
+
+count_wifi_enables_after_last_disable() {
+  local separator=$'\x1f'
+  command_lines | awk -v disable="svc${separator}wifi${separator}disable" \
+    -v enable="svc${separator}wifi${separator}enable" '
+      index($0, disable) { count = 0; seen = 1; next }
+      seen && index($0, enable) { count++ }
+      END { print count + 0 }
+    '
+}
+
 assert_selected_serial() {
   python3 - "$ADB_LOG" "$SERIAL" <<'PY'
 import sys
@@ -425,6 +511,8 @@ runner_env() {
     VOICE_STAGE1_POLL_SECONDS=0 \
     VOICE_STAGE1_ADB_TIMEOUT_SECONDS=5 \
     VOICE_STAGE1_WAIT_TIMEOUT_SECONDS=120 \
+    VOICE_STAGE1_MAX_WAIT_ATTEMPTS=8 \
+    VOICE_STAGE1_LOCK_DIR="$LOCK_DIR" \
     VOICE_STAGE1_SERIAL="$SERIAL" \
     VOICE_STAGE1_PACKAGE="$PACKAGE" \
     "$@"
@@ -508,6 +596,78 @@ set -e
 assert_not_contains "$multiple_output" "stage1.device="
 unset FAKE_ADB_DEVICES_MODE
 
+reset_fake
+set +e
+wrong_serial_output="$(runner_env VOICE_STAGE1_SERIAL=WRONG_SERIAL bash "$RUNNER" --preflight </dev/null 2>&1)"
+wrong_serial_status=$?
+set -e
+[[ "$wrong_serial_status" -ne 0 ]] || fail "preflight accepted the wrong physical serial"
+assert_contains "$wrong_serial_output" "requires physical device $SERIAL"
+[[ ! -s "$ADB_LOG" ]] || fail "wrong serial reached ADB before rejection"
+
+reset_fake
+export FAKE_ADB_EMULATOR=1
+set +e
+emulator_output="$(runner_env bash "$RUNNER" --preflight </dev/null 2>&1)"
+emulator_status=$?
+set -e
+[[ "$emulator_status" -ne 0 ]] || fail "preflight accepted emulator properties"
+assert_contains "$emulator_output" "physical device verification failed"
+assert_no_adb_mutations
+unset FAKE_ADB_EMULATOR
+
+reset_fake
+export FAKE_ADB_FAIL_MODE=preflight_stage
+set +e
+runner_env bash "$RUNNER" --preflight </dev/null >/dev/null 2>&1
+preflight_stage_status=$?
+set -e
+[[ "$preflight_stage_status" -ne 0 ]] || fail "partial preflight stage unexpectedly succeeded"
+separator=$'\x1f'
+[[ "$(command_count "rm${separator}-f${separator}files/voice-stage1/.preflight")" == "1" ]] ||
+  fail "partial preflight stage was not cleaned exactly once"
+assert_private_path_absent "files/voice-stage1/.preflight"
+unset FAKE_ADB_FAIL_MODE
+
+reset_fake
+export FAKE_ADB_FAIL_MODE=preflight_remove
+set +e
+runner_env bash "$RUNNER" --preflight </dev/null >/dev/null 2>&1
+preflight_remove_status=$?
+set -e
+[[ "$preflight_remove_status" -ne 0 ]] || fail "ambiguous preflight remove unexpectedly succeeded"
+separator=$'\x1f'
+[[ "$(command_count "rm${separator}-f${separator}files/voice-stage1/.preflight")" == "1" ]] ||
+  fail "ambiguous preflight remove was retried"
+assert_private_path_absent "files/voice-stage1/.preflight"
+unset FAKE_ADB_FAIL_MODE
+
+reset_fake
+lock_path="$LOCK_DIR/voice-agent-stage1-$SERIAL.lock"
+: > "$lock_path"
+chmod 600 "$lock_path"
+exec {held_lock_fd}> "$lock_path"
+flock -n "$held_lock_fd"
+set +e
+locked_output="$(run_scenario direct_gemini stable_wifi speaker foreground steady 20 2>&1)"
+locked_status=$?
+set -e
+flock -u "$held_lock_fd"
+exec {held_lock_fd}>&-
+[[ "$locked_status" -ne 0 ]] || fail "concurrent runner acquired an already-held device lock"
+assert_contains "$locked_output" "another Stage1 runner owns $SERIAL"
+[[ ! -s "$ADB_LOG" ]] || fail "locked runner reached ADB"
+
+reset_fake
+export FAKE_ADB_INITIAL_RUN=foreign
+set +e
+run_scenario direct_gemini stable_wifi speaker foreground steady 20 >/dev/null 2>&1
+foreign_active_status=$?
+set -e
+[[ "$foreign_active_status" -ne 0 ]] || fail "runner accepted a foreign active run"
+[[ "$(command_count "automation.FINALIZE")" == "0" ]] || fail "cleanup finalized a foreign active run"
+unset FAKE_ADB_INITIAL_RUN
+
 ROWS=(
   'stable_wifi|speaker|foreground|steady|20'
   'stable_wifi|earpiece|background|steady|60'
@@ -563,6 +723,45 @@ run_scenario livekit_experimental stable_wifi speaker foreground steady 20 >/dev
 assert_common_success_contract livekit_experimental
 
 reset_fake
+export FAKE_ADB_ROUTE_MODE=delayed
+run_scenario direct_gemini stable_wifi speaker foreground steady 20 >/dev/null
+assert_common_success_contract direct_gemini
+unset FAKE_ADB_ROUTE_MODE
+
+reset_fake
+export FAKE_ADB_ROUTE_MODE=stale
+set +e
+stale_route_output="$(run_scenario direct_gemini stable_wifi speaker background steady 20 2>&1)"
+stale_route_status=$?
+set -e
+[[ "$stale_route_status" -ne 0 ]] || fail "stale pre-request route observation was accepted"
+assert_contains "$stale_route_output" "timed out waiting for fresh route_observed"
+separator=$'\x1f'
+[[ "$(command_count "shell${separator}input${separator}keyevent${separator}HOME")" == "0" ]] ||
+  fail "background transition ran before a fresh route observation"
+unset FAKE_ADB_ROUTE_MODE
+
+reset_fake
+export FAKE_ADB_ROUTE_MODE=conflicting
+set +e
+conflicting_route_output="$(run_scenario direct_gemini stable_wifi speaker foreground steady 20 2>&1)"
+conflicting_route_status=$?
+set -e
+[[ "$conflicting_route_status" -ne 0 ]] || fail "conflicting delayed route observation was accepted"
+assert_contains "$conflicting_route_output" "conflicting route observation"
+unset FAKE_ADB_ROUTE_MODE
+
+reset_fake
+export FAKE_ADB_LIFECYCLE_MODE=stale
+set +e
+stale_lifecycle_output="$(run_scenario direct_gemini stable_wifi speaker foreground steady 20 2>&1)"
+stale_lifecycle_status=$?
+set -e
+[[ "$stale_lifecycle_status" -ne 0 ]] || fail "stale pre-action lifecycle observation was accepted"
+assert_contains "$stale_lifecycle_output" "timed out waiting for fresh lifecycle_observed"
+unset FAKE_ADB_LIFECYCLE_MODE
+
+reset_fake
 export FAKE_ADB_APP_NETWORK=cellular
 set +e
 network_mismatch="$(run_scenario direct_gemini stable_wifi speaker foreground steady 20 2>&1)"
@@ -608,6 +807,17 @@ set -e
 unset FAKE_ADB_FAIL_MODE
 
 reset_fake
+export FAKE_ADB_FAIL_MODE=prepare_foreign
+set +e
+run_scenario direct_gemini stable_wifi speaker foreground steady 20 >/dev/null 2>&1
+prepare_foreign_status=$?
+set -e
+[[ "$prepare_foreign_status" -ne 0 ]] || fail "foreign ambiguous prepare unexpectedly succeeded"
+[[ "$(command_count "automation.PREPARE")" == "1" ]] || fail "foreign ambiguous prepare was retried"
+[[ "$(command_count "automation.FINALIZE")" == "0" ]] || fail "cleanup finalized foreign ambiguous run"
+unset FAKE_ADB_FAIL_MODE
+
+reset_fake
 export FAKE_ADB_FAIL_MODE=stage_interrupt
 set +e
 run_scenario direct_gemini stable_wifi speaker foreground steady 20 >/dev/null 2>&1
@@ -646,6 +856,16 @@ separator=$'\x1f'
 unset FAKE_ADB_FAIL_MODE
 
 reset_fake
+export FAKE_ADB_FAIL_MODE=wifi_restore
+set +e
+run_scenario direct_gemini wifi_cellular_wifi speaker foreground reconnect 180 >/dev/null 2>&1
+restore_status=$?
+set -e
+[[ "$restore_status" -ne 0 ]] || fail "ambiguous Wi-Fi restore unexpectedly succeeded"
+[[ "$(count_wifi_enables_after_last_disable)" == "1" ]] || fail "ambiguous Wi-Fi restore was retried"
+unset FAKE_ADB_FAIL_MODE
+
+reset_fake
 export FAKE_ADB_SUPPRESS_EVENT=playback_written
 set +e
 recovery_output="$(run_scenario direct_gemini wifi_cellular_wifi speaker foreground reconnect 180 2>&1)"
@@ -665,5 +885,29 @@ set -e
 assert_contains "$timeout_output" "timed out waiting for call_active"
 [[ -s "$CLOCK_LOG" ]] || fail "bounded waits did not use the injected clock"
 unset FAKE_ADB_SUPPRESS_EVENT
+
+reset_fake
+export FAKE_ADB_SUPPRESS_EVENT=call_active
+export FAKE_CLOCK_MODE=frozen
+set +e
+frozen_output="$(run_scenario direct_gemini stable_wifi speaker foreground steady 20 2>&1)"
+frozen_status=$?
+set -e
+[[ "$frozen_status" -ne 0 ]] || fail "frozen injected clock produced an unbounded or successful wait"
+assert_contains "$frozen_output" "wait attempt limit reached for call_active"
+[[ "$(command_count '\"name\":\"call_active\"')" -le 8 ]] || fail "frozen clock exceeded wait attempt cap"
+unset FAKE_ADB_SUPPRESS_EVENT FAKE_CLOCK_MODE
+
+reset_fake
+export FAKE_ADB_SUPPRESS_EVENT=call_active
+export FAKE_CLOCK_MODE=backward
+set +e
+backward_output="$(run_scenario direct_gemini stable_wifi speaker foreground steady 20 2>&1)"
+backward_status=$?
+set -e
+[[ "$backward_status" -ne 0 ]] || fail "backward injected clock was accepted"
+assert_contains "$backward_output" "clock moved backward while waiting for call_active"
+[[ "$(command_count '\"name\":\"call_active\"')" -le 2 ]] || fail "backward clock continued polling"
+unset FAKE_ADB_SUPPRESS_EVENT FAKE_CLOCK_MODE
 
 printf 'voice-agent-stage1-e2e tests passed.\n'
