@@ -105,34 +105,56 @@ class VoiceAutomationControlTest {
     }
 
     @Test
-    fun `prepare resets a finalized runtime only after validating the next binding`() {
-        val runtime = RecordingRuntime(
-            currentStatus = VoiceAutomationStatus(
-                state = VoiceAutomationRunState.Finalized,
-                runHash = RUN_HASH,
-                comparisonHash = COMPARISON_HASH,
-                requestedTransport = VoiceAgentTransport.DirectGemini,
-                eventCount = 2,
-            ),
+    fun `failed next prepare preserves finalized status and dump artifact`() {
+        val root = createTempDirectory("voice-automation-control-transaction").toFile()
+        val runtime = DefaultVoiceAutomationRuntime(root, IncrementingClock())
+        val control = VoiceAutomationControl(
+            runtime = runtime,
+            routeRequester = { false },
+            connectivityReader = {
+                VoiceAutomationConnectivity(VoiceAutomationNetwork.WIFI, true)
+            },
+            artifactFile = { status ->
+                status.runHash?.let { runHash ->
+                    File(
+                        root,
+                        "voice-e2e/${runHash.removePrefix("sha256:")}/automation-events.jsonl",
+                    ).takeIf(File::isFile)
+                }
+            },
         )
-        val control = control(runtime)
+        assertSuccess(control.handle(VoiceAutomationControl.ACTION_PREPARE, validPrepareExtras()))
+        assertSuccess(control.handle(VoiceAutomationControl.ACTION_FINALIZE, emptyMap()))
+        val finalizedArtifact = File(
+            root,
+            "voice-e2e/${RUN_HASH.removePrefix("sha256:")}/automation-events.jsonl",
+        )
+        val finalizedContent = finalizedArtifact.readText()
+        File(
+            root,
+            "voice-e2e/${NEXT_RUN_HASH.removePrefix("sha256:")}/automation-events.jsonl",
+        ).apply {
+            checkNotNull(parentFile).mkdirs()
+            writeText("occupied")
+        }
 
-        assertInvalid(
-            control.handle(
-                VoiceAutomationControl.ACTION_PREPARE,
-                validPrepareExtras().plus(VoiceAutomationControl.EXTRA_RUN_HASH to "raw-run-id"),
-            ),
+        val failedPrepare = control.handle(
+            VoiceAutomationControl.ACTION_PREPARE,
+            validPrepareExtras().plus(VoiceAutomationControl.EXTRA_RUN_HASH to NEXT_RUN_HASH),
         )
-        assertEquals(0, runtime.resetCalls)
 
-        assertSuccess(
-            control.handle(
-                VoiceAutomationControl.ACTION_PREPARE,
-                validPrepareExtras().plus(VoiceAutomationControl.EXTRA_RUN_HASH to NEXT_RUN_HASH),
-            ),
+        assertEquals(VoiceAutomationControl.RESULT_ERROR, failedPrepare.resultCode)
+        assertEquals("status=error\nerror=invalid_state", failedPrepare.resultData)
+        val status = control.handle(VoiceAutomationControl.ACTION_STATUS, emptyMap())
+        assertEquals("finalized", status.resultData.lineValue("run_state"))
+        assertEquals(RUN_HASH, status.resultData.lineValue("run_hash"))
+        val dump = control.handle(VoiceAutomationControl.ACTION_DUMP, emptyMap())
+        assertSuccess(dump)
+        assertEquals(finalizedArtifact.absolutePath, dump.resultData.lineValue("artifact_path"))
+        assertEquals(
+            finalizedContent.replace("\\", "\\\\").replace("\n", "\\n"),
+            dump.resultData.lineValue("artifact_content"),
         )
-        assertEquals(1, runtime.resetCalls)
-        assertEquals(NEXT_RUN_HASH, runtime.preparedBinding?.runHash)
     }
 
     @Test
@@ -395,7 +417,6 @@ class VoiceAutomationControlTest {
         private val onRecord: (VoiceAutomationEventInput) -> Unit = {},
     ) : VoiceAutomationRuntime {
         var preparedBinding: VoiceAutomationRunBinding? = null
-        var resetCalls = 0
         val events = mutableListOf<VoiceAutomationEventInput>()
 
         override fun prepare(binding: VoiceAutomationRunBinding) {
@@ -422,7 +443,6 @@ class VoiceAutomationControlTest {
         }
 
         override fun reset() {
-            resetCalls += 1
             currentStatus = VoiceAutomationStatus(VoiceAutomationRunState.Idle)
         }
     }

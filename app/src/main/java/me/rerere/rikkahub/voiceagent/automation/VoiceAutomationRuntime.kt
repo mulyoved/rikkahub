@@ -40,17 +40,27 @@ internal class DefaultVoiceAutomationRuntime(
     private var binding: VoiceAutomationRunBinding? = null
     private var writer: VoiceAutomationEventWriter? = null
     private var currentStatus = VoiceAutomationStatus(VoiceAutomationRunState.Idle)
+    private var lastEmittedMonotonicMs: Long? = null
 
     @Synchronized
     override fun prepare(binding: VoiceAutomationRunBinding) {
-        check(currentStatus.state == VoiceAutomationRunState.Idle) {
-            "Automation run is already prepared or finalized"
+        check(currentStatus.state != VoiceAutomationRunState.Active) {
+            "Automation run is already active"
         }
         VoiceAutomationEventValidation.validate(binding)
+        val candidateWriter = VoiceAutomationEventWriter.create(noBackupFilesDir, binding.runHash)
+        val monotonicMs = nextMonotonicMs()
+        candidateWriter.append(
+            event(
+                binding = binding,
+                input = VoiceAutomationEventInput(VoiceAutomationEventName.RUN_PREPARED),
+                monotonicMs = monotonicMs,
+            ),
+        )
         this.binding = binding
-        writer = VoiceAutomationEventWriter.create(noBackupFilesDir, binding.runHash)
-        currentStatus = activeStatus(binding, eventCount = 0)
-        recordActive(VoiceAutomationEventInput(VoiceAutomationEventName.RUN_PREPARED))
+        writer = candidateWriter
+        lastEmittedMonotonicMs = monotonicMs
+        currentStatus = activeStatus(binding, eventCount = 1)
     }
 
     @Synchronized
@@ -90,25 +100,39 @@ internal class DefaultVoiceAutomationRuntime(
 
     private fun recordActive(input: VoiceAutomationEventInput) {
         val activeBinding = checkNotNull(binding)
-        val event = VoiceAutomationEvent(
-            monotonicMs = clock.monotonicMs(),
-            wallClockMs = clock.wallClockMs(),
-            runHash = activeBinding.runHash,
-            comparisonHash = activeBinding.comparisonHash,
-            requestedTransport = activeBinding.requestedTransport,
-            observedTransport = input.observedTransport,
-            name = input.name,
-            route = input.route,
-            network = input.network,
-            lifecycle = input.lifecycle,
-            playbackEpoch = input.playbackEpoch,
-            byteCount = input.byteCount,
-            succeeded = input.succeeded,
-            correlationKind = input.correlationKind,
-            correlationHash = input.correlationHash,
-        )
-        checkNotNull(writer).append(event)
+        val monotonicMs = nextMonotonicMs()
+        checkNotNull(writer).append(event(activeBinding, input, monotonicMs))
+        lastEmittedMonotonicMs = monotonicMs
         currentStatus = activeStatus(activeBinding, currentStatus.eventCount + 1)
+    }
+
+    private fun event(
+        binding: VoiceAutomationRunBinding,
+        input: VoiceAutomationEventInput,
+        monotonicMs: Long,
+    ) = VoiceAutomationEvent(
+        monotonicMs = monotonicMs,
+        wallClockMs = clock.wallClockMs(),
+        runHash = binding.runHash,
+        comparisonHash = binding.comparisonHash,
+        requestedTransport = binding.requestedTransport,
+        observedTransport = input.observedTransport,
+        name = input.name,
+        route = input.route,
+        network = input.network,
+        lifecycle = input.lifecycle,
+        playbackEpoch = input.playbackEpoch,
+        byteCount = input.byteCount,
+        succeeded = input.succeeded,
+        correlationKind = input.correlationKind,
+        correlationHash = input.correlationHash,
+    )
+
+    private fun nextMonotonicMs(): Long {
+        val observed = clock.monotonicMs()
+        val previous = lastEmittedMonotonicMs ?: return observed
+        check(previous < Long.MAX_VALUE) { "Automation monotonic timestamp exhausted" }
+        return maxOf(observed, previous + 1)
     }
 
     private fun activeStatus(binding: VoiceAutomationRunBinding, eventCount: Long) = VoiceAutomationStatus(

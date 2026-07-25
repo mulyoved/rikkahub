@@ -129,9 +129,6 @@ internal class VoiceAutomationControl(
             VoiceAutomationLifecycle.BACKGROUND.wireName -> VoiceAutomationLifecycle.BACKGROUND
             else -> throw IllegalArgumentException("Invalid lifecycle")
         }
-        if (runtime.status().state == VoiceAutomationRunState.Finalized) {
-            runtime.reset()
-        }
         runtime.prepare(VoiceAutomationRunBinding(runHash, comparisonHash, transport))
         runtime.record(
             VoiceAutomationEventInput(

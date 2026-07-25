@@ -44,6 +44,86 @@ class VoiceAutomationRuntimeTest {
     }
 
     @Test
+    fun `finalized runtime transactionally prepares a fresh run`() {
+        val root = Files.createTempDirectory("voice-automation-runtime-next").toFile()
+        val runtime = DefaultVoiceAutomationRuntime(root, FakeClock())
+        runtime.prepare(
+            VoiceAutomationRunBinding(RUN_HASH, COMPARISON_HASH, VoiceAgentTransport.DirectGemini),
+        )
+        runtime.finalizeRun()
+
+        runtime.prepare(
+            VoiceAutomationRunBinding(
+                NEXT_RUN_HASH,
+                NEXT_COMPARISON_HASH,
+                VoiceAgentTransport.LiveKitExperimental,
+            ),
+        )
+
+        assertEquals(VoiceAutomationRunState.Active, runtime.status().state)
+        assertEquals(NEXT_RUN_HASH, runtime.status().runHash)
+        assertEquals(NEXT_COMPARISON_HASH, runtime.status().comparisonHash)
+        assertEquals(VoiceAgentTransport.LiveKitExperimental, runtime.status().requestedTransport)
+        assertEquals(1, runtime.status().eventCount)
+    }
+
+    @Test
+    fun `failed next prepare preserves finalized state and artifact`() {
+        val root = Files.createTempDirectory("voice-automation-runtime-transaction").toFile()
+        val runtime = DefaultVoiceAutomationRuntime(root, FakeClock())
+        runtime.prepare(
+            VoiceAutomationRunBinding(RUN_HASH, COMPARISON_HASH, VoiceAgentTransport.DirectGemini),
+        )
+        val finalizedArtifact = runtime.finalizeRun()
+        val finalizedStatus = runtime.status()
+        val finalizedContent = finalizedArtifact.readText()
+        java.io.File(
+            root,
+            "voice-e2e/${NEXT_RUN_HASH.removePrefix("sha256:")}/automation-events.jsonl",
+        ).apply {
+            checkNotNull(parentFile).mkdirs()
+            writeText("occupied")
+        }
+
+        assertFailsWith<IllegalStateException> {
+            runtime.prepare(
+                VoiceAutomationRunBinding(
+                    NEXT_RUN_HASH,
+                    NEXT_COMPARISON_HASH,
+                    VoiceAgentTransport.LiveKitExperimental,
+                ),
+            )
+        }
+
+        assertEquals(finalizedStatus, runtime.status())
+        assertEquals(finalizedContent, finalizedArtifact.readText())
+    }
+
+    @Test
+    fun `non advancing clock still emits strictly increasing event timestamps`() {
+        val root = Files.createTempDirectory("voice-automation-runtime-monotonic").toFile()
+        val runtime = DefaultVoiceAutomationRuntime(root, ConstantClock())
+        runtime.prepare(
+            VoiceAutomationRunBinding(RUN_HASH, COMPARISON_HASH, VoiceAgentTransport.DirectGemini),
+        )
+
+        runtime.record(
+            VoiceAutomationEventInput(
+                name = VoiceAutomationEventName.LIFECYCLE_REQUESTED,
+                lifecycle = VoiceAutomationLifecycle.FOREGROUND,
+            ),
+        )
+
+        val timestamps = java.io.File(
+            root,
+            "voice-e2e/${RUN_HASH.removePrefix("sha256:")}/automation-events.jsonl",
+        ).readLines().map { line ->
+            Regex(""""monotonicMs":(\d+)""").find(line)!!.groupValues[1].toLong()
+        }
+        assertEquals(listOf(7L, 8L), timestamps)
+    }
+
+    @Test
     fun `runtime fails closed for duplicate preparation binding drift and invalid finalization`() {
         val runtime = DefaultVoiceAutomationRuntime(
             Files.createTempDirectory("voice-automation-runtime-closed").toFile(),
@@ -109,6 +189,12 @@ class VoiceAutomationRuntimeTest {
         override fun wallClockMs(): Long = 1_000 + tick
     }
 
+    private class ConstantClock : VoiceAutomationClock {
+        override fun monotonicMs(): Long = 7
+
+        override fun wallClockMs(): Long = 1_000
+    }
+
     private inline fun <reified T : Throwable> assertFailsWith(block: () -> Unit) {
         try {
             block()
@@ -121,5 +207,8 @@ class VoiceAutomationRuntimeTest {
     private companion object {
         const val RUN_HASH = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         const val COMPARISON_HASH = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        const val NEXT_RUN_HASH = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        const val NEXT_COMPARISON_HASH =
+            "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
     }
 }
