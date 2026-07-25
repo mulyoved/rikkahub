@@ -28,6 +28,37 @@ class LiveKitVoiceContractsTest {
     }
 
     @Test
+    fun `worker ready parser accepts valid canonical UTC-second timestamps`() {
+        listOf(
+            "2026-07-25T00:00:00Z",
+            "2024-02-29T23:59:59Z",
+        ).forEach { observedAt ->
+            assertEquals(
+                observedAt,
+                parseLiveKitReadyMessage(readyJsonWithObservedAt(observedAt))?.observedAt,
+            )
+        }
+    }
+
+    @Test
+    fun `worker ready parser rejects malformed and noncanonical timestamps`() {
+        listOf(
+            "not-a-time",
+            "2026-07-25T00:00:00+00:00",
+            "2026-07-25T00:00:00.000Z",
+            "2026-02-30T00:00:00Z",
+            "2026-07-25T00:00:00z",
+            " 2026-07-25T00:00:00Z",
+            "2016-12-31T23:59:60Z",
+        ).forEach { observedAt ->
+            assertNull(
+                observedAt,
+                parseLiveKitReadyMessage(readyJsonWithObservedAt(observedAt)),
+            )
+        }
+    }
+
+    @Test
     fun `worker ready parser rejects duplicate missing extra uppercase and malformed fields`() {
         listOf(
             CANONICAL_READY_JSON.replace(
@@ -194,6 +225,9 @@ private const val WORKER_EVENT_HASH =
 private const val CANONICAL_READY_JSON =
     "{\"version\":1,\"voiceSessionId\":\"voice-session-id\",\"kind\":\"ready\"," +
         "\"observedAt\":\"2026-07-25T00:00:00Z\",\"eventIdHash\":\"$WORKER_EVENT_HASH\"}"
+
+private fun readyJsonWithObservedAt(observedAt: String): String =
+    CANONICAL_READY_JSON.replace("2026-07-25T00:00:00Z", observedAt)
 
 private fun transportFor(handler: (Request) -> Response): HermesVoiceHttpTransport =
     HermesVoiceHttpTransport(handler)

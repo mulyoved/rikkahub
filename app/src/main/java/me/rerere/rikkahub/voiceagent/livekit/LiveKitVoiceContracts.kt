@@ -7,9 +7,12 @@ import kotlinx.serialization.json.Json
 import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationCorrelationKind
 import java.net.URI
 import java.security.MessageDigest
+import java.time.Instant
+import java.time.format.DateTimeFormatter
 
 private val LIVEKIT_IDENTIFIER = Regex("^[A-Za-z0-9_-]{1,128}$")
 private val LIVEKIT_HASH = Regex("sha256:[0-9a-f]{64}")
+private val LIVEKIT_READY_TIMESTAMP = Regex("[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
 
 @Serializable
 internal data class LiveKitReadyMessage(
@@ -27,10 +30,17 @@ internal fun parseLiveKitReadyMessage(payload: String): LiveKitReadyMessage? {
     if (
         message.version != 1 ||
         message.kind != "ready" ||
+        !message.observedAt.isCanonicalLiveKitReadyTimestamp() ||
         !LIVEKIT_HASH.matches(message.eventIdHash)
     ) return null
     if (Json.encodeToString(message) != payload) return null
     return message
+}
+
+private fun String.isCanonicalLiveKitReadyTimestamp(): Boolean {
+    if (!LIVEKIT_READY_TIMESTAMP.matches(this) || startsWith("0000-")) return false
+    val instant = runCatching { Instant.parse(this) }.getOrNull() ?: return false
+    return DateTimeFormatter.ISO_INSTANT.format(instant) == this
 }
 
 @Serializable

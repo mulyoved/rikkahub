@@ -202,6 +202,26 @@ class LiveKitVoiceCallSessionTest {
     }
 
     @Test
+    fun `ready rejects invalid observed timestamp without worker evidence`() = runTest {
+        val runtime = SessionRecordingAutomationRuntime()
+        val fixture = fixture(automationRuntime = runtime)
+        fixture.session.start()
+        runCurrent()
+        fixture.room.emit(LiveKitRoomEvent.Connected)
+        fixture.room.emit(
+            LiveKitRoomEvent.Data(
+                AGENT_IDENTITY,
+                READY_TOPIC,
+                readyJson(observedAt = "not-a-time"),
+            ),
+        )
+        runCurrent()
+
+        assertFalse(fixture.session.state.value.session is VoiceSessionStatus.Connected)
+        assertTrue(runtime.events.none { it.correlationKind == VoiceAutomationCorrelationKind.WORKER_EVENT })
+    }
+
+    @Test
     fun `mute and explicit interrupt use only LiveKit`() = runTest {
         val fixture = fixture()
         fixture.session.start()
@@ -941,9 +961,11 @@ private fun details() = LiveKitSessionDetails(
 
 private fun readyJson(
     voiceSessionId: String = VOICE_SESSION_ID,
+    observedAt: String = "2026-07-20T00:00:00Z",
     eventIdHash: String = WORKER_EVENT_HASH,
 ): String =
-    """{"version":1,"voiceSessionId":"$voiceSessionId","kind":"ready","observedAt":"2026-07-20T00:00:00Z","eventIdHash":"$eventIdHash"}"""
+    """{"version":1,"voiceSessionId":"$voiceSessionId","kind":"ready",""" +
+        """"observedAt":"$observedAt","eventIdHash":"$eventIdHash"}"""
 
 private const val LIVEKIT_URL = "wss://project.livekit.cloud"
 private const val PARTICIPANT_TOKEN = "participant-token"
