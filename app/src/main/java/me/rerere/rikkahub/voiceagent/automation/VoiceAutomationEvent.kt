@@ -86,7 +86,7 @@ internal data class VoiceAutomationEvent(
     val observedModelHash: String? = null,
     val voiceHash: String? = null,
     val instructionHash: String? = null,
-    val accountStateHash: String? = null,
+    val directAccountConfigurationHash: String? = null,
     val conversationHash: String? = null,
 )
 
@@ -111,7 +111,7 @@ internal data class VoiceAutomationEventInput(
     val observedModelHash: String? = null,
     val voiceHash: String? = null,
     val instructionHash: String? = null,
-    val accountStateHash: String? = null,
+    val directAccountConfigurationHash: String? = null,
     val conversationHash: String? = null,
 )
 
@@ -142,7 +142,7 @@ internal object VoiceAutomationEventValidation {
             "observedModelHash" to event.observedModelHash,
             "voiceHash" to event.voiceHash,
             "instructionHash" to event.instructionHash,
-            "accountStateHash" to event.accountStateHash,
+            "directAccountConfigurationHash" to event.directAccountConfigurationHash,
             "conversationHash" to event.conversationHash,
         )
         if (event.name == VoiceAutomationEventName.DIRECT_CONFIG_ATTESTED) {

@@ -177,6 +177,6 @@ internal fun orchestratorRequest(label: String): VoiceAgentCallRequest = VoiceAg
         voiceModelId = label,
         assistantName = "Assistant $label",
         assistantPrompt = "Prompt $label",
-        accountStateHash = "sha256:" + "a".repeat(64),
+        directAccountConfigurationHash = "sha256:" + "a".repeat(64),
     ),
 )

@@ -46,7 +46,7 @@ class VoiceAutomationEventTest {
                 "\"playbackEpoch\":1,\"byteCount\":3200,\"succeeded\":true," +
                 "\"correlationKind\":\"session\",\"correlationHash\":\"$CORRELATION_HASH\"," +
                 "\"requestedModelHash\":null,\"observedModelHash\":null,\"voiceHash\":null," +
-                "\"instructionHash\":null,\"accountStateHash\":null," +
+                "\"instructionHash\":null,\"directAccountConfigurationHash\":null," +
                 "\"conversationHash\":null}\n",
             line,
         )

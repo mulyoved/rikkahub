@@ -6,13 +6,14 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
-import me.rerere.rikkahub.voiceagent.gemini.GeminiLiveEvent
+import me.rerere.rikkahub.voiceagent.automation.DefaultVoiceAutomationRuntime
 import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationEventInput
 import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationEventName
 import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationRunBinding
 import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationRunState
 import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationRuntime
 import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationStatus
+import me.rerere.rikkahub.voiceagent.gemini.GeminiLiveEvent
 import me.rerere.rikkahub.voiceagent.persistence.VoiceContext
 import me.rerere.rikkahub.voiceagent.telemetry.RecordedVoiceEvent
 import me.rerere.rikkahub.voiceagent.telemetry.RecordingVoiceObservability
@@ -22,11 +23,45 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.io.File
+import java.nio.file.Files
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
-import java.io.File
 
 class VoiceAgentReconnectTest {
+    @Test
+    fun `second real Direct reconnect callback remains structurally visible in artifact`() = runTest {
+        val runtime = DefaultVoiceAutomationRuntime(
+            Files.createTempDirectory("direct-second-reconnect").toFile(),
+        )
+        runtime.prepare(
+            VoiceAutomationRunBinding(
+                RECONNECT_AUTOMATION_RUN_HASH,
+                RECONNECT_AUTOMATION_COMPARISON_HASH,
+                VoiceAgentTransport.DirectGemini,
+            ),
+        )
+        val gemini = FakeGeminiLiveVoiceClient()
+        val session = reconnectSession(
+            gemini = gemini,
+            reconnectPolicy = fastReconnectPolicy(maxAttempts = 3, delayMs = 1),
+            automationRuntime = runtime,
+        )
+
+        session.start()
+        gemini.awaitConnectCount(1)
+        gemini.eventHandlers.single()(GeminiLiveEvent.WebSocketFailure(message = "first drop"))
+        gemini.awaitConnectCount(2)
+        gemini.eventHandlers.last()(GeminiLiveEvent.WebSocketFailure(message = "second drop"))
+        gemini.awaitConnectCount(3)
+        session.endAndDrain()
+
+        val names = runtime.finalizeRun().readLines().map { line ->
+            Regex("""\"name\":\"([^\"]+)\"""").find(line)!!.groupValues[1]
+        }
+        assertEquals(2, names.count { it == "reconnect_started" })
+    }
+
     @Test
     fun `post connected WebSocket failure automatically reconnects without terminal error`() = runTest {
         val diagnostics = VoiceDiagnostics()
@@ -915,7 +950,7 @@ class VoiceAgentReconnectTest {
             automationRuntimeProvider = { automationRuntime },
             directConfigurationBinding = automationRuntime?.let {
                 VoiceDirectConfigurationBinding(
-                    accountStateHash = RECONNECT_AUTOMATION_ACCOUNT_STATE_HASH,
+                    directAccountConfigurationHash = RECONNECT_AUTOMATION_DIRECT_ACCOUNT_CONFIGURATION_HASH,
                     conversationHash = RECONNECT_AUTOMATION_CONVERSATION_HASH,
                 )
             },
@@ -959,7 +994,7 @@ private const val RECONNECT_AUTOMATION_RUN_HASH =
     "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 private const val RECONNECT_AUTOMATION_COMPARISON_HASH =
     "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-private const val RECONNECT_AUTOMATION_ACCOUNT_STATE_HASH =
+private const val RECONNECT_AUTOMATION_DIRECT_ACCOUNT_CONFIGURATION_HASH =
     "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
 private const val RECONNECT_AUTOMATION_CONVERSATION_HASH =
     "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"

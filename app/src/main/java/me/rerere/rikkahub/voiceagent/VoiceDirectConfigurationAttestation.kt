@@ -8,11 +8,14 @@ import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationEventValidation
 import me.rerere.rikkahub.voiceagent.telemetry.sha256Hex
 
 internal data class VoiceDirectConfigurationBinding(
-    val accountStateHash: String,
+    val directAccountConfigurationHash: String,
     val conversationHash: String,
 ) {
     init {
-        VoiceAutomationEventValidation.validateHash("accountStateHash", accountStateHash)
+        VoiceAutomationEventValidation.validateHash(
+            "directAccountConfigurationHash",
+            directAccountConfigurationHash,
+        )
         VoiceAutomationEventValidation.validateHash("conversationHash", conversationHash)
     }
 }

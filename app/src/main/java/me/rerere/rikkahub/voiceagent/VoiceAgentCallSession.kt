@@ -624,7 +624,7 @@ class VoiceAgentCallSession internal constructor(
                     observedModelHash = voiceConfigurationIdentity(session.providerModel),
                     voiceHash = voiceConfigurationIdentity(voiceName),
                     instructionHash = voiceConfigurationIdentity(voiceContext.systemInstruction),
-                    accountStateHash = binding.accountStateHash,
+                    directAccountConfigurationHash = binding.directAccountConfigurationHash,
                     conversationHash = binding.conversationHash,
                 ),
             )

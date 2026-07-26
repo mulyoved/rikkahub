@@ -53,7 +53,7 @@ internal class VoiceAutomationEventWriter private constructor(
         appendNullableString("observedModelHash", event.observedModelHash)
         appendNullableString("voiceHash", event.voiceHash)
         appendNullableString("instructionHash", event.instructionHash)
-        appendNullableString("accountStateHash", event.accountStateHash)
+        appendNullableString("directAccountConfigurationHash", event.directAccountConfigurationHash)
         appendNullableString("conversationHash", event.conversationHash)
         append('}')
     }

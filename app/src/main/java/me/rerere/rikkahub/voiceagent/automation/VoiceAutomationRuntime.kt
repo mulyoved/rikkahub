@@ -136,9 +136,7 @@ internal class DefaultVoiceAutomationRuntime(
     override fun markReconnectTransportRestored(runHash: String): Boolean {
         if (
             currentStatus.state != VoiceAutomationRunState.Active ||
-            binding?.runHash != runHash ||
-            !reconnectStarted ||
-            reconnectTransportRestored
+            binding?.runHash != runHash
         ) {
             return false
         }
@@ -173,26 +171,42 @@ internal class DefaultVoiceAutomationRuntime(
     private fun recordActive(input: VoiceAutomationEventInput) {
         when (input.name) {
             VoiceAutomationEventName.RECONNECT_STARTED -> {
-                check(!reconnectStarted) { "Reconnect start must be unique" }
+                if (reconnectStarted) {
+                    rejectRecordedTransition(input, "Reconnect start must be unique")
+                }
                 reconnectStarted = true
             }
             VoiceAutomationEventName.RECONNECT_TRANSPORT_RESTORED -> {
-                check(reconnectStarted) { "Transport restoration must follow reconnect start" }
-                check(!reconnectTransportRestored) { "Transport restoration must be unique" }
+                if (!reconnectStarted) {
+                    rejectRecordedTransition(input, "Transport restoration must follow reconnect start")
+                }
+                if (reconnectTransportRestored) {
+                    rejectRecordedTransition(input, "Transport restoration must be unique")
+                }
                 reconnectTransportRestored = true
             }
             VoiceAutomationEventName.HANDOVER_STARTED -> {
-                check(!handoverStarted) { "Handover start must be unique" }
+                if (handoverStarted) {
+                    rejectRecordedTransition(input, "Handover start must be unique")
+                }
                 handoverStarted = true
             }
             VoiceAutomationEventName.HANDOVER_CELLULAR_OBSERVED -> {
-                check(!handoverCellularObserved) { "Cellular observation must be unique" }
-                check(handoverStarted) { "Cellular observation must follow handover start" }
+                if (handoverCellularObserved) {
+                    rejectRecordedTransition(input, "Cellular observation must be unique")
+                }
+                if (!handoverStarted) {
+                    rejectRecordedTransition(input, "Cellular observation must follow handover start")
+                }
                 handoverCellularObserved = true
             }
             VoiceAutomationEventName.HANDOVER_WIFI_RESTORED -> {
-                check(!handoverWifiRestored) { "Wi-Fi restoration must be unique" }
-                check(handoverCellularObserved) { "Wi-Fi restoration must follow cellular observation" }
+                if (handoverWifiRestored) {
+                    rejectRecordedTransition(input, "Wi-Fi restoration must be unique")
+                }
+                if (!handoverCellularObserved) {
+                    rejectRecordedTransition(input, "Wi-Fi restoration must follow cellular observation")
+                }
                 handoverWifiRestored = true
             }
             else -> Unit
@@ -201,6 +215,14 @@ internal class DefaultVoiceAutomationRuntime(
         if (input.name == VoiceAutomationEventName.PLAYBACK_WRITTEN) {
             recordRestoredMedia(input.playbackEpoch)
         }
+    }
+
+    private fun rejectRecordedTransition(
+        input: VoiceAutomationEventInput,
+        message: String,
+    ): Nothing {
+        appendActive(input)
+        error(message)
     }
 
     private fun appendActive(input: VoiceAutomationEventInput) {
@@ -271,7 +293,7 @@ internal class DefaultVoiceAutomationRuntime(
         observedModelHash = input.observedModelHash,
         voiceHash = input.voiceHash,
         instructionHash = input.instructionHash,
-        accountStateHash = input.accountStateHash,
+        directAccountConfigurationHash = input.directAccountConfigurationHash,
         conversationHash = input.conversationHash,
     )
 

@@ -212,7 +212,7 @@ internal class DefaultVoiceAgentCallFactory internal constructor(
                 metadataEpochNowMs = metadataEpochNowMs,
                 scope = scope,
                 directConfigurationBinding = VoiceDirectConfigurationBinding(
-                    accountStateHash = config.accountStateHash,
+                    directAccountConfigurationHash = config.directAccountConfigurationHash,
                     conversationHash = voiceConfigurationIdentity(conversationId.toString()),
                 ),
             )

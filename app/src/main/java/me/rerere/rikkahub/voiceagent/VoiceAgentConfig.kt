@@ -17,7 +17,7 @@ data class VoiceAgentLaunchConfig(
     val voiceModelId: String,
     val assistantName: String,
     val assistantPrompt: String,
-    val accountStateHash: String,
+    val directAccountConfigurationHash: String,
 )
 
 sealed interface VoiceAgentConfigResult {
@@ -62,7 +62,7 @@ class VoiceAgentConfigResolver(
                 voiceModelId = headers.valueFor(VOICE_AGENT_MODEL_ID_HEADER) ?: defaultVoiceModelId,
                 assistantName = assistant.name.ifBlank { "Default Assistant" },
                 assistantPrompt = conversation.customSystemPrompt ?: assistant.systemPrompt,
-                accountStateHash = voiceConfigurationStateIdentity(
+                directAccountConfigurationHash = voiceConfigurationStateIdentity(
                     "voice-agent-account-v1",
                     provider.id.toString(),
                     provider.apiKey,

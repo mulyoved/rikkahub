@@ -31,6 +31,7 @@ import me.rerere.rikkahub.voiceagent.VoiceSessionStatus
 import me.rerere.rikkahub.voiceagent.orchestratorRequest
 import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationAudioProbe
 import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationCorrelationKind
+import me.rerere.rikkahub.voiceagent.automation.DefaultVoiceAutomationRuntime
 import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationEventInput
 import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationEventName
 import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationRunBinding
@@ -38,6 +39,7 @@ import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationRunState
 import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationRuntime
 import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationStatus
 import me.rerere.rikkahub.voiceagent.telemetry.VoiceTraceContext
+import java.nio.file.Files
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertSame
@@ -49,6 +51,40 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
 class LiveKitVoiceCallSessionTest {
+    @Test
+    fun `second real LiveKit reconnect callback remains structurally visible in artifact`() = runTest {
+        val runtime = DefaultVoiceAutomationRuntime(
+            Files.createTempDirectory("livekit-second-reconnect").toFile(),
+        )
+        runtime.prepare(
+            VoiceAutomationRunBinding(
+                AUTOMATION_RUN_HASH,
+                AUTOMATION_COMPARISON_HASH,
+                VoiceAgentTransport.LiveKitExperimental,
+            ),
+        )
+        val fixture = fixture(automationRuntime = runtime)
+        fixture.session.start()
+        runCurrent()
+        fixture.room.emit(LiveKitRoomEvent.Data(AGENT_IDENTITY, READY_TOPIC, readyJson()))
+        runCurrent()
+
+        repeat(2) {
+            fixture.room.emit(LiveKitRoomEvent.Reconnecting)
+            fixture.room.emit(LiveKitRoomEvent.Reconnected)
+            runCurrent()
+        }
+        assertEquals(
+            VoiceAgentCleanupResult.Completed,
+            fixture.session.cleanupOperation.run(VoiceAgentCleanupMode.Immediate),
+        )
+
+        val names = runtime.finalizeRun().readLines().map { line ->
+            Regex("""\"name\":\"([^\"]+)\"""").find(line)!!.groupValues[1]
+        }
+        assertEquals(2, names.count { it == "reconnect_started" })
+    }
+
     @Test
     fun `autonomous failure cleanup does not block the session Main dispatcher`() = runTest {
         val mainDispatcher = Executors.newSingleThreadExecutor().asCoroutineDispatcher()

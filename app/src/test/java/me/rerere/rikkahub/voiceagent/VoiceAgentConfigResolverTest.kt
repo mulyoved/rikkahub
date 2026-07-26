@@ -33,6 +33,7 @@ class VoiceAgentConfigResolverTest {
             ),
             providers = listOf(
                 ProviderSetting.OpenAI(
+                    id = Uuid.parse("00000000-0000-0000-0000-000000000001"),
                     name = "RMS Hermes",
                     apiKey = "profile-api-key",
                     baseUrl = "https://hermes.example.test/v1",
@@ -51,7 +52,10 @@ class VoiceAgentConfigResolverTest {
         assertEquals("profile-api-key", config.credentials.deviceApiKey)
         assertEquals("gemini-flash", config.voiceModelId)
         assertEquals("Hermes", config.assistantName)
-        assertTrue(Regex("sha256:[0-9a-f]{64}").matches(config.accountStateHash))
+        assertEquals(
+            "sha256:8c9d46b59acb04a022fe63445de0e91617f450fed6b601483b11f713b6589fb3",
+            config.directAccountConfigurationHash,
+        )
 
         val changedAccount = settings.copy(
             providers = listOf(
@@ -64,7 +68,9 @@ class VoiceAgentConfigResolverTest {
             VoiceAgentConfigResolver(baseUrlOverride = "")
                 .resolve(changedAccount, conversation) as VoiceAgentConfigResult.Available
             ).config
-        assertTrue(config.accountStateHash != changedConfig.accountStateHash)
+        assertTrue(
+            config.directAccountConfigurationHash != changedConfig.directAccountConfigurationHash,
+        )
     }
 
     @Test

@@ -812,6 +812,6 @@ internal fun serviceRequest(
         voiceModelId = voiceModelId,
         assistantName = "Hermes",
         assistantPrompt = "system",
-        accountStateHash = "sha256:" + "a".repeat(64),
+        directAccountConfigurationHash = "sha256:" + "a".repeat(64),
     ),
 )

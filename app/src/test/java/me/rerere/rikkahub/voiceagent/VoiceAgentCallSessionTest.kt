@@ -49,7 +49,7 @@ class VoiceAgentCallSessionTest {
                 scope = this,
                 automationRuntimeProvider = { runtime },
                 directConfigurationBinding = VoiceDirectConfigurationBinding(
-                    accountStateHash = accountHash,
+                    directAccountConfigurationHash = accountHash,
                     conversationHash = conversationHash,
                 ),
             )
@@ -73,7 +73,7 @@ class VoiceAgentCallSessionTest {
             capture(instruction = "other prompt"),
         )
         assertEquals(
-            baseline.copy(accountStateHash = REPLACEMENT_AUTOMATION_RUN_HASH),
+            baseline.copy(directAccountConfigurationHash = REPLACEMENT_AUTOMATION_RUN_HASH),
             capture(accountHash = REPLACEMENT_AUTOMATION_RUN_HASH),
         )
         assertEquals(
@@ -98,7 +98,7 @@ class VoiceAgentCallSessionTest {
             scope = this,
             automationRuntimeProvider = { runtime },
             directConfigurationBinding = VoiceDirectConfigurationBinding(
-                accountStateHash = ACCOUNT_STATE_HASH,
+                directAccountConfigurationHash = ACCOUNT_STATE_HASH,
                 conversationHash = CONVERSATION_HASH,
             ),
         )
@@ -124,7 +124,7 @@ class VoiceAgentCallSessionTest {
                     observedModelHash = voiceConfigurationIdentity("gemini-live-test"),
                     voiceHash = voiceConfigurationIdentity("Puck"),
                     instructionHash = voiceConfigurationIdentity("system"),
-                    accountStateHash = ACCOUNT_STATE_HASH,
+                    directAccountConfigurationHash = ACCOUNT_STATE_HASH,
                     conversationHash = CONVERSATION_HASH,
                 ),
                 VoiceAutomationEventInput(
