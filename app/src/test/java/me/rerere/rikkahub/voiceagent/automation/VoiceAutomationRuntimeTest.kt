@@ -69,6 +69,73 @@ class VoiceAutomationRuntimeTest {
     }
 
     @Test
+    fun `validated handover closes reconnect on the first owned restored media write`() {
+        val root = Files.createTempDirectory("voice-automation-runtime-handover").toFile()
+        val runtime = DefaultVoiceAutomationRuntime(root, FakeClock())
+        runtime.prepare(
+            VoiceAutomationRunBinding(
+                RUN_HASH,
+                COMPARISON_HASH,
+                VoiceAgentTransport.LiveKitExperimental,
+            ),
+        )
+
+        listOf(
+            VoiceAutomationEventInput(VoiceAutomationEventName.RECONNECT_STARTED),
+            VoiceAutomationEventInput(VoiceAutomationEventName.HANDOVER_STARTED),
+            VoiceAutomationEventInput(
+                VoiceAutomationEventName.HANDOVER_CELLULAR_OBSERVED,
+                network = VoiceAutomationNetwork.CELLULAR,
+            ),
+        ).forEach { event -> assertTrue(runtime.recordIfActiveRun(RUN_HASH, event)) }
+        assertTrue(runtime.markReconnectTransportRestored(RUN_HASH))
+        assertTrue(
+            runtime.recordIfActiveRun(
+                RUN_HASH,
+                VoiceAutomationEventInput(
+                    VoiceAutomationEventName.PLAYBACK_WRITTEN,
+                    playbackEpoch = 2,
+                    byteCount = 3_200,
+                ),
+            ),
+        )
+        listOf(
+            VoiceAutomationEventInput(
+                VoiceAutomationEventName.HANDOVER_WIFI_RESTORED,
+                network = VoiceAutomationNetwork.WIFI,
+            ),
+            VoiceAutomationEventInput(
+                VoiceAutomationEventName.PLAYBACK_WRITTEN,
+                playbackEpoch = 3,
+                byteCount = 3_200,
+            ),
+        ).forEach { event -> assertTrue(runtime.recordIfActiveRun(RUN_HASH, event)) }
+
+        val artifact = runtime.finalizeRun()
+        val names = artifact.readLines().map { line ->
+            Regex("""\"name\":\"([^\"]+)\"""").find(line)!!.groupValues[1]
+        }
+        assertEquals(
+            listOf(
+                "run_prepared",
+                "reconnect_started",
+                "handover_started",
+                "handover_cellular_observed",
+                "playback_written",
+                "handover_wifi_restored",
+                "playback_written",
+                "handover_media_restored",
+                "reconnect_media_restored",
+                "run_finalized",
+            ),
+            names,
+        )
+        assertTrue(
+            artifact.readLines().takeLast(3).take(2).all { "\"playbackEpoch\":3" in it },
+        )
+    }
+
+    @Test
     fun `finalized runtime transactionally prepares a fresh run`() {
         val root = Files.createTempDirectory("voice-automation-runtime-next").toFile()
         val runtime = DefaultVoiceAutomationRuntime(root, FakeClock())

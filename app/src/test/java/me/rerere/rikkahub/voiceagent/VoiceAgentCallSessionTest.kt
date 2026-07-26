@@ -28,7 +28,7 @@ import java.util.Base64
 
 class VoiceAgentCallSessionTest {
     @Test
-    fun `connected direct session records its observed automation transport`() = runTest {
+    fun `direct session records one owned call lifecycle`() = runTest {
         val runtime = SessionRecordingAutomationRuntime()
         val session = VoiceAgentCallSession(
             modelId = "gemini-flash",
@@ -47,17 +47,64 @@ class VoiceAgentCallSessionTest {
         session.start()
 
         withTimeout(500) {
-            while (runtime.events.isEmpty()) {
+            while (runtime.events.none { it.name == VoiceAutomationEventName.CALL_ACTIVE }) {
                 delay(10)
             }
         }
+        session.endAndDrain()
+
         assertEquals(
             listOf(
+                VoiceAutomationEventInput(
+                    name = VoiceAutomationEventName.CALL_START_REQUESTED,
+                    observedTransport = VoiceAgentTransport.DirectGemini,
+                ),
                 VoiceAutomationEventInput(
                     name = VoiceAutomationEventName.CALL_ACTIVE,
                     observedTransport = VoiceAgentTransport.DirectGemini,
                     correlationKind = VoiceAutomationCorrelationKind.APP,
                     correlationHash = AUTOMATION_RUN_HASH,
+                ),
+                VoiceAutomationEventInput(
+                    name = VoiceAutomationEventName.CALL_STOPPED,
+                    succeeded = true,
+                ),
+            ),
+            runtime.events,
+        )
+    }
+
+    @Test
+    fun `direct callbacks cannot write into a replacement automation run`() = runTest {
+        val runtime = SessionRecordingAutomationRuntime()
+        val gemini = FakeGeminiLiveVoiceClient()
+        val blockedConnect = gemini.blockNextConnectCompletion()
+        val session = VoiceAgentCallSession(
+            modelId = "gemini-flash",
+            sessionApi = FakeVoiceSessionApi(),
+            toolApi = FakeVoiceToolApi(),
+            gemini = gemini,
+            audio = FakeVoiceAudioEngine(),
+            conversationStore = FakeVoiceConversationStore(),
+            contextProvider = FakeVoiceAgentContextProvider(
+                VoiceContext(systemInstruction = "system", turns = emptyList()),
+            ),
+            scope = this,
+            automationRuntimeProvider = { runtime },
+        )
+
+        session.start()
+        gemini.awaitConnect()
+        runtime.activeRunHash = REPLACEMENT_AUTOMATION_RUN_HASH
+        blockedConnect.release.complete(Unit)
+        delay(50)
+        session.endAndDrain()
+
+        assertEquals(
+            listOf(
+                VoiceAutomationEventInput(
+                    name = VoiceAutomationEventName.CALL_START_REQUESTED,
+                    observedTransport = VoiceAgentTransport.DirectGemini,
                 ),
             ),
             runtime.events,
@@ -920,6 +967,7 @@ class VoiceAgentCallSessionTest {
 
 private class SessionRecordingAutomationRuntime : VoiceAutomationRuntime {
     val events = mutableListOf<VoiceAutomationEventInput>()
+    var activeRunHash = AUTOMATION_RUN_HASH
 
     override fun prepare(binding: VoiceAutomationRunBinding) = Unit
 
@@ -929,7 +977,7 @@ private class SessionRecordingAutomationRuntime : VoiceAutomationRuntime {
 
     override fun status() = VoiceAutomationStatus(
         state = VoiceAutomationRunState.Active,
-        runHash = AUTOMATION_RUN_HASH,
+        runHash = activeRunHash,
         comparisonHash = AUTOMATION_COMPARISON_HASH,
         requestedTransport = VoiceAgentTransport.DirectGemini,
     )
@@ -943,3 +991,5 @@ private const val AUTOMATION_RUN_HASH =
     "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 private const val AUTOMATION_COMPARISON_HASH =
     "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+private const val REPLACEMENT_AUTOMATION_RUN_HASH =
+    "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"

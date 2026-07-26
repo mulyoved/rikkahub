@@ -21,6 +21,10 @@ internal interface VoiceAutomationRuntime {
         record(event)
         return true
     }
+    fun markReconnectTransportRestored(runHash: String): Boolean =
+        status().let { status ->
+            status.state == VoiceAutomationRunState.Active && status.runHash == runHash
+        }
     fun status(): VoiceAutomationStatus
     fun finalizeRun(): File
     fun reset()
@@ -50,6 +54,13 @@ internal class DefaultVoiceAutomationRuntime(
     private var currentStatus = VoiceAutomationStatus(VoiceAutomationRunState.Idle)
     private var lastEmittedMonotonicMs: Long? = null
     private var directAppCorrelationRecorded = false
+    private var reconnectStarted = false
+    private var reconnectTransportRestored = false
+    private var reconnectMediaRestored = false
+    private var handoverStarted = false
+    private var handoverCellularObserved = false
+    private var handoverWifiRestored = false
+    private var handoverMediaRestored = false
 
     @Synchronized
     override fun prepare(binding: VoiceAutomationRunBinding) {
@@ -70,6 +81,7 @@ internal class DefaultVoiceAutomationRuntime(
         writer = candidateWriter
         lastEmittedMonotonicMs = monotonicMs
         directAppCorrelationRecorded = false
+        resetRestorationState()
         currentStatus = activeStatus(binding, eventCount = 1)
     }
 
@@ -121,6 +133,19 @@ internal class DefaultVoiceAutomationRuntime(
     }
 
     @Synchronized
+    override fun markReconnectTransportRestored(runHash: String): Boolean {
+        if (
+            currentStatus.state != VoiceAutomationRunState.Active ||
+            binding?.runHash != runHash ||
+            !reconnectStarted
+        ) {
+            return false
+        }
+        reconnectTransportRestored = true
+        return true
+    }
+
+    @Synchronized
     override fun status(): VoiceAutomationStatus = currentStatus
 
     @Synchronized
@@ -138,15 +163,82 @@ internal class DefaultVoiceAutomationRuntime(
         binding = null
         writer = null
         directAppCorrelationRecorded = false
+        resetRestorationState()
         currentStatus = VoiceAutomationStatus(VoiceAutomationRunState.Idle)
     }
 
     private fun recordActive(input: VoiceAutomationEventInput) {
+        when (input.name) {
+            VoiceAutomationEventName.RECONNECT_STARTED -> {
+                if (reconnectStarted) return
+                reconnectStarted = true
+            }
+            VoiceAutomationEventName.HANDOVER_STARTED -> {
+                if (handoverStarted) return
+                check(reconnectStarted) { "Handover must belong to an active reconnect" }
+                handoverStarted = true
+            }
+            VoiceAutomationEventName.HANDOVER_CELLULAR_OBSERVED -> {
+                if (handoverCellularObserved) return
+                check(handoverStarted) { "Cellular observation must follow handover start" }
+                handoverCellularObserved = true
+            }
+            VoiceAutomationEventName.HANDOVER_WIFI_RESTORED -> {
+                if (handoverWifiRestored) return
+                check(handoverCellularObserved) { "Wi-Fi restoration must follow cellular observation" }
+                handoverWifiRestored = true
+                reconnectTransportRestored = true
+            }
+            else -> Unit
+        }
+        appendActive(input)
+        if (input.name == VoiceAutomationEventName.PLAYBACK_WRITTEN) {
+            recordRestoredMedia(input.playbackEpoch)
+        }
+    }
+
+    private fun appendActive(input: VoiceAutomationEventInput) {
         val activeBinding = checkNotNull(binding)
         val monotonicMs = nextMonotonicMs()
         checkNotNull(writer).append(event(activeBinding, input, monotonicMs))
         lastEmittedMonotonicMs = monotonicMs
         currentStatus = activeStatus(activeBinding, currentStatus.eventCount + 1)
+    }
+
+    private fun recordRestoredMedia(playbackEpoch: Long?) {
+        if (handoverWifiRestored && !handoverMediaRestored) {
+            handoverMediaRestored = true
+            appendActive(
+                VoiceAutomationEventInput(
+                    name = VoiceAutomationEventName.HANDOVER_MEDIA_RESTORED,
+                    playbackEpoch = checkNotNull(playbackEpoch),
+                ),
+            )
+        }
+        if (
+            reconnectStarted &&
+            reconnectTransportRestored &&
+            (!handoverStarted || handoverMediaRestored) &&
+            !reconnectMediaRestored
+        ) {
+            reconnectMediaRestored = true
+            appendActive(
+                VoiceAutomationEventInput(
+                    name = VoiceAutomationEventName.RECONNECT_MEDIA_RESTORED,
+                    playbackEpoch = checkNotNull(playbackEpoch),
+                ),
+            )
+        }
+    }
+
+    private fun resetRestorationState() {
+        reconnectStarted = false
+        reconnectTransportRestored = false
+        reconnectMediaRestored = false
+        handoverStarted = false
+        handoverCellularObserved = false
+        handoverWifiRestored = false
+        handoverMediaRestored = false
     }
 
     private fun event(

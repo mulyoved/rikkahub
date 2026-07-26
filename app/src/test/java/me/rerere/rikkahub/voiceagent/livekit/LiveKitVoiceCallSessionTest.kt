@@ -191,6 +191,8 @@ class LiveKitVoiceCallSessionTest {
 
         fixture.room.emit(LiveKitRoomEvent.Data(AGENT_IDENTITY, READY_TOPIC, readyJson()))
         runCurrent()
+        fixture.room.emit(LiveKitRoomEvent.Data(AGENT_IDENTITY, READY_TOPIC, readyJson()))
+        runCurrent()
 
         assertTrue(fixture.session.state.value.session is VoiceSessionStatus.Connected)
         val workerEvent = runtime.events.single {
@@ -199,6 +201,42 @@ class LiveKitVoiceCallSessionTest {
         assertEquals(VoiceAutomationEventName.CALL_ACTIVE, workerEvent.name)
         assertEquals(WORKER_EVENT_HASH, workerEvent.correlationHash)
         assertFalse(workerEvent.correlationHash.orEmpty().contains(TEST_TRACE_ID))
+
+        assertEquals(
+            VoiceAgentCleanupResult.Completed,
+            fixture.session.cleanupOperation.run(VoiceAgentCleanupMode.Immediate),
+        )
+        assertEquals(
+            VoiceAutomationEventInput(
+                name = VoiceAutomationEventName.CALL_STOPPED,
+                succeeded = true,
+            ),
+            runtime.events.last(),
+        )
+    }
+
+    @Test
+    fun `LiveKit callbacks cannot write into a replacement automation run`() = runTest {
+        val runtime = SessionRecordingAutomationRuntime()
+        val fixture = fixture(automationRuntime = runtime)
+        fixture.session.start()
+        runCurrent()
+        runtime.activeRunHash = REPLACEMENT_AUTOMATION_RUN_HASH
+
+        fixture.room.emit(
+            LiveKitRoomEvent.Data(AGENT_IDENTITY, READY_TOPIC, readyJson()),
+        )
+        fixture.room.emit(LiveKitRoomEvent.Reconnecting)
+        runCurrent()
+        assertEquals(
+            VoiceAgentCleanupResult.Completed,
+            fixture.session.cleanupOperation.run(VoiceAgentCleanupMode.Immediate),
+        )
+
+        assertTrue(runtime.events.all { it.name == VoiceAutomationEventName.CALL_START_REQUESTED })
+        assertTrue(runtime.events.none { it.name == VoiceAutomationEventName.CALL_ACTIVE })
+        assertTrue(runtime.events.none { it.name == VoiceAutomationEventName.RECONNECT_STARTED })
+        assertTrue(runtime.events.none { it.name == VoiceAutomationEventName.CALL_STOPPED })
     }
 
     @Test
@@ -928,6 +966,7 @@ private class SessionRecordingAudioProbe(
 
 private class SessionRecordingAutomationRuntime : VoiceAutomationRuntime {
     val events = mutableListOf<VoiceAutomationEventInput>()
+    var activeRunHash = AUTOMATION_RUN_HASH
 
     override fun prepare(binding: VoiceAutomationRunBinding) = Unit
 
@@ -937,7 +976,7 @@ private class SessionRecordingAutomationRuntime : VoiceAutomationRuntime {
 
     override fun status() = VoiceAutomationStatus(
         state = VoiceAutomationRunState.Active,
-        runHash = AUTOMATION_RUN_HASH,
+        runHash = activeRunHash,
         comparisonHash = AUTOMATION_COMPARISON_HASH,
         requestedTransport = VoiceAgentTransport.LiveKitExperimental,
         eventCount = events.size.toLong() + 1,
@@ -982,3 +1021,5 @@ private const val AUTOMATION_RUN_HASH =
     "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 private const val AUTOMATION_COMPARISON_HASH =
     "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+private const val REPLACEMENT_AUTOMATION_RUN_HASH =
+    "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"

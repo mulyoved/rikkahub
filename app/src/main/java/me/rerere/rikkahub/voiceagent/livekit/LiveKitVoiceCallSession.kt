@@ -75,6 +75,9 @@ internal class LiveKitVoiceCallSession(
     private var connectionJob: Job? = null
     private var microphoneJob: Job? = null
     private var automationRuntime: VoiceAutomationRuntime? = null
+    private var automationRunHash: String? = null
+    private val automationCallBecameActive = AtomicBoolean(false)
+    private val automationCallStoppedRecorded = AtomicBoolean(false)
     private var automationAudioActivation: AutoCloseable? = null
 
     init {
@@ -96,6 +99,7 @@ internal class LiveKitVoiceCallSession(
         rpcMethods = rpcMethods.keys,
         room = room,
         automationAudioActivation = { automationAudioActivation },
+        recordCallStopped = ::recordAutomationCallStopped,
     )
 
     override fun start() {
@@ -200,16 +204,20 @@ internal class LiveKitVoiceCallSession(
         val activation = room.automationAudio.activate(runHash)
         try {
             details.automationCorrelations().forEach { correlation ->
-                runtime.record(
-                    VoiceAutomationEventInput(
-                        name = VoiceAutomationEventName.CALL_START_REQUESTED,
-                        observedTransport = VoiceAgentTransport.LiveKitExperimental,
-                        correlationKind = correlation.kind,
-                        correlationHash = correlation.hash,
+                check(
+                    runtime.recordIfActiveRun(
+                        runHash = runHash,
+                        event = VoiceAutomationEventInput(
+                            name = VoiceAutomationEventName.CALL_START_REQUESTED,
+                            observedTransport = VoiceAgentTransport.LiveKitExperimental,
+                            correlationKind = correlation.kind,
+                            correlationHash = correlation.hash,
+                        ),
                     ),
-                )
+                ) { "LiveKit automation run changed during call start" }
             }
             automationRuntime = runtime
+            automationRunHash = runHash
             automationAudioActivation = activation
         } catch (error: Throwable) {
             activation.close()
@@ -252,9 +260,13 @@ internal class LiveKitVoiceCallSession(
                 }
             }
             LiveKitRoomEvent.Reconnecting -> {
+                recordOwnedAutomationEvent(
+                    VoiceAutomationEventInput(VoiceAutomationEventName.RECONNECT_STARTED),
+                )
                 mutableState.update { it.copy(session = VoiceSessionStatus.Reconnecting) }
             }
             LiveKitRoomEvent.Reconnected -> {
+                markOwnedReconnectTransportRestored()
                 mutableState.update {
                     it.copy(
                         session = if (wasReady) VoiceSessionStatus.Connected else VoiceSessionStatus.ConnectingGemini,
@@ -279,7 +291,8 @@ internal class LiveKitVoiceCallSession(
             message.voiceSessionId != details.voiceSessionId ||
             message.eventIdHash != liveKitWorkerReadyHash(activeTraceId)
         ) return
-        automationRuntime?.record(
+        if (wasReady) return
+        val recorded = recordOwnedAutomationEvent(
             VoiceAutomationEventInput(
                 name = VoiceAutomationEventName.CALL_ACTIVE,
                 observedTransport = VoiceAgentTransport.LiveKitExperimental,
@@ -287,6 +300,7 @@ internal class LiveKitVoiceCallSession(
                 correlationHash = message.eventIdHash,
             ),
         )
+        if (recorded) automationCallBecameActive.set(true)
         wasReady = true
         ready.complete(Unit)
         mutableState.update { it.copy(session = VoiceSessionStatus.Connected, error = null) }
@@ -309,6 +323,37 @@ internal class LiveKitVoiceCallSession(
                 )
             }
         }
+    }
+
+    private fun recordOwnedAutomationEvent(event: VoiceAutomationEventInput): Boolean {
+        val runtime = automationRuntime ?: return false
+        val runHash = automationRunHash ?: return false
+        return runCatching {
+            runtime.recordIfActiveRun(runHash = runHash, event = event)
+        }.getOrDefault(false)
+    }
+
+    private fun markOwnedReconnectTransportRestored(): Boolean {
+        val runtime = automationRuntime ?: return false
+        val runHash = automationRunHash ?: return false
+        return runCatching {
+            runtime.markReconnectTransportRestored(runHash)
+        }.getOrDefault(false)
+    }
+
+    private fun recordAutomationCallStopped() {
+        if (
+            !automationCallBecameActive.get() ||
+            !automationCallStoppedRecorded.compareAndSet(false, true)
+        ) {
+            return
+        }
+        recordOwnedAutomationEvent(
+            VoiceAutomationEventInput(
+                name = VoiceAutomationEventName.CALL_STOPPED,
+                succeeded = true,
+            ),
+        )
     }
 
     private fun appendDiagnostic(name: String, detail: String) {
@@ -348,6 +393,7 @@ private class LiveKitCleanupOperation(
     rpcMethods: Set<String>,
     private val room: LiveKitRoomFacade,
     private val automationAudioActivation: () -> AutoCloseable?,
+    private val recordCallStopped: () -> Unit,
 ) : JoinedCleanupOperation() {
     private var routeCompleted = false
     private var connectionJobCompleted = false
@@ -472,6 +518,7 @@ private class LiveKitCleanupOperation(
         try {
             room.close()
             closeCompleted = true
+            recordCallStopped()
         } catch (error: Throwable) {
             failures.add(error)
         }

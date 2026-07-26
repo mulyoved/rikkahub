@@ -255,6 +255,7 @@ elif tail[:4] == ["shell", "am", "start-foreground-service", "-n"]:
     action = tail[tail.index("-a") + 1]
     if action.endswith(".START"):
         state["call_started"] = True
+        emit("call_start_requested", observed_transport=state["transport"])
         save()
         if os.environ.get("FAKE_ADB_FAIL_MODE") == "start":
             sys.exit(74)
@@ -264,6 +265,8 @@ elif tail[:4] == ["shell", "am", "start-foreground-service", "-n"]:
         save()
     else:
         state["call_started"] = False
+        if state["run_state"] == "active":
+            emit("call_stopped", succeeded=True)
         save()
     print("Starting service: Intent")
 elif tail == ["shell", "dumpsys", "activity", "services", "me.rerere.rikkahub.debug"]:
@@ -335,9 +338,21 @@ elif tail[:3] == ["shell", "am", "broadcast"]:
         completed(0, f"status=ok\naction=route\nroute={route}\naccepted={str(accepted).lower()}")
     elif action.endswith(".MARK"):
         boundary = values["boundary"]
-        emit(boundary)
+        if values.get("run_hash") != state["run_hash"]:
+            completed(1, "status=error\nerror=invalid_state")
+            sys.exit(0)
+        if boundary == "handover_cellular_observed":
+            emit(boundary, network="cellular")
+        elif boundary == "handover_wifi_restored":
+            emit(boundary, network="wifi")
+        else:
+            emit(boundary)
+        if boundary == "reconnect_started":
+            state["reconnect_started"] = True
         if boundary == "handover_started":
             state["handover_started"] = True
+        if boundary == "handover_wifi_restored":
+            state["handover_wifi_restored"] = True
         save()
         completed(0, f"status=ok\naction=mark\nboundary={boundary}")
     elif action.endswith(".FINALIZE"):
@@ -377,6 +392,10 @@ elif tail[:5] == ["exec-out", "run-as", "me.rerere.rikkahub.debug", "grep", "-F"
             not state.get("recovery_emitted") and
             os.environ.get("FAKE_ADB_SUPPRESS_EVENT") != "playback_written"):
         emit("playback_written", playback_epoch=1, byte_count=3200)
+        if state.get("handover_wifi_restored"):
+            emit("handover_media_restored", playback_epoch=1)
+        if state.get("reconnect_started"):
+            emit("reconnect_media_restored", playback_epoch=1)
         state["recovery_emitted"] = True
         save()
     matches = [line for line in state["events"] if pattern in line]
@@ -458,7 +477,10 @@ command_count() {
 
 command_index() {
   local needle="$1"
-  command_lines | awk -v needle="$needle" 'index($0, needle) { print NR; exit }'
+  command_lines | awk -v needle="$needle" '
+    !found && index($0, needle) { found = NR }
+    END { if (found) print found }
+  '
 }
 
 last_command_index() {
@@ -736,6 +758,16 @@ for row in "${ROWS[@]}"; do
     restore_index="$(last_command_index "svc${separator}wifi${separator}enable")"
     (( handover_index < data_index && data_index < disable_index && disable_index < restore_index )) ||
       fail "handover mutation order was not mark, cellular, Wi-Fi off, Wi-Fi restore"
+    [[ "$(command_count "reconnect_started")" == "1" ]] ||
+      fail "reconnect row did not emit its start boundary"
+    [[ "$(command_count "handover_cellular_observed")" == "1" ]] ||
+      fail "handover row did not emit validated cellular evidence"
+    [[ "$(command_count "handover_wifi_restored")" == "1" ]] ||
+      fail "handover row did not emit validated Wi-Fi restoration evidence"
+    [[ "$(command_count "handover_media_restored")" == "1" ]] ||
+      fail "handover row did not emit post-restoration media evidence"
+    [[ "$(command_count "reconnect_media_restored")" == "1" ]] ||
+      fail "reconnect row did not emit its restored-media boundary"
   fi
 done
 

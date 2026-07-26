@@ -224,18 +224,30 @@ class VoiceAutomationControlTest {
         val control = control(runtime)
 
         val accepted = mapOf(
-            "prompt_ended" to VoiceAutomationEventName.PROMPT_ENDED,
-            "interrupt_started" to VoiceAutomationEventName.INTERRUPT_STARTED,
-            "handover_started" to VoiceAutomationEventName.HANDOVER_STARTED,
+            "prompt_ended" to VoiceAutomationEventInput(VoiceAutomationEventName.PROMPT_ENDED),
+            "interrupt_started" to VoiceAutomationEventInput(VoiceAutomationEventName.INTERRUPT_STARTED),
+            "reconnect_started" to VoiceAutomationEventInput(VoiceAutomationEventName.RECONNECT_STARTED),
+            "handover_started" to VoiceAutomationEventInput(VoiceAutomationEventName.HANDOVER_STARTED),
+            "handover_cellular_observed" to VoiceAutomationEventInput(
+                VoiceAutomationEventName.HANDOVER_CELLULAR_OBSERVED,
+                network = VoiceAutomationNetwork.CELLULAR,
+            ),
+            "handover_wifi_restored" to VoiceAutomationEventInput(
+                VoiceAutomationEventName.HANDOVER_WIFI_RESTORED,
+                network = VoiceAutomationNetwork.WIFI,
+            ),
         )
-        accepted.forEach { (wireName, eventName) ->
+        accepted.forEach { (wireName, event) ->
             assertSuccess(
                 control.handle(
                     VoiceAutomationControl.ACTION_MARK,
-                    mapOf(VoiceAutomationControl.EXTRA_BOUNDARY to wireName),
+                    mapOf(
+                        VoiceAutomationControl.EXTRA_BOUNDARY to wireName,
+                        VoiceAutomationControl.EXTRA_RUN_HASH to RUN_HASH,
+                    ),
                 ),
             )
-            assertEquals(eventName, runtime.events.last().name)
+            assertEquals(event, runtime.events.last())
         }
 
         listOf(
@@ -243,17 +255,28 @@ class VoiceAutomationControlTest {
             mapOf(VoiceAutomationControl.EXTRA_BOUNDARY to "INTERRUPT_STARTED"),
             mapOf(VoiceAutomationControl.EXTRA_BOUNDARY to "call_active"),
             mapOf(VoiceAutomationControl.EXTRA_BOUNDARY to "failure"),
-            mapOf(VoiceAutomationControl.EXTRA_BOUNDARY to "reconnect_started"),
             mapOf(VoiceAutomationControl.EXTRA_BOUNDARY to "reconnect_media_restored"),
-            mapOf(VoiceAutomationControl.EXTRA_BOUNDARY to "handover_cellular_observed"),
-            mapOf(VoiceAutomationControl.EXTRA_BOUNDARY to "handover_wifi_restored"),
             mapOf(VoiceAutomationControl.EXTRA_BOUNDARY to "handover_media_restored"),
             mapOf(VoiceAutomationControl.EXTRA_BOUNDARY to "dropout_started"),
             mapOf(VoiceAutomationControl.EXTRA_BOUNDARY to "dropout_ended"),
-            mapOf(VoiceAutomationControl.EXTRA_BOUNDARY to "prompt_ended", "raw_id" to "secret"),
+            mapOf(
+                VoiceAutomationControl.EXTRA_BOUNDARY to "prompt_ended",
+                VoiceAutomationControl.EXTRA_RUN_HASH to RUN_HASH,
+                "raw_id" to "secret",
+            ),
         ).forEach { extras ->
             assertInvalid(control.handle(VoiceAutomationControl.ACTION_MARK, extras))
         }
+
+        runtime.currentStatus = runtime.currentStatus.copy(runHash = NEXT_RUN_HASH)
+        val stale = control.handle(
+            VoiceAutomationControl.ACTION_MARK,
+            mapOf(
+                VoiceAutomationControl.EXTRA_BOUNDARY to "reconnect_started",
+                VoiceAutomationControl.EXTRA_RUN_HASH to RUN_HASH,
+            ),
+        )
+        assertEquals("status=error\nerror=invalid_state", stale.resultData)
     }
 
     @Test

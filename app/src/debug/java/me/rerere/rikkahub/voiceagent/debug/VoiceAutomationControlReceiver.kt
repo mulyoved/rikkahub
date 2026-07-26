@@ -169,11 +169,26 @@ internal class VoiceAutomationControl(
     }
 
     private fun mark(extras: Map<String, String>): VoiceAutomationControlResult {
-        requireExactKeys(extras, setOf(EXTRA_BOUNDARY))
+        requireExactKeys(extras, setOf(EXTRA_BOUNDARY, EXTRA_RUN_HASH))
         requireActiveRun()
         val boundary = SCENARIO_BOUNDARIES[extras.getValue(EXTRA_BOUNDARY)]
             ?: throw IllegalArgumentException("Invalid scenario boundary")
-        runtime.record(VoiceAutomationEventInput(name = boundary))
+        val runHash = extras.getValue(EXTRA_RUN_HASH)
+        VoiceAutomationEventValidation.validateHash("runHash", runHash)
+        val event = when (boundary) {
+            VoiceAutomationEventName.HANDOVER_CELLULAR_OBSERVED -> VoiceAutomationEventInput(
+                name = boundary,
+                network = VoiceAutomationNetwork.CELLULAR,
+            )
+            VoiceAutomationEventName.HANDOVER_WIFI_RESTORED -> VoiceAutomationEventInput(
+                name = boundary,
+                network = VoiceAutomationNetwork.WIFI,
+            )
+            else -> VoiceAutomationEventInput(name = boundary)
+        }
+        check(runtime.recordIfActiveRun(runHash = runHash, event = event)) {
+            "Automation run owner changed"
+        }
         return success("mark", "boundary" to boundary.wireName)
     }
 
@@ -265,7 +280,10 @@ internal class VoiceAutomationControl(
         private val SCENARIO_BOUNDARIES = listOf(
             VoiceAutomationEventName.PROMPT_ENDED,
             VoiceAutomationEventName.INTERRUPT_STARTED,
+            VoiceAutomationEventName.RECONNECT_STARTED,
             VoiceAutomationEventName.HANDOVER_STARTED,
+            VoiceAutomationEventName.HANDOVER_CELLULAR_OBSERVED,
+            VoiceAutomationEventName.HANDOVER_WIFI_RESTORED,
         ).associateBy { it.wireName }
 
         fun invalidRequest() = error("invalid_request")

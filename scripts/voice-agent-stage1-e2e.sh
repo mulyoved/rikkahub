@@ -546,7 +546,9 @@ wait_event_after() {
 
 mark_boundary() {
   local boundary="${1,,}"
-  control_broadcast MARK --es boundary "$boundary"
+  control_broadcast MARK \
+    --es boundary "$boundary" \
+    --es run_hash "$VOICE_STAGE1_RUN_HASH"
   expect_control_data $'status=ok\naction=mark\nboundary='"$boundary"
 }
 
@@ -698,19 +700,24 @@ wait_target_duration() {
 
 perform_handover() {
   local wifi_restored_ms
+  mark_boundary RECONNECT_STARTED
   mark_boundary HANDOVER_STARTED
   adb_command shell svc data enable >/dev/null
   WIFI_RESTORE_STATE="not_attempted"
   adb_command shell svc wifi disable >/dev/null
   wait_android_network cellular
   cross_check_network cellular
+  mark_boundary HANDOVER_CELLULAR_OBSERVED
   WIFI_RESTORE_STATE="pending"
   adb_command shell svc wifi enable >/dev/null
   wait_android_network wifi
   cross_check_network wifi
+  mark_boundary HANDOVER_WIFI_RESTORED
   WIFI_RESTORE_STATE="proven"
   wifi_restored_ms="$(latest_event_monotonic_ms NETWORK_OBSERVED)"
   wait_event_after PLAYBACK_WRITTEN "$wifi_restored_ms"
+  wait_event HANDOVER_MEDIA_RESTORED
+  wait_event RECONNECT_MEDIA_RESTORED
 }
 
 finalize_and_fetch() {
@@ -768,7 +775,8 @@ for event in events:
         raise SystemExit("observed transport mismatch")
 
 names = [event.get("name") for event in events]
-for required in ("run_prepared", "call_active", "route_requested", "route_observed",
+for required in ("run_prepared", "call_start_requested", "call_active", "call_stopped",
+                 "route_requested", "route_observed",
                  "lifecycle_requested", "lifecycle_observed", "prompt_ended",
                  "playback_active", "run_finalized"):
     if required not in names:
@@ -776,6 +784,16 @@ for required in ("run_prepared", "call_active", "route_requested", "route_observ
 if not any(event.get("name") == "call_active" and event.get("observedTransport") == transport
            for event in events):
     raise SystemExit("observed transport mismatch")
+call_starts = [index for index, event in enumerate(events)
+               if event.get("name") == "call_start_requested"]
+call_active = [index for index, event in enumerate(events)
+               if event.get("name") == "call_active"]
+call_stops = [index for index, event in enumerate(events)
+              if event.get("name") == "call_stopped" and event.get("succeeded") is True]
+if (not call_starts or not call_active or len(call_stops) != 1 or
+        max(call_starts) >= min(call_active) or max(call_active) >= call_stops[0] or
+        call_stops[0] >= names.index("run_finalized")):
+    raise SystemExit("call lifecycle evidence is incomplete or misordered")
 route_requested_index = next((index for index in range(len(events) - 1, -1, -1)
                               if events[index].get("name") == "route_requested" and
                               events[index].get("route") == route), -1)
@@ -812,8 +830,12 @@ else:
             cursor += 1
     if cursor != 3:
         raise SystemExit("handover network sequence mismatch")
-    if "handover_started" not in names:
-        raise SystemExit("missing handover marker")
+    for marker in ("reconnect_started", "handover_started",
+                   "handover_cellular_observed", "handover_wifi_restored",
+                   "handover_media_restored", "reconnect_media_restored"):
+        if names.count(marker) != 1:
+            raise SystemExit(f"missing or duplicate handover marker: {marker}")
+    reconnect_index = names.index("reconnect_started")
     handover_index = names.index("handover_started")
     cellular_index = next((index for index, event in enumerate(events)
                            if event.get("name") == "network_observed" and
@@ -825,8 +847,20 @@ else:
                                 event.get("network") == "wifi"), -1)
     media_index = next((index for index, event in enumerate(events)
                         if event.get("name") == "playback_written" and index > restored_wifi_index), -1)
+    cellular_marker_index = names.index("handover_cellular_observed")
+    wifi_marker_index = names.index("handover_wifi_restored")
+    handover_media_index = names.index("handover_media_restored")
+    reconnect_media_index = names.index("reconnect_media_restored")
     if restored_wifi_index < 0 or media_index < 0:
         raise SystemExit("missing post-handover media restoration")
+    if not (reconnect_index < handover_index < cellular_index <= cellular_marker_index <
+            restored_wifi_index <= wifi_marker_index < media_index <= handover_media_index <
+            reconnect_media_index < call_stops[0]):
+        raise SystemExit("handover restoration evidence is misordered")
+    restored_epoch = events[media_index].get("playbackEpoch")
+    if (events[handover_media_index].get("playbackEpoch") != restored_epoch or
+            events[reconnect_media_index].get("playbackEpoch") != restored_epoch):
+        raise SystemExit("handover restoration playback epoch mismatch")
 if lifecycle == "interruption":
     if "interrupt_started" not in names or "playback_stopped" not in names:
         raise SystemExit("interruption evidence is incomplete")
@@ -1028,13 +1062,13 @@ run_scenario() {
   esac
 
   wait_target_duration "$run_started_at"
-  end_call
-  wait_call_stopped
   if [[ "$VOICE_STAGE1_NETWORK" == "cellular" ]]; then
     cross_check_network cellular
   else
     cross_check_network wifi
   fi
+  end_call
+  wait_call_stopped
   finalize_and_fetch
   cleanup_resources
   trap - EXIT

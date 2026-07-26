@@ -109,6 +109,10 @@ class VoiceAgentCallSession internal constructor(
     private var sessionEndedRecorded = false
     private var sessionFailedRecordedSessionId: Long? = null
     private var runtimeFailureTelemetrySessionId: Long? = null
+    private var automationRuntimeOwner: VoiceAutomationRuntime? = null
+    private var automationRunHash: String? = null
+    private var automationCallBecameActive = false
+    private var automationCallStoppedRecorded = false
     private var hermesBridge: HermesSessionBridge? = null
     private var debugInjectionCaptureRestartSessionId: Long? = null
     private val reconnectController = VoiceReconnectController(
@@ -145,6 +149,7 @@ class VoiceAgentCallSession internal constructor(
 
     override fun start() {
         if (ended || startJob?.isActive == true) return
+        captureDirectAutomationCallOwner()
         val currentSessionId = coordinator.nextSessionId()
         sessionId = currentSessionId
         VoiceAgentLog.d(TAG, "start sessionId=$currentSessionId modelId=$modelId")
@@ -234,6 +239,7 @@ class VoiceAgentCallSession internal constructor(
         resourceCleaner.cleanupForEnd(closeGemini = false)
         coordinator.updateSessionStatus(VoiceSessionStatus.Ending)
         coordinator.close(waitForStartedSends = false)
+        recordDirectAutomationCallStopped()
         recordSessionEndedSafely(endReason = "close_now")
         coordinator.launchPersistenceDrain()
     }
@@ -551,6 +557,25 @@ class VoiceAgentCallSession internal constructor(
     }
 
     private fun recordDirectAutomationCallActive() {
+        val runtime = synchronized(sessionLock) { automationRuntimeOwner } ?: return
+        val appHash = synchronized(sessionLock) { automationRunHash } ?: return
+        runCatching {
+            val recorded = runtime.recordIfActiveRun(
+                runHash = appHash,
+                event = VoiceAutomationEventInput(
+                    name = VoiceAutomationEventName.CALL_ACTIVE,
+                    observedTransport = VoiceAgentTransport.DirectGemini,
+                    correlationKind = VoiceAutomationCorrelationKind.APP,
+                    correlationHash = appHash,
+                ),
+            )
+            if (recorded) {
+                synchronized(sessionLock) { automationCallBecameActive = true }
+            }
+        }
+    }
+
+    private fun captureDirectAutomationCallOwner() {
         val runtime = automationRuntimeProvider() ?: return
         val status = runCatching(runtime::status).getOrNull() ?: return
         if (
@@ -559,15 +584,41 @@ class VoiceAgentCallSession internal constructor(
         ) {
             return
         }
-        val appHash = status.runHash ?: return
-        runCatching {
+        val runHash = status.runHash ?: return
+        val recorded = runCatching {
             runtime.recordIfActiveRun(
-                runHash = appHash,
+                runHash = runHash,
                 event = VoiceAutomationEventInput(
-                    name = VoiceAutomationEventName.CALL_ACTIVE,
+                    name = VoiceAutomationEventName.CALL_START_REQUESTED,
                     observedTransport = VoiceAgentTransport.DirectGemini,
-                    correlationKind = VoiceAutomationCorrelationKind.APP,
-                    correlationHash = appHash,
+                ),
+            )
+        }.getOrDefault(false)
+        if (recorded) {
+            synchronized(sessionLock) {
+                automationRuntimeOwner = runtime
+                automationRunHash = runHash
+            }
+        }
+    }
+
+    private fun recordDirectAutomationCallStopped() {
+        val owner = synchronized(sessionLock) {
+            if (!automationCallBecameActive || automationCallStoppedRecorded) {
+                null
+            } else {
+                automationCallStoppedRecorded = true
+                automationRuntimeOwner?.let { runtime ->
+                    automationRunHash?.let { runHash -> runtime to runHash }
+                }
+            }
+        } ?: return
+        runCatching {
+            owner.first.recordIfActiveRun(
+                runHash = owner.second,
+                event = VoiceAutomationEventInput(
+                    name = VoiceAutomationEventName.CALL_STOPPED,
+                    succeeded = true,
                 ),
             )
         }
@@ -963,6 +1014,7 @@ class VoiceAgentCallSession internal constructor(
             coordinator.updateSessionStatus(VoiceSessionStatus.Ending)
             coordinator.close()
         } finally {
+            recordDirectAutomationCallStopped()
             terminalSessionMetadataWrite = recordSessionEndedSafely(endReason = visibleReason ?: "user_end")
         }
         visibleReason?.let(coordinator::setVisibleError)
