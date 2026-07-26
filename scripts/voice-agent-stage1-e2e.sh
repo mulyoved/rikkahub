@@ -365,7 +365,7 @@ cross_check_network() {
 
 stage_stream() {
   local destination="$1"
-  adb_command shell run-as "$VOICE_STAGE1_PACKAGE" mkdir -p "$PRIVATE_FIXTURE_DIR" >/dev/null
+  adb_command shell run-as "$VOICE_STAGE1_PACKAGE" mkdir -p "$PRIVATE_FIXTURE_DIR" </dev/null >/dev/null
   timeout "${ADB_TIMEOUT_SECONDS}s" adb -s "$VOICE_STAGE1_SERIAL" \
     exec-in run-as "$VOICE_STAGE1_PACKAGE" sh -c 'umask 077; cat > "$1"' sh "$destination"
 }

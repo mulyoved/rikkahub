@@ -218,7 +218,9 @@ elif tail == ["shell", "dumpsys", "activity", "activities"]:
                if state.get("app_foreground") else "com.android.launcher/.Launcher")
     print(f"mResumedActivity: ActivityRecord{{test u0 {resumed} t1}}")
 elif tail[:4] == ["shell", "run-as", "me.rerere.rikkahub.debug", "mkdir"]:
-    pass
+    # Real `adb shell` may consume the caller's stdin even when mkdir does not.
+    # The runner must keep fixture bytes away from this preparatory command.
+    sys.stdin.buffer.read()
 elif tail[:4] == ["shell", "run-as", "me.rerere.rikkahub.debug", "test"]:
     path = tail[-1]
     state["staged_reads"][path] = state["staged_reads"].get(path, 0) + 1
