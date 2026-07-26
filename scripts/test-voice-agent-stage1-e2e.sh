@@ -170,7 +170,9 @@ elif tail == ["shell", "run-as", "me.rerere.rikkahub.debug", "id"]:
 elif tail == ["shell", "svc", "wifi"]:
     print("usage: svc wifi [enable|disable]")
 elif tail == ["shell", "svc", "data"]:
-    print("usage: svc data [enable|disable]")
+    print(os.environ.get("FAKE_ADB_SVC_DATA_USAGE_OUTPUT", "usage: svc data [enable|disable]"))
+    if os.environ.get("FAKE_ADB_SVC_DATA_USAGE_STATUS"):
+        sys.exit(int(os.environ["FAKE_ADB_SVC_DATA_USAGE_STATUS"]))
 elif tail == ["shell", "svc", "data", "enable"]:
     state["cellular_enabled"] = True
     save()
@@ -631,6 +633,44 @@ stage1.fixture_staging=ready
 EOF
 )" "$preflight_output"
 assert_selected_serial
+
+reset_fake
+export FAKE_ADB_SVC_DATA_USAGE_STATUS=1
+preflight_output="$(runner_env bash "$RUNNER" --preflight </dev/null)"
+assert_equals "$(cat <<EOF
+stage1.device=$SERIAL
+stage1.run_as=ready
+stage1.wifi_control=ready
+stage1.cellular_control=ready
+stage1.connectivity_readback=ready
+stage1.automation_receiver=ready
+stage1.fixture_staging=ready
+EOF
+)" "$preflight_output"
+unset FAKE_ADB_SVC_DATA_USAGE_STATUS
+
+reset_fake
+export FAKE_ADB_SVC_DATA_USAGE_STATUS=1
+export FAKE_ADB_SVC_DATA_USAGE_OUTPUT="error: unable to enable or disable cellular service"
+set +e
+malformed_data_usage_output="$(runner_env bash "$RUNNER" --preflight </dev/null 2>&1)"
+malformed_data_usage_status=$?
+set -e
+[[ "$malformed_data_usage_status" -ne 0 ]] || fail "preflight accepted malformed svc data usage output"
+assert_contains "$malformed_data_usage_output" "cellular control is unavailable"
+assert_not_contains "$malformed_data_usage_output" "stage1.device="
+unset FAKE_ADB_SVC_DATA_USAGE_STATUS FAKE_ADB_SVC_DATA_USAGE_OUTPUT
+
+reset_fake
+export FAKE_ADB_SVC_DATA_USAGE_STATUS=2
+set +e
+invalid_data_usage_output="$(runner_env bash "$RUNNER" --preflight </dev/null 2>&1)"
+invalid_data_usage_status=$?
+set -e
+[[ "$invalid_data_usage_status" -ne 0 ]] || fail "preflight accepted an unexpected svc data usage status"
+assert_contains "$invalid_data_usage_output" "cellular control readback failed"
+assert_not_contains "$invalid_data_usage_output" "stage1.device="
+unset FAKE_ADB_SVC_DATA_USAGE_STATUS
 
 reset_fake
 export FAKE_ADB_DEVICES_MODE=multiple

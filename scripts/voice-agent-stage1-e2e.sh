@@ -894,11 +894,13 @@ run_preflight() {
   adb_command shell run-as "$VOICE_STAGE1_PACKAGE" id >/dev/null || fail "run-as is unavailable"
   local wifi_usage
   local data_usage
+  local data_usage_status=0
   local android_network
   wifi_usage="$(adb_command shell svc wifi)"
   [[ "$wifi_usage" == *enable* && "$wifi_usage" == *disable* ]] || fail "Wi-Fi control is unavailable"
-  data_usage="$(adb_command shell svc data)"
-  [[ "$data_usage" == *enable* && "$data_usage" == *disable* ]] || fail "cellular control is unavailable"
+  data_usage="$(adb_command shell svc data)" || data_usage_status=$?
+  [[ "$data_usage_status" -eq 0 || "$data_usage_status" -eq 1 ]] || fail "cellular control readback failed"
+  grep -Fxq 'usage: svc data [enable|disable]' <<<"$data_usage" || fail "cellular control is unavailable"
   android_network="$(read_android_network)"
   read_status
   [[ "$STATUS_RUN_STATE" == "idle" || "$STATUS_RUN_STATE" == "finalized" ]] ||
