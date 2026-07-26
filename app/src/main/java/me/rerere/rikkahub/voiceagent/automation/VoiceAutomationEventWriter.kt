@@ -49,6 +49,12 @@ internal class VoiceAutomationEventWriter private constructor(
         appendNullableBoolean("succeeded", event.succeeded)
         appendNullableString("correlationKind", event.correlationKind?.wireName)
         appendNullableString("correlationHash", event.correlationHash)
+        appendNullableString("requestedModelHash", event.requestedModelHash)
+        appendNullableString("observedModelHash", event.observedModelHash)
+        appendNullableString("voiceHash", event.voiceHash)
+        appendNullableString("instructionHash", event.instructionHash)
+        appendNullableString("accountStateHash", event.accountStateHash)
+        appendNullableString("conversationHash", event.conversationHash)
         append('}')
     }
 

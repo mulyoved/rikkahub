@@ -176,6 +176,9 @@ elif tail == ["shell", "svc", "data", "enable"]:
     save()
 elif tail == ["shell", "svc", "wifi", "disable"]:
     state["network"] = "cellular"
+    if os.environ.get("FAKE_ADB_SUPPRESS_EVENT") != "reconnect_started":
+        emit("reconnect_started")
+        state["reconnect_started"] = True
     save()
     if os.environ.get("FAKE_ADB_FAIL_MODE") == "wifi_disable":
         sys.exit(73)
@@ -185,6 +188,9 @@ elif tail == ["shell", "svc", "wifi", "enable"]:
         state["unvalidated"] = True
     if state.get("handover_started"):
         state["recovery_ready"] = True
+    if state.get("reconnect_started") and os.environ.get("FAKE_ADB_SUPPRESS_EVENT") != "reconnect_transport_restored":
+        emit("reconnect_transport_restored")
+        state["reconnect_transport_restored"] = True
     save()
     if os.environ.get("FAKE_ADB_FAIL_MODE") == "wifi_restore" and state.get("handover_started"):
         sys.exit(78)
@@ -347,8 +353,6 @@ elif tail[:3] == ["shell", "am", "broadcast"]:
             emit(boundary, network="wifi")
         else:
             emit(boundary)
-        if boundary == "reconnect_started":
-            state["reconnect_started"] = True
         if boundary == "handover_started":
             state["handover_started"] = True
         if boundary == "handover_wifi_restored":
@@ -394,7 +398,7 @@ elif tail[:5] == ["exec-out", "run-as", "me.rerere.rikkahub.debug", "grep", "-F"
         emit("playback_written", playback_epoch=1, byte_count=3200)
         if state.get("handover_wifi_restored"):
             emit("handover_media_restored", playback_epoch=1)
-        if state.get("reconnect_started"):
+        if state.get("reconnect_transport_restored"):
             emit("reconnect_media_restored", playback_epoch=1)
         state["recovery_emitted"] = True
         save()
@@ -760,6 +764,8 @@ for row in "${ROWS[@]}"; do
       fail "handover mutation order was not mark, cellular, Wi-Fi off, Wi-Fi restore"
     [[ "$(command_count "reconnect_started")" == "1" ]] ||
       fail "reconnect row did not emit its start boundary"
+    [[ "$(command_count "reconnect_transport_restored")" == "1" ]] ||
+      fail "reconnect row did not emit its transport-restored boundary"
     [[ "$(command_count "handover_cellular_observed")" == "1" ]] ||
       fail "handover row did not emit validated cellular evidence"
     [[ "$(command_count "handover_wifi_restored")" == "1" ]] ||
@@ -961,6 +967,16 @@ recovery_status=$?
 set -e
 [[ "$recovery_status" -ne 0 ]] || fail "missing post-handover media restoration was accepted"
 assert_contains "$recovery_output" "timed out waiting for post-handover playback_written"
+unset FAKE_ADB_SUPPRESS_EVENT
+
+reset_fake
+export FAKE_ADB_SUPPRESS_EVENT=reconnect_transport_restored
+set +e
+transport_recovery_output="$(run_scenario direct_gemini wifi_cellular_wifi speaker foreground reconnect 180 2>&1)"
+transport_recovery_status=$?
+set -e
+[[ "$transport_recovery_status" -ne 0 ]] || fail "missing transport-owned restoration was accepted"
+assert_contains "$transport_recovery_output" "timed out waiting for reconnect_transport_restored"
 unset FAKE_ADB_SUPPRESS_EVENT
 
 reset_fake

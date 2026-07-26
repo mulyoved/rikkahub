@@ -137,11 +137,14 @@ internal class DefaultVoiceAutomationRuntime(
         if (
             currentStatus.state != VoiceAutomationRunState.Active ||
             binding?.runHash != runHash ||
-            !reconnectStarted
+            !reconnectStarted ||
+            reconnectTransportRestored
         ) {
             return false
         }
-        reconnectTransportRestored = true
+        recordActive(
+            VoiceAutomationEventInput(VoiceAutomationEventName.RECONNECT_TRANSPORT_RESTORED),
+        )
         return true
     }
 
@@ -170,24 +173,27 @@ internal class DefaultVoiceAutomationRuntime(
     private fun recordActive(input: VoiceAutomationEventInput) {
         when (input.name) {
             VoiceAutomationEventName.RECONNECT_STARTED -> {
-                if (reconnectStarted) return
+                check(!reconnectStarted) { "Reconnect start must be unique" }
                 reconnectStarted = true
             }
+            VoiceAutomationEventName.RECONNECT_TRANSPORT_RESTORED -> {
+                check(reconnectStarted) { "Transport restoration must follow reconnect start" }
+                check(!reconnectTransportRestored) { "Transport restoration must be unique" }
+                reconnectTransportRestored = true
+            }
             VoiceAutomationEventName.HANDOVER_STARTED -> {
-                if (handoverStarted) return
-                check(reconnectStarted) { "Handover must belong to an active reconnect" }
+                check(!handoverStarted) { "Handover start must be unique" }
                 handoverStarted = true
             }
             VoiceAutomationEventName.HANDOVER_CELLULAR_OBSERVED -> {
-                if (handoverCellularObserved) return
+                check(!handoverCellularObserved) { "Cellular observation must be unique" }
                 check(handoverStarted) { "Cellular observation must follow handover start" }
                 handoverCellularObserved = true
             }
             VoiceAutomationEventName.HANDOVER_WIFI_RESTORED -> {
-                if (handoverWifiRestored) return
+                check(!handoverWifiRestored) { "Wi-Fi restoration must be unique" }
                 check(handoverCellularObserved) { "Wi-Fi restoration must follow cellular observation" }
                 handoverWifiRestored = true
-                reconnectTransportRestored = true
             }
             else -> Unit
         }
@@ -206,7 +212,7 @@ internal class DefaultVoiceAutomationRuntime(
     }
 
     private fun recordRestoredMedia(playbackEpoch: Long?) {
-        if (handoverWifiRestored && !handoverMediaRestored) {
+        if (handoverWifiRestored && reconnectTransportRestored && !handoverMediaRestored) {
             handoverMediaRestored = true
             appendActive(
                 VoiceAutomationEventInput(
@@ -261,6 +267,12 @@ internal class DefaultVoiceAutomationRuntime(
         succeeded = input.succeeded,
         correlationKind = input.correlationKind,
         correlationHash = input.correlationHash,
+        requestedModelHash = input.requestedModelHash,
+        observedModelHash = input.observedModelHash,
+        voiceHash = input.voiceHash,
+        instructionHash = input.instructionHash,
+        accountStateHash = input.accountStateHash,
+        conversationHash = input.conversationHash,
     )
 
     private fun nextMonotonicMs(): Long {

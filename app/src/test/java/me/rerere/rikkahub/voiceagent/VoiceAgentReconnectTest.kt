@@ -7,6 +7,12 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import me.rerere.rikkahub.voiceagent.gemini.GeminiLiveEvent
+import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationEventInput
+import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationEventName
+import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationRunBinding
+import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationRunState
+import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationRuntime
+import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationStatus
 import me.rerere.rikkahub.voiceagent.persistence.VoiceContext
 import me.rerere.rikkahub.voiceagent.telemetry.RecordedVoiceEvent
 import me.rerere.rikkahub.voiceagent.telemetry.RecordingVoiceObservability
@@ -18,6 +24,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.io.File
 
 class VoiceAgentReconnectTest {
     @Test
@@ -27,6 +34,7 @@ class VoiceAgentReconnectTest {
         val sessionApi = FakeVoiceSessionApi()
         val gemini = FakeGeminiLiveVoiceClient()
         val audio = FakeVoiceAudioEngine()
+        val automation = ReconnectRecordingAutomationRuntime()
         val session = reconnectSession(
             sessionApi = sessionApi,
             gemini = gemini,
@@ -34,6 +42,7 @@ class VoiceAgentReconnectTest {
             diagnostics = diagnostics,
             observability = observability,
             reconnectPolicy = fastReconnectPolicy(maxAttempts = 3, delayMs = 1),
+            automationRuntime = automation,
         )
 
         session.start()
@@ -51,6 +60,20 @@ class VoiceAgentReconnectTest {
         assertEquals(1, gemini.closeCalls)
         assertEquals(VoiceSessionStatus.Connected, session.state.value.session)
         assertNull(session.state.value.error)
+        assertEquals(
+            listOf(
+                VoiceAutomationEventName.RECONNECT_STARTED,
+                VoiceAutomationEventName.RECONNECT_TRANSPORT_RESTORED,
+            ),
+            automation.events.map { it.name }.filter {
+                it == VoiceAutomationEventName.RECONNECT_STARTED ||
+                it == VoiceAutomationEventName.RECONNECT_TRANSPORT_RESTORED
+            },
+        )
+        assertEquals(
+            1,
+            automation.events.count { it.name == VoiceAutomationEventName.DIRECT_CONFIG_ATTESTED },
+        )
         assertTrue(
             diagnostics.events.value.any {
                 it.name == "session_reconnect_scheduled" &&
@@ -872,6 +895,7 @@ class VoiceAgentReconnectTest {
         observability: RecordingVoiceObservability = RecordingVoiceObservability(),
         reconnectPolicy: VoiceReconnectPolicy = fastReconnectPolicy(),
         nowMs: () -> Long = { System.currentTimeMillis() },
+        automationRuntime: VoiceAutomationRuntime? = null,
     ): VoiceAgentCallSession =
         VoiceAgentCallSession(
             modelId = "gemini-flash",
@@ -888,6 +912,13 @@ class VoiceAgentReconnectTest {
             reconnectPolicy = reconnectPolicy,
             nowMs = nowMs,
             scope = this,
+            automationRuntimeProvider = { automationRuntime },
+            directConfigurationBinding = automationRuntime?.let {
+                VoiceDirectConfigurationBinding(
+                    accountStateHash = RECONNECT_AUTOMATION_ACCOUNT_STATE_HASH,
+                    conversationHash = RECONNECT_AUTOMATION_CONVERSATION_HASH,
+                )
+            },
         )
 
     private suspend fun RecordingVoiceObservability.awaitConnectedSessionId(count: Int = 1): Long =
@@ -903,3 +934,32 @@ class VoiceAgentReconnectTest {
 
     private fun runTest(block: suspend CoroutineScope.() -> Unit) = runBlocking(block = block)
 }
+
+private class ReconnectRecordingAutomationRuntime : VoiceAutomationRuntime {
+    val events = mutableListOf<VoiceAutomationEventInput>()
+
+    override fun prepare(binding: VoiceAutomationRunBinding) = Unit
+    override fun record(event: VoiceAutomationEventInput) { events += event }
+    override fun status() = VoiceAutomationStatus(
+        state = VoiceAutomationRunState.Active,
+        runHash = RECONNECT_AUTOMATION_RUN_HASH,
+        comparisonHash = RECONNECT_AUTOMATION_COMPARISON_HASH,
+        requestedTransport = VoiceAgentTransport.DirectGemini,
+    )
+    override fun markReconnectTransportRestored(runHash: String): Boolean {
+        if (runHash != RECONNECT_AUTOMATION_RUN_HASH) return false
+        events += VoiceAutomationEventInput(VoiceAutomationEventName.RECONNECT_TRANSPORT_RESTORED)
+        return true
+    }
+    override fun finalizeRun(): File = error("not used")
+    override fun reset() = Unit
+}
+
+private const val RECONNECT_AUTOMATION_RUN_HASH =
+    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+private const val RECONNECT_AUTOMATION_COMPARISON_HASH =
+    "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+private const val RECONNECT_AUTOMATION_ACCOUNT_STATE_HASH =
+    "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+private const val RECONNECT_AUTOMATION_CONVERSATION_HASH =
+    "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"

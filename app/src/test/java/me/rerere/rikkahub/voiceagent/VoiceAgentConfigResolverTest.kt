@@ -51,6 +51,20 @@ class VoiceAgentConfigResolverTest {
         assertEquals("profile-api-key", config.credentials.deviceApiKey)
         assertEquals("gemini-flash", config.voiceModelId)
         assertEquals("Hermes", config.assistantName)
+        assertTrue(Regex("sha256:[0-9a-f]{64}").matches(config.accountStateHash))
+
+        val changedAccount = settings.copy(
+            providers = listOf(
+                (settings.providers.single() as ProviderSetting.OpenAI).copy(
+                    apiKey = "different-profile-api-key",
+                ),
+            ),
+        )
+        val changedConfig = (
+            VoiceAgentConfigResolver(baseUrlOverride = "")
+                .resolve(changedAccount, conversation) as VoiceAgentConfigResult.Available
+            ).config
+        assertTrue(config.accountStateHash != changedConfig.accountStateHash)
     }
 
     @Test

@@ -44,7 +44,10 @@ class VoiceAutomationEventTest {
                 "\"observedTransport\":\"livekit_experimental\",\"name\":\"call_active\"," +
                 "\"route\":\"Speaker\",\"network\":\"wifi\",\"lifecycle\":\"foreground\"," +
                 "\"playbackEpoch\":1,\"byteCount\":3200,\"succeeded\":true," +
-                "\"correlationKind\":\"session\",\"correlationHash\":\"$CORRELATION_HASH\"}\n",
+                "\"correlationKind\":\"session\",\"correlationHash\":\"$CORRELATION_HASH\"," +
+                "\"requestedModelHash\":null,\"observedModelHash\":null,\"voiceHash\":null," +
+                "\"instructionHash\":null,\"accountStateHash\":null," +
+                "\"conversationHash\":null}\n",
             line,
         )
         assertTrue(writer.file.canRead())

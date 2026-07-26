@@ -227,6 +227,7 @@ class LiveKitVoiceCallSessionTest {
             LiveKitRoomEvent.Data(AGENT_IDENTITY, READY_TOPIC, readyJson()),
         )
         fixture.room.emit(LiveKitRoomEvent.Reconnecting)
+        fixture.room.emit(LiveKitRoomEvent.Reconnected)
         runCurrent()
         assertEquals(
             VoiceAgentCleanupResult.Completed,
@@ -236,6 +237,7 @@ class LiveKitVoiceCallSessionTest {
         assertTrue(runtime.events.all { it.name == VoiceAutomationEventName.CALL_START_REQUESTED })
         assertTrue(runtime.events.none { it.name == VoiceAutomationEventName.CALL_ACTIVE })
         assertTrue(runtime.events.none { it.name == VoiceAutomationEventName.RECONNECT_STARTED })
+        assertTrue(runtime.events.none { it.name == VoiceAutomationEventName.RECONNECT_TRANSPORT_RESTORED })
         assertTrue(runtime.events.none { it.name == VoiceAutomationEventName.CALL_STOPPED })
     }
 
@@ -716,7 +718,8 @@ class LiveKitVoiceCallSessionTest {
 
     @Test
     fun `reconnect events preserve readiness and remote disconnect ends experimental path`() = runTest {
-        val fixture = fixture()
+        val runtime = SessionRecordingAutomationRuntime()
+        val fixture = fixture(automationRuntime = runtime)
         fixture.session.start()
         runCurrent()
         fixture.room.emit(LiveKitRoomEvent.Data(AGENT_IDENTITY, READY_TOPIC, readyJson()))
@@ -728,6 +731,16 @@ class LiveKitVoiceCallSessionTest {
         fixture.room.emit(LiveKitRoomEvent.Reconnected)
         runCurrent()
         assertTrue(fixture.session.state.value.session is VoiceSessionStatus.Connected)
+        assertEquals(
+            listOf(
+                VoiceAutomationEventName.RECONNECT_STARTED,
+                VoiceAutomationEventName.RECONNECT_TRANSPORT_RESTORED,
+            ),
+            runtime.events.map { it.name }.filter {
+                it == VoiceAutomationEventName.RECONNECT_STARTED ||
+                    it == VoiceAutomationEventName.RECONNECT_TRANSPORT_RESTORED
+            },
+        )
 
         fixture.room.emit(LiveKitRoomEvent.ParticipantDisconnected(AGENT_IDENTITY))
         runCurrent()
@@ -972,6 +985,12 @@ private class SessionRecordingAutomationRuntime : VoiceAutomationRuntime {
 
     override fun record(event: VoiceAutomationEventInput) {
         events += event
+    }
+
+    override fun markReconnectTransportRestored(runHash: String): Boolean {
+        if (runHash != activeRunHash) return false
+        events += VoiceAutomationEventInput(VoiceAutomationEventName.RECONNECT_TRANSPORT_RESTORED)
+        return true
     }
 
     override fun status() = VoiceAutomationStatus(

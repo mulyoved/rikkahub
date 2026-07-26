@@ -211,6 +211,10 @@ internal class DefaultVoiceAgentCallFactory internal constructor(
                 ),
                 metadataEpochNowMs = metadataEpochNowMs,
                 scope = scope,
+                directConfigurationBinding = VoiceDirectConfigurationBinding(
+                    accountStateHash = config.accountStateHash,
+                    conversationHash = voiceConfigurationIdentity(conversationId.toString()),
+                ),
             )
         }.getOrElse { throwable ->
             runCatching {

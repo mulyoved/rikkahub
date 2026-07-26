@@ -28,6 +28,61 @@ import java.util.Base64
 
 class VoiceAgentCallSessionTest {
     @Test
+    fun `direct attestation changes only with each consumed configuration value`() = runTest {
+        suspend fun capture(
+            modelId: String = "gemini-flash",
+            instruction: String = "system",
+            accountHash: String = ACCOUNT_STATE_HASH,
+            conversationHash: String = CONVERSATION_HASH,
+        ): VoiceAutomationEventInput {
+            val runtime = SessionRecordingAutomationRuntime()
+            val session = VoiceAgentCallSession(
+                modelId = modelId,
+                sessionApi = FakeVoiceSessionApi(),
+                toolApi = FakeVoiceToolApi(),
+                gemini = FakeGeminiLiveVoiceClient(),
+                audio = FakeVoiceAudioEngine(),
+                conversationStore = FakeVoiceConversationStore(),
+                contextProvider = FakeVoiceAgentContextProvider(
+                    VoiceContext(systemInstruction = instruction, turns = emptyList()),
+                ),
+                scope = this,
+                automationRuntimeProvider = { runtime },
+                directConfigurationBinding = VoiceDirectConfigurationBinding(
+                    accountStateHash = accountHash,
+                    conversationHash = conversationHash,
+                ),
+            )
+            session.start()
+            withTimeout(500) {
+                while (runtime.events.none { it.name == VoiceAutomationEventName.DIRECT_CONFIG_ATTESTED }) {
+                    delay(10)
+                }
+            }
+            session.endAndDrain()
+            return runtime.events.single { it.name == VoiceAutomationEventName.DIRECT_CONFIG_ATTESTED }
+        }
+
+        val baseline = capture()
+        assertEquals(
+            baseline.copy(requestedModelHash = voiceConfigurationIdentity("other-model")),
+            capture(modelId = "other-model"),
+        )
+        assertEquals(
+            baseline.copy(instructionHash = voiceConfigurationIdentity("other prompt")),
+            capture(instruction = "other prompt"),
+        )
+        assertEquals(
+            baseline.copy(accountStateHash = REPLACEMENT_AUTOMATION_RUN_HASH),
+            capture(accountHash = REPLACEMENT_AUTOMATION_RUN_HASH),
+        )
+        assertEquals(
+            baseline.copy(conversationHash = REPLACEMENT_AUTOMATION_RUN_HASH),
+            capture(conversationHash = REPLACEMENT_AUTOMATION_RUN_HASH),
+        )
+    }
+
+    @Test
     fun `direct session records one owned call lifecycle`() = runTest {
         val runtime = SessionRecordingAutomationRuntime()
         val session = VoiceAgentCallSession(
@@ -42,6 +97,10 @@ class VoiceAgentCallSessionTest {
             ),
             scope = this,
             automationRuntimeProvider = { runtime },
+            directConfigurationBinding = VoiceDirectConfigurationBinding(
+                accountStateHash = ACCOUNT_STATE_HASH,
+                conversationHash = CONVERSATION_HASH,
+            ),
         )
 
         session.start()
@@ -58,6 +117,15 @@ class VoiceAgentCallSessionTest {
                 VoiceAutomationEventInput(
                     name = VoiceAutomationEventName.CALL_START_REQUESTED,
                     observedTransport = VoiceAgentTransport.DirectGemini,
+                ),
+                VoiceAutomationEventInput(
+                    name = VoiceAutomationEventName.DIRECT_CONFIG_ATTESTED,
+                    requestedModelHash = voiceConfigurationIdentity("gemini-flash"),
+                    observedModelHash = voiceConfigurationIdentity("gemini-live-test"),
+                    voiceHash = voiceConfigurationIdentity("Puck"),
+                    instructionHash = voiceConfigurationIdentity("system"),
+                    accountStateHash = ACCOUNT_STATE_HASH,
+                    conversationHash = CONVERSATION_HASH,
                 ),
                 VoiceAutomationEventInput(
                     name = VoiceAutomationEventName.CALL_ACTIVE,
@@ -993,3 +1061,7 @@ private const val AUTOMATION_COMPARISON_HASH =
     "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 private const val REPLACEMENT_AUTOMATION_RUN_HASH =
     "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+private const val ACCOUNT_STATE_HASH =
+    "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+private const val CONVERSATION_HASH =
+    "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"

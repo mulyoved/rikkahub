@@ -10,6 +10,53 @@ import org.junit.Test
 
 class VoiceAutomationRuntimeTest {
     @Test
+    fun `host network restoration cannot synthesize recovery without transport callback`() {
+        val root = Files.createTempDirectory("voice-automation-runtime-no-transport").toFile()
+        val runtime = DefaultVoiceAutomationRuntime(root, FakeClock())
+        runtime.prepare(
+            VoiceAutomationRunBinding(RUN_HASH, COMPARISON_HASH, VoiceAgentTransport.LiveKitExperimental),
+        )
+
+        listOf(
+            VoiceAutomationEventInput(VoiceAutomationEventName.RECONNECT_STARTED),
+            VoiceAutomationEventInput(VoiceAutomationEventName.HANDOVER_STARTED),
+            VoiceAutomationEventInput(
+                VoiceAutomationEventName.HANDOVER_CELLULAR_OBSERVED,
+                network = VoiceAutomationNetwork.CELLULAR,
+            ),
+            VoiceAutomationEventInput(
+                VoiceAutomationEventName.HANDOVER_WIFI_RESTORED,
+                network = VoiceAutomationNetwork.WIFI,
+            ),
+            VoiceAutomationEventInput(
+                VoiceAutomationEventName.PLAYBACK_WRITTEN,
+                playbackEpoch = 2,
+                byteCount = 3_200,
+            ),
+        ).forEach { runtime.record(it) }
+
+        val artifact = runtime.finalizeRun().readText()
+        assertFalse("handover_media_restored" in artifact)
+        assertFalse("reconnect_media_restored" in artifact)
+    }
+
+    @Test
+    fun `duplicate recovery episode is rejected instead of silently discarded`() {
+        val runtime = DefaultVoiceAutomationRuntime(
+            Files.createTempDirectory("voice-automation-runtime-duplicate-recovery").toFile(),
+            FakeClock(),
+        )
+        runtime.prepare(
+            VoiceAutomationRunBinding(RUN_HASH, COMPARISON_HASH, VoiceAgentTransport.LiveKitExperimental),
+        )
+        runtime.record(VoiceAutomationEventInput(VoiceAutomationEventName.RECONNECT_STARTED))
+
+        assertFailsWith<IllegalStateException> {
+            runtime.record(VoiceAutomationEventInput(VoiceAutomationEventName.RECONNECT_STARTED))
+        }
+    }
+
+    @Test
     fun `record is inactive until a run is prepared`() {
         val root = Files.createTempDirectory("voice-automation-runtime-inactive").toFile()
         val runtime = DefaultVoiceAutomationRuntime(root, FakeClock())
@@ -121,6 +168,7 @@ class VoiceAutomationRuntimeTest {
                 "reconnect_started",
                 "handover_started",
                 "handover_cellular_observed",
+                "reconnect_transport_restored",
                 "playback_written",
                 "handover_wifi_restored",
                 "playback_written",

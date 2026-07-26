@@ -9,6 +9,7 @@ import me.rerere.rikkahub.voiceagent.VoiceAgentTransport
 internal enum class VoiceAutomationEventName(val wireName: String) {
     @SerialName("run_prepared") RUN_PREPARED("run_prepared"),
     @SerialName("call_start_requested") CALL_START_REQUESTED("call_start_requested"),
+    @SerialName("direct_config_attested") DIRECT_CONFIG_ATTESTED("direct_config_attested"),
     @SerialName("call_active") CALL_ACTIVE("call_active"),
     @SerialName("call_stopped") CALL_STOPPED("call_stopped"),
     @SerialName("run_finalized") RUN_FINALIZED("run_finalized"),
@@ -29,6 +30,7 @@ internal enum class VoiceAutomationEventName(val wireName: String) {
     @SerialName("network_observed") NETWORK_OBSERVED("network_observed"),
     @SerialName("interrupt_started") INTERRUPT_STARTED("interrupt_started"),
     @SerialName("reconnect_started") RECONNECT_STARTED("reconnect_started"),
+    @SerialName("reconnect_transport_restored") RECONNECT_TRANSPORT_RESTORED("reconnect_transport_restored"),
     @SerialName("reconnect_media_restored") RECONNECT_MEDIA_RESTORED("reconnect_media_restored"),
     @SerialName("handover_started") HANDOVER_STARTED("handover_started"),
     @SerialName("handover_cellular_observed") HANDOVER_CELLULAR_OBSERVED("handover_cellular_observed"),
@@ -80,6 +82,12 @@ internal data class VoiceAutomationEvent(
     val succeeded: Boolean? = null,
     val correlationKind: VoiceAutomationCorrelationKind? = null,
     val correlationHash: String? = null,
+    val requestedModelHash: String? = null,
+    val observedModelHash: String? = null,
+    val voiceHash: String? = null,
+    val instructionHash: String? = null,
+    val accountStateHash: String? = null,
+    val conversationHash: String? = null,
 )
 
 internal data class VoiceAutomationRunBinding(
@@ -99,6 +107,12 @@ internal data class VoiceAutomationEventInput(
     val succeeded: Boolean? = null,
     val correlationKind: VoiceAutomationCorrelationKind? = null,
     val correlationHash: String? = null,
+    val requestedModelHash: String? = null,
+    val observedModelHash: String? = null,
+    val voiceHash: String? = null,
+    val instructionHash: String? = null,
+    val accountStateHash: String? = null,
+    val conversationHash: String? = null,
 )
 
 internal object VoiceAutomationEventValidation {
@@ -123,6 +137,24 @@ internal object VoiceAutomationEventValidation {
             "correlation kind and hash must be supplied together"
         }
         event.correlationHash?.let { validateHash("correlationHash", it) }
+        val configurationHashes = listOf(
+            "requestedModelHash" to event.requestedModelHash,
+            "observedModelHash" to event.observedModelHash,
+            "voiceHash" to event.voiceHash,
+            "instructionHash" to event.instructionHash,
+            "accountStateHash" to event.accountStateHash,
+            "conversationHash" to event.conversationHash,
+        )
+        if (event.name == VoiceAutomationEventName.DIRECT_CONFIG_ATTESTED) {
+            configurationHashes.forEach { (name, value) ->
+                requireNotNull(value) { "$name is required for Direct configuration attestation" }
+                validateHash(name, value)
+            }
+        } else {
+            require(configurationHashes.all { it.second == null }) {
+                "configuration hashes are only allowed on Direct configuration attestation"
+            }
+        }
     }
 
     fun validateHash(name: String, value: String) {

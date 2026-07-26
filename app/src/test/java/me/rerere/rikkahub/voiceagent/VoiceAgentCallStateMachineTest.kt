@@ -888,6 +888,7 @@ internal fun request(label: String): VoiceAgentCallRequest = VoiceAgentCallReque
         voiceModelId = label,
         assistantName = "Assistant $label",
         assistantPrompt = "Prompt $label",
+        accountStateHash = "sha256:" + "a".repeat(64),
     ),
 )
 

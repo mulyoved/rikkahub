@@ -51,6 +51,7 @@ class VoiceAgentCallSession internal constructor(
     hermesAnnouncementNowMs: () -> Long = System::currentTimeMillis,
     private val scope: CoroutineScope,
     private val automationRuntimeProvider: () -> VoiceAutomationRuntime? = ::directAutomationRuntimeOrNull,
+    private val directConfigurationBinding: VoiceDirectConfigurationBinding? = null,
 ) : ManagedVoiceCallSession {
     constructor(
         modelId: String,
@@ -112,6 +113,7 @@ class VoiceAgentCallSession internal constructor(
     private var automationRuntimeOwner: VoiceAutomationRuntime? = null
     private var automationRunHash: String? = null
     private var automationCallBecameActive = false
+    private var automationConfigurationAttested = false
     private var automationCallStoppedRecorded = false
     private var hermesBridge: HermesSessionBridge? = null
     private var debugInjectionCaptureRestartSessionId: Long? = null
@@ -281,6 +283,7 @@ class VoiceAgentCallSession internal constructor(
             ) {
                 return
             }
+            recordDirectAutomationConfiguration(session, voiceContext)
             if (!prepareConnectedResourceActivation(
                     currentSessionId = currentSessionId,
                     automaticReconnectJob = automaticReconnectJob,
@@ -536,6 +539,9 @@ class VoiceAgentCallSession internal constructor(
             restoreReconnectingStatusIfAutomaticReconnectPending()
             return false
         }
+        if (completedReconnectAttempt != null) {
+            markDirectAutomationReconnectTransportRestored()
+        }
         recordDirectAutomationCallActive()
         completedReconnectAttempt?.let { attempt ->
             coordinator.recordDiagnostic(
@@ -571,6 +577,63 @@ class VoiceAgentCallSession internal constructor(
             )
             if (recorded) {
                 synchronized(sessionLock) { automationCallBecameActive = true }
+            }
+        }
+    }
+
+    private fun markDirectAutomationReconnectTransportRestored() {
+        val runtime = synchronized(sessionLock) { automationRuntimeOwner } ?: return
+        val runHash = synchronized(sessionLock) { automationRunHash } ?: return
+        runCatching { runtime.markReconnectTransportRestored(runHash) }
+    }
+
+    private fun recordDirectAutomationReconnectStarted() {
+        val runtime = synchronized(sessionLock) { automationRuntimeOwner } ?: return
+        val runHash = synchronized(sessionLock) { automationRunHash } ?: return
+        runCatching {
+            runtime.recordIfActiveRun(
+                runHash,
+                VoiceAutomationEventInput(VoiceAutomationEventName.RECONNECT_STARTED),
+            )
+        }
+    }
+
+    private fun recordDirectAutomationConfiguration(
+        session: MobileVoiceSessionResponse,
+        voiceContext: VoiceContext,
+    ) {
+        val binding = directConfigurationBinding ?: return
+        val voiceName = runCatching {
+            session.liveConnectConfig.directVoiceNameOrNull()
+        }.getOrNull() ?: return
+        val owner = synchronized(sessionLock) {
+            if (automationConfigurationAttested) {
+                null
+            } else {
+                automationRuntimeOwner?.let { runtime ->
+                    automationRunHash?.let { runHash -> runtime to runHash }
+                }
+            }
+        } ?: return
+        val recorded = runCatching {
+            owner.first.recordIfActiveRun(
+                runHash = owner.second,
+                event = VoiceAutomationEventInput(
+                    name = VoiceAutomationEventName.DIRECT_CONFIG_ATTESTED,
+                    requestedModelHash = voiceConfigurationIdentity(modelId),
+                    observedModelHash = voiceConfigurationIdentity(session.providerModel),
+                    voiceHash = voiceConfigurationIdentity(voiceName),
+                    instructionHash = voiceConfigurationIdentity(voiceContext.systemInstruction),
+                    accountStateHash = binding.accountStateHash,
+                    conversationHash = binding.conversationHash,
+                ),
+            )
+        }.getOrDefault(false)
+        if (recorded) {
+            synchronized(sessionLock) {
+                if (automationRuntimeOwner === owner.first && automationRunHash == owner.second) {
+                    automationConfigurationAttested = true
+                }
             }
         }
     }
@@ -756,6 +819,7 @@ class VoiceAgentCallSession internal constructor(
                 name = "session_reconnect_attempting",
                 detail = "attempt=${plan.attempt}",
             )
+            recordDirectAutomationReconnectStarted()
             currentCoroutineContext().ensureActive()
             runSession(currentSessionId, automaticReconnectJob = job)
         }

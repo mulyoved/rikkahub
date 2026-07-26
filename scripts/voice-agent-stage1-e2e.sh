@@ -700,11 +700,11 @@ wait_target_duration() {
 
 perform_handover() {
   local wifi_restored_ms
-  mark_boundary RECONNECT_STARTED
   mark_boundary HANDOVER_STARTED
   adb_command shell svc data enable >/dev/null
   WIFI_RESTORE_STATE="not_attempted"
   adb_command shell svc wifi disable >/dev/null
+  wait_event RECONNECT_STARTED
   wait_android_network cellular
   cross_check_network cellular
   mark_boundary HANDOVER_CELLULAR_OBSERVED
@@ -714,6 +714,7 @@ perform_handover() {
   cross_check_network wifi
   mark_boundary HANDOVER_WIFI_RESTORED
   WIFI_RESTORE_STATE="proven"
+  wait_event RECONNECT_TRANSPORT_RESTORED
   wifi_restored_ms="$(latest_event_monotonic_ms NETWORK_OBSERVED)"
   wait_event_after PLAYBACK_WRITTEN "$wifi_restored_ms"
   wait_event HANDOVER_MEDIA_RESTORED
@@ -830,12 +831,13 @@ else:
             cursor += 1
     if cursor != 3:
         raise SystemExit("handover network sequence mismatch")
-    for marker in ("reconnect_started", "handover_started",
+    for marker in ("reconnect_started", "reconnect_transport_restored", "handover_started",
                    "handover_cellular_observed", "handover_wifi_restored",
                    "handover_media_restored", "reconnect_media_restored"):
         if names.count(marker) != 1:
             raise SystemExit(f"missing or duplicate handover marker: {marker}")
     reconnect_index = names.index("reconnect_started")
+    transport_restored_index = names.index("reconnect_transport_restored")
     handover_index = names.index("handover_started")
     cellular_index = next((index for index, event in enumerate(events)
                            if event.get("name") == "network_observed" and
@@ -853,9 +855,12 @@ else:
     reconnect_media_index = names.index("reconnect_media_restored")
     if restored_wifi_index < 0 or media_index < 0:
         raise SystemExit("missing post-handover media restoration")
-    if not (reconnect_index < handover_index < cellular_index <= cellular_marker_index <
-            restored_wifi_index <= wifi_marker_index < media_index <= handover_media_index <
-            reconnect_media_index < call_stops[0]):
+    if not (
+        handover_index < reconnect_index < cellular_index <= cellular_marker_index < restored_wifi_index
+        and restored_wifi_index <= wifi_marker_index < media_index
+        and reconnect_index < transport_restored_index < media_index
+        and media_index <= handover_media_index < reconnect_media_index < call_stops[0]
+    ):
         raise SystemExit("handover restoration evidence is misordered")
     restored_epoch = events[media_index].get("playbackEpoch")
     if (events[handover_media_index].get("playbackEpoch") != restored_epoch or
