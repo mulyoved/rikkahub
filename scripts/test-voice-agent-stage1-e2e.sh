@@ -168,7 +168,9 @@ elif tail == ["shell", "pm", "path", "me.rerere.rikkahub.debug"]:
 elif tail == ["shell", "run-as", "me.rerere.rikkahub.debug", "id"]:
     print("uid=10123(u0_a123) gid=10123(u0_a123)")
 elif tail == ["shell", "svc", "wifi"]:
-    print("usage: svc wifi [enable|disable]")
+    print(os.environ.get("FAKE_ADB_SVC_WIFI_USAGE_OUTPUT", "usage: svc wifi [enable|disable]"))
+    if os.environ.get("FAKE_ADB_SVC_WIFI_USAGE_STATUS"):
+        sys.exit(int(os.environ["FAKE_ADB_SVC_WIFI_USAGE_STATUS"]))
 elif tail == ["shell", "svc", "data"]:
     print(os.environ.get("FAKE_ADB_SVC_DATA_USAGE_OUTPUT", "usage: svc data [enable|disable]"))
     if os.environ.get("FAKE_ADB_SVC_DATA_USAGE_STATUS"):
@@ -633,6 +635,44 @@ stage1.fixture_staging=ready
 EOF
 )" "$preflight_output"
 assert_selected_serial
+
+reset_fake
+export FAKE_ADB_SVC_WIFI_USAGE_STATUS=1
+preflight_output="$(runner_env bash "$RUNNER" --preflight </dev/null)"
+assert_equals "$(cat <<EOF
+stage1.device=$SERIAL
+stage1.run_as=ready
+stage1.wifi_control=ready
+stage1.cellular_control=ready
+stage1.connectivity_readback=ready
+stage1.automation_receiver=ready
+stage1.fixture_staging=ready
+EOF
+)" "$preflight_output"
+unset FAKE_ADB_SVC_WIFI_USAGE_STATUS
+
+reset_fake
+export FAKE_ADB_SVC_WIFI_USAGE_STATUS=1
+export FAKE_ADB_SVC_WIFI_USAGE_OUTPUT="error: unable to enable or disable Wi-Fi"
+set +e
+malformed_wifi_usage_output="$(runner_env bash "$RUNNER" --preflight </dev/null 2>&1)"
+malformed_wifi_usage_status=$?
+set -e
+[[ "$malformed_wifi_usage_status" -ne 0 ]] || fail "preflight accepted malformed svc wifi usage output"
+assert_contains "$malformed_wifi_usage_output" "Wi-Fi control is unavailable"
+assert_not_contains "$malformed_wifi_usage_output" "stage1.device="
+unset FAKE_ADB_SVC_WIFI_USAGE_STATUS FAKE_ADB_SVC_WIFI_USAGE_OUTPUT
+
+reset_fake
+export FAKE_ADB_SVC_WIFI_USAGE_STATUS=2
+set +e
+invalid_wifi_usage_output="$(runner_env bash "$RUNNER" --preflight </dev/null 2>&1)"
+invalid_wifi_usage_status=$?
+set -e
+[[ "$invalid_wifi_usage_status" -ne 0 ]] || fail "preflight accepted an unexpected svc wifi usage status"
+assert_contains "$invalid_wifi_usage_output" "Wi-Fi control readback failed"
+assert_not_contains "$invalid_wifi_usage_output" "stage1.device="
+unset FAKE_ADB_SVC_WIFI_USAGE_STATUS
 
 reset_fake
 export FAKE_ADB_SVC_DATA_USAGE_STATUS=1
