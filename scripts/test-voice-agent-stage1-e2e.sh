@@ -121,6 +121,9 @@ def emit(name, *, observed_transport=None, route=None, network=None, lifecycle=N
     state["events"].append(json.dumps(event, separators=(",", ":")))
 
 def completed(result, data):
+    if os.environ.get("FAKE_ADB_BROADCAST_MULTILINE") == "1":
+        print(f'Broadcast completed: result={result}, data="{data}"')
+        return
     escaped = data.replace("\\", "\\\\").replace("\r", "\\r").replace("\n", "\\n")
     print(f'Broadcast completed: result={result}, data="{escaped}"')
 
@@ -636,6 +639,21 @@ stage1.fixture_staging=ready
 EOF
 )" "$preflight_output"
 assert_selected_serial
+
+reset_fake
+export FAKE_ADB_BROADCAST_MULTILINE=1
+preflight_output="$(runner_env bash "$RUNNER" --preflight </dev/null)"
+assert_equals "$(cat <<EOF
+stage1.device=$SERIAL
+stage1.run_as=ready
+stage1.wifi_control=ready
+stage1.cellular_control=ready
+stage1.connectivity_readback=ready
+stage1.automation_receiver=ready
+stage1.fixture_staging=ready
+EOF
+)" "$preflight_output"
+unset FAKE_ADB_BROADCAST_MULTILINE
 
 reset_fake
 export FAKE_ADB_SVC_WIFI_USAGE_STATUS=1

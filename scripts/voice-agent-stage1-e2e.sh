@@ -162,7 +162,7 @@ control_broadcast() {
   local action="$1"
   shift
   local output
-  local completed_line
+  local completed_output
   local result_code
   local raw_data
   if ! output="$(adb_command shell am broadcast --user 0 \
@@ -171,8 +171,11 @@ control_broadcast() {
     fail "automation ${action,,} broadcast failed"
     return 1
   fi
-  completed_line="$(printf '%s\n' "$output" | awk '/^Broadcast completed:/ { line = $0 } END { print line }')"
-  if [[ ! "$completed_line" =~ ^Broadcast\ completed:\ result=([-0-9]+),\ data=\"(.*)\"$ ]]; then
+  completed_output="$(printf '%s\n' "$output" | awk '
+    capture { print; next }
+    /^Broadcast completed:/ { capture=1; print }
+  ')"
+  if [[ ! "$completed_output" =~ ^Broadcast\ completed:\ result=([-0-9]+),\ data=\"(.*)\"$ ]]; then
     fail "automation ${action,,} returned malformed broadcast output"
     return 1
   fi
