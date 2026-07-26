@@ -339,6 +339,12 @@ elif tail[:3] == ["shell", "am", "broadcast"]:
             sys.exit(0)
         state["status_reads"] += 1
         app_network = os.environ.get("FAKE_ADB_APP_NETWORK", state["network"])
+        if (
+            os.environ.get("FAKE_ADB_BACKGROUND_NETWORK_BLOCKED") == "1"
+            and not state.get("app_foreground")
+            and not state.get("call_started")
+        ):
+            app_network = "none"
         cold_start = (
             os.environ.get("FAKE_ADB_STATUS_COLD_START") == "1"
             and state["status_reads"] == 1
@@ -358,7 +364,7 @@ elif tail[:3] == ["shell", "am", "broadcast"]:
             f"requested_transport={state['transport']}",
             f"event_count={state['event_count']}",
             f"network={app_network}",
-            f"validated={str(not cold_start).lower()}",
+            f"validated={str(not cold_start and app_network != 'none').lower()}",
         ]))
     elif action.endswith(".ROUTE"):
         route = values["route"]
@@ -472,22 +478,6 @@ print(value)
 PY
 chmod +x "$BIN_DIR/fake-clock"
 
-cat > "$BIN_DIR/sleep" <<'PY'
-#!/usr/bin/env python3
-import json
-import os
-import sys
-from pathlib import Path
-
-seconds = float(sys.argv[1])
-if os.environ.get("FAKE_SLEEP_RESETS_STATUS") == "1" and seconds > 0:
-    state_file = Path(os.environ["FAKE_ADB_STATE_DIR"]) / "state.json"
-    state = json.loads(state_file.read_text())
-    state["status_reads"] = 0
-    state_file.write_text(json.dumps(state, separators=(",", ":")))
-PY
-chmod +x "$BIN_DIR/sleep"
-
 reset_fake() {
   rm -rf "$STATE_DIR"
   mkdir -p "$STATE_DIR"
@@ -499,8 +489,8 @@ reset_fake() {
   unset FAKE_ADB_APP_NETWORK FAKE_ADB_SUPPRESS_EVENT FAKE_ADB_EMULATOR
   unset FAKE_ADB_ROUTE_MODE FAKE_ADB_LIFECYCLE_MODE FAKE_CLOCK_MODE FAKE_ADB_INITIAL_RUN
   unset FAKE_ADB_UNVALIDATED_AFTER_RESTORE FAKE_ADB_STATUS_COLD_START
+  unset FAKE_ADB_BACKGROUND_NETWORK_BLOCKED
   unset FAKE_ADB_STATUS_MALFORMED FAKE_ADB_STAGE_VISIBILITY_DELAY
-  unset FAKE_SLEEP_RESETS_STATUS
 }
 
 command_lines() {
@@ -700,8 +690,7 @@ unset FAKE_ADB_BROADCAST_MULTILINE
 
 reset_fake
 export FAKE_ADB_STATUS_COLD_START=1
-export FAKE_SLEEP_RESETS_STATUS=1
-preflight_output="$(runner_env VOICE_STAGE1_POLL_SECONDS=1 bash "$RUNNER" --preflight </dev/null)"
+preflight_output="$(runner_env bash "$RUNNER" --preflight </dev/null)"
 assert_equals "$(cat <<EOF
 stage1.device=$SERIAL
 stage1.run_as=ready
@@ -712,10 +701,17 @@ stage1.automation_receiver=ready
 stage1.fixture_staging=ready
 EOF
 )" "$preflight_output"
-[[ "$(command_count "automation.STATUS")" == "2" ]] \
-  || fail "cold-start preflight did not retry STATUS exactly once"
+[[ "$(command_count "automation.STATUS")" == "1" ]] \
+  || fail "idle-background preflight retried a valid unavailable network readback"
 unset FAKE_ADB_STATUS_COLD_START
-unset FAKE_SLEEP_RESETS_STATUS
+
+reset_fake
+export FAKE_ADB_BACKGROUND_NETWORK_BLOCKED=1
+preflight_output="$(runner_env bash "$RUNNER" --preflight </dev/null)"
+assert_contains "$preflight_output" "stage1.connectivity_readback=ready"
+[[ "$(command_count "automation.STATUS")" == "1" ]] \
+  || fail "background-blocked preflight did not accept one valid idle readback"
+unset FAKE_ADB_BACKGROUND_NETWORK_BLOCKED
 
 reset_fake
 export FAKE_ADB_STAGE_VISIBILITY_DELAY=1
@@ -927,6 +923,16 @@ ROWS=(
   'wifi_cellular_wifi|speaker|foreground|reconnect|180'
   'wifi_cellular_wifi|earpiece|background|reconnect|60'
 )
+
+reset_fake
+export FAKE_ADB_BACKGROUND_NETWORK_BLOCKED=1
+blocked_foreground_output="$(run_scenario direct_gemini stable_wifi speaker foreground steady 20)"
+assert_equals 'stage1.run=complete' "$blocked_foreground_output"
+call_active_index="$(command_index "dumpsys${separator}activity${separator}services")"
+network_status_index="$(last_command_index "automation.STATUS")"
+(( network_status_index > call_active_index )) \
+  || fail "strict app network readback happened before the call service became active"
+unset FAKE_ADB_BACKGROUND_NETWORK_BLOCKED
 
 for row in "${ROWS[@]}"; do
   IFS='|' read -r network route app_state lifecycle target_seconds <<< "$row"

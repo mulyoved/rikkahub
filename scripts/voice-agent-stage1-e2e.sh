@@ -301,7 +301,6 @@ begin_wait() {
 continue_wait() {
   local timeout_seconds="$1"
   local timeout_message="$2"
-  local sleep_before_next="${3:-1}"
   local now
   WAIT_ATTEMPTS=$((WAIT_ATTEMPTS + 1))
   if (( WAIT_ATTEMPTS >= MAX_WAIT_ATTEMPTS )); then
@@ -318,9 +317,7 @@ continue_wait() {
     fail "$timeout_message"
     return 1
   fi
-  if (( sleep_before_next == 1 )); then
-    sleep_poll
-  fi
+  sleep_poll
 }
 
 wait_android_network() {
@@ -335,22 +332,20 @@ wait_android_network() {
   done
 }
 
-wait_app_network() {
+read_idle_status() {
   local expected="$1"
-  local sleep_before_next=0
-  begin_wait "app $expected network"
-  while true; do
-    read_status || return 1
-    if [[ "$STATUS_RUN_STATE" == "active" ]]; then
-      fail "automation receiver already has an active run"
-      return 1
-    fi
-    if [[ "$STATUS_NETWORK" == "$expected" && "$STATUS_VALIDATED" == "true" ]]; then
-      return 0
-    fi
-    continue_wait "$WAIT_TIMEOUT_SECONDS" "timed out waiting for app $expected network" "$sleep_before_next" || return 1
-    sleep_before_next=1
-  done
+  read_status || return 1
+  if [[ "$STATUS_RUN_STATE" == "active" ]]; then
+    fail "automation receiver already has an active run"
+    return 1
+  fi
+  if [[ "$STATUS_NETWORK" == "$expected" && "$STATUS_VALIDATED" == "true" ]]; then
+    return 0
+  fi
+  if [[ "$STATUS_NETWORK" == "none" && "$STATUS_VALIDATED" == "false" ]]; then
+    return 0
+  fi
+  fail "network observation mismatch: app=$STATUS_NETWORK expected=$expected"
 }
 
 cross_check_network() {
@@ -971,9 +966,7 @@ run_preflight() {
   [[ "$data_usage_status" -eq 0 || "$data_usage_status" -eq 1 ]] || fail "cellular control readback failed"
   grep -Fxq 'usage: svc data [enable|disable]' <<<"$data_usage" || fail "cellular control is unavailable"
   android_network="$(read_android_network)"
-  wait_app_network "$android_network"
-  [[ "$STATUS_RUN_STATE" == "idle" || "$STATUS_RUN_STATE" == "finalized" ]] ||
-    fail "automation receiver already has an active run"
+  read_idle_status "$android_network"
 
   trap preflight_on_exit EXIT
   PREFLIGHT_STAGE_STATE="pending"
@@ -1082,9 +1075,7 @@ run_scenario() {
       ;;
   esac
   wait_android_network "$initial_network"
-  cross_check_network "$initial_network"
-  [[ "$STATUS_RUN_STATE" == "idle" || "$STATUS_RUN_STATE" == "finalized" ]] ||
-    fail "automation receiver already has an active run"
+  read_idle_status "$initial_network"
 
   AUTOMATION_ACTIVE=1
   control_broadcast PREPARE \
@@ -1093,7 +1084,6 @@ run_scenario() {
     --es transport "$VOICE_STAGE1_TRANSPORT" \
     --es lifecycle "$VOICE_STAGE1_APP_STATE"
   expect_control_data $'status=ok\naction=prepare'
-  cross_check_network "$initial_network"
 
   FIXTURES_STAGED=1
   stage_file "$VOICE_STAGE1_PCM_PATH" "$PRIVATE_PROMPT_PATH"
@@ -1102,6 +1092,7 @@ run_scenario() {
   run_started_at="$(clock_now)"
   start_call
   wait_event CALL_ACTIVE 1
+  cross_check_network "$initial_network"
   request_route
 
   lifecycle_boundary_ms="$(latest_run_event_monotonic_ms)"
