@@ -27,15 +27,15 @@ The aggregate `runs[]` contains exactly 14 matrix runs. Canaries are private
 validation gates; they are never added to aggregate `runs[]` or published as
 matrix evidence.
 
-| Comparison ID | Network | Route | App state | Lifecycle | Target |
-|---|---|---|---|---|---:|
-| `wifi-speaker-fg-fast-steady` | Wi-Fi | speaker | foreground | steady | 20 s |
-| `wifi-earpiece-bg-minute-steady` | Wi-Fi | earpiece | background | steady | 60 s |
-| `wifi-speaker-bg-minute-interrupt` | Wi-Fi | speaker | background | interrupt output | 60 s |
-| `cell-speaker-fg-fast-steady` | cellular | speaker | foreground | steady | 20 s |
-| `cell-earpiece-bg-minute-interrupt` | cellular | earpiece | background | interrupt output | 60 s |
-| `handover-speaker-fg-multi-reconnect` | Wi-Fi → cellular → Wi-Fi | speaker | foreground | reconnect | 180 s |
-| `handover-earpiece-bg-minute-reconnect` | Wi-Fi → cellular → Wi-Fi | earpiece | background | reconnect | 60 s |
+| Comparison ID | Network | Route | App state | Lifecycle | Transports | Target |
+|---|---|---|---|---|---|---:|
+| `wifi-speaker-fg-fast-steady` | Wi-Fi | speaker | foreground | steady | `direct_gemini` + `livekit_experimental` | 20 s |
+| `wifi-earpiece-bg-minute-steady` | Wi-Fi | earpiece | background | steady | `direct_gemini` + `livekit_experimental` | 60 s |
+| `wifi-speaker-bg-minute-interrupt` | Wi-Fi | speaker | background | interrupt output | `direct_gemini` + `livekit_experimental` | 60 s |
+| `cell-speaker-fg-fast-steady` | cellular | speaker | foreground | steady | `direct_gemini` + `livekit_experimental` | 20 s |
+| `cell-earpiece-bg-minute-interrupt` | cellular | earpiece | background | interrupt output | `direct_gemini` + `livekit_experimental` | 60 s |
+| `handover-speaker-fg-multi-reconnect` | Wi-Fi → cellular → Wi-Fi | speaker | foreground | reconnect | `direct_gemini` + `livekit_experimental` | 180 s |
+| `handover-earpiece-bg-minute-reconnect` | Wi-Fi → cellular → Wi-Fi | earpiece | background | reconnect | `direct_gemini` + `livekit_experimental` | 60 s |
 
 Paired runs bind the same device, source, configuration, deployment, fixtures,
 account state, and comparison metadata. Direct and LiveKit use separately built
