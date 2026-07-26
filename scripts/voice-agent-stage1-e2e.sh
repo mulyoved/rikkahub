@@ -370,15 +370,30 @@ stage_stream() {
     exec-in run-as "$VOICE_STAGE1_PACKAGE" sh -c 'umask 077; cat > "$1"' sh "$destination"
 }
 
+wait_staged_size() {
+  local destination="$1"
+  local expected_size="$2"
+  local actual_size
+  begin_wait "private fixture $destination"
+  while true; do
+    actual_size="$(
+      adb_command shell run-as "$VOICE_STAGE1_PACKAGE" stat -c %s "$destination" 2>/dev/null |
+        tr -d '\r[:space:]'
+    )" || actual_size=""
+    if [[ "$actual_size" =~ ^[0-9]+$ && "$actual_size" == "$expected_size" ]]; then
+      return 0
+    fi
+    continue_wait "$WAIT_TIMEOUT_SECONDS" "private fixture staging size mismatch" || return 1
+  done
+}
+
 stage_file() {
   local source_path="$1"
   local destination="$2"
   local expected_size
-  local actual_size
   expected_size="$(wc -c < "$source_path" | tr -d '[:space:]')"
   stage_stream "$destination" < "$source_path" >/dev/null
-  actual_size="$(adb_command shell run-as "$VOICE_STAGE1_PACKAGE" stat -c %s "$destination" | tr -d '\r[:space:]')"
-  [[ "$actual_size" == "$expected_size" ]] || fail "private fixture staging size mismatch"
+  wait_staged_size "$destination" "$expected_size"
 }
 
 remove_private_fixtures() {
@@ -922,6 +937,7 @@ PY
 }
 
 run_preflight() {
+  local preflight_payload=$'stage1-preflight\n'
   require_env VOICE_STAGE1_SERIAL
   require_env VOICE_STAGE1_PACKAGE
   require_expected_serial
@@ -956,8 +972,8 @@ run_preflight() {
 
   trap preflight_on_exit EXIT
   PREFLIGHT_STAGE_STATE="pending"
-  printf 'stage1-preflight\n' | stage_stream "$PRIVATE_FIXTURE_DIR/.preflight" >/dev/null
-  adb_command shell run-as "$VOICE_STAGE1_PACKAGE" test -s "$PRIVATE_FIXTURE_DIR/.preflight" >/dev/null ||
+  printf '%s' "$preflight_payload" | stage_stream "$PRIVATE_FIXTURE_DIR/.preflight" >/dev/null
+  wait_staged_size "$PRIVATE_FIXTURE_DIR/.preflight" "${#preflight_payload}" ||
     fail "private fixture staging verification failed"
   remove_preflight_fixture_once
   trap - EXIT

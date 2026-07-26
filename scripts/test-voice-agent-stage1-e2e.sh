@@ -86,6 +86,7 @@ else:
         "call_started": False,
         "injections": 0,
         "staged": {},
+        "staged_reads": {},
     }
     if os.environ.get("FAKE_ADB_INITIAL_RUN") == "foreign":
         state.update({
@@ -220,12 +221,21 @@ elif tail[:4] == ["shell", "run-as", "me.rerere.rikkahub.debug", "mkdir"]:
     pass
 elif tail[:4] == ["shell", "run-as", "me.rerere.rikkahub.debug", "test"]:
     path = tail[-1]
+    state["staged_reads"][path] = state["staged_reads"].get(path, 0) + 1
+    save()
+    if os.environ.get("FAKE_ADB_STAGE_VISIBILITY_DELAY") == "1" and state["staged_reads"][path] == 1:
+        sys.exit(1)
     if state["staged"].get(path, 0) <= 0:
         sys.exit(1)
 elif tail[:5] == ["shell", "run-as", "me.rerere.rikkahub.debug", "stat", "-c"]:
     path = tail[-1]
     if path not in state["staged"]:
         sys.exit(1)
+    state["staged_reads"][path] = state["staged_reads"].get(path, 0) + 1
+    save()
+    if os.environ.get("FAKE_ADB_STAGE_VISIBILITY_DELAY") == "1" and state["staged_reads"][path] == 1:
+        print(0)
+        sys.exit(0)
     print(state["staged"][path])
 elif tail[:4] == ["shell", "run-as", "me.rerere.rikkahub.debug", "rm"]:
     for value in tail[5:]:
@@ -236,6 +246,7 @@ elif tail[:4] == ["shell", "run-as", "me.rerere.rikkahub.debug", "rm"]:
 elif tail[:5] == ["exec-in", "run-as", "me.rerere.rikkahub.debug", "sh", "-c"]:
     path = tail[-1]
     state["staged"][path] = len(sys.stdin.buffer.read())
+    state["staged_reads"][path] = 0
     save()
     if os.environ.get("FAKE_ADB_FAIL_MODE") == "preflight_stage" and path.endswith(".preflight"):
         sys.exit(80)
@@ -470,7 +481,7 @@ reset_fake() {
   unset FAKE_ADB_APP_NETWORK FAKE_ADB_SUPPRESS_EVENT FAKE_ADB_EMULATOR
   unset FAKE_ADB_ROUTE_MODE FAKE_ADB_LIFECYCLE_MODE FAKE_CLOCK_MODE FAKE_ADB_INITIAL_RUN
   unset FAKE_ADB_UNVALIDATED_AFTER_RESTORE FAKE_ADB_STATUS_COLD_START
-  unset FAKE_ADB_STATUS_MALFORMED
+  unset FAKE_ADB_STATUS_MALFORMED FAKE_ADB_STAGE_VISIBILITY_DELAY
 }
 
 command_lines() {
@@ -684,6 +695,23 @@ EOF
 [[ "$(command_count "automation.STATUS")" == "2" ]] \
   || fail "cold-start preflight did not retry STATUS exactly once"
 unset FAKE_ADB_STATUS_COLD_START
+
+reset_fake
+export FAKE_ADB_STAGE_VISIBILITY_DELAY=1
+preflight_output="$(runner_env bash "$RUNNER" --preflight </dev/null)"
+assert_equals "$(cat <<EOF
+stage1.device=$SERIAL
+stage1.run_as=ready
+stage1.wifi_control=ready
+stage1.cellular_control=ready
+stage1.connectivity_readback=ready
+stage1.automation_receiver=ready
+stage1.fixture_staging=ready
+EOF
+)" "$preflight_output"
+[[ "$(command_count "stat")" == "2" ]] \
+  || fail "delayed fixture visibility did not retry size verification exactly once"
+unset FAKE_ADB_STAGE_VISIBILITY_DELAY
 
 reset_fake
 export FAKE_ADB_INITIAL_RUN=foreign
