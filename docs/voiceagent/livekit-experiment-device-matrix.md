@@ -18,11 +18,14 @@ intelligibility, or any route outside speaker and earpiece.
 
 ## Fixed paired matrix
 
-Each comparison has exactly one `direct_gemini` run and one
-`livekit_experimental` run. The coordinator first performs a Direct canary,
-runs all seven Direct rows, validates the Direct checkpoint, then performs a
-LiveKit canary and runs the same seven rows. The final record therefore has
-exactly 14 matrix runs; canaries are validation gates and are not matrix rows.
+The matrix has exactly two transports: `direct_gemini` and
+`livekit_experimental`. The coordinator first performs a Direct canary, runs
+all seven Direct rows, validates the Direct checkpoint, then performs a
+LiveKit canary and runs the same seven rows.
+
+The aggregate `runs[]` contains exactly 14 matrix runs. Canaries are private
+validation gates; they are never added to aggregate `runs[]` or published as
+matrix evidence.
 
 | Comparison ID | Network | Route | App state | Lifecycle | Target |
 |---|---|---|---|---|---:|
@@ -34,9 +37,10 @@ exactly 14 matrix runs; canaries are validation gates and are not matrix rows.
 | `handover-speaker-fg-multi-reconnect` | Wi-Fi → cellular → Wi-Fi | speaker | foreground | reconnect | 180 s |
 | `handover-earpiece-bg-minute-reconnect` | Wi-Fi → cellular → Wi-Fi | earpiece | background | reconnect | 60 s |
 
-Each paired run remains bound to the same device, source, APK, configuration,
-deployment, fixture, account-state, and comparison metadata. The only intended
-build difference is the transport experiment flag.
+Paired runs bind the same device, source, configuration, deployment, fixtures,
+account state, and comparison metadata. Direct and LiveKit use separately built
+APKs; those APKs differ only through the expected transport-flag dependency,
+bytecode, and hash consequences.
 
 ## Machine-observed scope
 
