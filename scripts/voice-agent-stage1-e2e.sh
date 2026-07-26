@@ -220,7 +220,8 @@ read_status() {
 read_android_network() {
   local connectivity
   local active_id
-  local active_block
+  local active_header
+  local active_network_capabilities
   connectivity="$(adb_command shell dumpsys connectivity)" || {
     fail "Android connectivity readback failed"
     return 1
@@ -230,25 +231,48 @@ read_android_network() {
     fail "Android has no numeric active default network"
     return 1
   }
-  active_block="$(printf '%s\n' "$connectivity" | awk -v id="$active_id" '
-    /NetworkAgentInfo\{network\{/ {
-      if (found) exit
-      found = index($0, "network{" id "}") > 0
+  active_header="$(printf '%s\n' "$connectivity" | awk -v id="$active_id" '
+    {
+      line = $0
+      sub(/^[[:space:]]*/, "", line)
+      prefix = "NetworkAgentInfo{network{" id "}"
+      if (index(line, prefix) == 1) { print; exit }
     }
-    found { print }
   ')"
-  [[ -n "$active_block" ]] || {
+  [[ -n "$active_header" ]] || {
     fail "active default network details were not found"
     return 1
   }
-  [[ "$active_block" =~ (^|[^A-Z0-9_])VALIDATED([^A-Z0-9_]|$) ]] || {
+  active_network_capabilities="$(printf '%s\n' "$active_header" | awk '
+    {
+      marker = " nc{"
+      start = index($0, marker)
+      if (start == 0) exit
+      start += length(marker)
+      depth = 1
+      for (position = start; position <= length($0); position++) {
+        character = substr($0, position, 1)
+        if (character == "{") depth++
+        if (character == "}") depth--
+        if (depth == 0) {
+          print substr($0, start, position - start)
+          exit
+        }
+      }
+    }
+  ')"
+  [[ -n "$active_network_capabilities" ]] || {
+    fail "active default network capabilities were not found"
+    return 1
+  }
+  [[ "$active_network_capabilities" =~ (^|[^A-Z0-9_])VALIDATED([^A-Z0-9_]|$) ]] || {
     fail "active default network is not validated"
     return 1
   }
   local has_wifi=0
   local has_cellular=0
-  [[ "$active_block" =~ (^|[^A-Z0-9_])WIFI([^A-Z0-9_]|$) ]] && has_wifi=1
-  [[ "$active_block" =~ (^|[^A-Z0-9_])CELLULAR([^A-Z0-9_]|$) ]] && has_cellular=1
+  [[ "$active_network_capabilities" =~ (^|[^A-Z0-9_])WIFI([^A-Z0-9_]|$) ]] && has_wifi=1
+  [[ "$active_network_capabilities" =~ (^|[^A-Z0-9_])CELLULAR([^A-Z0-9_]|$) ]] && has_cellular=1
   if (( has_wifi == 1 && has_cellular == 0 )); then
     printf 'wifi'
   elif (( has_cellular == 1 && has_wifi == 0 )); then

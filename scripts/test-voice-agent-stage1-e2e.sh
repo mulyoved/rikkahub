@@ -204,9 +204,10 @@ elif tail == ["shell", "dumpsys", "connectivity"]:
     inactive_transport = "CELLULAR" if state["network"] == "wifi" else "WIFI"
     active_transport = state["network"].upper()
     print(f"Active default network: {active_id}")
-    print(f"  NetworkAgentInfo{{network{{{inactive_id}}} nc{{[ Transports: {inactive_transport} Capabilities: VALIDATED&INTERNET ]}}}}")
+    print(f"  NetworkAgentInfo{{network{{{inactive_id}}} ni{{extra=network{{{active_id}}}}} nc{{[ Transports: {inactive_transport} Capabilities: VALIDATED&INTERNET ]}}}}")
     active_capabilities = "INTERNET" if state.get("unvalidated") else "VALIDATED&INTERNET"
-    print(f"  NetworkAgentInfo{{network{{{active_id}}} nc{{[ Transports: {active_transport} Capabilities: {active_capabilities} ]}}}}")
+    print(f"  NetworkAgentInfo{{network{{{active_id}}} ni{{WIFI CELLULAR VALIDATED}} nc{{[ Transports: {active_transport} Capabilities: {active_capabilities} ]}}}}")
+    print("    NetworkRequestInfo{requests=[ Transports: WIFI|CELLULAR Capabilities: INTERNET ]}")
 elif tail == ["shell", "dumpsys", "activity", "activities"]:
     resumed = ("me.rerere.rikkahub.debug/me.rerere.rikkahub.RouteActivity"
                if state.get("app_foreground") else "com.android.launcher/.Launcher")
