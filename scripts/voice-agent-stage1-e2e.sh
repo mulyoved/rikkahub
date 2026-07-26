@@ -301,6 +301,7 @@ begin_wait() {
 continue_wait() {
   local timeout_seconds="$1"
   local timeout_message="$2"
+  local sleep_before_next="${3:-1}"
   local now
   WAIT_ATTEMPTS=$((WAIT_ATTEMPTS + 1))
   if (( WAIT_ATTEMPTS >= MAX_WAIT_ATTEMPTS )); then
@@ -317,7 +318,9 @@ continue_wait() {
     fail "$timeout_message"
     return 1
   fi
-  sleep_poll
+  if (( sleep_before_next == 1 )); then
+    sleep_poll
+  fi
 }
 
 wait_android_network() {
@@ -334,6 +337,7 @@ wait_android_network() {
 
 wait_app_network() {
   local expected="$1"
+  local sleep_before_next=0
   begin_wait "app $expected network"
   while true; do
     read_status || return 1
@@ -344,7 +348,8 @@ wait_app_network() {
     if [[ "$STATUS_NETWORK" == "$expected" && "$STATUS_VALIDATED" == "true" ]]; then
       return 0
     fi
-    continue_wait "$WAIT_TIMEOUT_SECONDS" "timed out waiting for app $expected network" || return 1
+    continue_wait "$WAIT_TIMEOUT_SECONDS" "timed out waiting for app $expected network" "$sleep_before_next" || return 1
+    sleep_before_next=1
   done
 }
 

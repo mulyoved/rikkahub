@@ -472,6 +472,22 @@ print(value)
 PY
 chmod +x "$BIN_DIR/fake-clock"
 
+cat > "$BIN_DIR/sleep" <<'PY'
+#!/usr/bin/env python3
+import json
+import os
+import sys
+from pathlib import Path
+
+seconds = float(sys.argv[1])
+if os.environ.get("FAKE_SLEEP_RESETS_STATUS") == "1" and seconds > 0:
+    state_file = Path(os.environ["FAKE_ADB_STATE_DIR"]) / "state.json"
+    state = json.loads(state_file.read_text())
+    state["status_reads"] = 0
+    state_file.write_text(json.dumps(state, separators=(",", ":")))
+PY
+chmod +x "$BIN_DIR/sleep"
+
 reset_fake() {
   rm -rf "$STATE_DIR"
   mkdir -p "$STATE_DIR"
@@ -484,6 +500,7 @@ reset_fake() {
   unset FAKE_ADB_ROUTE_MODE FAKE_ADB_LIFECYCLE_MODE FAKE_CLOCK_MODE FAKE_ADB_INITIAL_RUN
   unset FAKE_ADB_UNVALIDATED_AFTER_RESTORE FAKE_ADB_STATUS_COLD_START
   unset FAKE_ADB_STATUS_MALFORMED FAKE_ADB_STAGE_VISIBILITY_DELAY
+  unset FAKE_SLEEP_RESETS_STATUS
 }
 
 command_lines() {
@@ -683,7 +700,8 @@ unset FAKE_ADB_BROADCAST_MULTILINE
 
 reset_fake
 export FAKE_ADB_STATUS_COLD_START=1
-preflight_output="$(runner_env bash "$RUNNER" --preflight </dev/null)"
+export FAKE_SLEEP_RESETS_STATUS=1
+preflight_output="$(runner_env VOICE_STAGE1_POLL_SECONDS=1 bash "$RUNNER" --preflight </dev/null)"
 assert_equals "$(cat <<EOF
 stage1.device=$SERIAL
 stage1.run_as=ready
@@ -697,6 +715,7 @@ EOF
 [[ "$(command_count "automation.STATUS")" == "2" ]] \
   || fail "cold-start preflight did not retry STATUS exactly once"
 unset FAKE_ADB_STATUS_COLD_START
+unset FAKE_SLEEP_RESETS_STATUS
 
 reset_fake
 export FAKE_ADB_STAGE_VISIBILITY_DELAY=1
