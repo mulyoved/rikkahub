@@ -81,6 +81,7 @@ else:
         "lifecycle": "foreground",
         "route": "speaker",
         "event_count": 0,
+        "status_reads": 0,
         "events": [],
         "call_started": False,
         "injections": 0,
@@ -320,7 +321,18 @@ elif tail[:3] == ["shell", "am", "broadcast"]:
             sys.exit(76)
         completed(0, "status=ok\naction=prepare")
     elif action.endswith(".STATUS"):
+        if os.environ.get("FAKE_ADB_STATUS_MALFORMED") == "1":
+            print("Broadcast completed: result=0")
+            sys.exit(0)
+        state["status_reads"] += 1
         app_network = os.environ.get("FAKE_ADB_APP_NETWORK", state["network"])
+        cold_start = (
+            os.environ.get("FAKE_ADB_STATUS_COLD_START") == "1"
+            and state["status_reads"] == 1
+        )
+        if cold_start:
+            app_network = "none"
+        save()
         if state["run_state"] == "active":
             emit("network_observed", network=app_network, succeeded=True)
             save()
@@ -333,7 +345,7 @@ elif tail[:3] == ["shell", "am", "broadcast"]:
             f"requested_transport={state['transport']}",
             f"event_count={state['event_count']}",
             f"network={app_network}",
-            "validated=true",
+            f"validated={str(not cold_start).lower()}",
         ]))
     elif action.endswith(".ROUTE"):
         route = values["route"]
@@ -457,7 +469,8 @@ reset_fake() {
   unset FAKE_ADB_DEVICES_MODE FAKE_ADB_FAIL_MODE FAKE_ADB_OBSERVED_TRANSPORT
   unset FAKE_ADB_APP_NETWORK FAKE_ADB_SUPPRESS_EVENT FAKE_ADB_EMULATOR
   unset FAKE_ADB_ROUTE_MODE FAKE_ADB_LIFECYCLE_MODE FAKE_CLOCK_MODE FAKE_ADB_INITIAL_RUN
-  unset FAKE_ADB_UNVALIDATED_AFTER_RESTORE
+  unset FAKE_ADB_UNVALIDATED_AFTER_RESTORE FAKE_ADB_STATUS_COLD_START
+  unset FAKE_ADB_STATUS_MALFORMED
 }
 
 command_lines() {
@@ -654,6 +667,48 @@ stage1.fixture_staging=ready
 EOF
 )" "$preflight_output"
 unset FAKE_ADB_BROADCAST_MULTILINE
+
+reset_fake
+export FAKE_ADB_STATUS_COLD_START=1
+preflight_output="$(runner_env bash "$RUNNER" --preflight </dev/null)"
+assert_equals "$(cat <<EOF
+stage1.device=$SERIAL
+stage1.run_as=ready
+stage1.wifi_control=ready
+stage1.cellular_control=ready
+stage1.connectivity_readback=ready
+stage1.automation_receiver=ready
+stage1.fixture_staging=ready
+EOF
+)" "$preflight_output"
+[[ "$(command_count "automation.STATUS")" == "2" ]] \
+  || fail "cold-start preflight did not retry STATUS exactly once"
+unset FAKE_ADB_STATUS_COLD_START
+
+reset_fake
+export FAKE_ADB_INITIAL_RUN=foreign
+export FAKE_ADB_APP_NETWORK=cellular
+set +e
+foreign_preflight_output="$(runner_env bash "$RUNNER" --preflight </dev/null 2>&1)"
+foreign_preflight_status=$?
+set -e
+[[ "$foreign_preflight_status" -ne 0 ]] || fail "preflight accepted a foreign active run"
+assert_contains "$foreign_preflight_output" "automation receiver already has an active run"
+[[ "$(command_count "automation.STATUS")" == "1" ]] \
+  || fail "preflight retried STATUS against a foreign active run"
+unset FAKE_ADB_INITIAL_RUN FAKE_ADB_APP_NETWORK
+
+reset_fake
+export FAKE_ADB_STATUS_MALFORMED=1
+set +e
+malformed_status_output="$(runner_env bash "$RUNNER" --preflight </dev/null 2>&1)"
+malformed_status_status=$?
+set -e
+[[ "$malformed_status_status" -ne 0 ]] || fail "preflight accepted malformed STATUS output"
+assert_contains "$malformed_status_output" "automation status returned malformed broadcast output"
+[[ "$(command_count "automation.STATUS")" == "1" ]] \
+  || fail "preflight retried malformed STATUS output"
+unset FAKE_ADB_STATUS_MALFORMED
 
 reset_fake
 export FAKE_ADB_SVC_WIFI_USAGE_STATUS=1

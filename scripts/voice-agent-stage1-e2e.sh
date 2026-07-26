@@ -332,6 +332,22 @@ wait_android_network() {
   done
 }
 
+wait_app_network() {
+  local expected="$1"
+  begin_wait "app $expected network"
+  while true; do
+    read_status || return 1
+    if [[ "$STATUS_RUN_STATE" == "active" ]]; then
+      fail "automation receiver already has an active run"
+      return 1
+    fi
+    if [[ "$STATUS_NETWORK" == "$expected" && "$STATUS_VALIDATED" == "true" ]]; then
+      return 0
+    fi
+    continue_wait "$WAIT_TIMEOUT_SECONDS" "timed out waiting for app $expected network" || return 1
+  done
+}
+
 cross_check_network() {
   local expected="$1"
   local android_network
@@ -911,6 +927,9 @@ run_preflight() {
   require_expected_serial
   [[ "$VOICE_STAGE1_PACKAGE" =~ ^[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)+$ ]] || fail "invalid package name"
   validate_positive_integer VOICE_STAGE1_ADB_TIMEOUT_SECONDS "$ADB_TIMEOUT_SECONDS"
+  validate_positive_integer VOICE_STAGE1_WAIT_TIMEOUT_SECONDS "$WAIT_TIMEOUT_SECONDS"
+  validate_positive_integer VOICE_STAGE1_MAX_WAIT_ATTEMPTS "$MAX_WAIT_ATTEMPTS"
+  validate_nonnegative_number VOICE_STAGE1_POLL_SECONDS "$POLL_SECONDS"
   require_command adb
   require_command timeout
   require_command awk
@@ -931,11 +950,9 @@ run_preflight() {
   [[ "$data_usage_status" -eq 0 || "$data_usage_status" -eq 1 ]] || fail "cellular control readback failed"
   grep -Fxq 'usage: svc data [enable|disable]' <<<"$data_usage" || fail "cellular control is unavailable"
   android_network="$(read_android_network)"
-  read_status
+  wait_app_network "$android_network"
   [[ "$STATUS_RUN_STATE" == "idle" || "$STATUS_RUN_STATE" == "finalized" ]] ||
     fail "automation receiver already has an active run"
-  [[ "$STATUS_NETWORK" == "$android_network" && "$STATUS_VALIDATED" == "true" ]] ||
-    fail "network observation mismatch: Android=$android_network app=$STATUS_NETWORK"
 
   trap preflight_on_exit EXIT
   PREFLIGHT_STAGE_STATE="pending"
