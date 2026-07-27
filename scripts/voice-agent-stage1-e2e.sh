@@ -116,16 +116,15 @@ acquire_run_lock() {
 
 select_device() {
   local devices_output
-  local authorized_count
   local selected_state
   devices_output="$(timeout "${ADB_TIMEOUT_SECONDS}s" adb devices -l)" ||
     fail "unable to enumerate ADB devices"
-  authorized_count="$(printf '%s\n' "$devices_output" | awk '$2 == "device" { count++ } END { print count + 0 }')"
-  [[ "$authorized_count" == "1" ]] ||
-    fail "expected exactly one authorized ADB device, found $authorized_count"
-  selected_state="$(printf '%s\n' "$devices_output" | awk -v serial="$VOICE_STAGE1_SERIAL" '$1 == serial { print $2; exit }')"
+  selected_state="$(printf '%s\n' "$devices_output" | awk -v serial="$VOICE_STAGE1_SERIAL" '
+    $1 == serial { count++; state = $2 }
+    END { if (count == 1) print state }
+  ')"
   [[ "$selected_state" == "device" ]] ||
-    fail "selected device $VOICE_STAGE1_SERIAL is not the sole authorized device"
+    fail "selected device $VOICE_STAGE1_SERIAL is not uniquely authorized"
 
   VOICE_AGENT_E2E_SERIAL="$VOICE_STAGE1_SERIAL" \
     ADB_DEVICE_READY_TIMEOUT_SECONDS="$ADB_TIMEOUT_SECONDS" \

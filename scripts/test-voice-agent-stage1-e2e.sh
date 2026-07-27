@@ -833,12 +833,9 @@ unset FAKE_ADB_SVC_DATA_USAGE_STATUS
 
 reset_fake
 export FAKE_ADB_DEVICES_MODE=multiple
-set +e
 multiple_output="$(runner_env bash "$RUNNER" --preflight </dev/null 2>&1)"
-multiple_status=$?
-set -e
-[[ "$multiple_status" -ne 0 ]] || fail "preflight accepted multiple authorized devices"
-assert_not_contains "$multiple_output" "stage1.device="
+assert_contains "$multiple_output" "stage1.device=$SERIAL"
+assert_selected_serial
 unset FAKE_ADB_DEVICES_MODE
 
 reset_fake
