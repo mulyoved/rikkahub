@@ -491,18 +491,21 @@ validate_event_lines() {
   local line
   while IFS= read -r line; do
     [[ "$line" == *"\"name\":\"$event_name\""* ]] || continue
-    [[ "$line" == *"\"runHash\":\"$VOICE_STAGE1_RUN_HASH\""* ]] || fail "event run hash mismatch"
+    [[ "$line" == *"\"runHash\":\"$VOICE_STAGE1_RUN_HASH\""* ]] ||
+      { fail "event run hash mismatch"; return 1; }
     [[ "$line" == *"\"comparisonHash\":\"$VOICE_STAGE1_COMPARISON_HASH\""* ]] ||
-      fail "event comparison hash mismatch"
+      { fail "event comparison hash mismatch"; return 1; }
     [[ "$line" == *"\"requestedTransport\":\"$VOICE_STAGE1_TRANSPORT\""* ]] ||
-      fail "event requested transport mismatch"
+      { fail "event requested transport mismatch"; return 1; }
     if [[ "$line" != *'"observedTransport":null'* &&
           "$line" != *"\"observedTransport\":\"$VOICE_STAGE1_TRANSPORT\""* ]]; then
       fail "observed transport mismatch"
+      return 1
     fi
     if [[ "$require_observed_transport" == "1" &&
           "$line" != *"\"observedTransport\":\"$VOICE_STAGE1_TRANSPORT\""* ]]; then
       fail "observed transport mismatch"
+      return 1
     fi
   done <<< "$lines"
 }
@@ -515,8 +518,10 @@ wait_event() {
   begin_wait "$event_name"
   while true; do
     if lines="$(adb_command exec-out run-as "$VOICE_STAGE1_PACKAGE" \
-      grep -F "$event_pattern" "$AUTOMATION_EVENT_PATH" 2>/dev/null)"; then
-      validate_event_lines "$event_name" "$require_observed_transport" "$lines"
+      grep -F "$event_pattern" "$AUTOMATION_EVENT_PATH" 2>/dev/null)" &&
+      [[ -n "$lines" ]]; then
+      validate_event_lines "$event_name" "$require_observed_transport" "$lines" ||
+        return 1
       return 0
     fi
     continue_wait "$WAIT_TIMEOUT_SECONDS" "timed out waiting for $event_name" || return 1
@@ -526,13 +531,28 @@ wait_event() {
 latest_event_monotonic_ms() {
   local event_name="${1,,}"
   local lines
+  local boundary_ms
   local event_pattern="\"name\":\"$event_name\""
-  lines="$(adb_command exec-out run-as "$VOICE_STAGE1_PACKAGE" \
-    grep -F "$event_pattern" "$AUTOMATION_EVENT_PATH")" ||
-    fail "missing $event_name event for ordering boundary"
-  validate_event_lines "$event_name" 0 "$lines"
-  python3 -c 'import json, sys; print(max(json.loads(line)["monotonicMs"] for line in sys.stdin if line.strip()))' \
-    <<< "$lines"
+  begin_wait "$event_name ordering boundary"
+  while true; do
+    if lines="$(adb_command exec-out run-as "$VOICE_STAGE1_PACKAGE" \
+      grep -F "$event_pattern" "$AUTOMATION_EVENT_PATH" 2>/dev/null)" &&
+      [[ -n "$lines" ]]; then
+      validate_event_lines "$event_name" 0 "$lines" || return 1
+      if boundary_ms="$(python3 -c '
+import json, sys
+events = [json.loads(line) for line in sys.stdin if line.strip()]
+if not events:
+    raise SystemExit(1)
+print(max(event["monotonicMs"] for event in events))
+' <<< "$lines")"; then
+        printf '%s\n' "$boundary_ms"
+        return 0
+      fi
+    fi
+    continue_wait "$WAIT_TIMEOUT_SECONDS" \
+      "timed out waiting for $event_name ordering boundary" || return 1
+  done
 }
 
 latest_run_event_monotonic_ms() {

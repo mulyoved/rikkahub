@@ -87,6 +87,7 @@ else:
         "injections": 0,
         "staged": {},
         "staged_reads": {},
+        "event_grep_reads": {},
     }
     if os.environ.get("FAKE_ADB_INITIAL_RUN") == "foreign":
         state.update({
@@ -423,6 +424,25 @@ elif tail[:3] == ["shell", "am", "broadcast"]:
         sys.exit(91)
 elif tail[:5] == ["exec-out", "run-as", "me.rerere.rikkahub.debug", "grep", "-F"]:
     pattern = tail[5]
+    state["event_grep_reads"][pattern] = state["event_grep_reads"].get(pattern, 0) + 1
+    save()
+    if (
+        os.environ.get("FAKE_ADB_EMPTY_CALL_ACTIVE_SNAPSHOT_ONCE") == "1"
+        and '"name":"call_active"' in pattern
+        and state["event_grep_reads"][pattern] == 2
+    ):
+        save()
+        sys.exit(0)
+    if (
+        os.environ.get("FAKE_ADB_FOREIGN_CALL_ACTIVE_SNAPSHOT_ONCE") == "1"
+        and '"name":"call_active"' in pattern
+        and state["event_grep_reads"][pattern] == 2
+    ):
+        matches = [json.loads(line) for line in state["events"] if pattern in line]
+        for event in matches:
+            event["runHash"] = "sha256:" + "c" * 64
+            print(json.dumps(event, separators=(",", ":")))
+        sys.exit(0)
     if '"route":' in pattern and state.get("route_pending"):
         requested = state["route_requested_value"]
         observed = requested if state["route_pending"] == "delayed" else (
@@ -986,6 +1006,23 @@ done
 reset_fake
 run_scenario livekit_experimental stable_wifi speaker foreground steady 20 >/dev/null
 assert_common_success_contract livekit_experimental
+
+reset_fake
+export FAKE_ADB_EMPTY_CALL_ACTIVE_SNAPSHOT_ONCE=1
+run_scenario direct_gemini stable_wifi speaker foreground steady 20 >/dev/null
+assert_common_success_contract direct_gemini
+unset FAKE_ADB_EMPTY_CALL_ACTIVE_SNAPSHOT_ONCE
+
+reset_fake
+export FAKE_ADB_FOREIGN_CALL_ACTIVE_SNAPSHOT_ONCE=1
+set +e
+foreign_boundary_output="$(run_scenario direct_gemini stable_wifi speaker foreground steady 20 2>&1)"
+foreign_boundary_status=$?
+set -e
+[[ "$foreign_boundary_status" -ne 0 ]] ||
+  fail "foreign event identity was accepted as an ordering boundary"
+assert_contains "$foreign_boundary_output" "event run hash mismatch"
+unset FAKE_ADB_FOREIGN_CALL_ACTIVE_SNAPSHOT_ONCE
 
 reset_fake
 export FAKE_ADB_ROUTE_MODE=delayed
