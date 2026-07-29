@@ -35,18 +35,21 @@ class VoiceAgentTransportTest {
         val decoded = decodeVoiceAgentCallStartFields(
             conversationId = encoded.conversationId,
             transportWireName = encoded.transportWireName,
+            captureFixtureToken = "fixture-17",
         )
 
         assertEquals(conversationId, decoded?.conversationId?.toString())
         assertEquals(VoiceAgentTransport.LiveKitExperimental, decoded?.transport)
+        assertEquals("fixture-17", decoded?.captureFixtureToken)
     }
 
     @Test
     fun `service intent fields reject missing or invalid transport`() {
         val conversationId = "11111111-1111-4111-8111-111111111111"
 
-        assertNull(decodeVoiceAgentCallStartFields(conversationId, null))
-        assertNull(decodeVoiceAgentCallStartFields(conversationId, "unknown"))
-        assertNull(decodeVoiceAgentCallStartFields("not-a-uuid", "direct_gemini"))
+        assertNull(decodeVoiceAgentCallStartFields(conversationId, null, null))
+        assertNull(decodeVoiceAgentCallStartFields(conversationId, "unknown", null))
+        assertNull(decodeVoiceAgentCallStartFields("not-a-uuid", "direct_gemini", null))
+        assertNull(decodeVoiceAgentCallStartFields(conversationId, "direct_gemini", " "))
     }
 }

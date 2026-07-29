@@ -116,7 +116,7 @@ class VoiceAgentCallSession internal constructor(
     private var automationConfigurationAttested = false
     private var automationCallStoppedRecorded = false
     private var hermesBridge: HermesSessionBridge? = null
-    private var debugInjectionCaptureRestartSessionId: Long? = null
+    private var completedCaptureSourceRestartSessionId: Long? = null
     private val reconnectController = VoiceReconnectController(
         policy = reconnectPolicy,
         nowMs = nowMs,
@@ -725,7 +725,7 @@ class VoiceAgentCallSession internal constructor(
             return
         }
         coordinator.onGeminiEvent(sessionId, coordinatorEvent)
-        restartDebugInjectionCaptureAfterGeneration(sessionId, coordinatorEvent)
+        restartCompletedCaptureSourceAfterGeneration(sessionId, coordinatorEvent)
         if (stopReason != null) {
             if (coordinator.isActiveSession(sessionId)) {
                 val runtimeFailure = isRuntimeFailureTelemetryEligible(sessionId) || automaticReconnectAttemptFailure
@@ -1111,10 +1111,10 @@ class VoiceAgentCallSession internal constructor(
         }
     }
 
-    private fun restartDebugInjectionCaptureAfterGeneration(sessionId: Long, event: GeminiLiveEvent) {
+    private fun restartCompletedCaptureSourceAfterGeneration(sessionId: Long, event: GeminiLiveEvent) {
         if (event != GeminiLiveEvent.GenerationComplete) return
-        if (debugInjectionCaptureRestartSessionId != sessionId) return
-        debugInjectionCaptureRestartSessionId = null
+        if (completedCaptureSourceRestartSessionId != sessionId) return
+        completedCaptureSourceRestartSessionId = null
         if (isSessionOpenAndActive(sessionId)) {
             captureStartController.launch(sessionId)
         }
@@ -1174,16 +1174,16 @@ class VoiceAgentCallSession internal constructor(
                         }
                     }
                 },
-                onDebugInjectionComplete = {
+                onCaptureSourceComplete = {
                     val admission = synchronized(sessionLock) {
-                        captureEpochOwner.claimDebugCompletion(token)?.also {
-                            debugInjectionCaptureRestartSessionId = currentSessionId
+                        captureEpochOwner.claimSourceCompletion(token)?.also {
+                            completedCaptureSourceRestartSessionId = currentSessionId
                         }
                     } ?: return@startCapture
                     admission.use {
                         VoiceAgentLog.d(
                             TAG,
-                            "debug injection complete; stopping capture and sending audio stream end " +
+                            "capture source complete; stopping capture and sending audio stream end " +
                                 "sessionId=$currentSessionId",
                         )
                         audio.stopCapture()

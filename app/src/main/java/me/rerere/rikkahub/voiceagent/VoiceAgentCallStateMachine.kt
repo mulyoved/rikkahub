@@ -11,6 +11,7 @@ internal data class VoiceAgentCallRequest(
     val conversationId: Uuid,
     val config: VoiceAgentLaunchConfig,
     val transport: VoiceAgentTransport,
+    val captureFixtureToken: String? = null,
 )
 
 internal data class ActiveVoiceAgentIdentity(

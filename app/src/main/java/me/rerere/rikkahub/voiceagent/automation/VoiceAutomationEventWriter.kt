@@ -55,6 +55,9 @@ internal class VoiceAutomationEventWriter private constructor(
         appendNullableString("instructionHash", event.instructionHash)
         appendNullableString("directAccountConfigurationHash", event.directAccountConfigurationHash)
         appendNullableString("conversationHash", event.conversationHash)
+        appendNullableString("captureSource", event.captureSource)
+        appendNullableNumber("micBytes", event.micBytes)
+        appendNullableNumber("fixtureBytes", event.fixtureBytes)
         append('}')
     }
 

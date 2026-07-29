@@ -10,6 +10,8 @@ import me.rerere.rikkahub.service.ChatService
 import me.rerere.rikkahub.voiceagent.audio.AndroidVoiceAudioEngine
 import me.rerere.rikkahub.voiceagent.audio.VoiceAudioEngine
 import me.rerere.rikkahub.voiceagent.audio.VoiceAudioRouteOwner
+import me.rerere.rikkahub.voiceagent.audio.VoiceCaptureFixtureArming
+import me.rerere.rikkahub.voiceagent.audio.VoiceCaptureSource
 import me.rerere.rikkahub.voiceagent.gemini.GeminiLiveVoiceClient
 import me.rerere.rikkahub.voiceagent.gemini.OkHttpGeminiLiveVoiceClient
 import me.rerere.rikkahub.voiceagent.telemetry.NoOpVoiceObservability
@@ -98,8 +100,8 @@ internal class DefaultVoiceAgentCallFactory internal constructor(
     private val geminiFactory: () -> GeminiLiveVoiceClient = {
         OkHttpGeminiLiveVoiceClient(httpClient = okHttpClient)
     },
-    private val audioFactory: (VoiceAudioRouteOwner) -> VoiceAudioEngine = { owner ->
-        AndroidVoiceAudioEngine(context = context, routeOwner = owner)
+    private val audioFactory: (VoiceAudioRouteOwner, VoiceCaptureSource) -> VoiceAudioEngine = { owner, source ->
+        AndroidVoiceAudioEngine(context = context, routeOwner = owner, captureSource = source)
     },
     private val conversationStoreFactory: (Uuid) -> VoiceConversationStore = { conversationId ->
         ChatServiceVoiceConversationStore(
@@ -147,6 +149,7 @@ internal class DefaultVoiceAgentCallFactory internal constructor(
                         routeLease,
                         scope,
                         endDrainTimeoutMillis,
+                        request.captureFixtureToken,
                     )
                     VoiceAgentTransport.LiveKitExperimental -> {
                         throw VoiceAgentCallConfigurationException(
@@ -166,6 +169,7 @@ internal class DefaultVoiceAgentCallFactory internal constructor(
         routeLease: VoiceAgentRouteLease,
         scope: CoroutineScope,
         endDrainTimeoutMillis: Long,
+        captureFixtureToken: String?,
     ): RouteOwnedManagedVoiceCallSession {
         val route = routeLease.metadata
         val baseTraceContext = newVoiceTraceContext()
@@ -184,18 +188,25 @@ internal class DefaultVoiceAgentCallFactory internal constructor(
             }
             baseTraceContext to HermesVoiceTraceHeaders.from(baseTraceContext)
         }
+        val captureSource = VoiceCaptureFixtureArming.claimSource(captureFixtureToken)
+            .getOrElse { cause ->
+                throw VoiceAgentCallConfigurationException("Capture fixture token is not armed")
+                    .also { it.initCause(cause) }
+            }
+        var audio: VoiceAudioEngine? = null
         val coreSession = runCatching {
             val mobileApi = HermesVoiceApi(
                 baseUrl = config.hermesVoiceBaseUrl,
                 credentials = config.credentials,
                 traceHeaders = traceHeaders,
             )
+            audio = audioFactory(route.owner, captureSource)
             VoiceAgentCallSession(
                 modelId = config.voiceModelId,
                 sessionApi = sessionApiFactory(mobileApi),
                 toolApi = toolApiFactory(mobileApi),
                 gemini = geminiFactory(),
-                audio = audioFactory(route.owner),
+                audio = checkNotNull(audio),
                 conversationStore = conversationStoreFactory(conversationId),
                 contextProvider = contextProviderFactory(config.voiceModelId),
                 observability = observability,
@@ -217,6 +228,8 @@ internal class DefaultVoiceAgentCallFactory internal constructor(
                 ),
             )
         }.getOrElse { throwable ->
+            runCatching { audio?.release() }
+            captureSource.close()
             runCatching {
                 observability.recordEvent(
                     name = "hermes_voice.mobile.session.ended",

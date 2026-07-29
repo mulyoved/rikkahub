@@ -85,6 +85,8 @@ else:
         "events": [],
         "call_started": False,
         "injections": 0,
+        "fixture_token": None,
+        "fixture_initial_bytes": 0,
         "staged": {},
         "staged_reads": {},
         "event_grep_reads": {},
@@ -101,7 +103,8 @@ def save():
     state_file.write_text(json.dumps(state, separators=(",", ":")))
 
 def emit(name, *, observed_transport=None, route=None, network=None, lifecycle=None,
-         playback_epoch=None, byte_count=None, succeeded=None):
+         playback_epoch=None, byte_count=None, succeeded=None, capture_source=None,
+         mic_bytes=None, fixture_bytes=None):
     state["event_count"] += 1
     event = {
         "schemaVersion": 1,
@@ -120,6 +123,9 @@ def emit(name, *, observed_transport=None, route=None, network=None, lifecycle=N
         "succeeded": succeeded,
         "correlationKind": None,
         "correlationHash": None,
+        "captureSource": capture_source,
+        "micBytes": mic_bytes,
+        "fixtureBytes": fixture_bytes,
     }
     state["events"].append(json.dumps(event, separators=(",", ":")))
 
@@ -283,6 +289,7 @@ elif tail == ["shell", "input", "keyevent", "HOME"]:
 elif tail[:4] == ["shell", "am", "start-foreground-service", "-n"]:
     action = tail[tail.index("-a") + 1]
     if action.endswith(".START"):
+        values = extras()
         state["call_started"] = True
         emit("call_start_requested", observed_transport=state["transport"])
         save()
@@ -291,6 +298,17 @@ elif tail[:4] == ["shell", "am", "start-foreground-service", "-n"]:
         observed = os.environ.get("FAKE_ADB_OBSERVED_TRANSPORT", state["transport"])
         if os.environ.get("FAKE_ADB_SUPPRESS_EVENT") != "call_active":
             emit("call_active", observed_transport=observed)
+        if values.get("captureFixtureToken") == state.get("fixture_token"):
+            state["injections"] = 1
+            fixture_bytes = state["fixture_initial_bytes"]
+            emit("injection_started", byte_count=fixture_bytes)
+            emit("injection_first_chunk", byte_count=fixture_bytes)
+            emit("injection_completed", byte_count=fixture_bytes)
+            emit("prompt_ended", byte_count=fixture_bytes)
+            if os.environ.get("FAKE_ADB_SUPPRESS_CAPTURE_ATTESTATION") != "1":
+                emit("capture_attested", capture_source="fixture", mic_bytes=0, fixture_bytes=fixture_bytes)
+            emit("remote_audio_first_non_silent", playback_epoch=1)
+            emit("playback_active", playback_epoch=1)
         save()
     else:
         state["call_started"] = False
@@ -407,18 +425,27 @@ elif tail[:3] == ["shell", "am", "broadcast"]:
             state["run_state"] = "finalized"
             save()
             completed(0, "status=ok\naction=finalize")
-    elif action.endswith(".INJECT_PCM"):
+    elif action.endswith(".ARM_CAPTURE_FIXTURE"):
+        if os.environ.get("FAKE_ADB_ARM_MALFORMED") == "1":
+            completed(0, "status=ok\naction=arm")
+            sys.exit(0)
+        state["fixture_token"] = "fixture-1"
+        state["fixture_initial_bytes"] = state["staged"].get("files/" + values["initial_path"], 0)
+        save()
+        completed(0, "status=ok\naction=arm\ntoken=fixture-1")
+    elif action.endswith(".TRIGGER_CAPTURE_FIXTURE"):
+        if values.get("token") != state.get("fixture_token"):
+            completed(1, "status=error\nerror=invalid_request")
+            sys.exit(0)
         state["injections"] += 1
         emit("injection_started", byte_count=12)
         emit("injection_first_chunk", byte_count=12)
         emit("injection_completed", byte_count=12)
-        emit("prompt_ended")
-        if state["injections"] == 1:
-            emit("playback_active", playback_epoch=1)
-        else:
-            emit("playback_stopped", playback_epoch=1)
+        emit("prompt_ended", byte_count=12)
+        emit("capture_attested", capture_source="fixture", mic_bytes=0, fixture_bytes=12)
+        emit("playback_stopped", playback_epoch=1)
         save()
-        print("Broadcast completed: result=0")
+        completed(0, "status=ok\naction=trigger\naccepted=true")
     else:
         print(f"unexpected broadcast action: {action}", file=sys.stderr)
         sys.exit(91)
@@ -511,6 +538,7 @@ reset_fake() {
   unset FAKE_ADB_UNVALIDATED_AFTER_RESTORE FAKE_ADB_STATUS_COLD_START
   unset FAKE_ADB_BACKGROUND_NETWORK_BLOCKED
   unset FAKE_ADB_STATUS_MALFORMED FAKE_ADB_STAGE_VISIBILITY_DELAY
+  unset FAKE_ADB_ARM_MALFORMED FAKE_ADB_SUPPRESS_CAPTURE_ATTESTATION
 }
 
 command_lines() {
@@ -969,16 +997,24 @@ for row in "${ROWS[@]}"; do
     [[ "$(command_count "$home_needle")" == "0" ]] || fail "foreground row used the background keyevent"
   fi
 
-  injection_needle="me.rerere.rikkahub.debug.voiceagent.INJECT_PCM"
+  arm_needle="me.rerere.rikkahub.debug.voiceagent.ARM_CAPTURE_FIXTURE"
+  trigger_needle="me.rerere.rikkahub.debug.voiceagent.TRIGGER_CAPTURE_FIXTURE"
+  start_index="$(command_index "action.START")"
+  arm_index="$(command_index "$arm_needle")"
+  (( arm_index < start_index )) || fail "fixture was not armed before call start"
+  [[ "$(command_count "$arm_needle")" == "1" ]] || fail "fixture was not armed exactly once"
+  start_command="$(commands_matching "action.START")"
+  [[ "$start_command" == *"captureFixtureToken"* && "$start_command" == *"fixture-1"* ]] ||
+    fail "call start did not carry the armed fixture token"
   if [[ "$lifecycle" == "interruption" ]]; then
-    [[ "$(command_count "$injection_needle")" == "2" ]] || fail "interruption row did not inject twice"
+    [[ "$(command_count "$trigger_needle")" == "1" ]] || fail "interruption row did not trigger once"
     playback_index="$(command_index '\"name\":\"playback_active\"')"
     mark_index="$(command_index "interrupt_started")"
-    second_injection_index="$(last_command_index "$injection_needle")"
-    (( playback_index < mark_index && mark_index < second_injection_index )) ||
-      fail "interruption injection did not follow playback-active and marker"
+    trigger_index="$(last_command_index "$trigger_needle")"
+    (( playback_index < mark_index && mark_index < trigger_index )) ||
+      fail "interruption trigger did not follow playback-active and marker"
   else
-    [[ "$(command_count "$injection_needle")" == "1" ]] || fail "non-interruption row injected more than prompt"
+    [[ "$(command_count "$trigger_needle")" == "0" ]] || fail "non-interruption row triggered another fixture"
   fi
 
   if [[ "$network" == "wifi_cellular_wifi" ]]; then
@@ -1006,6 +1042,27 @@ done
 reset_fake
 run_scenario livekit_experimental stable_wifi speaker foreground steady 20 >/dev/null
 assert_common_success_contract livekit_experimental
+
+reset_fake
+export FAKE_ADB_ARM_MALFORMED=1
+set +e
+missing_arm_output="$(run_scenario direct_gemini stable_wifi speaker foreground steady 20 2>&1)"
+missing_arm_status=$?
+set -e
+[[ "$missing_arm_status" -ne 0 ]] || fail "runner accepted missing fixture arm readback"
+assert_contains "$missing_arm_output" "fixture arm returned malformed data"
+[[ "$(command_count "action.START")" == "0" ]] || fail "missing fixture arm readback started a call"
+unset FAKE_ADB_ARM_MALFORMED
+
+reset_fake
+export FAKE_ADB_SUPPRESS_CAPTURE_ATTESTATION=1
+set +e
+missing_attestation_output="$(run_scenario direct_gemini stable_wifi speaker foreground steady 20 2>&1)"
+missing_attestation_status=$?
+set -e
+[[ "$missing_attestation_status" -ne 0 ]] || fail "runner accepted missing capture attestation"
+assert_contains "$missing_attestation_output" "missing required automation event: capture_attested"
+unset FAKE_ADB_SUPPRESS_CAPTURE_ATTESTATION
 
 reset_fake
 export FAKE_ADB_EMPTY_CALL_ACTIVE_SNAPSHOT_ONCE=1

@@ -9,6 +9,8 @@ import me.rerere.rikkahub.voiceagent.VoiceAgentCallFactory
 import me.rerere.rikkahub.voiceagent.VoiceAgentCallRequest
 import me.rerere.rikkahub.voiceagent.VoiceAgentRouteLease
 import me.rerere.rikkahub.voiceagent.VoiceAgentSessionCreationResult
+import me.rerere.rikkahub.voiceagent.audio.VoiceCaptureFixtureArming
+import me.rerere.rikkahub.voiceagent.audio.VoiceCaptureSource
 import me.rerere.rikkahub.voiceagent.finishFailedOwnedVoiceSessionCreation
 import me.rerere.rikkahub.voiceagent.hermesvoice.HermesVoiceApi
 import me.rerere.rikkahub.voiceagent.hermesvoice.HermesVoiceTraceHeaders
@@ -44,7 +46,15 @@ internal class LiveKitVoiceCallFactory internal constructor(
         endDrainTimeoutMillis: Long,
     ): VoiceAgentSessionCreationResult {
         val cleanup = voiceAgentRouteCleanupOperation(routeLease)
+        var captureSource: VoiceCaptureSource? = null
         return try {
+            captureSource = VoiceCaptureFixtureArming.claimSource(request.captureFixtureToken)
+                .getOrElse { cause ->
+                    throw LiveKitExperimentalVoiceCallException(
+                        message = "Capture fixture token is not armed",
+                        cause = cause,
+                    )
+                }
             val trace = traceContextFactory()
             val details = withTimeout(sessionCreationTimeoutMillis) {
                 sessionDetailsFactory(request, trace)
@@ -56,14 +66,17 @@ internal class LiveKitVoiceCallFactory internal constructor(
                     room = roomFactory(),
                     routeLease = routeLease,
                     scope = scope,
+                    captureSource = checkNotNull(captureSource),
                 ),
             )
         } catch (_: TimeoutCancellationException) {
+            captureSource?.close()
             finishFailedOwnedVoiceSessionCreation(
                 LiveKitExperimentalVoiceCallException("LiveKit experimental voice session request timed out"),
                 cleanup,
             )
         } catch (creationError: Throwable) {
+            captureSource?.close()
             finishFailedOwnedVoiceSessionCreation(
                 if (creationError is CancellationException) {
                     creationError

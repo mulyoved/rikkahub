@@ -295,6 +295,9 @@ internal class DefaultVoiceAutomationRuntime(
         instructionHash = input.instructionHash,
         directAccountConfigurationHash = input.directAccountConfigurationHash,
         conversationHash = input.conversationHash,
+        captureSource = input.captureSource,
+        micBytes = input.micBytes,
+        fixtureBytes = input.fixtureBytes,
     )
 
     private fun nextMonotonicMs(): Long {

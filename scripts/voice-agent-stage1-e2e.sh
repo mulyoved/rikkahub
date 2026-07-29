@@ -12,11 +12,12 @@ ARTIFACT_HELPERS="$ROOT_DIR/scripts/voice-agent-e2e-artifacts.sh"
 source "$ARTIFACT_HELPERS"
 
 CONTROL_RECEIVER_CLASS="me.rerere.rikkahub.voiceagent.debug.VoiceAutomationControlReceiver"
-INJECTION_RECEIVER_CLASS="me.rerere.rikkahub.voiceagent.debug.VoiceAudioDebugInjectionReceiver"
+FIXTURE_RECEIVER_CLASS="me.rerere.rikkahub.voiceagent.debug.VoiceCaptureFixtureDebugReceiver"
 SERVICE_CLASS="me.rerere.rikkahub.voiceagent.VoiceAgentCallService"
 ROUTE_ACTIVITY_CLASS="me.rerere.rikkahub.RouteActivity"
 CONTROL_ACTION_PREFIX="me.rerere.rikkahub.voiceagent.automation"
-INJECTION_ACTION="me.rerere.rikkahub.debug.voiceagent.INJECT_PCM"
+FIXTURE_ARM_ACTION="me.rerere.rikkahub.debug.voiceagent.ARM_CAPTURE_FIXTURE"
+FIXTURE_TRIGGER_ACTION="me.rerere.rikkahub.debug.voiceagent.TRIGGER_CAPTURE_FIXTURE"
 CALL_START_ACTION="me.rerere.rikkahub.voiceagent.action.START"
 CALL_END_ACTION="me.rerere.rikkahub.voiceagent.action.END"
 EXPECTED_PHYSICAL_SERIAL="RZCX71NXRPB"
@@ -51,6 +52,8 @@ STATUS_TRANSPORT=""
 STATUS_EVENT_COUNT=""
 STATUS_NETWORK=""
 STATUS_VALIDATED=""
+FIXTURE_TOKEN=""
+FIXTURE_DATA=""
 
 fail() {
   printf 'stage1: %s\n' "$*" >&2
@@ -709,16 +712,48 @@ raise SystemExit(0 if any(event["lifecycle"] == expected for event in events) el
   done
 }
 
-inject_pcm() {
-  local app_relative_path="$1"
-  adb_command shell am broadcast --user 0 \
-    -n "$VOICE_STAGE1_PACKAGE/$INJECTION_RECEIVER_CLASS" \
-    -a "$INJECTION_ACTION" \
-    --es path "$app_relative_path" \
+fixture_broadcast() {
+  local action="$1"
+  shift
+  local output
+  local completed_output
+  local result_code
+  local raw_data
+  output="$(adb_command shell am broadcast --user 0 \
+    -n "$VOICE_STAGE1_PACKAGE/$FIXTURE_RECEIVER_CLASS" \
+    -a "$action" "$@")" || fail "fixture broadcast failed"
+  completed_output="$(printf '%s\n' "$output" | awk '
+    capture { print; next }
+    /^Broadcast completed:/ { capture=1; print }
+  ')"
+  if [[ ! "$completed_output" =~ ^Broadcast\ completed:\ result=([-0-9]+),\ data=\"(.*)\"$ ]]; then
+    fail "fixture broadcast returned malformed output"
+    return 1
+  fi
+  result_code="${BASH_REMATCH[1]}"
+  raw_data="${BASH_REMATCH[2]}"
+  FIXTURE_DATA="$(decode_broadcast_data "$raw_data")"
+  [[ "$result_code" == "0" ]] || fail "fixture broadcast was rejected"
+}
+
+arm_capture_fixture() {
+  fixture_broadcast "$FIXTURE_ARM_ACTION" \
+    --es initial_path "$INJECTION_PROMPT_PATH" \
+    --es staged_path "$INJECTION_INTERRUPT_PATH" \
     --ei chunk_bytes 3200 \
-    --el chunk_delay_ms 100 \
-    --el leading_silence_ms 0 \
-    --el trailing_silence_ms 0 >/dev/null
+    --el chunk_delay_ms 100
+  [[ "$FIXTURE_DATA" =~ ^status=ok$'\n'action=arm$'\n'token=(fixture-[1-9][0-9]*)$ ]] ||
+    fail "fixture arm returned malformed data"
+  FIXTURE_TOKEN="${BASH_REMATCH[1]}"
+}
+
+trigger_capture_fixture() {
+  local app_relative_path="$1"
+  fixture_broadcast "$FIXTURE_TRIGGER_ACTION" \
+    --es token "$FIXTURE_TOKEN" \
+    --es path "$app_relative_path"
+  [[ "$FIXTURE_DATA" == $'status=ok\naction=trigger\naccepted=true' ]] ||
+    fail "fixture trigger returned malformed data"
 }
 
 start_call() {
@@ -727,7 +762,8 @@ start_call() {
     -n "$VOICE_STAGE1_PACKAGE/$SERVICE_CLASS" \
     -a "$CALL_START_ACTION" \
     --es conversationId "$VOICE_STAGE1_CONVERSATION_ID" \
-    --es transport "$VOICE_STAGE1_TRANSPORT" >/dev/null
+    --es transport "$VOICE_STAGE1_TRANSPORT" \
+    --es captureFixtureToken "$FIXTURE_TOKEN" >/dev/null
 }
 
 end_call() {
@@ -802,6 +838,7 @@ finalize_and_fetch() {
   local output_parent
   local temp_output
   local expected_route
+  local expected_fixture_bytes
   output_parent="$(dirname "$VOICE_STAGE1_EVENT_OUTPUT")"
   mkdir -p "$output_parent"
   [[ ! -L "$VOICE_STAGE1_EVENT_OUTPUT" ]] || fail "VOICE_STAGE1_EVENT_OUTPUT must not be a symlink"
@@ -829,13 +866,15 @@ finalize_and_fetch() {
     fail "finalized automation events are empty"
   }
   expected_route="${VOICE_STAGE1_ROUTE^}"
+  expected_fixture_bytes="$(wc -c < "$VOICE_STAGE1_PCM_PATH" | tr -d '[:space:]')"
   if ! python3 - "$temp_output" "$VOICE_STAGE1_RUN_HASH" "$VOICE_STAGE1_COMPARISON_HASH" \
     "$VOICE_STAGE1_TRANSPORT" "$expected_route" "$VOICE_STAGE1_APP_STATE" \
-    "$VOICE_STAGE1_NETWORK" "$VOICE_STAGE1_LIFECYCLE" <<'PY'
+    "$VOICE_STAGE1_NETWORK" "$VOICE_STAGE1_LIFECYCLE" "$expected_fixture_bytes" <<'PY'
 import json
 import sys
 
-path, run_hash, comparison_hash, transport, route, app_state, network_mode, lifecycle = sys.argv[1:]
+path, run_hash, comparison_hash, transport, route, app_state, network_mode, lifecycle, expected_fixture_bytes = sys.argv[1:]
+expected_fixture_bytes = int(expected_fixture_bytes)
 try:
     with open(path, encoding="utf-8") as handle:
         events = [json.loads(line) for line in handle if line.strip()]
@@ -856,9 +895,24 @@ names = [event.get("name") for event in events]
 for required in ("run_prepared", "call_start_requested", "call_active", "call_stopped",
                  "route_requested", "route_observed",
                  "lifecycle_requested", "lifecycle_observed", "prompt_ended",
+                 "capture_attested", "remote_audio_first_non_silent",
                  "playback_active", "run_finalized"):
     if required not in names:
         raise SystemExit(f"missing required automation event: {required}")
+attestations = [event for event in events if event.get("name") == "capture_attested"]
+if (not attestations or attestations[0].get("captureSource") != "fixture" or
+        attestations[0].get("micBytes") != 0 or
+        attestations[0].get("fixtureBytes") != expected_fixture_bytes):
+    raise SystemExit("capture source attestation mismatch")
+if any(event.get("captureSource") != "fixture" or event.get("micBytes") != 0
+       for event in attestations):
+    raise SystemExit("microphone contamination attested")
+prompt_end_ms = min(event["monotonicMs"] for event in events
+                    if event.get("name") == "prompt_ended")
+first_output_ms = min(event["monotonicMs"] for event in events
+                      if event.get("name") == "remote_audio_first_non_silent")
+if first_output_ms - prompt_end_ms < 0:
+    raise SystemExit("output audio began before prompt end")
 if not any(event.get("name") == "call_active" and event.get("observedTransport") == transport
            for event in events):
     raise SystemExit("observed transport mismatch")
@@ -1107,6 +1161,7 @@ run_scenario() {
   FIXTURES_STAGED=1
   stage_file "$VOICE_STAGE1_PCM_PATH" "$PRIVATE_PROMPT_PATH"
   stage_file "$VOICE_STAGE1_INTERRUPT_PCM_PATH" "$PRIVATE_INTERRUPT_PATH"
+  arm_capture_fixture
 
   run_started_at="$(clock_now)"
   start_call
@@ -1123,7 +1178,6 @@ run_scenario() {
   fi
   wait_lifecycle "$VOICE_STAGE1_APP_STATE" "$lifecycle_boundary_ms"
 
-  inject_pcm "$INJECTION_PROMPT_PATH"
   wait_event PROMPT_ENDED
   wait_event PLAYBACK_ACTIVE
 
@@ -1133,7 +1187,7 @@ run_scenario() {
     interruption)
       wait_event PLAYBACK_ACTIVE
       mark_boundary INTERRUPT_STARTED
-      inject_pcm "$INJECTION_INTERRUPT_PATH"
+      trigger_capture_fixture "$INJECTION_INTERRUPT_PATH"
       wait_event PLAYBACK_STOPPED
       ;;
     reconnect)

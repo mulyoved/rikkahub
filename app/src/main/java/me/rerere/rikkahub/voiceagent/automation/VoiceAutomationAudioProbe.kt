@@ -21,6 +21,7 @@ internal interface VoiceAutomationAudioProbe {
     fun onInjectionStarted(totalBytes: Long)
     fun onInjectionChunk(byteCount: Int)
     fun onInjectionCompleted()
+    fun onCaptureAttested(source: String, micBytes: Long, fixtureBytes: Long) = Unit
     fun onOutputQueued(byteCount: Int)
     fun onOutputWritten(byteCount: Int, nonSilent: Boolean)
     fun captureLiveKitMediaOwner(): VoiceAutomationMediaOwner? = null
@@ -119,6 +120,25 @@ internal class DefaultVoiceAutomationAudioProbe(
                 VoiceAutomationEventInput(
                     name = VoiceAutomationEventName.PROMPT_ENDED,
                     byteCount = totalBytes,
+                ),
+            )
+        }
+    }
+
+    @Synchronized
+    override fun onCaptureAttested(
+        source: String,
+        micBytes: Long,
+        fixtureBytes: Long,
+    ) {
+        withActiveRuntime { runtime ->
+            record(
+                runtime,
+                VoiceAutomationEventInput(
+                    name = VoiceAutomationEventName.CAPTURE_ATTESTED,
+                    captureSource = source,
+                    micBytes = micBytes,
+                    fixtureBytes = fixtureBytes,
                 ),
             )
         }

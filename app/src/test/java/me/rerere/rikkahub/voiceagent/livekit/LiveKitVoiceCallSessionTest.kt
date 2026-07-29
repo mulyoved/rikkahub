@@ -38,6 +38,9 @@ import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationRunBinding
 import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationRunState
 import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationRuntime
 import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationStatus
+import me.rerere.rikkahub.voiceagent.audio.VoiceCaptureFixture
+import me.rerere.rikkahub.voiceagent.audio.VoiceCaptureFixtureArming
+import me.rerere.rikkahub.voiceagent.audio.VoiceCaptureSource
 import me.rerere.rikkahub.voiceagent.telemetry.VoiceTraceContext
 import java.nio.file.Files
 import org.junit.Assert.assertEquals
@@ -51,6 +54,40 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
 class LiveKitVoiceCallSessionTest {
+    @Test
+    fun `fixture remains armed until the matching ready event`() = runTest {
+        VoiceCaptureFixtureArming.clearForTest()
+        val token = VoiceCaptureFixtureArming.arm(
+            initial = VoiceCaptureFixture("prompt.pcm", byteArrayOf(1, 2), 2, 0),
+            staged = emptyList(),
+        )
+        val captureSource = VoiceCaptureFixtureArming.claim(token).getOrThrow()
+        val delivered = mutableListOf<List<Byte>>()
+        val pump = backgroundScope.launch {
+            captureSource.pump(
+                onPcm16 = { delivered += it.toList() },
+                onFixtureComplete = {},
+            )
+        }
+        val fixture = fixture(
+            automationRuntime = SessionRecordingAutomationRuntime(),
+            captureSource = captureSource,
+        )
+
+        fixture.session.start()
+        runCurrent()
+        assertTrue(delivered.isEmpty())
+
+        fixture.room.emit(LiveKitRoomEvent.Data(AGENT_IDENTITY, READY_TOPIC, readyJson()))
+        runCurrent()
+        captureSource.awaitIdle()
+        assertEquals(listOf(listOf<Byte>(1, 2)), delivered)
+
+        fixture.session.cleanupOperation.run(VoiceAgentCleanupMode.Immediate)
+        pump.cancel()
+        VoiceCaptureFixtureArming.clearForTest()
+    }
+
     @Test
     fun `second real LiveKit reconnect callback remains structurally visible in artifact`() = runTest {
         val runtime = DefaultVoiceAutomationRuntime(
@@ -833,6 +870,7 @@ class LiveKitVoiceCallSessionTest {
         automationRuntime: VoiceAutomationRuntime? = null,
         automationAudio: SessionAutomationAudioBinding = SessionAutomationAudioBinding(),
         automationAudioProbe: VoiceAutomationAudioProbe? = null,
+        captureSource: VoiceCaptureSource = VoiceCaptureSource.Microphone,
     ): SessionFixture {
         val room = FakeLiveKitRoomFacade(
             connectFailure = connectFailure,
@@ -851,6 +889,7 @@ class LiveKitVoiceCallSessionTest {
                 cleanupDispatcher = cleanupDispatcher,
                 automationRuntimeProvider = { automationRuntime },
                 automationAudioProbeProvider = { automationAudioProbe },
+                captureSource = captureSource,
             ),
             room = room,
             route = route,
@@ -981,16 +1020,17 @@ private class SessionAutomationAudioBinding : LiveKitAutomationAudioBinding {
     var closeCalls = 0
         private set
 
-    override fun activate(runHash: String): AutoCloseable {
+    override fun activate(
+        runHash: String,
+        captureSource: me.rerere.rikkahub.voiceagent.audio.VoiceCaptureSource,
+        scope: CoroutineScope,
+    ): AutoCloseable {
         activations += runHash
         return AutoCloseable {
             closeCalls += 1
         }
     }
 
-    override fun enqueuePcm16(pcm16: ByteArray) = Unit
-
-    override fun injectionComplete(): Boolean = false
 }
 
 private class SessionRecordingAudioProbe(

@@ -386,7 +386,7 @@ class VoiceAgentCallFactoryTest {
                     FakeVoiceToolApi()
                 },
                 geminiFactory = { gemini },
-                audioFactory = { owner ->
+                audioFactory = { owner, _ ->
                     audioRouteOwner = owner
                     FakeVoiceAudioEngine()
                 },
@@ -520,7 +520,7 @@ class VoiceAgentCallFactoryTest {
             sessionApiFactory = sessionApiFactory,
             toolApiFactory = { FakeVoiceToolApi() },
             geminiFactory = { FakeGeminiLiveVoiceClient() },
-            audioFactory = { FakeVoiceAudioEngine() },
+            audioFactory = { _, _ -> FakeVoiceAudioEngine() },
             conversationStoreFactory = {
                 InMemoryVoiceConversationStore(Conversation.ofId(id = conversationId))
             },

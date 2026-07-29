@@ -591,7 +591,7 @@ class VoiceAgentCallSessionTest {
     }
 
     @Test
-    fun `debug injection completion stops capture and closes Gemini audio stream`() = runTest {
+    fun `fixture source completion stops capture and closes Gemini audio stream`() = runTest {
         val gemini = FakeGeminiLiveVoiceClient()
         val audio = FakeVoiceAudioEngine()
         val session = VoiceAgentCallSession(
@@ -609,14 +609,14 @@ class VoiceAgentCallSessionTest {
 
         session.start()
         gemini.awaitConnect()
-        audio.completeDebugInjection()
+        audio.completeCaptureSource()
 
         assertEquals(1, audio.stopCaptureCalls)
         assertEquals(listOf(1L), gemini.audioStreamEndSessionIds)
     }
 
     @Test
-    fun `debug injection can resume capture after model generation completes`() = runTest {
+    fun `fixture source can resume capture after model generation completes`() = runTest {
         val gemini = FakeGeminiLiveVoiceClient()
         val audio = FakeVoiceAudioEngine()
         val session = VoiceAgentCallSession(
@@ -636,7 +636,7 @@ class VoiceAgentCallSessionTest {
         gemini.awaitConnect()
         assertEquals(1, audio.startCaptureCalls)
 
-        audio.completeDebugInjection()
+        audio.completeCaptureSource()
         assertEquals(1, audio.stopCaptureCalls)
 
         gemini.eventHandlers.single()(GeminiLiveEvent.GenerationComplete)

@@ -9,6 +9,7 @@ object VoiceAgentCallContract {
     const val ACTION_END = "me.rerere.rikkahub.voiceagent.action.END"
     const val EXTRA_CONVERSATION_ID = "conversationId"
     const val EXTRA_TRANSPORT = "transport"
+    const val EXTRA_CAPTURE_FIXTURE_TOKEN = "captureFixtureToken"
     const val EXTRA_ROUTE_VOICE_AGENT_CONVERSATION_ID = "voiceAgentConversationId"
     const val EXTRA_ROUTE_VOICE_AGENT_TRANSPORT = "voiceAgentTransport"
     const val NOTIFICATION_ID = 2401
@@ -33,6 +34,7 @@ fun voiceAgentCallEndIntent(context: Context): Intent =
 internal data class VoiceAgentCallStartFields(
     val conversationId: Uuid,
     val transport: VoiceAgentTransport,
+    val captureFixtureToken: String?,
 )
 
 internal data class EncodedVoiceAgentCallStartFields(
@@ -61,11 +63,14 @@ internal fun encodeVoiceAgentCallStartFields(
 internal fun decodeVoiceAgentCallStartFields(
     conversationId: String?,
     transportWireName: String?,
+    captureFixtureToken: String?,
 ): VoiceAgentCallStartFields? {
     val parsedConversationId = conversationId?.let { runCatching { Uuid.parse(it) }.getOrNull() }
         ?: return null
     val transport = VoiceAgentTransport.fromWireName(transportWireName) ?: return null
-    return VoiceAgentCallStartFields(parsedConversationId, transport)
+    val normalizedFixtureToken = captureFixtureToken?.trim()?.takeIf(String::isNotEmpty)
+    if (captureFixtureToken != null && normalizedFixtureToken == null) return null
+    return VoiceAgentCallStartFields(parsedConversationId, transport, normalizedFixtureToken)
 }
 
 internal fun encodeVoiceAgentNotificationRouteFields(

@@ -1,6 +1,8 @@
 package me.rerere.rikkahub.voiceagent.livekit
 
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.flow.Flow
+import me.rerere.rikkahub.voiceagent.audio.VoiceCaptureSource
 
 internal sealed interface LiveKitRoomEvent {
     data object Connected : LiveKitRoomEvent
@@ -22,18 +24,20 @@ internal data class LiveKitRpcInvocation(
 )
 
 internal interface LiveKitAutomationAudioBinding {
-    fun activate(runHash: String): AutoCloseable
-    fun enqueuePcm16(pcm16: ByteArray)
-    fun injectionComplete(): Boolean
+    fun activate(
+        runHash: String,
+        captureSource: VoiceCaptureSource,
+        scope: CoroutineScope,
+    ): AutoCloseable
 }
 
 internal object UnavailableLiveKitAutomationAudioBinding : LiveKitAutomationAudioBinding {
-    override fun activate(runHash: String): AutoCloseable =
+    override fun activate(
+        runHash: String,
+        captureSource: VoiceCaptureSource,
+        scope: CoroutineScope,
+    ): AutoCloseable =
         error("LiveKit automation audio is unavailable")
-
-    override fun enqueuePcm16(pcm16: ByteArray) = Unit
-
-    override fun injectionComplete(): Boolean = false
 }
 
 internal interface LiveKitRoomFacade {

@@ -30,6 +30,8 @@ import me.rerere.rikkahub.voiceagent.VoiceAgentUiState
 import me.rerere.rikkahub.voiceagent.VoiceAudioStatus
 import me.rerere.rikkahub.voiceagent.VoiceDiagnosticLine
 import me.rerere.rikkahub.voiceagent.VoiceSessionStatus
+import me.rerere.rikkahub.voiceagent.audio.VoiceCaptureFixtureSource
+import me.rerere.rikkahub.voiceagent.audio.VoiceCaptureSource
 import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationAudioProbe
 import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationAudioProbes
 import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationCorrelationKind
@@ -50,6 +52,7 @@ internal class LiveKitVoiceCallSession(
     private val room: LiveKitRoomFacade,
     private val routeLease: VoiceAgentRouteLease,
     private val scope: CoroutineScope,
+    private val captureSource: VoiceCaptureSource = VoiceCaptureSource.Microphone,
     private val rpcMethods: Map<String, suspend (LiveKitRpcInvocation) -> String> = emptyMap(),
     private val connectTimeoutMillis: Long = DEFAULT_LIVEKIT_CONNECT_TIMEOUT_MS,
     private val readyTimeoutMillis: Long = DEFAULT_LIVEKIT_READY_TIMEOUT_MS,
@@ -99,6 +102,7 @@ internal class LiveKitVoiceCallSession(
         rpcMethods = rpcMethods.keys,
         room = room,
         automationAudioActivation = { automationAudioActivation },
+        captureSource = captureSource,
         recordCallStopped = ::recordAutomationCallStopped,
     )
 
@@ -201,7 +205,7 @@ internal class LiveKitVoiceCallSession(
         val runHash = checkNotNull(status.runHash) {
             "Active LiveKit automation run has no run hash"
         }
-        val activation = room.automationAudio.activate(runHash)
+        val activation = room.automationAudio.activate(runHash, captureSource, scope)
         try {
             details.automationCorrelations().forEach { correlation ->
                 check(
@@ -302,6 +306,7 @@ internal class LiveKitVoiceCallSession(
         )
         if (recorded) automationCallBecameActive.set(true)
         wasReady = true
+        (captureSource as? VoiceCaptureFixtureSource)?.startInitial()
         ready.complete(Unit)
         mutableState.update { it.copy(session = VoiceSessionStatus.Connected, error = null) }
     }
@@ -393,6 +398,7 @@ private class LiveKitCleanupOperation(
     rpcMethods: Set<String>,
     private val room: LiveKitRoomFacade,
     private val automationAudioActivation: () -> AutoCloseable?,
+    private val captureSource: VoiceCaptureSource,
     private val recordCallStopped: () -> Unit,
 ) : JoinedCleanupOperation() {
     private var routeCompleted = false
@@ -401,6 +407,7 @@ private class LiveKitCleanupOperation(
     private var microphoneJobCompleted = false
     private var rpcWorkCompleted = false
     private var automationAudioCompleted = false
+    private var captureSourceCompleted = false
     private val pendingRpcMethods = rpcMethods.toMutableSet()
     private var disconnectCompleted = false
     private var closeCompleted = false
@@ -416,6 +423,7 @@ private class LiveKitCleanupOperation(
                     automationAudioCompleted,
                     failures,
                 )
+                captureSourceCompleted = cleanCaptureSource(captureSourceCompleted, failures)
                 retireRoute(failures)
                 unregisterRpcMethods(failures)
                 connectionJobCompleted = cleanJob(connectionJob(), connectionJobCompleted, failures)
@@ -449,6 +457,20 @@ private class LiveKitCleanupOperation(
         if (completed) return true
         return try {
             activation?.close()
+            true
+        } catch (error: Throwable) {
+            failures.add(error)
+            false
+        }
+    }
+
+    private fun cleanCaptureSource(
+        completed: Boolean,
+        failures: CleanupAttemptFailures,
+    ): Boolean {
+        if (completed) return true
+        return try {
+            captureSource.close()
             true
         } catch (error: Throwable) {
             failures.add(error)
@@ -529,6 +551,7 @@ private class LiveKitCleanupOperation(
 
     override fun hasUnfinishedStages(): Boolean =
         !automationAudioCompleted ||
+            !captureSourceCompleted ||
             !routeCompleted ||
             !jobsCompleted() ||
             !rpcWorkCompleted ||

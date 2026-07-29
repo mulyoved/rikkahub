@@ -136,9 +136,10 @@ private class FakeLiveKitRoomSdkAdapter : LiveKitRoomSdkAdapter {
 }
 
 private class FakeLiveKitAutomationAudioBinding : LiveKitAutomationAudioBinding {
-    override fun activate(runHash: String): AutoCloseable = AutoCloseable { }
+    override fun activate(
+        runHash: String,
+        captureSource: me.rerere.rikkahub.voiceagent.audio.VoiceCaptureSource,
+        scope: kotlinx.coroutines.CoroutineScope,
+    ): AutoCloseable = AutoCloseable { }
 
-    override fun enqueuePcm16(pcm16: ByteArray) = Unit
-
-    override fun injectionComplete(): Boolean = false
 }

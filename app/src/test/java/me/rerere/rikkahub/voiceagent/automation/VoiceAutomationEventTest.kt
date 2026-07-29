@@ -47,7 +47,8 @@ class VoiceAutomationEventTest {
                 "\"correlationKind\":\"session\",\"correlationHash\":\"$CORRELATION_HASH\"," +
                 "\"requestedModelHash\":null,\"observedModelHash\":null,\"voiceHash\":null," +
                 "\"instructionHash\":null,\"directAccountConfigurationHash\":null," +
-                "\"conversationHash\":null}\n",
+                "\"conversationHash\":null,\"captureSource\":null,\"micBytes\":null," +
+                "\"fixtureBytes\":null}\n",
             line,
         )
         assertTrue(writer.file.canRead())

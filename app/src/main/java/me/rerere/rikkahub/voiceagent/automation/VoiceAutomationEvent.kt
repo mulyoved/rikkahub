@@ -17,6 +17,7 @@ internal enum class VoiceAutomationEventName(val wireName: String) {
     @SerialName("injection_first_chunk") INJECTION_FIRST_CHUNK("injection_first_chunk"),
     @SerialName("injection_completed") INJECTION_COMPLETED("injection_completed"),
     @SerialName("prompt_ended") PROMPT_ENDED("prompt_ended"),
+    @SerialName("capture_attested") CAPTURE_ATTESTED("capture_attested"),
     @SerialName("remote_audio_first_non_silent") REMOTE_AUDIO_FIRST_NON_SILENT("remote_audio_first_non_silent"),
     @SerialName("playback_queued") PLAYBACK_QUEUED("playback_queued"),
     @SerialName("playback_active") PLAYBACK_ACTIVE("playback_active"),
@@ -88,6 +89,9 @@ internal data class VoiceAutomationEvent(
     val instructionHash: String? = null,
     val directAccountConfigurationHash: String? = null,
     val conversationHash: String? = null,
+    val captureSource: String? = null,
+    val micBytes: Long? = null,
+    val fixtureBytes: Long? = null,
 )
 
 internal data class VoiceAutomationRunBinding(
@@ -113,6 +117,9 @@ internal data class VoiceAutomationEventInput(
     val instructionHash: String? = null,
     val directAccountConfigurationHash: String? = null,
     val conversationHash: String? = null,
+    val captureSource: String? = null,
+    val micBytes: Long? = null,
+    val fixtureBytes: Long? = null,
 )
 
 internal object VoiceAutomationEventValidation {
@@ -133,6 +140,19 @@ internal object VoiceAutomationEventValidation {
             "playbackEpoch must be positive"
         }
         require(event.byteCount == null || event.byteCount >= 0) { "byteCount must not be negative" }
+        require(event.micBytes == null || event.micBytes >= 0) { "micBytes must not be negative" }
+        require(event.fixtureBytes == null || event.fixtureBytes >= 0) {
+            "fixtureBytes must not be negative"
+        }
+        if (event.name == VoiceAutomationEventName.CAPTURE_ATTESTED) {
+            require(event.captureSource in setOf("microphone", "fixture"))
+            requireNotNull(event.micBytes)
+            requireNotNull(event.fixtureBytes)
+        } else {
+            require(event.captureSource == null && event.micBytes == null && event.fixtureBytes == null) {
+                "Capture fields are only allowed on capture attestation"
+            }
+        }
         require((event.correlationKind == null) == (event.correlationHash == null)) {
             "correlation kind and hash must be supplied together"
         }

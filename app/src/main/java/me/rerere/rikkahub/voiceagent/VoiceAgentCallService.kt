@@ -92,6 +92,7 @@ class VoiceAgentCallService : Service() {
                         conversationId = conversationId,
                         config = result.config,
                         transport = fields.transport,
+                        captureFixtureToken = fields.captureFixtureToken,
                     )
                 }
                 is VoiceAgentConfigResult.Unavailable -> {
@@ -107,6 +108,9 @@ class VoiceAgentCallService : Service() {
         val fields = decodeVoiceAgentCallStartFields(
             conversationId = intent.getStringExtra(VoiceAgentCallContract.EXTRA_CONVERSATION_ID),
             transportWireName = intent.getStringExtra(VoiceAgentCallContract.EXTRA_TRANSPORT),
+            captureFixtureToken = intent.getStringExtra(
+                VoiceAgentCallContract.EXTRA_CAPTURE_FIXTURE_TOKEN,
+            ),
         )
         if (fields == null) {
             VoiceAgentLog.w(TAG, "start ignored: missing or invalid start fields")
