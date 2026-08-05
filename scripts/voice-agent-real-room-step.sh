@@ -32,6 +32,9 @@ MDEV="${MDEV:-mdev}"
 MDEV_OWNER=''
 MDEV_OWNER_HASH=''
 PACKAGE=''
+PACKAGE_APK=''
+BUILD_BINDING=''
+COMPLETE_BINDING=''
 ANDROID_USER_ID=''
 PACKAGE_UID=''
 RUN_HASH=''
@@ -812,6 +815,7 @@ run_preflight() {
   local status_snapshot
   local -a status=()
   validate_runtime
+  verify_installed_binding_contract "$PACKAGE_APK" "$BUILD_BINDING" "$COMPLETE_BINDING"
   ensure_device_and_package
   resolve_package_identity
   verify_package_contract
@@ -950,10 +954,13 @@ shift
 
 case "$operation" in
   preflight)
-    parse_options '--mdev-owner --package' "$@"
-    require_options --mdev-owner --package
+    parse_options '--mdev-owner --package --apk --build-binding --binding' "$@"
+    require_options --mdev-owner --package --apk --build-binding --binding
     MDEV_OWNER="${PARSED[--mdev-owner]}"
     PACKAGE="${PARSED[--package]}"
+    PACKAGE_APK="${PARSED[--apk]}"
+    BUILD_BINDING="${PARSED[--build-binding]}"
+    COMPLETE_BINDING="${PARSED[--binding]}"
     prepare_mdev_owner
     validate_package "$PACKAGE"
     run_preflight

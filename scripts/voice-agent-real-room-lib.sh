@@ -133,6 +133,290 @@ validate_hash() {
   [[ "$1" =~ ^sha256:[0-9a-f]{64}$ ]] || die "invalid $2"
 }
 
+verify_installed_binding_contract() {
+  local apk_path="$1"
+  local build_binding_path="$2"
+  local complete_binding_path="$3"
+  python3 - "$apk_path" "$build_binding_path" "$complete_binding_path" \
+    "$MDEV_OWNER_HASH" "$PACKAGE" 2>/dev/null <<'PY' || die 'package contract mismatch'
+from datetime import datetime
+import hashlib
+import json
+import os
+import re
+import stat
+import sys
+
+apk_path, build_path, binding_path, owner_hash, package = sys.argv[1:]
+HASH = re.compile(r"sha256:[0-9a-f]{64}\Z")
+COMMIT = re.compile(r"[0-9a-f]{40}\Z")
+VERSION_NAME = re.compile(r"[A-Za-z0-9._+-]{1,64}\Z")
+PYTHON_VERSION = re.compile(r"[0-9]+\.[0-9]+(?:\.[0-9]+)?\Z")
+CANONICAL_DECIMAL = re.compile(r"(?:[1-9][0-9]*(?:\.[0-9]{0,8}[1-9])?|0\.[0-9]{0,8}[1-9])\Z")
+CANONICAL_INSTANT = re.compile(
+    r"[1-9][0-9]{3}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
+    r"(?:\.(?:[0-9]{3}|[0-9]{6}|[0-9]{9}))?Z\Z"
+)
+STABLE_FIELDS = (
+    "st_dev", "st_ino", "st_mode", "st_nlink", "st_uid", "st_size",
+    "st_mtime_ns", "st_ctime_ns",
+)
+
+
+def reject() -> None:
+    raise SystemExit(1)
+
+
+def identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return tuple(getattr(metadata, field) for field in STABLE_FIELDS)
+
+
+def validate_path(path: str) -> tuple[int, os.stat_result, int]:
+    if (
+        not path
+        or not os.path.isabs(path)
+        or os.path.normpath(path) != path
+        or os.path.realpath(path) != path
+    ):
+        reject()
+    parent = os.path.dirname(path)
+    name = os.path.basename(path)
+    if not name or name in {".", ".."} or os.path.realpath(parent) != parent:
+        reject()
+    parent_metadata = os.lstat(parent)
+    if (
+        stat.S_ISLNK(parent_metadata.st_mode)
+        or not stat.S_ISDIR(parent_metadata.st_mode)
+        or stat.S_IMODE(parent_metadata.st_mode) != 0o700
+        or parent_metadata.st_uid != os.geteuid()
+    ):
+        reject()
+    parent_descriptor = os.open(
+        parent, os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+    )
+    try:
+        named = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0),
+            dir_fd=parent_descriptor,
+        )
+    except BaseException:
+        os.close(parent_descriptor)
+        raise
+    opened = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(opened.st_mode)
+        or stat.S_IMODE(opened.st_mode) != 0o600
+        or opened.st_uid != os.geteuid()
+        or opened.st_nlink != 1
+        or (named.st_dev, named.st_ino) != (opened.st_dev, opened.st_ino)
+    ):
+        os.close(descriptor)
+        os.close(parent_descriptor)
+        reject()
+    return descriptor, opened, parent_descriptor
+
+
+def read_pass(descriptor: int, max_bytes: int | None, collect: bool) -> tuple[bytes, str, int]:
+    chunks: list[bytes] = []
+    digest = hashlib.sha256()
+    size = 0
+    while True:
+        chunk = os.read(descriptor, 65_536)
+        if not chunk:
+            break
+        size += len(chunk)
+        if max_bytes is not None and size > max_bytes:
+            reject()
+        digest.update(chunk)
+        if collect:
+            chunks.append(chunk)
+    return b"".join(chunks), "sha256:" + digest.hexdigest(), size
+
+
+def read_stable(path: str, max_bytes: int | None, collect: bool) -> tuple[bytes, str]:
+    descriptor, before, parent_descriptor = validate_path(path)
+    try:
+        first, first_hash, first_size = read_pass(descriptor, max_bytes, collect)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        second, second_hash, second_size = read_pass(descriptor, max_bytes, collect)
+        after = os.fstat(descriptor)
+        current = os.stat(
+            os.path.basename(path), dir_fd=parent_descriptor, follow_symlinks=False
+        )
+        if (
+            identity(before) != identity(after)
+            or identity(after) != identity(current)
+            or first_hash != second_hash
+            or first_size != second_size
+            or (collect and first != second)
+            or first_size <= 0
+        ):
+            reject()
+        return first, first_hash
+    finally:
+        os.close(descriptor)
+        os.close(parent_descriptor)
+
+
+def no_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, member in pairs:
+        if key in value:
+            reject()
+        value[key] = member
+    return value
+
+
+def load_json(path: str, require_canonical: bool) -> dict[str, object]:
+    raw, _ = read_stable(path, 1_048_576, True)
+    if not raw.endswith(b"\n"):
+        reject()
+    try:
+        value = json.loads(raw[:-1].decode("utf-8"), object_pairs_hook=no_duplicate_keys)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        reject()
+    if type(value) is not dict:
+        reject()
+    if require_canonical and raw != canonical(value) + b"\n":
+        reject()
+    return value
+
+
+def canonical(value: object) -> bytes:
+    def validate(member: object) -> None:
+        if type(member) is dict:
+            for key, child in member.items():
+                if type(key) is not str:
+                    reject()
+                validate(child)
+        elif type(member) is list:
+            for child in member:
+                validate(child)
+        elif type(member) not in (str, bool, int):
+            reject()
+    validate(value)
+    return json.dumps(
+        value, ensure_ascii=False, allow_nan=False, sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def exact_object(value: object, fields: set[str]) -> dict[str, object]:
+    if type(value) is not dict or set(value) != fields:
+        reject()
+    return value
+
+
+def require_hash(value: object) -> str:
+    if type(value) is not str or HASH.fullmatch(value) is None:
+        reject()
+    return value
+
+
+def require_positive_integer(value: object) -> int:
+    if type(value) is not int or value <= 0:
+        reject()
+    return value
+
+
+apk_raw, apk_hash = read_stable(apk_path, None, False)
+build = load_json(build_path, False)
+if set(build) != {
+    "schema", "variant", "transport", "versionName", "versionCode",
+    "livekitExperimentEnabled", "apkHash", "rikkaSourceTreeHash",
+    "rikkaBuildConfigHash",
+}:
+    reject()
+if (
+    build["schema"] != 1
+    or build["variant"] != "livekit"
+    or build["transport"] != "livekit_experimental"
+    or build["livekitExperimentEnabled"] is not True
+    or type(build["versionName"]) is not str
+    or VERSION_NAME.fullmatch(build["versionName"]) is None
+):
+    reject()
+build_version_code = require_positive_integer(build["versionCode"])
+for field in ("apkHash", "rikkaSourceTreeHash", "rikkaBuildConfigHash"):
+    require_hash(build[field])
+
+binding = load_json(binding_path, True)
+if set(binding) != {
+    "schemaVersion", "bindingId", "createdAt", "repositories", "worker",
+    "hermesVoice", "android", "fixtureSetHash", "mdevOwnerHash",
+    "hostReadinessHash",
+} or binding["schemaVersion"] != 2:
+    reject()
+binding_id = require_hash(binding["bindingId"])
+created_at = binding["createdAt"]
+if type(created_at) is not str or CANONICAL_INSTANT.fullmatch(created_at) is None:
+    reject()
+try:
+    datetime.fromisoformat(created_at[:-1] + "+00:00")
+except ValueError:
+    reject()
+
+repositories = exact_object(binding["repositories"], {
+    "agoraCommit", "agoraTreeHash", "rikkaCommit", "rikkaTreeHash",
+})
+for field in ("agoraCommit", "rikkaCommit"):
+    if type(repositories[field]) is not str or COMMIT.fullmatch(repositories[field]) is None:
+        reject()
+for field in ("agoraTreeHash", "rikkaTreeHash"):
+    require_hash(repositories[field])
+
+worker = exact_object(binding["worker"], {
+    "versionHash", "deploymentHash", "lockHash", "pythonVersion", "health",
+    "deliveryQuietSeconds", "stillWorkingSeconds", "verificationReleasePlan",
+})
+for field in ("versionHash", "deploymentHash", "lockHash"):
+    require_hash(worker[field])
+if (
+    type(worker["pythonVersion"]) is not str
+    or PYTHON_VERSION.fullmatch(worker["pythonVersion"]) is None
+    or worker["health"] != "healthy"
+    or worker["verificationReleasePlan"] != "3,2,1"
+):
+    reject()
+for field in ("deliveryQuietSeconds", "stillWorkingSeconds"):
+    if type(worker[field]) is not str or CANONICAL_DECIMAL.fullmatch(worker[field]) is None:
+        reject()
+
+hermes_voice = exact_object(binding["hermesVoice"], {
+    "endpointHash", "configurationHash", "health",
+})
+require_hash(hermes_voice["endpointHash"])
+require_hash(hermes_voice["configurationHash"])
+if hermes_voice["health"] != "ready":
+    reject()
+
+android = exact_object(binding["android"], {
+    "package", "versionCode", "apkHash", "featureFlag", "deviceHash",
+})
+android_version_code = require_positive_integer(android["versionCode"])
+require_hash(android["apkHash"])
+require_hash(android["deviceHash"])
+for field in ("fixtureSetHash", "mdevOwnerHash", "hostReadinessHash"):
+    require_hash(binding[field])
+if (
+    android["package"] != package
+    or android["featureFlag"] != "livekit_experimental"
+    or binding["mdevOwnerHash"] != owner_hash
+    or build_version_code != android_version_code
+    or build["apkHash"] != apk_hash
+    or android["apkHash"] != apk_hash
+):
+    reject()
+without_id = dict(binding)
+del without_id["bindingId"]
+expected_id = "sha256:" + hashlib.sha256(canonical(without_id)).hexdigest()
+if binding_id != expected_id:
+    reject()
+PY
+}
+
 validate_package() {
   [[ "$1" == "$PACKAGE_EXPECTED" ]] || die 'invalid package'
 }
@@ -790,12 +1074,27 @@ resolve_package_identity() {
 verify_package_contract() {
   local package_dump
   local protected_probe
+  local service_component="$PACKAGE/$SERVICE_CLASS"
+  local service_query
   package_dump="$(adb_read shell dumpsys package "$PACKAGE" 2>/dev/null)" || die 'package readback failed'
-  [[ "$package_dump" == *'DEBUGGABLE'* &&
-     "$package_dump" == *'VOICE_AGENT_LIVEKIT_EXPERIMENT_ENABLED=true'* &&
-     "$package_dump" == *"$PACKAGE/$SERVICE_CLASS"* &&
-     "$package_dump" == *"$PACKAGE/$CONTROL_RECEIVER"* &&
-     "$package_dump" == *"$PACKAGE/$FIXTURE_RECEIVER"* ]] || die 'package contract mismatch'
+  printf '%s\n' "$package_dump" | awk \
+    -v control="$PACKAGE/$CONTROL_RECEIVER" \
+    -v fixture="$PACKAGE/$FIXTURE_RECEIVER" '
+      /^[[:space:]]*flags=\[[^]]*\][[:space:]]*$/ &&
+        $0 ~ /(^|[[:space:]])DEBUGGABLE([[:space:]]|$)/ { debug += 1 }
+      NF == 4 && $1 ~ /^[0-9A-Fa-f]+$/ && $3 == "filter" &&
+        $4 ~ /^[0-9A-Fa-f]+$/ {
+          if ($2 == control) control_rows += 1
+          if ($2 == fixture) fixture_rows += 1
+        }
+      END { exit !(debug == 1 && control_rows == 1 && fixture_rows == 1) }
+    ' >/dev/null 2>&1 || die 'package contract mismatch'
+  service_query="$(
+    adb_read shell cmd package query-services --brief --components \
+      --user current -n "$service_component" 2>/dev/null || exit 1
+    printf '\034'
+  )" || die 'package contract mismatch'
+  [[ "$service_query" == "$service_component"$'\n\034' ]] || die 'package contract mismatch'
   protected_probe="$(adb_read shell run-as "$PACKAGE" --user "$ANDROID_USER_ID" sh -c '
 : voice-step-protected-root
 root=$(readlink -f files) || exit 1

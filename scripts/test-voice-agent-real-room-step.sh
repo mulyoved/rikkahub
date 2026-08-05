@@ -31,6 +31,10 @@ mkdir "$HELPER_TEMP_ROOT"
 chmod 700 "$HELPER_TEMP_ROOT"
 REMOTE_APP_DATA_ROOT="$TMP_DIR/remote-app-data"
 RMDIR_BOUNDARY_FILE="$TMP_DIR/rmdir-boundary"
+PACKAGE_CONTRACT_DIR="$TMP_DIR/package-contract"
+PACKAGE_APK="$PACKAGE_CONTRACT_DIR/rikkahub-livekit.apk"
+BUILD_BINDING="$PACKAGE_CONTRACT_DIR/rikka-build-binding.json"
+COMPLETE_BINDING="$PACKAGE_CONTRACT_DIR/complete-binding.json"
 TEST_COUNT=0
 ACTOR_PID=''
 declare -a LAST_PRIVATE_PATHS=()
@@ -765,11 +769,34 @@ if command == ["shell", "pm", "path", EXPECTED_PACKAGE]:
     raise SystemExit(0)
 if command == ["shell", "dumpsys", "package", EXPECTED_PACKAGE]:
     print(f"Package [{EXPECTED_PACKAGE}]")
-    print("  flags=[ DEBUGGABLE HAS_CODE ]")
-    print("  VOICE_AGENT_LIVEKIT_EXPERIMENT_ENABLED=true")
-    print(f"  {EXPECTED_PACKAGE}/{SERVICE}")
-    print(f"  {EXPECTED_PACKAGE}/{CONTROL}")
-    print(f"  {EXPECTED_PACKAGE}/{FIXTURE}")
+    flags = "HAS_CODE" if os.environ.get("FAKE_ADB_NON_DEBUGGABLE") == "1" else "DEBUGGABLE HAS_CODE"
+    print(f"  flags=[ {flags} ]")
+    print("Receiver Resolver Table:")
+    print("  Non-Data Actions:")
+    if os.environ.get("FAKE_ADB_MISSING_CONTROL_RECEIVER") != "1":
+        print(f"        1a2b3c4 {EXPECTED_PACKAGE}/{CONTROL} filter 111aaaa")
+    if os.environ.get("FAKE_ADB_MISSING_FIXTURE_RECEIVER") != "1":
+        print(f"        2b3c4d5 {EXPECTED_PACKAGE}/{FIXTURE} filter 222bbbb")
+    raise SystemExit(0)
+if command == [
+    "shell", "cmd", "package", "query-services", "--brief", "--components",
+    "--user", "current", "-n", f"{EXPECTED_PACKAGE}/{SERVICE}",
+]:
+    mode = os.environ.get("FAKE_ADB_SERVICE_QUERY", "resolved")
+    if mode == "unresolved":
+        pass
+    elif mode == "ambiguous":
+        print(f"{EXPECTED_PACKAGE}/{SERVICE}")
+        print(f"{EXPECTED_PACKAGE}/me.rerere.rikkahub.voiceagent.OtherService")
+    elif mode == "malformed":
+        print(f"{EXPECTED_PACKAGE}/.VoiceAgentCallService")
+    elif mode == "missing-newline":
+        sys.stdout.write(f"{EXPECTED_PACKAGE}/{SERVICE}")
+    elif mode == "extra-blank-line":
+        print(f"{EXPECTED_PACKAGE}/{SERVICE}")
+        print()
+    else:
+        print(f"{EXPECTED_PACKAGE}/{SERVICE}")
     raise SystemExit(0)
 run_as_tail = None
 if command[:5] == ["shell", "run-as", EXPECTED_PACKAGE, "--user", str(state["android_user_id"])]:
@@ -1367,6 +1394,122 @@ export VOICE_STEP_WAIT_TIMEOUT_SECONDS=2
 export VOICE_STEP_MAX_WAIT_ATTEMPTS=2
 export VOICE_STEP_POLL_SECONDS=0
 
+write_valid_package_contract_fixtures() {
+  rm -rf -- "$PACKAGE_CONTRACT_DIR"
+  mkdir "$PACKAGE_CONTRACT_DIR"
+  chmod 700 "$PACKAGE_CONTRACT_DIR"
+  python3 - "$PACKAGE_APK" "$BUILD_BINDING" "$COMPLETE_BINDING" "$MDEV_OWNER" <<'PY'
+import hashlib
+import json
+import os
+import sys
+
+apk_path, build_path, binding_path, owner = sys.argv[1:]
+apk = b"real-rikkahub-livekit-apk-fixture\n"
+apk_hash = "sha256:" + hashlib.sha256(apk).hexdigest()
+
+def digest(character):
+    return "sha256:" + character * 64
+
+build = {
+    "schema": 1,
+    "variant": "livekit",
+    "transport": "livekit_experimental",
+    "versionName": "1.0-debug",
+    "versionCode": 1,
+    "livekitExperimentEnabled": True,
+    "apkHash": apk_hash,
+    "rikkaSourceTreeHash": digest("1"),
+    "rikkaBuildConfigHash": digest("2"),
+}
+binding = {
+    "schemaVersion": 2,
+    "createdAt": "2026-08-05T00:00:00Z",
+    "repositories": {
+        "agoraCommit": "1" * 40,
+        "agoraTreeHash": digest("3"),
+        "rikkaCommit": "2" * 40,
+        "rikkaTreeHash": digest("4"),
+    },
+    "worker": {
+        "versionHash": digest("5"),
+        "deploymentHash": digest("6"),
+        "lockHash": digest("7"),
+        "pythonVersion": "3.13",
+        "health": "healthy",
+        "deliveryQuietSeconds": "1.5",
+        "stillWorkingSeconds": "5",
+        "verificationReleasePlan": "3,2,1",
+    },
+    "hermesVoice": {
+        "endpointHash": digest("8"),
+        "configurationHash": digest("9"),
+        "health": "ready",
+    },
+    "android": {
+        "package": "me.rerere.rikkahub.debug",
+        "versionCode": 1,
+        "apkHash": apk_hash,
+        "featureFlag": "livekit_experimental",
+        "deviceHash": digest("a"),
+    },
+    "fixtureSetHash": digest("b"),
+    "mdevOwnerHash": "sha256:" + hashlib.sha256(owner.encode()).hexdigest(),
+    "hostReadinessHash": digest("c"),
+}
+canonical = lambda value: json.dumps(
+    value, ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":")
+).encode()
+binding["bindingId"] = "sha256:" + hashlib.sha256(canonical(binding)).hexdigest()
+
+for path, content in (
+    (apk_path, apk),
+    (build_path, canonical(build) + b"\n"),
+    (binding_path, canonical(binding) + b"\n"),
+):
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(descriptor, "wb") as handle:
+        handle.write(content)
+PY
+}
+
+rewrite_json_fixture() {
+  local path="$1"
+  local expression="$2"
+  python3 - "$path" "$expression" <<'PY'
+import hashlib
+import json
+import os
+import sys
+
+path, expression = sys.argv[1:]
+with open(path, encoding="utf-8") as handle:
+    value = json.load(handle)
+exec(expression, {"value": value})
+if "bindingId" in value and not expression.startswith("value['bindingId']"):
+    without_id = dict(value)
+    del without_id["bindingId"]
+    encoded = json.dumps(
+        without_id, ensure_ascii=False, allow_nan=False, sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    value["bindingId"] = "sha256:" + hashlib.sha256(encoded).hexdigest()
+encoded = json.dumps(
+    value, ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":")
+).encode() + b"\n"
+temporary = path + ".tmp"
+descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+with os.fdopen(descriptor, "wb") as handle:
+    handle.write(encoded)
+os.replace(temporary, path)
+PY
+}
+
+run_valid_preflight() {
+  run_helper preflight --mdev-owner "$MDEV_OWNER" --package me.rerere.rikkahub.debug \
+    --apk "$PACKAGE_APK" --build-binding "$BUILD_BINDING" --binding "$COMPLETE_BINDING"
+}
+
 reset_fake() {
   : > "$ADB_LOG"
   : > "$TIMEOUT_LOG"
@@ -1456,6 +1599,9 @@ PY
   unset FAKE_ADB_DEVICE_LOST_AFTER_FINALIZE FAKE_ADB_ROUTE_LOST_AFTER_FINALIZE
   unset FAKE_ADB_MALFORMED_AFTER_FINALIZE
   unset FAKE_ADB_PREOPEN_REPLACE_CAPTURE_SOURCE
+  unset FAKE_ADB_NON_DEBUGGABLE FAKE_ADB_MISSING_CONTROL_RECEIVER
+  unset FAKE_ADB_MISSING_FIXTURE_RECEIVER FAKE_ADB_SERVICE_QUERY
+  write_valid_package_contract_fixtures
 }
 
 make_fixture() {
@@ -1987,6 +2133,20 @@ for command in commands:
 PY
 }
 
+assert_preflight_contract_rejected() {
+  local label="$1"
+  [[ "$RUN_STATUS" -ne 0 ]] || fail "package-contract test: $label succeeded"
+  [[ ! -s "$STDOUT_FILE" ]] || fail "package-contract test: $label wrote stdout"
+  assert_no_adb_mutations
+  [[ "$(command_count start-foreground-service)" == "0" &&
+     "$(command_count ARM_CAPTURE_FIXTURE)" == "0" &&
+     "$(command_count STAGE_CAPTURE_FIXTURE)" == "0" &&
+     "$(command_count TRIGGER_CAPTURE_FIXTURE)" == "0" ]] ||
+    fail "package-contract test: $label started a call or mutated a fixture"
+  assert_private_output_absent
+  pass
+}
+
 selected() {
   local operation="$1"
   [[ "$#" -gt 0 ]]
@@ -2017,7 +2177,8 @@ run_managed_owner_contract_tests() {
 
   for operation in preflight start inject interrupt status finalize capture end; do
     case "$operation" in
-      preflight) invocation=(preflight --package me.rerere.rikkahub.debug) ;;
+      preflight) invocation=(preflight --package me.rerere.rikkahub.debug \
+        --apk "$PACKAGE_APK" --build-binding "$BUILD_BINDING" --binding "$COMPLETE_BINDING") ;;
       start) invocation=(start --state "$TMP_DIR/owner-missing-start.json" --package me.rerere.rikkahub.debug --conversation-id conversation-owner --run-hash "$hash_a" --comparison-hash "$hash_b" --fixture "$fixture") ;;
       inject) invocation=(inject --state "$state" --fixture "$fixture" --role request) ;;
       interrupt) invocation=(interrupt --state "$state" --fixture "$fixture") ;;
@@ -2064,7 +2225,8 @@ run_managed_owner_contract_tests() {
   for operation in preflight start; do
     : >"$MDEV_LOG"
     if [[ "$operation" == preflight ]]; then
-      run_helper preflight --mdev-owner $'owner\tinvalid' --package me.rerere.rikkahub.debug
+      run_helper preflight --mdev-owner $'owner\tinvalid' --package me.rerere.rikkahub.debug \
+        --apk "$PACKAGE_APK" --build-binding "$BUILD_BINDING" --binding "$COMPLETE_BINDING"
     else
       run_helper start --mdev-owner $'owner\ninvalid' \
         --state "$TMP_DIR/invalid-owner-start.json" --package me.rerere.rikkahub.debug \
@@ -2401,7 +2563,7 @@ BASH
 
   reset_fake
   export FAKE_ADB_DEVICE_LOST=1
-  run_helper preflight --mdev-owner OWNER_SECRET_123 --package me.rerere.rikkahub.debug
+  run_valid_preflight
   [[ "$RUN_STATUS" -ne 0 ]] || fail "managed-phone test: offline owner-scoped phone succeeded"
   assert_no_adb_mutations
   assert_private_output_absent
@@ -2409,7 +2571,7 @@ BASH
 
   reset_fake
   export FAKE_ADB_EMULATOR=1
-  run_helper preflight --mdev-owner OWNER_SECRET_123 --package me.rerere.rikkahub.debug
+  run_valid_preflight
   [[ "$RUN_STATUS" -ne 0 ]] || fail "physical-device test: emulator properties succeeded"
   assert_no_adb_mutations
   assert_private_output_absent
@@ -2417,7 +2579,7 @@ BASH
 
   reset_fake
   export FAKE_ADB_NO_RUN_AS=1
-  run_helper preflight --mdev-owner OWNER_SECRET_123 --package me.rerere.rikkahub.debug
+  run_valid_preflight
   [[ "$RUN_STATUS" -ne 0 ]] || fail "run-as test: missing run-as succeeded"
   assert_no_adb_mutations
   assert_private_output_absent
@@ -2425,15 +2587,14 @@ BASH
 
   reset_fake
   export FAKE_TIMEOUT_EXIT=124
-  run_helper preflight --mdev-owner OWNER_SECRET_123 --package me.rerere.rikkahub.debug
+  run_valid_preflight
   [[ "$RUN_STATUS" -ne 0 ]] || fail "timeout test: timed-out ADB succeeded"
   assert_no_adb_mutations
   assert_private_output_absent
   pass
 
   reset_fake
-  VOICE_STEP_ADB_TIMEOUT_SECONDS=0 run_helper preflight \
-    --mdev-owner OWNER_SECRET_123 --package me.rerere.rikkahub.debug
+  VOICE_STEP_ADB_TIMEOUT_SECONDS=0 run_valid_preflight
   [[ "$RUN_STATUS" -ne 0 ]] || fail "timeout-validation test: zero timeout succeeded"
   [[ ! -s "$ADB_LOG" ]] || fail "timeout-validation test: ADB ran before timeout validation"
   pass
@@ -2442,8 +2603,7 @@ BASH
   export FAKE_TIMEOUT_ENFORCE=1
   export FAKE_ADB_BLOCK=1
   local timeout_started=$SECONDS
-  VOICE_STEP_ADB_TIMEOUT_SECONDS=1 run_helper preflight \
-    --mdev-owner OWNER_SECRET_123 --package me.rerere.rikkahub.debug
+  VOICE_STEP_ADB_TIMEOUT_SECONDS=1 run_valid_preflight
   local timeout_elapsed=$((SECONDS - timeout_started))
   [[ "$RUN_STATUS" -ne 0 && "$timeout_elapsed" -lt 4 ]] ||
     fail "timeout-enforcement test: blocking ADB was not terminated by the configured deadline"
@@ -2469,7 +2629,7 @@ PY
 
 run_preflight_tests() {
   reset_fake
-  run_helper preflight --mdev-owner OWNER_SECRET_123 --package me.rerere.rikkahub.debug
+  run_valid_preflight
   [[ "$RUN_STATUS" -eq 0 ]] ||
     fail "broadcast-framing test: literal multiline resultData was not consumed as one receiver record"
   assert_exact_output $'voice-step.status=ok\nvoice-step.operation=preflight\nvoice-step.device=ready\nvoice-step.package=ready\nvoice-step.automation=ready\nvoice-step.protected_path=ready'
@@ -2488,6 +2648,8 @@ run_preflight_tests() {
     fail "preflight-process test: exact package-process capability readbacks were absent"
   [[ "$(exact_command_count -s DEVICE_SECRET_123 shell run-as me.rerere.rikkahub.debug --user 0 id)" == "1" ]] ||
     fail "preflight-run-as test: package access was not pinned to the resolved Android user"
+  [[ "$(exact_command_count -s DEVICE_SECRET_123 shell cmd package query-services --brief --components --user current -n me.rerere.rikkahub.debug/me.rerere.rikkahub.voiceagent.VoiceAgentCallService)" == "1" ]] ||
+    fail "package-contract test: exact read-only service query was not required once"
   [[ "$(command_count start-foreground-service)" == "0" ]] || fail "preflight-read-only test: service was started"
   [[ "$(command_count mkdir)" == "0" ]] || fail "preflight-read-only test: remote directory was created"
   [[ "$(command_count rm)" == "0" ]] || fail "preflight-read-only test: remote file was removed"
@@ -2508,6 +2670,110 @@ PY
   fi
   pass
 
+  local missing_option
+  for missing_option in apk build-binding binding; do
+    reset_fake
+    local -a invocation=(preflight --mdev-owner "$MDEV_OWNER" \
+      --package me.rerere.rikkahub.debug --apk "$PACKAGE_APK" \
+      --build-binding "$BUILD_BINDING" --binding "$COMPLETE_BINDING")
+    case "$missing_option" in
+      apk) unset 'invocation[5]' 'invocation[6]' ;;
+      build-binding) unset 'invocation[7]' 'invocation[8]' ;;
+      binding) unset 'invocation[9]' 'invocation[10]' ;;
+    esac
+    run_helper "${invocation[@]}"
+    assert_preflight_contract_rejected "missing --$missing_option"
+  done
+
+  reset_fake
+  rewrite_json_fixture "$BUILD_BINDING" "value['livekitExperimentEnabled'] = False"
+  run_valid_preflight
+  assert_preflight_contract_rejected 'false build feature flag'
+
+  reset_fake
+  rewrite_json_fixture "$BUILD_BINDING" "value['apkHash'] = 'sha256:' + 'd' * 64"
+  run_valid_preflight
+  assert_preflight_contract_rejected 'build binding APK hash mismatch'
+
+  reset_fake
+  rewrite_json_fixture "$COMPLETE_BINDING" "value['android']['apkHash'] = 'sha256:' + 'd' * 64"
+  run_valid_preflight
+  assert_preflight_contract_rejected 'complete binding APK hash mismatch'
+
+  reset_fake
+  printf 'changed-local-apk\n' >"$PACKAGE_APK"
+  chmod 600 "$PACKAGE_APK"
+  run_valid_preflight
+  assert_preflight_contract_rejected 'local APK hash mismatch'
+
+  reset_fake
+  rewrite_json_fixture "$COMPLETE_BINDING" "value['mdevOwnerHash'] = 'sha256:' + 'd' * 64"
+  run_valid_preflight
+  assert_preflight_contract_rejected 'complete binding owner mismatch'
+
+  reset_fake
+  rewrite_json_fixture "$COMPLETE_BINDING" "value['bindingId'] = 'sha256:' + 'd' * 64"
+  run_valid_preflight
+  assert_preflight_contract_rejected 'invalid complete bindingId'
+
+  reset_fake
+  rewrite_json_fixture "$COMPLETE_BINDING" "value['schemaVersion'] = 1"
+  run_valid_preflight
+  assert_preflight_contract_rejected 'invalid complete binding schema'
+
+  reset_fake
+  rewrite_json_fixture "$BUILD_BINDING" "value['schema'] = 2"
+  run_valid_preflight
+  assert_preflight_contract_rejected 'invalid build binding schema'
+
+  reset_fake
+  rm "$BUILD_BINDING"
+  run_valid_preflight
+  assert_preflight_contract_rejected 'missing build binding'
+
+  reset_fake
+  chmod 644 "$PACKAGE_APK"
+  run_valid_preflight
+  assert_preflight_contract_rejected 'unsafe APK mode'
+
+  reset_fake
+  chmod 755 "$PACKAGE_CONTRACT_DIR"
+  run_valid_preflight
+  assert_preflight_contract_rejected 'unsafe package-contract parent'
+
+  reset_fake
+  local build_target="$PACKAGE_CONTRACT_DIR/build-target.json"
+  mv "$BUILD_BINDING" "$build_target"
+  ln -s "$build_target" "$BUILD_BINDING"
+  run_valid_preflight
+  assert_preflight_contract_rejected 'symlink build binding'
+
+  reset_fake
+  run_helper preflight --mdev-owner "$MDEV_OWNER" --package me.rerere.rikkahub.debug \
+    --apk "$PACKAGE_CONTRACT_DIR/../package-contract/rikkahub-livekit.apk" \
+    --build-binding "$BUILD_BINDING" --binding "$COMPLETE_BINDING"
+  assert_preflight_contract_rejected 'noncanonical APK path'
+
+  local service_mode
+  for service_mode in unresolved ambiguous malformed missing-newline extra-blank-line; do
+    reset_fake
+    export FAKE_ADB_SERVICE_QUERY="$service_mode"
+    run_valid_preflight
+    assert_preflight_contract_rejected "$service_mode service query"
+  done
+
+  local package_mode
+  for package_mode in non-debuggable missing-control missing-fixture; do
+    reset_fake
+    case "$package_mode" in
+      non-debuggable) export FAKE_ADB_NON_DEBUGGABLE=1 ;;
+      missing-control) export FAKE_ADB_MISSING_CONTROL_RECEIVER=1 ;;
+      missing-fixture) export FAKE_ADB_MISSING_FIXTURE_RECEIVER=1 ;;
+    esac
+    run_valid_preflight
+    assert_preflight_contract_rejected "$package_mode package dump"
+  done
+
   reset_fake
   python3 - "$FAKE_STATE" <<'PY'
 import json, sys
@@ -2516,7 +2782,7 @@ state = json.load(open(path, encoding="utf-8"))
 state["automation_state"] = "active"
 json.dump(state, open(path, "w", encoding="utf-8"), separators=(",", ":"))
 PY
-  run_helper preflight --mdev-owner OWNER_SECRET_123 --package me.rerere.rikkahub.debug
+  run_valid_preflight
   [[ "$RUN_STATUS" -ne 0 ]] || fail "preflight-idle test: active automation succeeded"
   assert_no_adb_mutations
   assert_private_output_absent
@@ -2524,7 +2790,7 @@ PY
 
   reset_fake
   export FAKE_ADB_PADDED_PS_OUTPUT=1
-  run_helper preflight --mdev-owner OWNER_SECRET_123 --package me.rerere.rikkahub.debug
+  run_valid_preflight
   [[ "$RUN_STATUS" -eq 0 ]] ||
     fail "preflight-process-layout test: padded header or spaced process name was rejected"
   assert_exact_output $'voice-step.status=ok\nvoice-step.operation=preflight\nvoice-step.device=ready\nvoice-step.package=ready\nvoice-step.automation=ready\nvoice-step.protected_path=ready'
@@ -2540,7 +2806,7 @@ PY
       ps-header) export FAKE_ADB_MALFORMED_QUIESCENCE=ps-header ;;
       isolated) export FAKE_ADB_MALFORMED_QUIESCENCE=isolated ;;
     esac
-    run_helper preflight --mdev-owner OWNER_SECRET_123 --package me.rerere.rikkahub.debug
+    run_valid_preflight
     [[ "$RUN_STATUS" -ne 0 ]] || fail "preflight-capability test: malformed $malformed_mode readback succeeded"
     assert_no_adb_mutations
     assert_private_output_absent
@@ -2549,7 +2815,7 @@ PY
 
   reset_fake
   export FAKE_ADB_BROADCAST_TRAILING_JUNK=1
-  run_helper preflight --mdev-owner OWNER_SECRET_123 --package me.rerere.rikkahub.debug
+  run_valid_preflight
   [[ "$RUN_STATUS" -ne 0 ]] ||
     fail "broadcast-framing test: trailing junk after the literal multiline resultData succeeded"
   assert_no_adb_mutations
