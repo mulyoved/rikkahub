@@ -795,6 +795,10 @@ if command == [
     elif mode == "extra-blank-line":
         print(f"{EXPECTED_PACKAGE}/{SERVICE}")
         print()
+    elif mode == "nul-after-line":
+        sys.stdout.buffer.write(f"{EXPECTED_PACKAGE}/{SERVICE}\n".encode() + b"\0")
+    elif mode == "trailing-byte":
+        sys.stdout.buffer.write(f"{EXPECTED_PACKAGE}/{SERVICE}\nX".encode())
     else:
         print(f"{EXPECTED_PACKAGE}/{SERVICE}")
     raise SystemExit(0)
@@ -1508,6 +1512,130 @@ PY
 run_valid_preflight() {
   run_helper preflight --mdev-owner "$MDEV_OWNER" --package me.rerere.rikkahub.debug \
     --apk "$PACKAGE_APK" --build-binding "$BUILD_BINDING" --binding "$COMPLETE_BINDING"
+}
+
+prepare_package_contract_race() {
+  python3 - "$PACKAGE_APK" "$BUILD_BINDING" "$COMPLETE_BINDING" <<'PY'
+import hashlib
+import json
+import os
+import sys
+
+apk_path, build_path, binding_path = sys.argv[1:]
+with open(apk_path, "r+b", buffering=0) as handle:
+    handle.truncate(64 * 1024 * 1024)
+digest = hashlib.sha256()
+with open(apk_path, "rb", buffering=0) as handle:
+    while chunk := handle.read(1024 * 1024):
+        digest.update(chunk)
+apk_hash = "sha256:" + digest.hexdigest()
+
+with open(build_path, encoding="utf-8") as handle:
+    build = json.load(handle)
+build["apkHash"] = apk_hash
+build_raw = json.dumps(
+    build, ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":")
+).encode() + b"\n"
+build_raw = b" " * (1_000_000 - len(build_raw)) + build_raw
+with open(build_path, "wb", buffering=0) as handle:
+    handle.write(build_raw)
+
+with open(binding_path, encoding="utf-8") as handle:
+    binding = json.load(handle)
+binding["android"]["apkHash"] = apk_hash
+binding_without_id = dict(binding)
+del binding_without_id["bindingId"]
+canonical = lambda value: json.dumps(
+    value, ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":")
+).encode()
+binding["bindingId"] = "sha256:" + hashlib.sha256(canonical(binding_without_id)).hexdigest()
+with open(binding_path, "wb", buffering=0) as handle:
+    handle.write(canonical(binding) + b"\n")
+PY
+}
+
+run_preflight_with_package_contract_race() {
+  local raced_marker="$1"
+  LAST_OPERATION=preflight
+  LAST_PRIVATE_PATHS=("$TMP_DIR" "$FAKE_STATE" "$STDOUT_FILE" "$STDERR_FILE" \
+    "$HELPER_TEMP_ROOT" "$PACKAGE_APK" "$BUILD_BINDING" "$COMPLETE_BINDING")
+  : >"$STDOUT_FILE"
+  : >"$STDERR_FILE"
+  TMPDIR="$HELPER_TEMP_ROOT" "$HELPER" preflight --mdev-owner "$MDEV_OWNER" \
+    --package me.rerere.rikkahub.debug --apk "$PACKAGE_APK" \
+    --build-binding "$BUILD_BINDING" --binding "$COMPLETE_BINDING" \
+    >"$STDOUT_FILE" 2>"$STDERR_FILE" &
+  local helper_pid=$!
+  python3 - "$helper_pid" "$PACKAGE_APK" "$BUILD_BINDING" "$raced_marker" <<'PY' &
+import os
+from pathlib import Path
+import signal
+import sys
+import time
+
+helper_pid = int(sys.argv[1])
+apk_path, build_path, marker_path = sys.argv[2:]
+deadline = time.monotonic() + 10
+validator_pid = None
+
+def children(pid):
+    try:
+        raw = Path(f"/proc/{pid}/task/{pid}/children").read_text(encoding="ascii")
+    except (FileNotFoundError, ProcessLookupError):
+        return []
+    return [int(value) for value in raw.split()]
+
+def descriptor_targets(pid):
+    try:
+        entries = list(Path(f"/proc/{pid}/fd").iterdir())
+    except (FileNotFoundError, ProcessLookupError, PermissionError):
+        return set()
+    targets = set()
+    for entry in entries:
+        try:
+            targets.add(os.readlink(entry))
+        except (FileNotFoundError, ProcessLookupError, PermissionError, OSError):
+            pass
+    return targets
+
+while time.monotonic() < deadline and validator_pid is None:
+    pending = [helper_pid]
+    while pending:
+        pid = pending.pop()
+        for child in children(pid):
+            pending.append(child)
+            if apk_path in descriptor_targets(child):
+                validator_pid = child
+                break
+        if validator_pid is not None:
+            break
+
+if validator_pid is None:
+    raise SystemExit(2)
+
+while time.monotonic() < deadline:
+    if build_path in descriptor_targets(validator_pid):
+        os.kill(validator_pid, signal.SIGSTOP)
+        temporary = apk_path + ".race-replacement"
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(b"same-uid-replacement\n")
+        os.replace(temporary, apk_path)
+        Path(marker_path).write_text("replaced\n", encoding="utf-8")
+        os.kill(validator_pid, signal.SIGCONT)
+        raise SystemExit(0)
+raise SystemExit(3)
+PY
+  ACTOR_PID=$!
+  set +e
+  wait "$helper_pid"
+  RUN_STATUS=$?
+  wait "$ACTOR_PID"
+  local actor_status=$?
+  set -e
+  ACTOR_PID=''
+  [[ "$actor_status" -eq 0 && -f "$raced_marker" ]] ||
+    fail 'package-contract race test: actor did not replace the APK at the build-read boundary'
 }
 
 reset_fake() {
@@ -2755,12 +2883,27 @@ PY
   assert_preflight_contract_rejected 'noncanonical APK path'
 
   local service_mode
-  for service_mode in unresolved ambiguous malformed missing-newline extra-blank-line; do
+  for service_mode in unresolved ambiguous malformed missing-newline extra-blank-line \
+      nul-after-line trailing-byte; do
     reset_fake
     export FAKE_ADB_SERVICE_QUERY="$service_mode"
     run_valid_preflight
     assert_preflight_contract_rejected "$service_mode service query"
+    [[ "$(<"$STDERR_FILE")" == 'voice-step.error=package contract mismatch' ]] ||
+      fail "package-contract test: $service_mode service output changed diagnostics"
   done
+
+  reset_fake
+  prepare_package_contract_race
+  local raced_marker="$TMP_DIR/package-contract-raced"
+  run_preflight_with_package_contract_race "$raced_marker"
+  [[ "$RUN_STATUS" -ne 0 ]] ||
+    fail 'package-contract race test: replaced APK was accepted at the success boundary'
+  [[ ! -s "$ADB_LOG" ]] ||
+    fail 'package-contract race test: device access occurred after replaced evidence'
+  assert_no_adb_mutations
+  assert_private_output_absent
+  pass
 
   local package_mode
   for package_mode in non-debuggable missing-control missing-fixture; do

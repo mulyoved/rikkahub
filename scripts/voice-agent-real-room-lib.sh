@@ -171,7 +171,7 @@ def identity(metadata: os.stat_result) -> tuple[int, ...]:
     return tuple(getattr(metadata, field) for field in STABLE_FIELDS)
 
 
-def validate_path(path: str) -> tuple[int, os.stat_result, int]:
+def open_snapshot(path: str) -> dict[str, object]:
     if (
         not path
         or not os.path.isabs(path)
@@ -215,7 +215,13 @@ def validate_path(path: str) -> tuple[int, os.stat_result, int]:
         os.close(descriptor)
         os.close(parent_descriptor)
         reject()
-    return descriptor, opened, parent_descriptor
+    return {
+        "path": path,
+        "name": name,
+        "descriptor": descriptor,
+        "parent_descriptor": parent_descriptor,
+        "initial": opened,
+    }
 
 
 def read_pass(descriptor: int, max_bytes: int | None, collect: bool) -> tuple[bytes, str, int]:
@@ -235,29 +241,45 @@ def read_pass(descriptor: int, max_bytes: int | None, collect: bool) -> tuple[by
     return b"".join(chunks), "sha256:" + digest.hexdigest(), size
 
 
-def read_stable(path: str, max_bytes: int | None, collect: bool) -> tuple[bytes, str]:
-    descriptor, before, parent_descriptor = validate_path(path)
-    try:
-        first, first_hash, first_size = read_pass(descriptor, max_bytes, collect)
-        os.lseek(descriptor, 0, os.SEEK_SET)
-        second, second_hash, second_size = read_pass(descriptor, max_bytes, collect)
-        after = os.fstat(descriptor)
-        current = os.stat(
-            os.path.basename(path), dir_fd=parent_descriptor, follow_symlinks=False
-        )
-        if (
-            identity(before) != identity(after)
-            or identity(after) != identity(current)
-            or first_hash != second_hash
-            or first_size != second_size
-            or (collect and first != second)
-            or first_size <= 0
-        ):
-            reject()
-        return first, first_hash
-    finally:
-        os.close(descriptor)
-        os.close(parent_descriptor)
+def named_metadata(snapshot: dict[str, object]) -> os.stat_result:
+    return os.stat(
+        snapshot["name"],
+        dir_fd=snapshot["parent_descriptor"],
+        follow_symlinks=False,
+    )
+
+
+def verify_snapshot_identity(snapshot: dict[str, object]) -> None:
+    initial = snapshot["initial"]
+    opened = os.fstat(snapshot["descriptor"])
+    named = named_metadata(snapshot)
+    if identity(initial) != identity(opened) or identity(opened) != identity(named):
+        reject()
+
+
+def read_once(
+    snapshot: dict[str, object], max_bytes: int | None, collect: bool
+) -> tuple[bytes, str, int]:
+    descriptor = snapshot["descriptor"]
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    return read_pass(descriptor, max_bytes, collect)
+
+
+def read_stable(
+    snapshot: dict[str, object], max_bytes: int | None, collect: bool
+) -> tuple[bytes, str]:
+    verify_snapshot_identity(snapshot)
+    first, first_hash, first_size = read_once(snapshot, max_bytes, collect)
+    second, second_hash, second_size = read_once(snapshot, max_bytes, collect)
+    verify_snapshot_identity(snapshot)
+    if (
+        first_hash != second_hash
+        or first_size != second_size
+        or (collect and first != second)
+        or first_size <= 0
+    ):
+        reject()
+    return first, first_hash
 
 
 def no_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -269,8 +291,10 @@ def no_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
     return value
 
 
-def load_json(path: str, require_canonical: bool) -> dict[str, object]:
-    raw, _ = read_stable(path, 1_048_576, True)
+def load_json(
+    snapshot: dict[str, object], require_canonical: bool
+) -> tuple[dict[str, object], bytes]:
+    raw, _ = read_stable(snapshot, 1_048_576, True)
     if not raw.endswith(b"\n"):
         reject()
     try:
@@ -281,7 +305,7 @@ def load_json(path: str, require_canonical: bool) -> dict[str, object]:
         reject()
     if require_canonical and raw != canonical(value) + b"\n":
         reject()
-    return value
+    return value, raw
 
 
 def canonical(value: object) -> bytes:
@@ -321,8 +345,12 @@ def require_positive_integer(value: object) -> int:
     return value
 
 
-apk_raw, apk_hash = read_stable(apk_path, None, False)
-build = load_json(build_path, False)
+apk_snapshot = open_snapshot(apk_path)
+build_snapshot = open_snapshot(build_path)
+binding_snapshot = open_snapshot(binding_path)
+
+_, apk_hash = read_stable(apk_snapshot, None, False)
+build, build_raw = load_json(build_snapshot, False)
 if set(build) != {
     "schema", "variant", "transport", "versionName", "versionCode",
     "livekitExperimentEnabled", "apkHash", "rikkaSourceTreeHash",
@@ -342,7 +370,7 @@ build_version_code = require_positive_integer(build["versionCode"])
 for field in ("apkHash", "rikkaSourceTreeHash", "rikkaBuildConfigHash"):
     require_hash(build[field])
 
-binding = load_json(binding_path, True)
+binding, binding_raw = load_json(binding_snapshot, True)
 if set(binding) != {
     "schemaVersion", "bindingId", "createdAt", "repositories", "worker",
     "hermesVoice", "android", "fixtureSetHash", "mdevOwnerHash",
@@ -413,6 +441,18 @@ without_id = dict(binding)
 del without_id["bindingId"]
 expected_id = "sha256:" + hashlib.sha256(canonical(without_id)).hexdigest()
 if binding_id != expected_id:
+    reject()
+
+_, final_apk_hash, _ = read_once(apk_snapshot, None, False)
+final_build_raw, _, _ = read_once(build_snapshot, 1_048_576, True)
+final_binding_raw, _, _ = read_once(binding_snapshot, 1_048_576, True)
+for snapshot in (apk_snapshot, build_snapshot, binding_snapshot):
+    verify_snapshot_identity(snapshot)
+if (
+    final_apk_hash != apk_hash
+    or final_build_raw != build_raw
+    or final_binding_raw != binding_raw
+):
     reject()
 PY
 }
@@ -1075,7 +1115,7 @@ verify_package_contract() {
   local package_dump
   local protected_probe
   local service_component="$PACKAGE/$SERVICE_CLASS"
-  local service_query
+  local service_query_path
   package_dump="$(adb_read shell dumpsys package "$PACKAGE" 2>/dev/null)" || die 'package readback failed'
   printf '%s\n' "$package_dump" | awk \
     -v control="$PACKAGE/$CONTROL_RECEIVER" \
@@ -1089,12 +1129,42 @@ verify_package_contract() {
         }
       END { exit !(debug == 1 && control_rows == 1 && fixture_rows == 1) }
     ' >/dev/null 2>&1 || die 'package contract mismatch'
-  service_query="$(
-    adb_read shell cmd package query-services --brief --components \
-      --user current -n "$service_component" 2>/dev/null || exit 1
-    printf '\034'
-  )" || die 'package contract mismatch'
-  [[ "$service_query" == "$service_component"$'\n\034' ]] || die 'package contract mismatch'
+  ensure_local_temp_dir
+  service_query_path="$(mktemp "$LOCAL_TEMP_DIR/service-query.XXXXXX" 2>/dev/null)" ||
+    die 'package contract mismatch'
+  register_temp_file "$service_query_path"
+  adb_read shell cmd package query-services --brief --components \
+    --user current -n "$service_component" >"$service_query_path" 2>/dev/null ||
+    die 'package contract mismatch'
+  if ! python3 - "$service_query_path" "$service_component" 2>/dev/null <<'PY'
+import os
+import stat
+import sys
+
+path, component = sys.argv[1:]
+named = os.lstat(path)
+descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+try:
+    opened = os.fstat(descriptor)
+    raw = os.read(descriptor, len(component.encode("utf-8")) + 2)
+    after = os.fstat(descriptor)
+finally:
+    os.close(descriptor)
+if (
+    not stat.S_ISREG(opened.st_mode)
+    or stat.S_IMODE(opened.st_mode) != 0o600
+    or opened.st_uid != os.geteuid()
+    or opened.st_nlink != 1
+    or (named.st_dev, named.st_ino) != (opened.st_dev, opened.st_ino)
+    or (opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns) !=
+       (after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+    or raw != component.encode("utf-8") + b"\n"
+):
+    raise SystemExit(1)
+PY
+  then
+    die 'package contract mismatch'
+  fi
   protected_probe="$(adb_read shell run-as "$PACKAGE" --user "$ANDROID_USER_ID" sh -c '
 : voice-step-protected-root
 root=$(readlink -f files) || exit 1
