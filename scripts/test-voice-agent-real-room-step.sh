@@ -703,9 +703,16 @@ if command == ["exec-out", "ps", "-A", "-n", "-o", "UID,PID,PPID,STAT,NAME"]:
     if malformed == "ps-header":
         print("PID UID NAME")
     else:
-        print("UID PID PPID STAT NAME")
+        if os.environ.get("FAKE_ADB_PADDED_PS_OUTPUT") == "1":
+            print("  UID   PID  PPID STAT NAME")
+            print(f"{state['package_uid']} 222 1 S package process")
+            print(f"{state['package_uid']} 223 1 S package process worker")
+        else:
+            print("UID PID PPID STAT NAME")
         if malformed == "ps-row":
             print(f"{state['package_uid']} not-a-pid 1 S bad")
+        elif os.environ.get("FAKE_ADB_PADDED_PS_OUTPUT") == "1":
+            pass
         elif os.environ.get("FAKE_ADB_PACKAGE_PROCESS") == "1":
             print(f"{state['package_uid']} 222 1 S {EXPECTED_PACKAGE}")
         elif os.environ.get("FAKE_ADB_UNSTABLE_QUIESCENCE") == "1" and state["process_readbacks"] % 2 == 0:
@@ -1404,7 +1411,7 @@ PY
   unset FAKE_ADB_TWO_DEVICES FAKE_ADB_EMULATOR FAKE_ADB_NO_RUN_AS FAKE_TIMEOUT_EXIT
   unset FAKE_TIMEOUT_EXIT_MATCH FAKE_ADB_MALFORMED_ANDROID_USER
   unset FAKE_ADB_MALFORMED_STOPPED_ROW FAKE_ADB_SHARED_UID
-  unset FAKE_ADB_MALFORMED_QUIESCENCE FAKE_ADB_PACKAGE_PROCESS
+  unset FAKE_ADB_MALFORMED_QUIESCENCE FAKE_ADB_PACKAGE_PROCESS FAKE_ADB_PADDED_PS_OUTPUT
   unset FAKE_ADB_MALFORMED_QUIESCENCE_AFTER_FORCE_STOP
   unset FAKE_ADB_ISOLATED_PROCESS FAKE_ADB_UNSTABLE_QUIESCENCE
   unset FAKE_ADB_FAIL_FORCE_STOP FAKE_ADB_FAIL_CLEANUP_BROKER
@@ -2513,6 +2520,14 @@ PY
   [[ "$RUN_STATUS" -ne 0 ]] || fail "preflight-idle test: active automation succeeded"
   assert_no_adb_mutations
   assert_private_output_absent
+  pass
+
+  reset_fake
+  export FAKE_ADB_PADDED_PS_OUTPUT=1
+  run_helper preflight --mdev-owner OWNER_SECRET_123 --package me.rerere.rikkahub.debug
+  [[ "$RUN_STATUS" -eq 0 ]] ||
+    fail "preflight-process-layout test: padded header or spaced process name was rejected"
+  assert_exact_output $'voice-step.status=ok\nvoice-step.operation=preflight\nvoice-step.device=ready\nvoice-step.package=ready\nvoice-step.automation=ready\nvoice-step.protected_path=ready'
   pass
 
   local malformed_mode
