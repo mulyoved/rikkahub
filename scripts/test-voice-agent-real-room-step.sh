@@ -774,9 +774,17 @@ if command == ["shell", "dumpsys", "package", EXPECTED_PACKAGE]:
     print("Receiver Resolver Table:")
     print("  Non-Data Actions:")
     if os.environ.get("FAKE_ADB_MISSING_CONTROL_RECEIVER") != "1":
-        print(f"        1a2b3c4 {EXPECTED_PACKAGE}/{CONTROL} filter 111aaaa")
+        control = (
+            "me.rerere.rikkahub.voiceagent.debug.WrongReceiver"
+            if os.environ.get("FAKE_ADB_WRONG_CONTROL_RECEIVER") == "1"
+            else CONTROL
+        )
+        for index in range(7):
+            print(f"        1a2b3c{index} {EXPECTED_PACKAGE}/{control} filter 111aaa{index}")
     if os.environ.get("FAKE_ADB_MISSING_FIXTURE_RECEIVER") != "1":
-        print(f"        2b3c4d5 {EXPECTED_PACKAGE}/{FIXTURE} filter 222bbbb")
+        for index in range(3):
+            suffix = " trailing" if os.environ.get("FAKE_ADB_MALFORMED_FIXTURE_RECEIVER") == "1" else ""
+            print(f"        2b3c4d{index} {EXPECTED_PACKAGE}/{FIXTURE} filter 222bbb{index}{suffix}")
     raise SystemExit(0)
 if command == [
     "shell", "cmd", "package", "query-services", "--brief", "--components",
@@ -1728,7 +1736,8 @@ PY
   unset FAKE_ADB_MALFORMED_AFTER_FINALIZE
   unset FAKE_ADB_PREOPEN_REPLACE_CAPTURE_SOURCE
   unset FAKE_ADB_NON_DEBUGGABLE FAKE_ADB_MISSING_CONTROL_RECEIVER
-  unset FAKE_ADB_MISSING_FIXTURE_RECEIVER FAKE_ADB_SERVICE_QUERY
+  unset FAKE_ADB_MISSING_FIXTURE_RECEIVER FAKE_ADB_WRONG_CONTROL_RECEIVER
+  unset FAKE_ADB_MALFORMED_FIXTURE_RECEIVER FAKE_ADB_SERVICE_QUERY
   write_valid_package_contract_fixtures
 }
 
@@ -2906,12 +2915,15 @@ PY
   pass
 
   local package_mode
-  for package_mode in non-debuggable missing-control missing-fixture; do
+  for package_mode in non-debuggable missing-control missing-fixture wrong-control \
+      malformed-fixture; do
     reset_fake
     case "$package_mode" in
       non-debuggable) export FAKE_ADB_NON_DEBUGGABLE=1 ;;
       missing-control) export FAKE_ADB_MISSING_CONTROL_RECEIVER=1 ;;
       missing-fixture) export FAKE_ADB_MISSING_FIXTURE_RECEIVER=1 ;;
+      wrong-control) export FAKE_ADB_WRONG_CONTROL_RECEIVER=1 ;;
+      malformed-fixture) export FAKE_ADB_MALFORMED_FIXTURE_RECEIVER=1 ;;
     esac
     run_valid_preflight
     assert_preflight_contract_rejected "$package_mode package dump"

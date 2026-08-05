@@ -1127,7 +1127,7 @@ verify_package_contract() {
           if ($2 == control) control_rows += 1
           if ($2 == fixture) fixture_rows += 1
         }
-      END { exit !(debug == 1 && control_rows == 1 && fixture_rows == 1) }
+      END { exit !(debug == 1 && control_rows >= 1 && fixture_rows >= 1) }
     ' >/dev/null 2>&1 || die 'package contract mismatch'
   ensure_local_temp_dir
   service_query_path="$(mktemp "$LOCAL_TEMP_DIR/service-query.XXXXXX" 2>/dev/null)" ||
