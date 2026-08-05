@@ -28,6 +28,28 @@ adb_read() {
   run_mdev_adb "$@"
 }
 
+adb_shell_quote() {
+  local value="${1//\'/\'\"\'\"\'}"
+  printf "'%s'" "$value"
+}
+
+adb_run_as_script() {
+  local transport="$1"
+  local script="$2"
+  local command='run-as'
+  local word
+  shift 2
+  for word in "$PACKAGE" --user "$ANDROID_USER_ID" sh -c "$script"; do
+    command+=" $(adb_shell_quote "$word")"
+  done
+  if (( $# > 0 )); then
+    for word in sh "$@"; do
+      command+=" $(adb_shell_quote "$word")"
+    done
+  fi
+  adb_read "$transport" "$command"
+}
+
 register_temp_file() {
   OWNED_TEMP_FILES+=("$1")
 }
@@ -1165,23 +1187,25 @@ PY
   then
     die 'package contract mismatch'
   fi
-  protected_probe="$(adb_read shell run-as "$PACKAGE" --user "$ANDROID_USER_ID" sh -c '
+  protected_probe="$(adb_run_as_script shell "
 : voice-step-protected-root
-root=$(readlink -f files) || exit 1
-[ -d "$root" ] || exit 1
-case "$root" in
-  /data/user/[0-9]*/me.rerere.rikkahub.debug/files|/data/data/me.rerere.rikkahub.debug/files) ;;
-  *) exit 1 ;;
-esac
+root=/data/user/${ANDROID_USER_ID}/${PACKAGE}
+cd -- \"\$root\" || exit 1
+[ \"\$(pwd -P)\" = \"\$root\" ] || exit 1
+if [ -e files ] || [ -L files ]; then
+  [ -d files ] && [ ! -L files ] || exit 1
+  files_root=\$(readlink -f files) || exit 1
+  [ \"\$files_root\" = \"\$root/files\" ] || exit 1
+fi
 printf ready
-' 2>/dev/null)" || die 'protected path unavailable'
+" 2>/dev/null)" || die 'protected path unavailable'
   [[ "$protected_probe" == ready ]] || die 'protected path unavailable'
 }
 
 read_trace_pointer() {
   local probe
   local value
-  probe="$(adb_read shell run-as "$PACKAGE" --user "$ANDROID_USER_ID" sh -c '
+  probe="$(adb_run_as_script shell '
 : voice-step-trace-probe
 if [ -L "$1" ]; then
   printf invalid
@@ -1191,7 +1215,7 @@ elif [ -e "$1" ]; then
 else
   printf absent
 fi
-' sh "$LATEST_TRACE_PATH" 2>/dev/null)" || die 'trace readback failed'
+' "$LATEST_TRACE_PATH" 2>/dev/null)" || die 'trace readback failed'
   case "$probe" in
     absent)
       TRACE_POINTER_PRESENT=0
@@ -1229,7 +1253,7 @@ create_owned_remote_directory() {
   local owner_hash="$2"
   local result
   local -a receipt=()
-  result="$(adb_read shell run-as "$PACKAGE" --user "$ANDROID_USER_ID" sh -c '
+  result="$(adb_run_as_script shell '
 set -eu
 : voice-step-create-owned-directory
 directory=$1
@@ -1313,7 +1337,7 @@ exec 4<&-
 exec 5<&-
 printf "created\nparent_identity=%s\ndirectory_identity=%s\nownership_nonce=%s\n" \
   "$parent_identity" "$directory_identity" "$nonce"
-' sh "$remote_directory" "$owner_hash" </dev/null)" ||
+' "$remote_directory" "$owner_hash" </dev/null)" ||
     die 'fixture staging failed'
   mapfile -t receipt <<< "$result"
   [[ "${#receipt[@]}" == 4 && "${receipt[0]}" == created &&
@@ -1337,7 +1361,7 @@ stage_owned_snapshot() {
   local fixture_hash="$6"
   local metadata
   validate_fixture_size "$fixture_size"
-  metadata="$(adb_read shell run-as "$PACKAGE" --user "$ANDROID_USER_ID" sh -c '
+  metadata="$(adb_run_as_script shell '
 set -eu
 : voice-step-stage-owned-fixture
 : voice-step-descriptor-owned-stage
@@ -1384,7 +1408,7 @@ published=1
 exec 3>&-
 trap - EXIT HUP INT TERM
 printf "%s\n" "$metadata"
-' sh "$remote_directory" "$remote_path" "$owner_hash" \
+' "$remote_directory" "$remote_path" "$owner_hash" \
     < "$fixture_snapshot")" || die 'fixture staging failed'
   [[ "$metadata" == "$fixture_size"$'\n'"$fixture_hash" ]] ||
     die 'fixture staging verification failed'
@@ -1604,7 +1628,7 @@ for line in sys.stdin.read().splitlines()[1:]:
 remove_owned_remote_directory_quiescent() {
   local remote_directory="$1"
   local result
-  result="$(adb_read shell run-as "$PACKAGE" --user "$ANDROID_USER_ID" sh -c '
+  result="$(adb_run_as_script shell '
 set -eu
 : voice-step-cleanup-broker
 directory=$1
@@ -1662,7 +1686,7 @@ rmdir -- "$name" || exit 1
 exec 4<&-
 exec 5<&-
 printf removed
-' sh "$remote_directory" "$FIXTURE_PARENT_IDENTITY" "$FIXTURE_DIRECTORY_IDENTITY" \
+' "$remote_directory" "$FIXTURE_PARENT_IDENTITY" "$FIXTURE_DIRECTORY_IDENTITY" \
     "$FIXTURE_OWNERSHIP_NONCE" "$PACKAGE_UID" </dev/null)" || return 1
   [[ "$result" == removed ]] || return 2
 }
@@ -1850,7 +1874,7 @@ read_capture_bundle_snapshots() {
   register_temp_file "$sanitized_candidate"
   chmod 600 -- "$automation_candidate" "$private_candidate" "$sanitized_candidate" 2>/dev/null ||
     die 'capture temporary storage failed'
-  adb_read exec-out run-as "$PACKAGE" --user "$ANDROID_USER_ID" sh -c '
+  adb_run_as_script exec-out '
 set -eu
 : voice-step-capture-bundle
 first=$1
@@ -1899,7 +1923,7 @@ cat /proc/self/fd/3 /proc/self/fd/4 /proc/self/fd/5 || exit 1
 [ "$(name_metadata "$first")" = "$first_before" ] || exit 1
 [ "$(name_metadata "$second")" = "$second_before" ] || exit 1
 [ "$(name_metadata "$third")" = "$third_before" ] || exit 1
-' sh "$automation_source" "$private_source" "$sanitized_source" >"$bundle" 2>/dev/null ||
+' "$automation_source" "$private_source" "$sanitized_source" >"$bundle" 2>/dev/null ||
     die 'artifact source changed'
   python3 - "$bundle" "$automation_candidate" "$private_candidate" "$sanitized_candidate" 2>/dev/null <<'PY' || die 'artifact source invalid'
 import os
@@ -1951,11 +1975,11 @@ PY
 read_source_metadata() {
   local source_path="$1"
   local metadata
-  metadata="$(adb_read shell run-as "$PACKAGE" --user "$ANDROID_USER_ID" sh -c '
+  metadata="$(adb_run_as_script shell '
 : voice-step-source-metadata
 [ -f "$1" ] && [ ! -L "$1" ] && [ "$(stat -c %a "$1")" = 600 ] || exit 1
 LC_ALL=C stat -c "%F|%h|%u|%a|%d|%i|%s|%y|%z" "$1"
-' sh "$source_path" 2>/dev/null)" || die 'artifact source unavailable'
+' "$source_path" 2>/dev/null)" || die 'artifact source unavailable'
   [[ "$metadata" =~ ^regular\ file\|1\|[0-9]+\|600\|[0-9]+\|[0-9]+\|[1-9][0-9]*\|[-0-9:.+\ ]+\|[-0-9:.+\ ]+$ ]] ||
     die 'artifact source invalid'
   printf '%s' "$metadata"
@@ -2027,13 +2051,13 @@ read_checkpoint_artifact_snapshots() {
   automation_path="$(app_artifact_path "$APP_ARTIFACT_ROOT/${RUN_HASH#sha256:}" automation-events.jsonl)"
   private_path="$(app_artifact_path "$APP_ARTIFACT_ROOT/$TRACE_ID" voice-experience-private.ndjson)"
   sanitized_path="$(app_artifact_path "$APP_ARTIFACT_ROOT/$TRACE_ID" voice-experience-events.ndjson)"
-  presence="$(adb_read shell run-as "$PACKAGE" --user "$ANDROID_USER_ID" sh -c '
+  presence="$(adb_run_as_script shell '
 : voice-step-artifact-presence
 for path do
   [ -f "$path" ] && [ ! -L "$path" ] && [ -s "$path" ] || exit 1
   printf "present\n"
 done
-' sh "$automation_path" "$private_path" "$sanitized_path" 2>/dev/null)" ||
+' "$automation_path" "$private_path" "$sanitized_path" 2>/dev/null)" ||
     die 'required artifact unavailable'
   [[ "$presence" == $'present\npresent\npresent' ]] || die 'required artifact unavailable'
   ensure_local_temp_dir

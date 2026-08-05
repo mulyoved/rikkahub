@@ -163,6 +163,7 @@ import hashlib
 import json
 import os
 import signal
+import shlex
 import subprocess
 import sys
 import time
@@ -639,6 +640,19 @@ if (
 ):
     raise SystemExit(1)
 
+if (
+    command[:1] in (["shell"], ["exec-out"])
+    and len(command) >= 2
+    and (
+        command[1].startswith("run-as ")
+        or (len(command) >= 7 and command[1] == "run-as" and command[5:7] == ["sh", "-c"])
+    )
+):
+    try:
+        command = [command[0], *shlex.split(" ".join(command[1:]))]
+    except ValueError:
+        raise SystemExit(1)
+
 if len(command) > 3 and command[:3] == ["shell", "sh", "-c"] and "voice-step-service-status" in command[3]:
     if os.environ.get("FAKE_ADB_AMBIGUOUS_SERVICE") == "1":
         print("invalid")
@@ -827,7 +841,52 @@ if run_as_tail is not None:
     if tail[:2] == ["sh", "-c"]:
         script = tail[2] if len(tail) > 2 else ""
         if "voice-step-protected-root" in script:
-            print("ready")
+            if len(tail) != 3:
+                raise SystemExit(1)
+            expected_root = f"/data/user/{state['android_user_id']}/{EXPECTED_PACKAGE}"
+            reported_root = os.environ.get("FAKE_ADB_PROTECTED_ROOT_PWD", expected_root)
+            inherited_cwd = REMOTE_APP_DATA_ROOT.parent / "inherited-adb-cwd"
+            inherited_cwd.mkdir(exist_ok=True)
+            environment = os.environ.copy()
+            environment.update({
+                "VOICE_STEP_FAKE_APP_DATA_ROOT": str(REMOTE_APP_DATA_ROOT),
+                "VOICE_STEP_FAKE_EXPECTED_ROOT": expected_root,
+                "VOICE_STEP_FAKE_REPORTED_ROOT": reported_root,
+            })
+            wrapper = r'''
+cd() {
+    [ "${1:-}" = -- ] && shift
+    [ "$#" -eq 1 ] && [ "$1" = "$VOICE_STEP_FAKE_EXPECTED_ROOT" ] || return 1
+    builtin cd -- "$VOICE_STEP_FAKE_APP_DATA_ROOT"
+}
+pwd() {
+    [ "$#" -eq 1 ] && [ "$1" = -P ] || return 1
+    printf '%s\n' "$VOICE_STEP_FAKE_REPORTED_ROOT"
+}
+readlink() {
+    [ "$#" -eq 2 ] && [ "$1" = -f ] || return 1
+    resolved=$(command readlink -f -- "$2") || return 1
+    case "$resolved" in
+        "$VOICE_STEP_FAKE_APP_DATA_ROOT"/*)
+            printf '%s%s\n' "$VOICE_STEP_FAKE_EXPECTED_ROOT" \
+                "${resolved#"$VOICE_STEP_FAKE_APP_DATA_ROOT"}"
+            ;;
+        *) printf '%s\n' "$resolved" ;;
+    esac
+}
+'''
+            completed = subprocess.run(
+                ["bash", "-c", wrapper + "\n" + script],
+                cwd=inherited_cwd,
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            if completed.returncode != 0:
+                raise SystemExit(completed.returncode)
+            sys.stdout.buffer.write(completed.stdout)
             raise SystemExit(0)
         if "voice-step-trace-probe" in script:
             print("present")
@@ -1738,6 +1797,7 @@ PY
   unset FAKE_ADB_NON_DEBUGGABLE FAKE_ADB_MISSING_CONTROL_RECEIVER
   unset FAKE_ADB_MISSING_FIXTURE_RECEIVER FAKE_ADB_WRONG_CONTROL_RECEIVER
   unset FAKE_ADB_MALFORMED_FIXTURE_RECEIVER FAKE_ADB_SERVICE_QUERY
+  unset FAKE_ADB_PROTECTED_ROOT_PWD
   write_valid_package_contract_fixtures
 }
 
@@ -2284,6 +2344,44 @@ assert_preflight_contract_rejected() {
   pass
 }
 
+assert_protected_root_probe_framing() {
+  python3 - "$MDEV_LOG" <<'PY' || fail 'protected-root framing test: probe was not one quoted ADB shell command'
+import shlex
+import sys
+
+data = open(sys.argv[1], "rb").read()
+commands = [chunk.split(b"\0") for chunk in data.split(b"\0\0") if chunk]
+prefix = [
+    b"android", b"adb", b"--device", b"phone", b"--owner", b"OWNER_SECRET_123", b"--",
+]
+probes = [
+    command for command in commands
+    if command[:len(prefix)] == prefix
+    and len(command) == len(prefix) + 2
+    and command[len(prefix)] == b"shell"
+    and b"voice-step-protected-root" in command[len(prefix) + 1]
+]
+assert len(probes) == 1
+words = shlex.split(probes[0][-1].decode("utf-8"))
+assert words[:6] == [
+    "run-as", "me.rerere.rikkahub.debug", "--user", "0", "sh", "-c",
+]
+assert "voice-step-protected-root" in words[6]
+assert words[7:] == []
+PY
+}
+
+assert_protected_path_rejected() {
+  local label="$1"
+  [[ "$RUN_STATUS" -ne 0 && ! -s "$STDOUT_FILE" ]] ||
+    fail "protected-root test: $label succeeded or wrote stdout"
+  [[ "$(<"$STDERR_FILE")" == 'voice-step.error=protected path unavailable' ]] ||
+    fail "protected-root test: $label changed the sanitized diagnostic"
+  assert_no_adb_mutations
+  assert_private_output_absent
+  pass
+}
+
 selected() {
   local operation="$1"
   [[ "$#" -gt 0 ]]
@@ -2765,6 +2863,43 @@ PY
 }
 
 run_preflight_tests() {
+  reset_fake
+  rm -rf -- "$REMOTE_APP_DATA_ROOT/files"
+  run_valid_preflight
+  [[ "$RUN_STATUS" -eq 0 ]] ||
+    fail 'protected-root test: absent files child was rejected from inherited ADB cwd'
+  assert_exact_output $'voice-step.status=ok\nvoice-step.operation=preflight\nvoice-step.device=ready\nvoice-step.package=ready\nvoice-step.automation=ready\nvoice-step.protected_path=ready'
+  assert_protected_root_probe_framing
+  assert_no_adb_mutations
+  assert_private_output_absent
+  pass
+
+  reset_fake
+  run_valid_preflight
+  [[ "$RUN_STATUS" -eq 0 ]] ||
+    fail 'protected-root test: valid existing files directory was rejected'
+  assert_exact_output $'voice-step.status=ok\nvoice-step.operation=preflight\nvoice-step.device=ready\nvoice-step.package=ready\nvoice-step.automation=ready\nvoice-step.protected_path=ready'
+  assert_no_adb_mutations
+  assert_private_output_absent
+  pass
+
+  reset_fake
+  rm -rf -- "$REMOTE_APP_DATA_ROOT/files"
+  ln -s "$TMP_DIR/untrusted-files" "$REMOTE_APP_DATA_ROOT/files"
+  run_valid_preflight
+  assert_protected_path_rejected 'symlink files child'
+
+  reset_fake
+  rm -rf -- "$REMOTE_APP_DATA_ROOT/files"
+  : > "$REMOTE_APP_DATA_ROOT/files"
+  run_valid_preflight
+  assert_protected_path_rejected 'non-directory files child'
+
+  reset_fake
+  export FAKE_ADB_PROTECTED_ROOT_PWD='/data/user/0/com.example.unexpected'
+  run_valid_preflight
+  assert_protected_path_rejected 'unexpected canonical app-data root'
+
   reset_fake
   run_valid_preflight
   [[ "$RUN_STATUS" -eq 0 ]] ||
@@ -3279,6 +3414,7 @@ run_inject_tests() {
        "$(command_count start-foreground-service)" == "0" ]] ||
       fail "inject-scope test: injection changed call lifecycle"
     python3 - "$ADB_LOG" "$role" <<'PY' || fail "inject-path test: role/hash path or broadcast extras were wrong"
+import shlex
 import sys
 
 data = open(sys.argv[1], "rb").read()
@@ -3292,7 +3428,8 @@ stream = [command for command in commands if any(b"voice-step-stage-owned-fixtur
 stage = [command for command in commands if any(b"STAGE_CAPTURE_FIXTURE" in value for value in command)]
 trigger = [command for command in commands if any(b"TRIGGER_CAPTURE_FIXTURE" in value for value in command)]
 assert len(stream) == len(stage) == len(trigger) == 1
-assert stream[0][-2] == expected_path
+stream_words = shlex.split(stream[0][-1].decode("utf-8"))
+assert stream_words[-2].encode() == expected_path
 assert b"exec-in" not in stream[0]
 stream_script = next(value for value in stream[0] if b"voice-step-stage-owned-fixture" in value)
 assert b"voice-step-descriptor-owned-stage" in stream_script
@@ -4716,15 +4853,16 @@ run_capture_tests() {
       fail "capture-publication test: published artifact was not nonempty mode-0600 regular data"
   done
   if ! python3 - "$ADB_LOG" "$automation" "$private" "$sanitized" <<'PY'
-import json
+import shlex
 import sys
 
 data = open(sys.argv[1], "rb").read()
 commands = [chunk.split(b"\0") for chunk in data.split(b"\0\0") if chunk]
 bundles = [command for command in commands if any(b"voice-step-capture-bundle" in value for value in command)]
 assert len(bundles) == 1
+bundle_words = shlex.split(bundles[0][-1].decode("utf-8"))
 for name in (b"automation-events.jsonl", b"voice-experience-private.ndjson", b"voice-experience-events.ndjson"):
-    assert any(value.endswith(name) for value in bundles[0])
+    assert any(value.encode().endswith(name) for value in bundle_words)
 automation = open(sys.argv[2], "rb").read()
 private = open(sys.argv[3], "rb").read()
 sanitized = open(sys.argv[4], "rb").read()
@@ -5075,6 +5213,7 @@ PY
     fail "end-command-count test: exact force-stop, stable quiescence, broker, or restoration count changed"
   python3 - "$ADB_LOG" "$FAKE_STATE" <<'PY' || fail "end-order/receipt test: teardown ordering or schema-v2 ownership receipt changed"
 import json
+import shlex
 import sys
 
 data = open(sys.argv[1], "rb").read()
@@ -5101,7 +5240,8 @@ assert len(brokers) == len(restorations) == 1
 broker_index, broker = brokers[0]
 assert artifact_reads[0] < force_stop < processes[0] < isolated[0] < processes[1] < isolated[1] < broker_index
 assert any(broker_index < index < restorations[0] for index in artifact_reads)
-assert broker[-5:] == [
+broker_words = shlex.split(broker[-1].decode("utf-8"))
+assert [value.encode() for value in broker_words[-5:]] == [
     b"files/voice-real-room/" + b"a" * 64,
     state["fixture_parent_identity"].encode(),
     state["fixture_directory_identity"].encode(),
