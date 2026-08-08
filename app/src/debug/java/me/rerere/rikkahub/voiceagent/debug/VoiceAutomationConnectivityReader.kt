@@ -28,12 +28,20 @@ internal class VoiceAutomationConnectivityReader(
         val immediate = source.current()
         if (immediate.validated) return immediate
         var latest = immediate
-        return withTimeoutOrNull(timeoutMillis) {
+        val observed = withTimeoutOrNull(timeoutMillis) {
             source.updates().first { observed ->
                 latest = observed
                 observed.validated
             }
-        } ?: latest
+        }
+        if (observed != null) return observed
+
+        val refreshed = source.current()
+        return if (refreshed.validated || refreshed.network != VoiceAutomationNetwork.NONE) {
+            refreshed
+        } else {
+            latest
+        }
     }
 }
 

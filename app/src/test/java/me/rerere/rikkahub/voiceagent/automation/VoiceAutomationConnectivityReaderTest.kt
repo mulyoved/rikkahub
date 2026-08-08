@@ -53,13 +53,36 @@ class VoiceAutomationConnectivityReaderTest {
             reader.read(),
         )
     }
+
+    @Test
+    fun `timeout refreshes a cold missing default network`() = runTest {
+        val reader = VoiceAutomationConnectivityReader(
+            source = FakeConnectivitySource(
+                immediate = VoiceAutomationConnectivity(VoiceAutomationNetwork.NONE, false),
+                refreshed = VoiceAutomationConnectivity(VoiceAutomationNetwork.WIFI, true),
+                updates = flow {
+                    suspendCancellableCoroutine<Nothing> { }
+                },
+            ),
+            timeoutMillis = 100,
+        )
+
+        assertEquals(
+            VoiceAutomationConnectivity(VoiceAutomationNetwork.WIFI, true),
+            reader.read(),
+        )
+    }
 }
 
 private class FakeConnectivitySource(
     private val immediate: VoiceAutomationConnectivity,
+    private val refreshed: VoiceAutomationConnectivity = immediate,
     private val updates: Flow<VoiceAutomationConnectivity>,
 ) : VoiceAutomationConnectivitySource {
-    override fun current(): VoiceAutomationConnectivity = immediate
+    private var currentReads = 0
+
+    override fun current(): VoiceAutomationConnectivity =
+        if (currentReads++ == 0) immediate else refreshed
 
     override fun updates(): Flow<VoiceAutomationConnectivity> = updates
 }
