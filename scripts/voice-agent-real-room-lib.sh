@@ -20,8 +20,18 @@ die() {
 FIXTURE_MAX_BYTES=16777216
 
 run_mdev_adb() {
-  timeout --signal=TERM --kill-after=2s "${VOICE_STEP_ADB_TIMEOUT_SECONDS:-10}s" \
-    "$MDEV" android adb --device phone --owner "$MDEV_OWNER" -- "$@" 2>/dev/null
+  "$MDEV" android adb --device phone --owner "$MDEV_OWNER" \
+    --timeout-ms "${CURRENT_ADB_TIMEOUT_MS:-10000}" -- "$@"
+}
+
+classify_mdev_failure() {
+  case "$1" in
+    mdev.android.error=owner_lock_timeout) return 71 ;;
+    mdev.android.error=device_resolution_timeout) return 72 ;;
+    mdev.android.error=adb_timeout) return 73 ;;
+    mdev.android.error=state_commit_timeout) return 74 ;;
+    *) return 1 ;;
+  esac
 }
 
 adb_read() {
@@ -104,11 +114,15 @@ validate_fixture_size() {
 
 validate_runtime() {
   validate_positive_integer "${VOICE_STEP_ADB_TIMEOUT_SECONDS:-10}"
+  validate_positive_integer "${VOICE_STEP_READINESS_TIMEOUT_SECONDS:=15}"
+  validate_positive_integer "${VOICE_STEP_ADB_PROBE_TIMEOUT_MS:=3000}"
+  [[ "${VOICE_STEP_READINESS_RETRY_SECONDS:=0.2}" =~ ^([0-9]+)(\.[0-9]+)?$ ]] &&
+    [[ "${VOICE_STEP_READINESS_RETRY_SECONDS}" != 0 ]] ||
+    die 'invalid timeout configuration'
   validate_positive_integer "${VOICE_STEP_WAIT_TIMEOUT_SECONDS:-120}"
   validate_positive_integer "${VOICE_STEP_MAX_WAIT_ATTEMPTS:-120}"
   [[ "${VOICE_STEP_POLL_SECONDS:-1}" =~ ^([0-9]+)(\.[0-9]+)?$ ]] ||
     die 'invalid timeout configuration'
-  require_command timeout
   require_command "$MDEV"
   require_command python3
   require_command mktemp

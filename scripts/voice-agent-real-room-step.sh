@@ -811,18 +811,123 @@ wait_for_new_trace() {
   die 'trace activation timed out'
 }
 
+readiness_now_ms() {
+  python3 -c 'import time; print(time.monotonic_ns() // 1_000_000)'
+}
+
+run_pre_mutation_readiness_attempt() {
+  local result_path="$1"
+  local status_path="$2"
+  local message_path="$3"
+  local status_snapshot
+  local -a status=()
+  (
+    die() {
+      local failure_status=1
+      printf '%s' "$1" > "$message_path"
+      if [[ -s "$status_path" ]]; then
+        failure_status="$(<"$status_path")"
+      fi
+      [[ "$failure_status" =~ ^7[1-4]$ ]] || failure_status=1
+      exit "$failure_status"
+    }
+    adb_read() {
+      local stderr_path
+      local command_status
+      local stderr
+      local remaining_ms
+      remaining_ms=$(( READINESS_DEADLINE_MS - $(readiness_now_ms) ))
+      (( remaining_ms > 0 )) || return 1
+      if (( remaining_ms < VOICE_STEP_ADB_PROBE_TIMEOUT_MS )); then
+        CURRENT_ADB_TIMEOUT_MS="$remaining_ms"
+      else
+        CURRENT_ADB_TIMEOUT_MS="$VOICE_STEP_ADB_PROBE_TIMEOUT_MS"
+      fi
+      stderr_path="$(mktemp "$LOCAL_TEMP_DIR/readiness-stderr.XXXXXX" 2>/dev/null)" || return 1
+      chmod 600 -- "$stderr_path" 2>/dev/null || { rm -f -- "$stderr_path"; return 1; }
+      set +e
+      run_mdev_adb "$@" 2>"$stderr_path"
+      command_status=$?
+      set -e
+      if (( command_status == 0 )); then
+        rm -f -- "$stderr_path"
+        return 0
+      fi
+      stderr="$(<"$stderr_path")"
+      rm -f -- "$stderr_path"
+      if classify_mdev_failure "$stderr"; then
+        return 1
+      else
+        command_status=$?
+      fi
+      if [[ "$command_status" =~ ^7[1-4]$ ]]; then
+        printf '%s\n' "$command_status" > "$status_path"
+        return "$command_status"
+      fi
+      return 1
+    }
+    ensure_device_and_package
+    resolve_package_identity
+    verify_package_contract
+    status_snapshot="$(read_status)"
+    mapfile -t status <<< "$status_snapshot"
+    [[ "${status[0]}" == idle || "${status[0]}" == finalized ]] ||
+      die 'automation is not ready'
+    rm -f -- "$LOCAL_TEMP_DIR"/service-query.* 2>/dev/null || exit 1
+    printf '%s\n' "$ANDROID_USER_ID" "$PACKAGE_UID" > "$result_path"
+  ) >/dev/null 2>&1
+}
+
+run_pre_mutation_readiness() {
+  local recover="$1"
+  local result_path
+  local status_path
+  local message_path
+  local attempt_status
+  local -a result=()
+  local remaining_ms
+  ensure_local_temp_dir
+  READINESS_DEADLINE_MS=$(( $(readiness_now_ms) + VOICE_STEP_READINESS_TIMEOUT_SECONDS * 1000 ))
+  result_path="$(mktemp "$LOCAL_TEMP_DIR/readiness-result.XXXXXX" 2>/dev/null)" ||
+    die 'local temporary storage failed'
+  status_path="$(mktemp "$LOCAL_TEMP_DIR/readiness-status.XXXXXX" 2>/dev/null)" ||
+    die 'local temporary storage failed'
+  message_path="$(mktemp "$LOCAL_TEMP_DIR/readiness-message.XXXXXX" 2>/dev/null)" ||
+    die 'local temporary storage failed'
+  chmod 600 -- "$result_path" "$status_path" "$message_path" 2>/dev/null || die 'local temporary storage failed'
+  register_temp_file "$result_path"
+  register_temp_file "$status_path"
+  register_temp_file "$message_path"
+  while :; do
+    : > "$status_path"
+    : > "$message_path"
+    if run_pre_mutation_readiness_attempt "$result_path" "$status_path" "$message_path"; then
+      mapfile -t result < "$result_path"
+      [[ "${#result[@]}" == 2 ]] || die 'readiness failed'
+      ANDROID_USER_ID="${result[0]}"
+      PACKAGE_UID="${result[1]}"
+      return 0
+    else
+    attempt_status=$?
+    fi
+    if [[ "$recover" != true || ! "$attempt_status" =~ ^7[1-4]$ ]]; then
+      [[ -s "$message_path" ]] && die "$(<"$message_path")"
+      die 'readiness failed'
+    fi
+    remaining_ms=$(( READINESS_DEADLINE_MS - $(readiness_now_ms) ))
+    (( remaining_ms > 0 )) || die 'readiness timed out'
+    sleep "$VOICE_STEP_READINESS_RETRY_SECONDS"
+    remaining_ms=$(( READINESS_DEADLINE_MS - $(readiness_now_ms) ))
+    (( remaining_ms > 0 )) || die 'readiness timed out'
+  done
+}
+
 run_preflight() {
   local status_snapshot
   local -a status=()
   validate_runtime
   verify_installed_binding_contract "$PACKAGE_APK" "$BUILD_BINDING" "$COMPLETE_BINDING"
-  ensure_device_and_package
-  resolve_package_identity
-  verify_package_contract
-  status_snapshot="$(read_status)"
-  mapfile -t status <<< "$status_snapshot"
-  [[ "${status[0]}" == idle || "${status[0]}" == finalized ]] ||
-    die 'automation is not ready'
+  run_pre_mutation_readiness false
   printf '%s\n' \
     'voice-step.status=ok' \
     'voice-step.operation=preflight' \
@@ -834,24 +939,15 @@ run_preflight() {
 
 run_start() {
   local state_path="$1"
-  local fixture_path="$2"
   local old_trace_present
   local old_trace_value
   local reply
   local status_snapshot
   local -a status=()
-  local fixture_snapshot
-  local fixture_size
-  local fixture_hash
-  local remote_fixture_path
   validate_runtime
   acquire_host_operation_lock
-  snapshot_fixture "$fixture_path" fixture_snapshot fixture_size fixture_hash
+  run_pre_mutation_readiness true
   REMOTE_FIXTURE_DIR="files/voice-real-room/${RUN_HASH#sha256:}"
-  remote_fixture_path="$REMOTE_FIXTURE_DIR/request-${fixture_hash#sha256:}.pcm"
-  ensure_device_and_package
-  resolve_package_identity
-  verify_package_contract
   status_snapshot="$(read_status)"
   mapfile -t status <<< "$status_snapshot"
   [[ "${status[0]}" == idle || "${status[0]}" == finalized ]] ||
@@ -861,8 +957,7 @@ run_start() {
   old_trace_value="$TRACE_POINTER_VALUE"
 
   START_CLEANUP_NEEDED=1
-  stage_snapshot "$REMOTE_FIXTURE_DIR" "$remote_fixture_path" \
-    "$fixture_snapshot" "$fixture_size" "$fixture_hash"
+  create_owned_remote_directory "$REMOTE_FIXTURE_DIR" "$(compute_remote_owner_hash)"
   START_PREPARE_ATTEMPTED=1
   reply="$(broadcast_read "$CONTROL_RECEIVER" "$CONTROL_ACTION_PREFIX.PREPARE" \
     --es run_hash "$RUN_HASH" \
@@ -872,9 +967,6 @@ run_start() {
   [[ "$reply" == $'status=ok\naction=prepare' ]] || die 'unexpected receiver response'
 
   reply="$(broadcast_read "$FIXTURE_RECEIVER" "$FIXTURE_ARM_ACTION" \
-    --es initial_path "$remote_fixture_path" \
-    --el expected_size "$fixture_size" \
-    --es expected_sha256 "$fixture_hash" \
     --ei chunk_bytes "$FIXTURE_CHUNK_BYTES" \
     --el chunk_delay_ms "$FIXTURE_CHUNK_DELAY_MS")"
   if [[ "$reply" =~ ^status=ok$'\n'action=arm$'\n'token=(fixture-[1-9][0-9]*)$ ]]; then
@@ -966,8 +1058,8 @@ case "$operation" in
     run_preflight
     ;;
   start)
-    parse_options '--state --mdev-owner --package --conversation-id --run-hash --comparison-hash --fixture' "$@"
-    require_options --mdev-owner --state --package --conversation-id --run-hash --comparison-hash --fixture
+    parse_options '--state --mdev-owner --package --conversation-id --run-hash --comparison-hash' "$@"
+    require_options --mdev-owner --state --package --conversation-id --run-hash --comparison-hash
     MDEV_OWNER="${PARSED[--mdev-owner]}"
     PACKAGE="${PARSED[--package]}"
     CONVERSATION_ID="${PARSED[--conversation-id]}"
@@ -979,7 +1071,7 @@ case "$operation" in
     validate_hash "$RUN_HASH" 'run hash'
     validate_hash "$COMPARISON_HASH" 'comparison hash'
     validate_absent_destination "${PARSED[--state]}" || die 'invalid state destination'
-    run_start "${PARSED[--state]}" "${PARSED[--fixture]}"
+    run_start "${PARSED[--state]}"
     ;;
   inject)
     parse_options '--mdev-owner --state --fixture --role' "$@"
