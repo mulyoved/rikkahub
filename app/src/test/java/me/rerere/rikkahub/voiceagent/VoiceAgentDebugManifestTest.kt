@@ -112,12 +112,13 @@ class VoiceAgentDebugManifestTest {
     @Test
     fun `arm request without initial fixture metadata creates a silent fixture token`() {
         val receiver = receiver()
-        receiver.onReceive(
+        val result = receiver.arm(
             context(createTempDirectory("voice-empty-fixture").toFile()),
             emptyArmIntent(),
         )
 
-        val token = requireNotNull(receiver.resultData).substringAfter("token=")
+        assertEquals("status=ok\naction=arm\ntoken=fixture-1", result)
+        val token = result.substringAfter("token=")
         val source = VoiceCaptureFixtureArming.claim(token, delays = {}).getOrThrow()
         assertFalse(source.startInitial())
         source.close()

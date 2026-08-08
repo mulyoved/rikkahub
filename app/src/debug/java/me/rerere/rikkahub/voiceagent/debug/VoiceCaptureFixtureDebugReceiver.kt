@@ -76,7 +76,7 @@ class VoiceCaptureFixtureDebugReceiver internal constructor(
         }
     }
 
-    private fun arm(context: Context, intent: Intent): String {
+    internal fun arm(context: Context, intent: Intent): String {
         val chunkBytes = intent.getIntExtra(
             VoiceCaptureFixtureArming.EXTRA_CHUNK_BYTES,
             VoiceCaptureFixtureArming.DEFAULT_CHUNK_BYTES,
