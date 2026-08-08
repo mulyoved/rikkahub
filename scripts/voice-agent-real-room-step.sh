@@ -865,13 +865,18 @@ run_pre_mutation_readiness_attempt() {
         rm -f -- "$stderr_path"
         return 0
       fi
-      stderr="$(<"$stderr_path")"
+      if command_status="$(python3 -c '
+import sys
+raw = open(sys.argv[1], "rb").read()
+records = {
+    b"mdev.android.error=owner_lock_timeout\\n": "71",
+    b"mdev.android.error=device_resolution_timeout\\n": "72",
+    b"mdev.android.error=adb_timeout\\n": "73",
+    b"mdev.android.error=state_commit_timeout\\n": "74",
+}
+sys.stdout.write(records.get(raw, ""))
+' "$stderr_path" 2>/dev/null)"; then :; fi
       rm -f -- "$stderr_path"
-      if classify_mdev_failure "$stderr"; then
-        return 1
-      else
-        command_status=$?
-      fi
       if [[ "$command_status" =~ ^7[1-4]$ ]]; then
         printf '%s\n' "$command_status" > "$status_path"
         return "$command_status"
@@ -885,8 +890,9 @@ run_pre_mutation_readiness_attempt() {
     mapfile -t status <<< "$status_snapshot"
     [[ "${status[0]}" == idle || "${status[0]}" == finalized ]] ||
       die 'automation is not ready'
-    rm -f -- "$LOCAL_TEMP_DIR"/service-query.* 2>/dev/null || exit 1
-    printf '%s\n' "$ANDROID_USER_ID" "$PACKAGE_UID" > "$result_path"
+    read_trace_pointer
+    printf '%s\n' "$ANDROID_USER_ID" "$PACKAGE_UID" "$TRACE_POINTER_PRESENT" \
+      "$TRACE_POINTER_VALUE" > "$result_path"
   ) >/dev/null 2>&1
 }
 
@@ -915,9 +921,11 @@ run_pre_mutation_readiness() {
     : > "$message_path"
     if run_pre_mutation_readiness_attempt "$result_path" "$status_path" "$message_path"; then
       mapfile -t result < "$result_path"
-      [[ "${#result[@]}" == 2 ]] || die 'readiness failed'
+      [[ "${#result[@]}" == 4 ]] || die 'readiness failed'
       ANDROID_USER_ID="${result[0]}"
       PACKAGE_UID="${result[1]}"
+      TRACE_POINTER_PRESENT="${result[2]}"
+      TRACE_POINTER_VALUE="${result[3]}"
       return 0
     else
     attempt_status=$?
@@ -935,8 +943,6 @@ run_pre_mutation_readiness() {
 }
 
 run_preflight() {
-  local status_snapshot
-  local -a status=()
   validate_runtime
   verify_installed_binding_contract "$PACKAGE_APK" "$BUILD_BINDING" "$COMPLETE_BINDING"
   run_pre_mutation_readiness false
@@ -960,11 +966,6 @@ run_start() {
   acquire_host_operation_lock
   run_pre_mutation_readiness true
   REMOTE_FIXTURE_DIR="files/voice-real-room/${RUN_HASH#sha256:}"
-  status_snapshot="$(read_status)"
-  mapfile -t status <<< "$status_snapshot"
-  [[ "${status[0]}" == idle || "${status[0]}" == finalized ]] ||
-    die 'automation is not ready'
-  read_trace_pointer
   old_trace_present="$TRACE_POINTER_PRESENT"
   old_trace_value="$TRACE_POINTER_VALUE"
 

@@ -597,7 +597,14 @@ if failure:
     if always or count == 0:
         state["pre_mutation_failures"] = count + 1
         save_state(state)
-        print(f"mdev.android.error={failure}", file=sys.stderr)
+        framing = os.environ.get("FAKE_MDEV_FAILURE_FRAMING", "exact")
+        record = f"mdev.android.error={failure}".encode()
+        variants = {
+            "exact": record + b"\n", "blank": record + b"\n\n", "missing": record,
+            "leading": b" " + record + b"\n", "trailing": record + b" \n",
+            "extra": record + b"\nextra\n", "noisy": record + b"\nADB_STDERR_SECRET\n",
+        }
+        sys.stderr.buffer.write(variants[framing])
         raise SystemExit(124)
 if command == ["get-state"]:
     if (
@@ -793,7 +800,11 @@ if command == [
         os.kill(os.getppid(), getattr(signal, signal_name))
     raise SystemExit(0)
 if command == ["shell", "pm", "path", EXPECTED_PACKAGE]:
-    print(f"package:/data/app/{EXPECTED_PACKAGE}/base.apk")
+    mode = os.environ.get("FAKE_ADB_PM_PATH_MODE", "valid")
+    if mode == "valid":
+        print(f"package:/data/app/{EXPECTED_PACKAGE}/base.apk")
+    elif mode == "malformed":
+        print("not-a-package-path")
     raise SystemExit(0)
 if command == ["shell", "dumpsys", "package", EXPECTED_PACKAGE]:
     print(f"Package [{EXPECTED_PACKAGE}]")
@@ -1791,6 +1802,7 @@ PY
   unset FAKE_ADB_PREEXISTING_REMOTE_DIR FAKE_ADB_REMOTE_DESTINATION_TYPE
   unset FAKE_ADB_VALIDATED_FALSE FAKE_ADB_SUBSECOND_METADATA_CHANGE
   unset FAKE_MDEV_PRE_MUTATION_FAILURE FAKE_MDEV_PRE_MUTATION_ALWAYS
+  unset FAKE_MDEV_FAILURE_FRAMING FAKE_ADB_PM_PATH_MODE
   unset FAKE_ADB_PREPARE_REJECT FAKE_ADB_ARM_REJECT FAKE_ADB_FAIL_START
   unset FAKE_ADB_CALL_ACTIVE_TIMEOUT
   unset FAKE_ADB_PRIVATE_NOISE FAKE_ADB_DEVICE_LOST FAKE_ADB_RETAIN_FIXTURE_DIR
@@ -2815,6 +2827,30 @@ BASH
 }
 
 run_preflight_tests() {
+  local pm_mode
+  for pm_mode in empty malformed; do
+    reset_fake
+    export FAKE_ADB_PM_PATH_MODE="$pm_mode"
+    run_valid_preflight
+    [[ "$RUN_STATUS" -ne 0 && "$(<"$STDERR_FILE")" == 'voice-step.error=debug package unavailable' ]] ||
+      fail "preflight pm-path test: $pm_mode output was retried or accepted ($(tr '\n' ' ' < "$STDERR_FILE"))"
+    assert_no_adb_mutations
+    pass
+  done
+
+  local framing
+  for framing in blank missing leading trailing extra noisy; do
+    reset_fake
+    export FAKE_MDEV_PRE_MUTATION_FAILURE=adb_timeout
+    export FAKE_MDEV_FAILURE_FRAMING="$framing"
+    run_valid_preflight
+    [[ "$RUN_STATUS" -ne 0 && "$(<"$STDERR_FILE")" == 'voice-step.error=device is not ready' ]] ||
+      fail "readiness framing test: $framing stderr was classified as transient"
+    assert_no_adb_mutations
+    assert_private_output_absent
+    pass
+  done
+
   reset_fake
   rm -rf -- "$REMOTE_APP_DATA_ROOT/files"
   run_valid_preflight
@@ -3132,6 +3168,14 @@ run_start_tests() {
     fail 'start-silence test: start delivered or retried a fixture'
   command_sequence_present PREPARE ARM_CAPTURE_FIXTURE start-foreground-service ||
     fail 'start-order test: prepare, empty arm, and call start were not ordered'
+  python3 - "$ADB_LOG" <<'PYTEST' || fail 'start-readiness budget test: a pre-mutation mdev call escaped the probe budget'
+import sys
+commands = [part.split(b"\0") for part in open(sys.argv[1], "rb").read().split(b"\0\0") if part]
+first_mutation = next(i for i, command in enumerate(commands) if any(b"PREPARE" in value for value in command))
+for command in commands[:first_mutation]:
+    timeout = command.index(b"--timeout-ms")
+    assert command[timeout + 1] == b"3000"
+PYTEST
   python3 - "$ADB_LOG" <<'PYTEST' || fail 'start-empty-arm test: empty arming included initial fixture metadata'
 import sys
 commands = [part.split(b"\0") for part in open(sys.argv[1], "rb").read().split(b"\0\0") if part]
