@@ -1031,7 +1031,7 @@ parse_status_data() {
   [[ "$run_state" =~ ^(idle|active|finalized)$ ]] || return 1
   [[ "$event_count" =~ ^[0-9]+$ ]] || return 1
   [[ "$network" =~ ^(wifi|cellular|none)$ ]] || return 1
-  [[ "$validated" == true ]] || return 1
+  [[ "$validated" == true || "$validated" == false ]] || return 1
   case "$run_state" in
     idle)
       [[ "$run_hash" == none && "$comparison_hash" == none && "$transport" == none ]] || return 1
@@ -1042,6 +1042,7 @@ parse_status_data() {
          "$transport" == "$TRANSPORT_EXPECTED" ]] || return 1
       ;;
   esac
+  [[ "$validated" == true ]] || return 5
   printf '%s\n' "$run_state" "$run_hash" "$comparison_hash" "$transport" \
     "$event_count" "$network" "$validated"
 }
@@ -1057,12 +1058,29 @@ read_status_snapshot() {
   fi
   (( parse_status != 4 )) || return 3
   (( parse_status == 0 )) || return 2
-  parse_status_data "$data" || return 2
+  if parse_status_data "$data"; then
+    return 0
+  else
+    parse_status=$?
+  fi
+  (( parse_status == 5 )) && return 5
+  return 2
 }
 
 read_status() {
   local snapshot
-  snapshot="$(read_status_snapshot)" || die 'unexpected status response'
+  local status
+  if snapshot="$(read_status_snapshot)"; then
+    status=0
+  else
+    status=$?
+  fi
+  if (( status == 5 )); then
+    sleep "${VOICE_STEP_READINESS_RETRY_SECONDS:-0.2}"
+    snapshot="$(read_status_snapshot)" || die 'unexpected status response'
+  elif (( status != 0 )); then
+    die 'unexpected status response'
+  fi
   printf '%s' "$snapshot"
 }
 

@@ -1193,7 +1193,15 @@ if command[:4] == ["shell", "am", "broadcast", "--user"]:
                 f'requested_transport={state["transport"] if state["automation_state"] != "idle" else "none"}',
                 f"event_count={status_event_count}",
                 f"network={status_network}",
-                "validated=" + ("false" if os.environ.get("FAKE_ADB_VALIDATED_FALSE") == "1" else "true"),
+                "validated=" + (
+                    "false"
+                    if os.environ.get("FAKE_ADB_VALIDATED_FALSE") == "1"
+                    or (
+                        os.environ.get("FAKE_ADB_VALIDATED_FALSE_ONCE") == "1"
+                        and state["status_reads"] == 1
+                    )
+                    else "true"
+                ),
             ]
         )
         post_finalize_status = os.environ.get("FAKE_ADB_POST_FINALIZE_STATUS")
@@ -1805,7 +1813,8 @@ PY
   unset FAKE_ADB_BLOCK FAKE_TIMEOUT_ENFORCE FAKE_LN_RACE_DESTINATION
   unset FAKE_LN_SIGNAL_DESTINATION FAKE_LN_SIGNAL_TIMING
   unset FAKE_ADB_PREEXISTING_REMOTE_DIR FAKE_ADB_REMOTE_DESTINATION_TYPE
-  unset FAKE_ADB_VALIDATED_FALSE FAKE_ADB_SUBSECOND_METADATA_CHANGE
+  unset FAKE_ADB_VALIDATED_FALSE FAKE_ADB_VALIDATED_FALSE_ONCE
+  unset FAKE_ADB_SUBSECOND_METADATA_CHANGE
   unset FAKE_MDEV_PRE_MUTATION_FAILURE FAKE_MDEV_PRE_MUTATION_ALWAYS
   unset FAKE_MDEV_FAILURE_FRAMING FAKE_ADB_PM_PATH_MODE
   unset FAKE_ADB_PREPARE_REJECT FAKE_ADB_ARM_REJECT FAKE_ADB_FAIL_START
@@ -2873,6 +2882,18 @@ run_preflight_tests() {
   [[ "$RUN_STATUS" -eq 0 ]] ||
     fail 'protected-root test: valid existing files directory was rejected'
   assert_exact_output $'voice-step.status=ok\nvoice-step.operation=preflight\nvoice-step.device=ready\nvoice-step.package=ready\nvoice-step.automation=ready\nvoice-step.protected_path=ready'
+  assert_no_adb_mutations
+  assert_private_output_absent
+  pass
+
+  reset_fake
+  export FAKE_ADB_VALIDATED_FALSE_ONCE=1
+  run_valid_preflight
+  [[ "$RUN_STATUS" -eq 0 ]] ||
+    fail 'preflight cold-network test: one unvalidated STATUS was not retried'
+  assert_exact_output $'voice-step.status=ok\nvoice-step.operation=preflight\nvoice-step.device=ready\nvoice-step.package=ready\nvoice-step.automation=ready\nvoice-step.protected_path=ready'
+  [[ "$(command_count .STATUS)" == 2 ]] ||
+    fail 'preflight cold-network test: STATUS retry was not bounded to one'
   assert_no_adb_mutations
   assert_private_output_absent
   pass
