@@ -4,8 +4,10 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.net.ConnectivityManager
-import android.net.NetworkCapabilities
 import java.io.File
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import me.rerere.rikkahub.voiceagent.VoiceAgentCallEndpointType
 import me.rerere.rikkahub.voiceagent.VoiceAgentTelecomCallRegistry
 import me.rerere.rikkahub.voiceagent.VoiceAgentTransport
@@ -21,23 +23,44 @@ import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationRuntime
 import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationStatus
 import org.koin.core.context.GlobalContext
 
+private const val CONNECTIVITY_READ_TIMEOUT_MILLIS = 1_000L
+
 class VoiceAutomationControlReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
-        val result = runCatching {
-            decodeStringExtras(intent)?.let { extras ->
-                val koin = GlobalContext.get()
-                val connectivityManager = context.getSystemService(ConnectivityManager::class.java)
-                VoiceAutomationControl(
-                    runtime = koin.get<VoiceAutomationRuntime>(),
-                    routeRequester = koin.get<VoiceAgentTelecomCallRegistry>()::requestActiveAudioRoute,
-                    connectivityReader = { connectivityManager.readAutomationConnectivity() },
-                    artifactFile = { status -> context.automationArtifactFile(status) },
-                ).handle(intent.action, extras)
-            } ?: VoiceAutomationControl.invalidRequest()
-        }.getOrElse {
-            VoiceAutomationControl.runtimeFailure()
+        val pendingResult = goAsync()
+        CoroutineScope(Dispatchers.Default).launch {
+            val result = runCatching {
+                decodeStringExtras(intent)?.let { extras ->
+                    val koin = GlobalContext.get()
+                    val connectivityManager =
+                        context.getSystemService(ConnectivityManager::class.java)
+                    val connectivitySource =
+                        AndroidVoiceAutomationConnectivitySource(connectivityManager)
+                    val connectivity = if (intent.action == VoiceAutomationControl.ACTION_STATUS) {
+                        VoiceAutomationConnectivityReader(
+                            source = connectivitySource,
+                            timeoutMillis = CONNECTIVITY_READ_TIMEOUT_MILLIS,
+                        ).read()
+                    } else {
+                        null
+                    }
+                    VoiceAutomationControl(
+                        runtime = koin.get<VoiceAutomationRuntime>(),
+                        routeRequester =
+                            koin.get<VoiceAgentTelecomCallRegistry>()::requestActiveAudioRoute,
+                        connectivityReader = { connectivity ?: connectivitySource.current() },
+                        artifactFile = { status -> context.automationArtifactFile(status) },
+                    ).handle(intent.action, extras)
+                } ?: VoiceAutomationControl.invalidRequest()
+            }.getOrElse {
+                VoiceAutomationControl.runtimeFailure()
+            }
+            try {
+                pendingResult.setResult(result.resultCode, result.resultData, null)
+            } finally {
+                pendingResult.finish()
+            }
         }
-        setResult(result.resultCode, result.resultData, null)
     }
 
     private fun decodeStringExtras(intent: Intent): Map<String, String>? {
@@ -46,21 +69,6 @@ class VoiceAutomationControlReceiver : BroadcastReceiver() {
             @Suppress("DEPRECATION")
             (extras.get(key) as? String) ?: return null
         }
-    }
-
-    private fun ConnectivityManager.readAutomationConnectivity(): VoiceAutomationConnectivity {
-        val network = activeNetwork
-        val capabilities = network?.let(::getNetworkCapabilities)
-        val observed = when {
-            capabilities?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true ->
-                VoiceAutomationNetwork.WIFI
-            capabilities?.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) == true ->
-                VoiceAutomationNetwork.CELLULAR
-            else -> VoiceAutomationNetwork.NONE
-        }
-        val validated =
-            capabilities?.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) == true
-        return VoiceAutomationConnectivity(observed, validated)
     }
 
     private fun Context.automationArtifactFile(status: VoiceAutomationStatus): File? {
