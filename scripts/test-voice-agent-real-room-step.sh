@@ -2852,6 +2852,10 @@ run_preflight_tests() {
   run_valid_preflight
   assert_protected_path_rejected 'unexpected canonical app-data root'
 
+  [[ -z "$(find "$HELPER_TEMP_ROOT" -mindepth 1 -print -quit)" ]] ||
+    fail 'preflight readiness cleanup test: failed readiness attempt leaked private temporary files'
+  pass
+
   reset_fake
   run_valid_preflight
   [[ "$RUN_STATUS" -eq 0 ]] ||

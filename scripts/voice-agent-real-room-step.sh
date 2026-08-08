@@ -822,6 +822,18 @@ run_pre_mutation_readiness_attempt() {
   local status_snapshot
   local -a status=()
   (
+    # A readiness attempt runs in a child so its temporary-file registry is a
+    # copy. Reset that copy and clean only entries created by this attempt.
+    # Parent-owned result/status/message files remain available to the caller.
+    OWNED_TEMP_FILES=()
+    cleanup_readiness_attempt_temps() {
+      local path
+      for path in "${OWNED_TEMP_FILES[@]}"; do
+        rm -f -- "$path" 2>/dev/null || :
+      done
+      OWNED_TEMP_FILES=()
+    }
+    trap cleanup_readiness_attempt_temps EXIT
     die() {
       local failure_status=1
       printf '%s' "$1" > "$message_path"
