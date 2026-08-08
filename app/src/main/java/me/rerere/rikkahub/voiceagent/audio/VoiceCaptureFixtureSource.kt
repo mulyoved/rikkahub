@@ -101,8 +101,8 @@ internal object VoiceCaptureFixtureArming {
     private var active: ActiveFixture? = null
 
     fun arm(
-        initial: VoiceCaptureFixture,
-        staged: List<VoiceCaptureFixture>,
+        initial: VoiceCaptureFixture? = null,
+        staged: List<VoiceCaptureFixture> = emptyList(),
     ): String = synchronized(lock) {
         check(active == null) { "A fixture capture source is already active" }
         check(generation < Long.MAX_VALUE) { "Fixture capture generation exhausted" }
@@ -112,7 +112,7 @@ internal object VoiceCaptureFixtureArming {
         generation += 1
         pending = ArmedFixture(
             token = token,
-            initial = initial.snapshot(),
+            initial = initial?.snapshot(),
             staged = stagedByPath.mapValues { (_, fixture) -> fixture.snapshot() },
         )
         token
@@ -128,7 +128,7 @@ internal object VoiceCaptureFixtureArming {
             check(active == null) { "A fixture capture source is already active" }
             VoiceCaptureFixtureSource(
                 token = armed.token,
-                initial = armed.initial.snapshot(),
+                initial = armed.initial?.snapshot(),
                 staged = armed.staged.mapValues { (_, fixture) -> fixture.snapshot() },
                 delays = delays,
                 releaseOwner = ::release,
@@ -185,7 +185,7 @@ internal object VoiceCaptureFixtureArming {
 
     private data class ArmedFixture(
         val token: String,
-        val initial: VoiceCaptureFixture,
+        val initial: VoiceCaptureFixture?,
         val staged: Map<String, VoiceCaptureFixture>,
     )
 
@@ -197,7 +197,7 @@ internal object VoiceCaptureFixtureArming {
 
 internal class VoiceCaptureFixtureSource(
     private val token: String,
-    initial: VoiceCaptureFixture,
+    initial: VoiceCaptureFixture?,
     staged: Map<String, VoiceCaptureFixture>,
     private val delays: suspend (Long) -> Unit,
     private val releaseOwner: (String, VoiceCaptureFixtureSource) -> Unit,

@@ -92,6 +92,35 @@ class LiveKitVoiceCallSessionTest {
     }
 
     @Test
+    fun `ready starts an empty fixture source without producing PCM`() = runTest {
+        VoiceCaptureFixtureArming.clearForTest()
+        val token = VoiceCaptureFixtureArming.arm()
+        val captureSource = VoiceCaptureFixtureArming.claim(token).getOrThrow()
+        val delivered = mutableListOf<List<Byte>>()
+        val pump = backgroundScope.launch {
+            captureSource.pump(
+                onPcm16 = { delivered += it.toList() },
+                onFixtureComplete = {},
+            )
+        }
+        val fixture = fixture(
+            automationRuntime = SessionRecordingAutomationRuntime(),
+            captureSource = captureSource,
+        )
+
+        fixture.session.start()
+        fixture.room.emit(LiveKitRoomEvent.Data(AGENT_IDENTITY, READY_TOPIC, readyJson()))
+        runCurrent()
+
+        assertTrue(delivered.isEmpty())
+
+        fixture.session.cleanupOperation.run(VoiceAgentCleanupMode.Immediate)
+        captureSource.close()
+        pump.cancel()
+        VoiceCaptureFixtureArming.clearForTest()
+    }
+
+    @Test
     fun `second real LiveKit reconnect callback remains structurally visible in artifact`() = runTest {
         val runtime = DefaultVoiceAutomationRuntime(
             Files.createTempDirectory("livekit-second-reconnect").toFile(),

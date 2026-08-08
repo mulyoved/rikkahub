@@ -110,6 +110,20 @@ class VoiceAgentDebugManifestTest {
     }
 
     @Test
+    fun `arm request without initial fixture metadata creates a silent fixture token`() {
+        val receiver = receiver()
+        receiver.onReceive(
+            context(createTempDirectory("voice-empty-fixture").toFile()),
+            emptyArmIntent(),
+        )
+
+        val token = requireNotNull(receiver.resultData).substringAfter("token=")
+        val source = VoiceCaptureFixtureArming.claim(token, delays = {}).getOrThrow()
+        assertFalse(source.startInitial())
+        source.close()
+    }
+
+    @Test
     fun `stage request uses bounded file and exact result contract`() = runTest {
         val filesDir = createTempDirectory("voice-fixture-files").toFile()
         val fixtureFile = File(filesDir, "voice-fixtures/request-2.pcm").apply {
@@ -400,6 +414,16 @@ class VoiceAgentDebugManifestTest {
         } returns chunkDelayMs
         every { getLongExtra("expected_size", any()) } returns expectedSize
         every { getStringExtra("expected_sha256") } returns expectedBytes.sha256()
+    }
+
+    private fun emptyArmIntent(): Intent = mockk {
+        every { action } returns VoiceCaptureFixtureArming.ACTION_ARM_FIXTURE
+        every { getIntExtra("chunk_bytes", any()) } returns VoiceCaptureFixtureArming.DEFAULT_CHUNK_BYTES
+        every { getLongExtra("chunk_delay_ms", any()) } returns VoiceCaptureFixtureArming.DEFAULT_CHUNK_DELAY_MS
+        every { getLongExtra("expected_size", any()) } returns -1L
+        every { getStringExtra("expected_sha256") } returns null
+        every { getStringExtra("initial_path") } returns null
+        every { getStringExtra("staged_path") } returns null
     }
 
     private fun fixture(path: String, bytes: ByteArray) = VoiceCaptureFixture(

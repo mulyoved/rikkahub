@@ -87,20 +87,25 @@ class VoiceCaptureFixtureDebugReceiver internal constructor(
         )
         val expectedSize = intent.getLongExtra(VoiceCaptureFixtureArming.EXTRA_EXPECTED_SIZE, -1)
         val expectedSha256 = intent.getStringExtra(VoiceCaptureFixtureArming.EXTRA_EXPECTED_SHA256)
-        val initial = fixture(
-            context = context,
-            path = requireNotNull(intent.getStringExtra(VoiceCaptureFixtureArming.EXTRA_INITIAL_PATH)),
-            chunkBytes = chunkBytes,
-            chunkDelayMs = chunkDelayMs,
-            expectedSize = expectedSize,
-            expectedSha256 = expectedSha256,
-        )
+        val initialPath = intent.getStringExtra(VoiceCaptureFixtureArming.EXTRA_INITIAL_PATH)
+        val hasInitialMetadata = expectedSize != -1L || expectedSha256 != null
+        require((initialPath == null) == !hasInitialMetadata)
+        val initial = initialPath?.let {
+            fixture(
+                context = context,
+                path = it,
+                chunkBytes = chunkBytes,
+                chunkDelayMs = chunkDelayMs,
+                expectedSize = expectedSize,
+                expectedSha256 = expectedSha256,
+            )
+        }
         val staged = intent.getStringExtra(VoiceCaptureFixtureArming.EXTRA_STAGED_PATH)
             ?.let {
                 listOf(fixture(context, it, chunkBytes, chunkDelayMs, expectedSize, expectedSha256))
             }
             .orEmpty()
-        val token = VoiceCaptureFixtureArming.arm(initial, staged)
+        val token = VoiceCaptureFixtureArming.arm(initial = initial, staged = staged)
         return "status=ok\naction=arm\ntoken=$token"
     }
 

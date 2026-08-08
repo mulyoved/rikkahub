@@ -4,6 +4,8 @@ import java.io.InputStream
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -72,6 +74,34 @@ class VoiceCaptureFixtureSourceTest {
 
         source.close()
         pump.await()
+    }
+
+    @Test
+    fun `empty armed source remains silent until one staged fixture is triggered`() = runTest {
+        val token = VoiceCaptureFixtureArming.arm()
+        val source = VoiceCaptureFixtureArming.claim(token, delays = {}).getOrThrow()
+        val delivered = mutableListOf<List<Byte>>()
+        var completions = 0
+        val pump = backgroundScope.launch {
+            source.pump(
+                onPcm16 = { delivered += it.toList() },
+                onFixtureComplete = { completions += 1 },
+            )
+        }
+
+        assertFalse(source.startInitial())
+        runCurrent()
+        assertTrue(delivered.isEmpty())
+        assertEquals(0, completions)
+
+        val request = fixture("request.pcm", byteArrayOf(1, 2), chunkBytes = 2)
+        assertTrue(VoiceCaptureFixtureArming.stage(token, request).accepted)
+        assertTrue(VoiceCaptureFixtureArming.trigger(token, request.path).accepted)
+        source.awaitIdle()
+        assertEquals(listOf(listOf<Byte>(1, 2)), delivered)
+        assertEquals(1, completions)
+        source.close()
+        pump.cancelAndJoin()
     }
 
     @Test
