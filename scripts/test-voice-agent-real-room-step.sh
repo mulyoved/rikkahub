@@ -865,6 +865,11 @@ if run_as_tail is not None:
         raise SystemExit(0)
     if tail[:2] == ["sh", "-c"]:
         script = tail[2] if len(tail) > 2 else ""
+        if (
+            os.environ.get("FAKE_ADB_REQUIRE_SHELL_PID_FD_PATHS") == "1"
+            and "/proc/self/fd/" in script
+        ):
+            raise SystemExit(1)
         if "voice-step-protected-root" in script:
             if len(tail) != 3:
                 raise SystemExit(1)
@@ -929,10 +934,10 @@ readlink() {
                 cleanup_markers = (
                     "exec 5< .",
                     "exec 4< .",
-                    'stat -Lc %d:%i /proc/self/fd/4',
+                    'stat -Lc %d:%i /proc/$$/fd/4',
                     'stat -c %d:%i "$name"',
                     'rmdir -- "$name"',
-                    'stat -Lc %h /proc/self/fd/4',
+                    'stat -Lc %h /proc/$$/fd/4',
                 )
                 state["missing_cleanup_markers"] = [
                     marker for marker in cleanup_markers if marker not in script
@@ -1805,6 +1810,7 @@ PY
   unset FAKE_MDEV_FAILURE_FRAMING FAKE_ADB_PM_PATH_MODE
   unset FAKE_ADB_PREPARE_REJECT FAKE_ADB_ARM_REJECT FAKE_ADB_FAIL_START
   unset FAKE_ADB_CALL_ACTIVE_TIMEOUT
+  unset FAKE_ADB_REQUIRE_SHELL_PID_FD_PATHS
   unset FAKE_ADB_PRIVATE_NOISE FAKE_ADB_DEVICE_LOST FAKE_ADB_RETAIN_FIXTURE_DIR
   unset FAKE_ADB_DEVICE_ENUMERATION_STATE FAKE_ADB_SIGNAL_DURING_FORCE_STOP
   unset FAKE_ADB_STATUS_EVENT_COUNT_DRIFT FAKE_ADB_STATUS_NETWORK_DRIFT
@@ -3154,6 +3160,7 @@ run_start_tests() {
 
   reset_fake
   rm -f -- "$state"
+  export FAKE_ADB_REQUIRE_SHELL_PID_FD_PATHS=1
   run_helper start --state "$state" --mdev-owner OWNER_SECRET_123 \
     --package me.rerere.rikkahub.debug --conversation-id CONVERSATION_SECRET_123 \
     --run-hash "sha256:$(printf 'a%.0s' {1..64})" \
@@ -3259,7 +3266,7 @@ assert stream_words[-2].encode() == expected_path
 assert b"exec-in" not in stream[0]
 stream_script = next(value for value in stream[0] if b"voice-step-stage-owned-fixture" in value)
 assert b"voice-step-descriptor-owned-stage" in stream_script
-assert b"/proc/self/fd/3" in stream_script
+assert b"/proc/$$/fd/3" in stream_script
 assert b"mktemp" not in stream_script and b'cat > "$temporary"' not in stream_script
 assert expected_path in stage[0] and expected_path in trigger[0]
 assert b"fixture-1" in stage[0] and b"fixture-1" in trigger[0]
@@ -5075,7 +5082,7 @@ assert [value.encode() for value in broker_words[-5:]] == [
     str(state["package_uid"]).encode(),
 ]
 script = next(value for value in broker if b"voice-step-cleanup-broker" in value)
-assert b"/proc/self/fd/4" in script and b'stat -Lc %h /proc/self/fd/4' in script
+assert b"/proc/$$/fd/4" in script and b'stat -Lc %h /proc/$$/fd/4' in script
 assert b'rm -rf -- "$directory"' not in script
 PY
   python3 - "$FAKE_STATE" <<'PY' || fail "end-state test: cleanup/restoration proof was incomplete"
