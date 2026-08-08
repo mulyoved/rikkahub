@@ -869,10 +869,10 @@ run_pre_mutation_readiness_attempt() {
 import sys
 raw = open(sys.argv[1], "rb").read()
 records = {
-    b"mdev.android.error=owner_lock_timeout\\n": "71",
-    b"mdev.android.error=device_resolution_timeout\\n": "72",
-    b"mdev.android.error=adb_timeout\\n": "73",
-    b"mdev.android.error=state_commit_timeout\\n": "74",
+    b"mdev.android.error=owner_lock_timeout\n": "71",
+    b"mdev.android.error=device_resolution_timeout\n": "72",
+    b"mdev.android.error=adb_timeout\n": "73",
+    b"mdev.android.error=state_commit_timeout\n": "74",
 }
 sys.stdout.write(records.get(raw, ""))
 ' "$stderr_path" 2>/dev/null)"; then :; fi

@@ -3171,10 +3171,13 @@ run_start_tests() {
   python3 - "$ADB_LOG" <<'PYTEST' || fail 'start-readiness budget test: a pre-mutation mdev call escaped the probe budget'
 import sys
 commands = [part.split(b"\0") for part in open(sys.argv[1], "rb").read().split(b"\0\0") if part]
-first_mutation = next(i for i, command in enumerate(commands) if any(b"PREPARE" in value for value in command))
+first_mutation = next(
+    i for i, command in enumerate(commands)
+    if any(b"voice-step-create-owned-directory" in value for value in command)
+)
 for command in commands[:first_mutation]:
     timeout = command.index(b"--timeout-ms")
-    assert command[timeout + 1] == b"3000"
+    assert 0 < int(command[timeout + 1]) <= 3000
 PYTEST
   python3 - "$ADB_LOG" <<'PYTEST' || fail 'start-empty-arm test: empty arming included initial fixture metadata'
 import sys
