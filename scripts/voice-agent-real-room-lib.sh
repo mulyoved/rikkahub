@@ -24,16 +24,6 @@ run_mdev_adb() {
     --timeout-ms "${CURRENT_ADB_TIMEOUT_MS:-10000}" -- "$@"
 }
 
-classify_mdev_failure() {
-  case "$1" in
-    mdev.android.error=owner_lock_timeout) return 71 ;;
-    mdev.android.error=device_resolution_timeout) return 72 ;;
-    mdev.android.error=adb_timeout) return 73 ;;
-    mdev.android.error=state_commit_timeout) return 74 ;;
-    *) return 1 ;;
-  esac
-}
-
 adb_read() {
   run_mdev_adb "$@"
 }
