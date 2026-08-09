@@ -18,6 +18,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.jsonObject
 import me.rerere.rikkahub.data.model.Conversation
+import me.rerere.rikkahub.voiceagent.VoiceAgentAutomationBinding
 import me.rerere.rikkahub.voiceagent.VoiceConversationStore
 import me.rerere.rikkahub.voiceagent.VoiceE2EArtifact
 import me.rerere.rikkahub.voiceagent.VoiceE2EArtifactWriter
@@ -27,8 +28,18 @@ import me.rerere.rikkahub.voiceagent.VoiceAgentCleanupResult
 import me.rerere.rikkahub.voiceagent.VoiceAgentSessionCreationResult
 import me.rerere.rikkahub.voiceagent.VoiceAgentTransport
 import me.rerere.rikkahub.voiceagent.orchestratorRequest
+import me.rerere.rikkahub.voiceagent.automation.DefaultVoiceAutomationRuntime
+import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationRunBinding
+import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationRuntime
+import me.rerere.rikkahub.voiceagent.audio.VoiceCaptureFixture
+import me.rerere.rikkahub.voiceagent.audio.VoiceCaptureFixtureArming
+import me.rerere.rikkahub.voiceagent.hermesvoice.HermesVoiceHttpException
+import me.rerere.rikkahub.voiceagent.hermesvoice.VoiceFailure
+import me.rerere.rikkahub.voiceagent.hermesvoice.VoiceFailureKind
+import me.rerere.rikkahub.voiceagent.hermesvoice.VoiceFailureSource
 import me.rerere.rikkahub.voiceagent.telemetry.VoiceTraceContext
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -91,7 +102,7 @@ class LiveKitVoiceCallFactoryTest {
 
         val failure = result.await() as VoiceAgentSessionCreationResult.FailedClean
         assertTrue(failure.error is LiveKitExperimentalVoiceCallException)
-        assertTrue(failure.error.message.orEmpty().contains("timed out"))
+        assertTrue(failure.error.message.orEmpty().contains("livekit_dispatch_deadline_exceeded"))
         assertEquals(1, route.retirementCalls)
         assertEquals(0, roomFactoryCalls)
     }
@@ -108,6 +119,161 @@ class LiveKitVoiceCallFactoryTest {
         assertTrue(failure.error is LiveKitExperimentalVoiceCallException)
         assertCausalChainContains(failure.error, requestError)
         assertEquals(1, route.retirementCalls)
+    }
+
+    @Test
+    fun `typed Hermes startup failure records one bound automation failure without leaking secrets`() = runTest {
+        val root = Files.createTempDirectory("livekit-factory-automation-failure").toFile()
+        val route = OrchestratorFakeRoute()
+        val binding = automationBinding()
+        val runtime = DefaultVoiceAutomationRuntime(root).apply { prepare(binding) }
+        val requestError = HermesVoiceHttpException(
+            statusCode = 503,
+            safePreview = "preview secret",
+            failure = voiceFailure("livekit_dispatch_unavailable"),
+        )
+        try {
+            val factory = factory(
+                sessionDetailsFactory = { _, _ -> throw requestError },
+                automationRuntimeProvider = { runtime },
+                noBackupFilesDir = root,
+            )
+
+            val result = factory.createOwned(
+                request(binding = binding),
+                route.lease,
+                backgroundScope,
+            )
+
+            val failure = result as VoiceAgentSessionCreationResult.FailedClean
+            assertTrue(failure.error is LiveKitExperimentalVoiceCallException)
+            assertTrue(failure.error.message.orEmpty().contains("livekit_dispatch_unavailable"))
+            assertFalse(failure.error.message.orEmpty().contains("preview secret"))
+            assertEquals(1, route.retirementCalls)
+
+            val failureRows = runtime.finalizeRun().readLines().filter { "\"name\":\"failure\"" in it }
+            assertEquals(1, failureRows.size)
+            assertTrue("\"observedTransport\":\"livekit_experimental\"" in failureRows.single())
+            assertTrue("\"succeeded\":false" in failureRows.single())
+            assertFalse(failureRows.single().contains("livekit_dispatch_unavailable"))
+            assertFalse(failureRows.single().contains("preview secret"))
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `unallowlisted Hermes startup failure falls back to internal code while recording one failure event`() = runTest {
+        val root = Files.createTempDirectory("livekit-factory-automation-fallback").toFile()
+        val route = OrchestratorFakeRoute()
+        val binding = automationBinding()
+        val runtime = DefaultVoiceAutomationRuntime(root).apply { prepare(binding) }
+        val requestError = HermesVoiceHttpException(
+            statusCode = 500,
+            safePreview = "preview secret",
+            failure = voiceFailure("server-secret raw-body"),
+        )
+        try {
+            val factory = factory(
+                sessionDetailsFactory = { _, _ -> throw requestError },
+                automationRuntimeProvider = { runtime },
+                noBackupFilesDir = root,
+            )
+
+            val result = factory.createOwned(
+                request(binding = binding),
+                route.lease,
+                backgroundScope,
+            )
+
+            val failure = result as VoiceAgentSessionCreationResult.FailedClean
+            assertTrue(failure.error.message.orEmpty().contains("livekit_dispatch_internal"))
+            assertFalse(failure.error.message.orEmpty().contains("server-secret raw-body"))
+            assertFalse(failure.error.message.orEmpty().contains("preview secret"))
+
+            val failureRows = runtime.finalizeRun().readLines().filter { "\"name\":\"failure\"" in it }
+            assertEquals(1, failureRows.size)
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `startup failure records no automation event when the active binding comparison hash differs`() = runTest {
+        val root = Files.createTempDirectory("livekit-factory-automation-mismatch").toFile()
+        val route = OrchestratorFakeRoute()
+        val activeBinding = automationBinding()
+        val runtime = DefaultVoiceAutomationRuntime(root).apply {
+            prepare(activeBinding.copy(comparisonHash = "sha256:" + "c".repeat(64)))
+        }
+        try {
+            val factory = factory(
+                sessionDetailsFactory = {
+                    _, _ -> throw HermesVoiceHttpException(
+                        statusCode = 503,
+                        safePreview = "preview secret",
+                        failure = voiceFailure("livekit_dispatch_unavailable"),
+                    )
+                },
+                automationRuntimeProvider = { runtime },
+                noBackupFilesDir = root,
+            )
+
+            val result = factory.createOwned(
+                request(binding = activeBinding),
+                route.lease,
+                backgroundScope,
+            )
+
+            assertTrue(result is VoiceAgentSessionCreationResult.FailedClean)
+            assertEquals(0, runtime.finalizeRun().readLines().count { "\"name\":\"failure\"" in it })
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `session request timeout records failure with deadline code and closes the fixture source`() = runTest {
+        VoiceCaptureFixtureArming.clearForTest()
+        val root = Files.createTempDirectory("livekit-factory-timeout-automation").toFile()
+        val route = OrchestratorFakeRoute()
+        val binding = automationBinding()
+        val runtime = DefaultVoiceAutomationRuntime(root).apply { prepare(binding) }
+        val fixture = VoiceCaptureFixture("staged.pcm", byteArrayOf(1, 2), 2, 0)
+        val token = VoiceCaptureFixtureArming.arm(initial = fixture, staged = listOf(fixture.copy(path = "later.pcm")))
+        try {
+            val factory = factory(
+                sessionDetailsFactory = { _, _ -> CompletableDeferred<LiveKitSessionDetails>().await() },
+                automationRuntimeProvider = { runtime },
+                noBackupFilesDir = root,
+                timeoutMillis = 100,
+            )
+            val result = async {
+                factory.createOwned(
+                    request(binding = binding, captureFixtureToken = token),
+                    route.lease,
+                    backgroundScope,
+                )
+            }
+
+            advanceTimeBy(100)
+            runCurrent()
+
+            val failure = result.await() as VoiceAgentSessionCreationResult.FailedClean
+            assertTrue(failure.error is LiveKitExperimentalVoiceCallException)
+            assertTrue(failure.error.message.orEmpty().contains("livekit_dispatch_deadline_exceeded"))
+            assertEquals(1, route.retirementCalls)
+            assertEquals(
+                "Fixture capture owner is not active",
+                VoiceCaptureFixtureArming.trigger(token, "later.pcm").message,
+            )
+
+            val failureRows = runtime.finalizeRun().readLines().filter { "\"name\":\"failure\"" in it }
+            assertEquals(1, failureRows.size)
+        } finally {
+            VoiceCaptureFixtureArming.clearForTest()
+            root.deleteRecursively()
+        }
     }
 
     @Test
@@ -364,6 +530,7 @@ class LiveKitVoiceCallFactoryTest {
         },
         artifactWriterFactory: (File, VoiceTraceContext, CoroutineScope) -> VoiceE2EArtifactWriter =
             { _, _, _ -> VoiceE2EArtifactWriter.disabled() },
+        automationRuntimeProvider: () -> VoiceAutomationRuntime? = { null },
         noBackupFilesDir: File = File("build/tmp/livekit-factory-test"),
         timeoutMillis: Long = 1_000,
     ) = LiveKitVoiceCallFactory(
@@ -380,12 +547,23 @@ class LiveKitVoiceCallFactoryTest {
         roomFactory = roomFactory,
         conversationStoreFactory = conversationStoreFactory,
         artifactWriterFactory = artifactWriterFactory,
+        automationRuntimeProvider = automationRuntimeProvider,
         sessionCreationTimeoutMillis = timeoutMillis,
     )
 
-    private fun request() = orchestratorRequest("livekit-factory").copy(
+    private fun request(
+        binding: VoiceAutomationRunBinding? = null,
+        captureFixtureToken: String? = null,
+    ) = orchestratorRequest("livekit-factory").copy(
         conversationId = Uuid.parse(CONVERSATION_ID),
         transport = VoiceAgentTransport.LiveKitExperimental,
+        captureFixtureToken = captureFixtureToken,
+        automationBinding = binding?.let {
+            VoiceAgentAutomationBinding(
+                runHash = it.runHash,
+                comparisonHash = it.comparisonHash,
+            )
+        },
     )
 }
 
@@ -440,6 +618,12 @@ private fun factoryDetails(
 )
 
 private const val CONVERSATION_ID = "018f0000-0000-7000-8000-000000000001"
+private fun automationBinding() = VoiceAutomationRunBinding(
+    runHash = "sha256:" + "a".repeat(64),
+    comparisonHash = "sha256:" + "b".repeat(64),
+    requestedTransport = VoiceAgentTransport.LiveKitExperimental,
+)
+
 private val SESSION_BINDING = LiveKitSessionCorrelationBinding(
     ownerHash = hash('1'),
     conversationHash = "sha256:d604c61b95ebfb79347557e2b9bad92e0226bc9ef75850258cb18edb91885c4b",
@@ -456,6 +640,14 @@ private fun acceptedEventJson(): String =
             """{"version":1,"voiceSessionId":"lvs_1","eventId":"evt_accepted","kind":"job_accepted","observedAt":"2026-07-30T12:00:00Z","userTurnId":"turn_1","requestHash":"sha256:${"2".repeat(64)}","toolCallId":"call_1","argumentHash":"sha256:${"1".repeat(64)}","jobId":"hj_1","ownerHash":"${SESSION_BINDING.ownerHash}","conversationHash":"${SESSION_BINDING.conversationHash}","voiceSessionHash":"${SESSION_BINDING.voiceSessionHash}","roomHash":"${SESSION_BINDING.roomHash}","traceHash":"${SESSION_BINDING.traceHash}","prompt":"private question"}"""
         ).jsonObject,
     )
+
+private fun voiceFailure(safeSummary: String) = VoiceFailure(
+    kind = VoiceFailureKind.Internal,
+    safeMessage = safeSummary,
+    safeSummary = safeSummary,
+    retryable = false,
+    source = VoiceFailureSource.HermesVoice,
+)
 
 private fun assertCausalChainContains(error: Throwable, expected: Throwable) {
     assertTrue(generateSequence(error as Throwable?) { it.cause }.any { it === expected })

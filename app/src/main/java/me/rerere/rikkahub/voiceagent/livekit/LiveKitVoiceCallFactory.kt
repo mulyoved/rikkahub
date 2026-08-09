@@ -16,8 +16,13 @@ import me.rerere.rikkahub.voiceagent.VoiceConversationStore
 import me.rerere.rikkahub.voiceagent.VoiceE2EArtifactWriter
 import me.rerere.rikkahub.voiceagent.audio.VoiceCaptureFixtureArming
 import me.rerere.rikkahub.voiceagent.audio.VoiceCaptureSource
+import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationEventInput
+import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationEventName
+import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationRunBinding
+import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationRuntime
 import me.rerere.rikkahub.voiceagent.finishFailedOwnedVoiceSessionCreation
 import me.rerere.rikkahub.voiceagent.hermesvoice.HermesVoiceApi
+import me.rerere.rikkahub.voiceagent.hermesvoice.HermesVoiceHttpException
 import me.rerere.rikkahub.voiceagent.hermesvoice.HermesVoiceTraceHeaders
 import me.rerere.rikkahub.voiceagent.hermes.HermesQueueStore
 import me.rerere.rikkahub.voiceagent.hermes.HermesToolRecordWriter
@@ -28,6 +33,34 @@ import me.rerere.rikkahub.voiceagent.voiceAgentRouteCleanupOperation
 import me.rerere.rikkahub.voiceagent.createDefaultVoiceE2EArtifactWriter
 import java.io.File
 import kotlin.uuid.Uuid
+import org.koin.core.context.GlobalContext
+
+private const val LIVEKIT_DISPATCH_INTERNAL = "livekit_dispatch_internal"
+private const val LIVEKIT_DISPATCH_DEADLINE_EXCEEDED = "livekit_dispatch_deadline_exceeded"
+private val LIVEKIT_DISPATCH_FAILURE_CODES = setOf(
+    "livekit_dispatch_canceled",
+    LIVEKIT_DISPATCH_DEADLINE_EXCEEDED,
+    "livekit_dispatch_not_found",
+    "livekit_dispatch_permission_denied",
+    "livekit_dispatch_unauthenticated",
+    "livekit_dispatch_resource_exhausted",
+    "livekit_dispatch_failed_precondition",
+    LIVEKIT_DISPATCH_INTERNAL,
+    "livekit_dispatch_unavailable",
+    "livekit_dispatch_unknown",
+)
+
+internal fun liveKitStartupFailureCode(error: Throwable): String =
+    (error as? HermesVoiceHttpException)
+        ?.failure
+        ?.safeSummary
+        ?.takeIf(LIVEKIT_DISPATCH_FAILURE_CODES::contains)
+        ?: LIVEKIT_DISPATCH_INTERNAL
+
+private fun liveKitFactoryAutomationRuntimeOrNull(): VoiceAutomationRuntime? =
+    runCatching {
+        GlobalContext.get().get<VoiceAutomationRuntime>()
+    }.getOrNull()
 
 internal class LiveKitVoiceCallFactory internal constructor(
     private val context: Context,
@@ -55,6 +88,8 @@ internal class LiveKitVoiceCallFactory internal constructor(
     },
     private val artifactWriterFactory: (File, VoiceTraceContext, CoroutineScope) -> VoiceE2EArtifactWriter =
         ::createDefaultVoiceE2EArtifactWriter,
+    private val automationRuntimeProvider: () -> VoiceAutomationRuntime? =
+        ::liveKitFactoryAutomationRuntimeOrNull,
     private val sessionCreationTimeoutMillis: Long = DEFAULT_LIVEKIT_SESSION_CREATION_TIMEOUT_MS,
 ) : VoiceAgentCallFactory {
     constructor(
@@ -136,8 +171,9 @@ internal class LiveKitVoiceCallFactory internal constructor(
             resourcesTransferred = true
             VoiceAgentSessionCreationResult.Created(session)
         } catch (_: TimeoutCancellationException) {
+            val safeCode = LIVEKIT_DISPATCH_DEADLINE_EXCEEDED
             val creationError = LiveKitExperimentalVoiceCallException(
-                "LiveKit experimental voice session request timed out",
+                "LiveKit experimental voice session request failed ($safeCode)",
             )
             if (!resourcesTransferred) {
                 runCatching { captureSource?.close() }
@@ -147,6 +183,7 @@ internal class LiveKitVoiceCallFactory internal constructor(
                 runCatching { conversationStore?.close() }
                     .onFailure(creationError::addSuppressed)
             }
+            recordStartupFailure(request, safeCode)
             finishFailedOwnedVoiceSessionCreation(
                 creationError,
                 cleanup,
@@ -160,18 +197,39 @@ internal class LiveKitVoiceCallFactory internal constructor(
                 runCatching { conversationStore?.close() }
                     .onFailure(creationError::addSuppressed)
             }
+            val safeCode = liveKitStartupFailureCode(creationError)
+            recordStartupFailure(request, safeCode)
             finishFailedOwnedVoiceSessionCreation(
                 if (creationError is CancellationException) {
                     creationError
                 } else {
                     LiveKitExperimentalVoiceCallException(
-                        message = "LiveKit experimental voice session request failed",
+                        message = "LiveKit experimental voice session request failed ($safeCode)",
                         cause = creationError,
                     )
                 },
                 cleanup,
             )
         }
+    }
+
+    private fun recordStartupFailure(request: VoiceAgentCallRequest, safeCode: String) {
+        val requestBinding = request.automationBinding ?: return
+        val runtime = automationRuntimeProvider() ?: return
+        val runBinding = VoiceAutomationRunBinding(
+            runHash = requestBinding.runHash,
+            comparisonHash = requestBinding.comparisonHash,
+            requestedTransport = me.rerere.rikkahub.voiceagent.VoiceAgentTransport.LiveKitExperimental,
+        )
+        if (!runtime.activeBindingMatches(runBinding)) return
+        runtime.recordIfActiveRun(
+            requestBinding.runHash,
+            VoiceAutomationEventInput(
+                name = VoiceAutomationEventName.FAILURE,
+                observedTransport = me.rerere.rikkahub.voiceagent.VoiceAgentTransport.LiveKitExperimental,
+                succeeded = false,
+            ),
+        )
     }
 
     private companion object {
