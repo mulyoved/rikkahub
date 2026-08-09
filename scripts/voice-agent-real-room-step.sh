@@ -769,16 +769,30 @@ for row in rows:
         or row.get("requestedTransport") != transport
     ):
         raise SystemExit(2)
-matching = [row for row in rows if row.get("name") == "call_active"]
-if any(row.get("observedTransport") != transport for row in matching):
+active = [row for row in rows if row.get("name") == "call_active"]
+failures = [row for row in rows if row.get("name") == "failure"]
+if len(active) > 1 or len(failures) > 1 or (active and failures):
     raise SystemExit(2)
-raise SystemExit(0 if matching else 1)
+if active:
+    if active[0].get("observedTransport") != transport:
+        raise SystemExit(2)
+    raise SystemExit(0)
+if failures:
+    failure = failures[0]
+    if (
+        failure.get("observedTransport") != transport
+        or failure.get("succeeded") is not False
+    ):
+        raise SystemExit(2)
+    raise SystemExit(3)
+raise SystemExit(1)
 PY
       check_status=$?
       set -e
       case "$check_status" in
         0) return 0 ;;
         1) ;;
+        3) die 'call activation failed' ;;
         *) die 'ambiguous call readback' ;;
       esac
     fi

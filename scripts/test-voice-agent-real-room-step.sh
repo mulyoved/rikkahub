@@ -488,6 +488,7 @@ def automation_event(state, sequence, name, *, observed_transport=None, succeede
 
 def automation_events(state):
     rows = [automation_event(state, 1, "run_prepared")]
+    failure_mode = os.environ.get("FAKE_ADB_CALL_ACTIVATION_FAILURE")
     if state.get("call_active_recorded"):
         rows.append(
             automation_event(
@@ -497,6 +498,30 @@ def automation_events(state):
                 observed_transport=state["transport"],
             )
         )
+    if failure_mode:
+        failure = automation_event(
+            state,
+            2,
+            "failure",
+            observed_transport=state["transport"],
+            succeeded=False,
+        )
+        if failure_mode == "wrong-transport":
+            failure["observedTransport"] = "direct_gemini"
+        elif failure_mode == "succeeded-true":
+            failure["succeeded"] = True
+        rows.append(failure)
+        if failure_mode == "duplicate":
+            rows.append(dict(failure, monotonicMs=3, wallClockMs=1_800_000_000_003))
+        elif failure_mode == "contradictory":
+            rows.append(
+                automation_event(
+                    state,
+                    3,
+                    "call_active",
+                    observed_transport=state["transport"],
+                )
+            )
     stop_visible_after = int(os.environ.get("FAKE_ADB_DURABLE_STOP_VISIBLE_AFTER", "0"))
     stop_visible = state.get("automation_artifact_reads", 0) >= stop_visible_after
     if state.get("call_stopped_recorded") and stop_visible:
@@ -1306,8 +1331,12 @@ if command[:5] == [
     if action.endswith(".START"):
         if os.environ.get("FAKE_ADB_FAIL_START") == "1":
             raise SystemExit(1)
-        state["call_active"] = os.environ.get("FAKE_ADB_CALL_ACTIVE_TIMEOUT") != "1"
-        state["call_active_recorded"] = state["call_active"]
+        failure_mode = os.environ.get("FAKE_ADB_CALL_ACTIVATION_FAILURE")
+        state["call_active"] = (
+            os.environ.get("FAKE_ADB_CALL_ACTIVE_TIMEOUT") != "1"
+            and not failure_mode
+        )
+        state["call_active_recorded"] = state["call_active"] and not failure_mode
         state["trace_id"] = "trace-new"
         state["conversation_id"] = values.get("conversationId", state["conversation_id"])
     elif action.endswith(".END_BOUND"):
@@ -1778,6 +1807,7 @@ payload = {
     "trace_id": "trace-old",
     "call_active": False,
     "call_active_recorded": False,
+    "automation_artifact_reads": 0,
     "call_stopped_recorded": False,
     "run_finalized_recorded": False,
     "event_count": 17,
@@ -1818,7 +1848,7 @@ PY
   unset FAKE_MDEV_PRE_MUTATION_FAILURE FAKE_MDEV_PRE_MUTATION_ALWAYS
   unset FAKE_MDEV_FAILURE_FRAMING FAKE_ADB_PM_PATH_MODE
   unset FAKE_ADB_PREPARE_REJECT FAKE_ADB_ARM_REJECT FAKE_ADB_FAIL_START
-  unset FAKE_ADB_CALL_ACTIVE_TIMEOUT
+  unset FAKE_ADB_CALL_ACTIVE_TIMEOUT FAKE_ADB_CALL_ACTIVATION_FAILURE
   unset FAKE_ADB_REQUIRE_SHELL_PID_FD_PATHS
   unset FAKE_ADB_PRIVATE_NOISE FAKE_ADB_DEVICE_LOST FAKE_ADB_RETAIN_FIXTURE_DIR
   unset FAKE_ADB_DEVICE_ENUMERATION_STATE FAKE_ADB_SIGNAL_DURING_FORCE_STOP
@@ -3242,6 +3272,58 @@ PYTEST
     [[ "$(command_count PREPARE)" == 1 && "$(exact_argument_count me.rerere.rikkahub.voiceagent.action.START)" -le 1 &&
        "$(command_count STAGE_CAPTURE_FIXTURE)" == 0 && "$(command_count TRIGGER_CAPTURE_FIXTURE)" == 0 ]] ||
       fail "start-no-retry test: $failure failure retried or delivered fixture data"
+    assert_private_output_absent
+    pass
+  done
+
+  reset_fake
+  rm -f -- "$state"
+  export FAKE_ADB_CALL_ACTIVATION_FAILURE=valid
+  run_helper start --state "$state" --mdev-owner OWNER_SECRET_123 \
+    --package me.rerere.rikkahub.debug --conversation-id CONVERSATION_SECRET_123 \
+    --run-hash "sha256:$(printf 'a%.0s' {1..64})" \
+    --comparison-hash "sha256:$(printf 'b%.0s' {1..64})"
+  [[ "$RUN_STATUS" -ne 0 && ! -s "$STDOUT_FILE" ]] ||
+    fail 'start-failure-event test: terminal failure succeeded or wrote stdout'
+  [[ "$(<"$STDERR_FILE")" == 'voice-step.error=call activation failed' ]] ||
+    fail 'start-failure-event test: diagnostic was not exact'
+  [[ ! -e "$state" ]] || fail 'start-failure-event test: failed start published state'
+  [[ "$(command_count PREPARE)" == 1 &&
+     "$(exact_argument_count me.rerere.rikkahub.voiceagent.action.START)" -le 1 &&
+     "$(command_count STAGE_CAPTURE_FIXTURE)" == 0 &&
+     "$(command_count TRIGGER_CAPTURE_FIXTURE)" == 0 ]] ||
+    fail 'start-failure-event test: failure retried or delivered fixture data'
+  python3 - "$ADB_LOG" <<'PY' || fail 'start-failure-event test: valid failure exhausted the poll budget'
+import sys
+data = open(sys.argv[1], "rb").read()
+commands = [chunk.split(b"\0") for chunk in data.split(b"\0\0") if chunk]
+artifact_reads = [
+    command for command in commands
+    if b"exec-out" in command and b"cat" in command and
+    any(value.endswith(b"automation-events.jsonl") for value in command)
+]
+assert len(artifact_reads) <= 2
+PY
+  assert_private_output_absent
+  pass
+
+  for failure in duplicate contradictory wrong-transport succeeded-true; do
+    reset_fake
+    rm -f -- "$state"
+    export FAKE_ADB_CALL_ACTIVATION_FAILURE="$failure"
+    run_helper start --state "$state" --mdev-owner OWNER_SECRET_123 \
+      --package me.rerere.rikkahub.debug --conversation-id CONVERSATION_SECRET_123 \
+      --run-hash "sha256:$(printf 'a%.0s' {1..64})" \
+      --comparison-hash "sha256:$(printf 'b%.0s' {1..64})"
+    [[ "$RUN_STATUS" -ne 0 && ! -s "$STDOUT_FILE" ]] ||
+      fail "start-failure-mutation test: $failure succeeded or wrote stdout"
+    [[ "$(<"$STDERR_FILE")" == 'voice-step.error=ambiguous call readback' ]] ||
+      fail "start-failure-mutation test: $failure diagnostic was not exact"
+    [[ ! -e "$state" ]] || fail "start-failure-mutation test: $failure published state"
+    [[ "$(exact_argument_count me.rerere.rikkahub.voiceagent.action.START)" -le 1 &&
+       "$(command_count STAGE_CAPTURE_FIXTURE)" == 0 &&
+       "$(command_count TRIGGER_CAPTURE_FIXTURE)" == 0 ]] ||
+      fail "start-failure-mutation test: $failure retried or delivered fixture data"
     assert_private_output_absent
     pass
   done
