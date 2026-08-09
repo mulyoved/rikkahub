@@ -750,25 +750,29 @@ wait_for_call_active() {
     if adb_read exec-out run-as "$PACKAGE" --user "$ANDROID_USER_ID" cat "$events_path" \
       >"$events_file" 2>/dev/null; then
       set +e
-      python3 - "$events_file" "$RUN_HASH" "$COMPARISON_HASH" "$TRANSPORT_EXPECTED" 2>/dev/null <<'PY'
-import json
+      python3 - "$events_file" "$RUN_HASH" "$COMPARISON_HASH" "$TRANSPORT_EXPECTED" \
+        "$REAL_ROOM_CONTRACT" 2>/dev/null <<'PY'
+import importlib.util
 import sys
 
-path, run_hash, comparison_hash, transport = sys.argv[1:]
+path, run_hash, comparison_hash, transport, contract_path = sys.argv[1:]
+module_name = "_voice_agent_real_room_contract"
 try:
-    with open(path, encoding="utf-8") as handle:
-        rows = [json.loads(line) for line in handle if line.strip()]
-except (OSError, ValueError):
+    spec = importlib.util.spec_from_file_location(module_name, contract_path)
+    if spec is None or spec.loader is None:
+        raise OSError
+    contract = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = contract
+    spec.loader.exec_module(contract)
+    with open(path, "rb") as handle:
+        rows = contract.parse_automation_bytes(
+            handle.read(),
+            run_hash,
+            comparison_hash,
+            transport,
+        )
+except Exception:
     raise SystemExit(2)
-if not rows or any(type(row) is not dict for row in rows):
-    raise SystemExit(2)
-for row in rows:
-    if (
-        row.get("runHash") != run_hash
-        or row.get("comparisonHash") != comparison_hash
-        or row.get("requestedTransport") != transport
-    ):
-        raise SystemExit(2)
 active = [row for row in rows if row.get("name") == "call_active"]
 failures = [row for row in rows if row.get("name") == "failure"]
 if len(active) > 1 or len(failures) > 1 or (active and failures):

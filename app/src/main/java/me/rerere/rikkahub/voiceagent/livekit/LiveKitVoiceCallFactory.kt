@@ -123,11 +123,9 @@ internal class LiveKitVoiceCallFactory internal constructor(
                         message = "Capture fixture token is not armed",
                         cause = cause,
                     )
-                }
-            val trace = traceContextFactory()
-            val details = withTimeout(sessionCreationTimeoutMillis) {
-                sessionDetailsFactory(request, trace)
             }
+            val trace = traceContextFactory()
+            val details = requestSessionDetails(request, trace)
             val trustedBinding = details.requireTrustedCorrelationBinding(
                 conversationId = request.conversationId.toString(),
                 traceId = trace.traceId,
@@ -198,7 +196,8 @@ internal class LiveKitVoiceCallFactory internal constructor(
                 runCatching { conversationStore?.close() }
                     .onFailure(creationError::addSuppressed)
             }
-            val safeCode = liveKitStartupFailureCode(creationError)
+            val safeCode = (creationError as? LiveKitSessionRequestException)?.safeCode
+                ?: liveKitStartupFailureCode(creationError)
             val returnedError = startupFailureResult(
                 creationError = creationError,
                 safeCode = safeCode,
@@ -216,12 +215,27 @@ internal class LiveKitVoiceCallFactory internal constructor(
         }
     }
 
+    private suspend fun requestSessionDetails(
+        request: VoiceAgentCallRequest,
+        trace: VoiceTraceContext,
+    ): LiveKitSessionDetails = try {
+        withTimeout(sessionCreationTimeoutMillis) {
+            sessionDetailsFactory(request, trace)
+        }
+    } catch (cancellation: CancellationException) {
+        throw cancellation
+    } catch (requestError: Throwable) {
+        throw LiveKitSessionRequestException(liveKitStartupFailureCode(requestError))
+    }
+
     private fun startupFailureResult(
         creationError: Throwable,
         safeCode: String,
     ): LiveKitExperimentalVoiceCallException = LiveKitExperimentalVoiceCallException(
         message = "LiveKit experimental voice session request failed ($safeCode)",
-        cause = creationError.takeUnless { it is HermesVoiceHttpException },
+        cause = creationError.takeUnless {
+            it is HermesVoiceHttpException || it is LiveKitSessionRequestException
+        },
     )
 
     private fun recordStartupFailure(request: VoiceAgentCallRequest) {
@@ -247,6 +261,10 @@ internal class LiveKitVoiceCallFactory internal constructor(
         const val DEFAULT_LIVEKIT_SESSION_CREATION_TIMEOUT_MS = 15_000L
     }
 }
+
+private class LiveKitSessionRequestException(
+    val safeCode: String,
+) : IllegalStateException(safeCode)
 
 private class LiveKitPersistenceResources(
     private val bridge: LiveKitPersistenceOwner,

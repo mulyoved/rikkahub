@@ -108,16 +108,29 @@ class LiveKitVoiceCallFactoryTest {
     }
 
     @Test
-    fun `session request error is wrapped and retires the exact route`() = runTest {
+    fun `malformed session response becomes a cause-free redacted internal failure`() = runTest {
         val route = OrchestratorFakeRoute()
-        val requestError = IllegalStateException("request failed")
+        val roomIdentifier = "rikka-private-room-identifier"
+        val dispatchIdentifier = "AD_private_dispatch_identifier"
+        val bodyMarker = "malformed-response-body-marker"
+        val requestError = IllegalStateException(
+            "decode failed roomName=$roomIdentifier dispatchId=$dispatchIdentifier",
+            IllegalArgumentException("response body contained $bodyMarker"),
+        ).apply {
+            addSuppressed(IllegalStateException("suppressed $bodyMarker"))
+        }
         val factory = factory(sessionDetailsFactory = { _, _ -> throw requestError })
 
         val result = factory.createOwned(request(), route.lease, backgroundScope)
 
         val failure = result as VoiceAgentSessionCreationResult.FailedClean
         assertTrue(failure.error is LiveKitExperimentalVoiceCallException)
-        assertCausalChainContains(failure.error, requestError)
+        assertTrue(failure.error.message.orEmpty().contains("livekit_dispatch_internal"))
+        assertEquals(listOf(failure.error), throwableGraph(failure.error))
+        val renderedGraph = renderThrowableGraph(failure.error)
+        listOf(roomIdentifier, dispatchIdentifier, bodyMarker).forEach { injectedValue ->
+            assertFalse(renderedGraph.contains(injectedValue))
+        }
         assertEquals(1, route.retirementCalls)
     }
 
@@ -366,14 +379,17 @@ class LiveKitVoiceCallFactoryTest {
         val retirementError = IllegalArgumentException("route retirement failed")
         var currentRetirementError: Throwable? = retirementError
         val route = OrchestratorFakeRoute { currentRetirementError?.let { throw it } }
-        val requestError = IllegalStateException("request failed")
-        val factory = factory(sessionDetailsFactory = { _, _ -> throw requestError })
+        val constructionError = IllegalStateException("room construction failed")
+        val factory = factory(
+            sessionDetailsFactory = { _, _ -> factoryDetails() },
+            roomFactory = { throw constructionError },
+        )
 
         val result = factory.createOwned(request(), route.lease, backgroundScope)
 
         val failure = result as VoiceAgentSessionCreationResult.FailedDirty
         assertTrue(failure.error is LiveKitExperimentalVoiceCallException)
-        assertCausalChainContains(failure.error, requestError)
+        assertCausalChainContains(failure.error, constructionError)
         assertEquals(listOf(retirementError), failure.error.suppressed.toList())
         assertEquals(1, route.retirementCalls)
 
@@ -725,6 +741,24 @@ private fun renderThrowableChain(error: Throwable): String =
         .joinToString(" <- ") { throwable ->
             "${throwable::class.qualifiedName}:${throwable.message}"
         }
+
+private fun throwableGraph(error: Throwable): List<Throwable> {
+    val graph = mutableListOf<Throwable>()
+    val pending = ArrayDeque<Throwable>().apply { add(error) }
+    while (pending.isNotEmpty()) {
+        val current = pending.removeFirst()
+        if (graph.any { it === current }) continue
+        graph += current
+        current.cause?.let(pending::addLast)
+        current.suppressed.forEach(pending::addLast)
+    }
+    return graph
+}
+
+private fun renderThrowableGraph(error: Throwable): String =
+    throwableGraph(error).joinToString(" <- ") { throwable ->
+        "${throwable::class.qualifiedName}:${throwable.message}"
+    }
 
 private fun assertCausalChainContains(error: Throwable, expected: Throwable) {
     assertTrue(generateSequence(error as Throwable?) { it.cause }.any { it === expected })

@@ -510,6 +510,21 @@ def automation_events(state):
             failure["observedTransport"] = "direct_gemini"
         elif failure_mode == "succeeded-true":
             failure["succeeded"] = True
+        elif failure_mode == "invalid-schema-version":
+            failure["schemaVersion"] = 2
+        elif failure_mode == "invalid-timestamp":
+            failure["wallClockMs"] = 0
+        elif failure_mode == "nonmonotonic-timestamp":
+            failure["monotonicMs"] = 1
+        elif failure_mode == "missing-key":
+            del failure["route"]
+        elif failure_mode == "extra-key":
+            failure["unexpected"] = "value"
+        elif failure_mode == "reordered-keys":
+            failure = {
+                "name": failure["name"],
+                **{key: value for key, value in failure.items() if key != "name"},
+            }
         rows.append(failure)
         if failure_mode == "duplicate":
             rows.append(dict(failure, monotonicMs=3, wallClockMs=1_800_000_000_003))
@@ -551,7 +566,14 @@ def automation_events(state):
     elif malformed == "noncanonical-keys" and rows:
         last = rows[-1]
         rows[-1] = {"name": last["name"], **{key: value for key, value in last.items() if key != "name"}}
-    return "".join(json.dumps(row, separators=(",", ":")) + "\n" for row in rows)
+    return "".join(
+        (
+            json.dumps(row)
+            if failure_mode == "noncanonical-json" and row["name"] == "failure"
+            else json.dumps(row, separators=(",", ":"))
+        ) + "\n"
+        for row in rows
+    )
 
 
 def artifact_content(path, state):
@@ -3307,7 +3329,19 @@ PY
   assert_private_output_absent
   pass
 
-  for failure in duplicate contradictory wrong-transport succeeded-true; do
+  for failure in \
+    duplicate \
+    contradictory \
+    wrong-transport \
+    succeeded-true \
+    invalid-schema-version \
+    invalid-timestamp \
+    nonmonotonic-timestamp \
+    missing-key \
+    extra-key \
+    reordered-keys \
+    noncanonical-json
+  do
     reset_fake
     rm -f -- "$state"
     export FAKE_ADB_CALL_ACTIVATION_FAILURE="$failure"
@@ -3320,7 +3354,8 @@ PY
     [[ "$(<"$STDERR_FILE")" == 'voice-step.error=ambiguous call readback' ]] ||
       fail "start-failure-mutation test: $failure diagnostic was not exact"
     [[ ! -e "$state" ]] || fail "start-failure-mutation test: $failure published state"
-    [[ "$(exact_argument_count me.rerere.rikkahub.voiceagent.action.START)" -le 1 &&
+    [[ "$(command_count PREPARE)" == 1 &&
+       "$(exact_argument_count me.rerere.rikkahub.voiceagent.action.START)" -le 1 &&
        "$(command_count STAGE_CAPTURE_FIXTURE)" == 0 &&
        "$(command_count TRIGGER_CAPTURE_FIXTURE)" == 0 ]] ||
       fail "start-failure-mutation test: $failure retried or delivered fixture data"
