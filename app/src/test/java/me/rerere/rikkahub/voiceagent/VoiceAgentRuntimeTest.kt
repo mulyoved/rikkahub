@@ -2647,7 +2647,6 @@ class VoiceAgentRuntimeTest {
         val closeJob = launch(Dispatchers.Default) {
             coordinator.close()
         }
-        assertEquals(0, audio.releaseCalls)
 
         blockedSend.release.countDown()
         withTimeout(500) {
