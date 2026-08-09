@@ -183,7 +183,8 @@ internal class LiveKitVoiceCallFactory internal constructor(
                 runCatching { conversationStore?.close() }
                     .onFailure(creationError::addSuppressed)
             }
-            recordStartupFailure(request, safeCode)
+            runCatching { recordStartupFailure(request) }
+                .onFailure(creationError::addSuppressed)
             finishFailedOwnedVoiceSessionCreation(
                 creationError,
                 cleanup,
@@ -198,22 +199,32 @@ internal class LiveKitVoiceCallFactory internal constructor(
                     .onFailure(creationError::addSuppressed)
             }
             val safeCode = liveKitStartupFailureCode(creationError)
-            recordStartupFailure(request, safeCode)
+            val returnedError = startupFailureResult(
+                creationError = creationError,
+                safeCode = safeCode,
+            )
+            runCatching { recordStartupFailure(request) }
+                .onFailure(returnedError::addSuppressed)
             finishFailedOwnedVoiceSessionCreation(
                 if (creationError is CancellationException) {
                     creationError
                 } else {
-                    LiveKitExperimentalVoiceCallException(
-                        message = "LiveKit experimental voice session request failed ($safeCode)",
-                        cause = creationError,
-                    )
+                    returnedError
                 },
                 cleanup,
             )
         }
     }
 
-    private fun recordStartupFailure(request: VoiceAgentCallRequest, safeCode: String) {
+    private fun startupFailureResult(
+        creationError: Throwable,
+        safeCode: String,
+    ): LiveKitExperimentalVoiceCallException = LiveKitExperimentalVoiceCallException(
+        message = "LiveKit experimental voice session request failed ($safeCode)",
+        cause = creationError.takeUnless { it is HermesVoiceHttpException },
+    )
+
+    private fun recordStartupFailure(request: VoiceAgentCallRequest) {
         val requestBinding = request.automationBinding ?: return
         val runtime = automationRuntimeProvider() ?: return
         val runBinding = VoiceAutomationRunBinding(

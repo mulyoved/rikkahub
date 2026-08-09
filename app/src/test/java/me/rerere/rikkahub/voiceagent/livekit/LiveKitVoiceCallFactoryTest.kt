@@ -163,6 +163,50 @@ class LiveKitVoiceCallFactoryTest {
     }
 
     @Test
+    fun `automation recording failure stays best effort so startup cleanup and fixture close still occur`() = runTest {
+        VoiceCaptureFixtureArming.clearForTest()
+        val route = OrchestratorFakeRoute()
+        val binding = automationBinding()
+        val fixture = VoiceCaptureFixture("staged.pcm", byteArrayOf(1, 2), 2, 0)
+        val token = VoiceCaptureFixtureArming.arm(
+            initial = fixture,
+            staged = listOf(fixture.copy(path = "later.pcm")),
+        )
+        try {
+            val factory = factory(
+                sessionDetailsFactory = {
+                    _, _ -> throw HermesVoiceHttpException(
+                        statusCode = 503,
+                        safePreview = "preview secret raw-body",
+                        failure = voiceFailure("livekit_dispatch_unavailable"),
+                    )
+                },
+                automationRuntimeProvider = {
+                    error("automation provider failure")
+                },
+            )
+
+            val result = factory.createOwned(
+                request(binding = binding, captureFixtureToken = token),
+                route.lease,
+                backgroundScope,
+            )
+
+            val failure = result as VoiceAgentSessionCreationResult.FailedClean
+            assertTrue(failure.error is LiveKitExperimentalVoiceCallException)
+            assertTrue(failure.error.message.orEmpty().contains("livekit_dispatch_unavailable"))
+            assertFalse(failure.error.message.orEmpty().contains("automation provider failure"))
+            assertEquals(1, route.retirementCalls)
+            assertEquals(
+                "Fixture capture owner is not active",
+                VoiceCaptureFixtureArming.trigger(token, "later.pcm").message,
+            )
+        } finally {
+            VoiceCaptureFixtureArming.clearForTest()
+        }
+    }
+
+    @Test
     fun `unallowlisted Hermes startup failure falls back to internal code while recording one failure event`() = runTest {
         val root = Files.createTempDirectory("livekit-factory-automation-fallback").toFile()
         val route = OrchestratorFakeRoute()
@@ -196,6 +240,33 @@ class LiveKitVoiceCallFactoryTest {
         } finally {
             root.deleteRecursively()
         }
+    }
+
+    @Test
+    fun `typed Hermes startup failure does not retain safe preview in the returned cause chain`() = runTest {
+        val route = OrchestratorFakeRoute()
+        val requestError = HermesVoiceHttpException(
+            statusCode = 503,
+            safePreview = "preview secret raw-body",
+            failure = voiceFailure("livekit_dispatch_unavailable"),
+        )
+        val factory = factory(
+            sessionDetailsFactory = { _, _ -> throw requestError },
+        )
+
+        val result = factory.createOwned(
+            request(),
+            route.lease,
+            backgroundScope,
+        )
+
+        val failure = result as VoiceAgentSessionCreationResult.FailedClean
+        val renderedChain = renderThrowableChain(failure.error)
+        assertTrue(failure.error.message.orEmpty().contains("livekit_dispatch_unavailable"))
+        assertFalse(renderedChain.contains("preview secret raw-body"))
+        assertFalse(renderedChain.contains("Hermes Voice request failed 503"))
+        assertFalse(generateSequence(failure.error as Throwable?) { it.cause }.any { it is HermesVoiceHttpException })
+        assertEquals(1, route.retirementCalls)
     }
 
     @Test
@@ -648,6 +719,12 @@ private fun voiceFailure(safeSummary: String) = VoiceFailure(
     retryable = false,
     source = VoiceFailureSource.HermesVoice,
 )
+
+private fun renderThrowableChain(error: Throwable): String =
+    generateSequence(error as Throwable?) { it.cause }
+        .joinToString(" <- ") { throwable ->
+            "${throwable::class.qualifiedName}:${throwable.message}"
+        }
 
 private fun assertCausalChainContains(error: Throwable, expected: Throwable) {
     assertTrue(generateSequence(error as Throwable?) { it.cause }.any { it === expected })
