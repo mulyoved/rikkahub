@@ -949,6 +949,14 @@ run_pre_mutation_readiness() {
     attempt_status=$?
     fi
     if [[ "$recover" != true || ! "$attempt_status" =~ ^7[1-4]$ ]]; then
+      # An attempt that runs out of the shared deadline mid-probe reports
+      # whatever its last read failed on, which is not the real cause and is
+      # not retryable. When recovery is enabled the deadline is authoritative,
+      # so classify exhaustion before trusting the attempt's own message.
+      if [[ "$recover" == true ]]; then
+        remaining_ms=$(( READINESS_DEADLINE_MS - $(readiness_now_ms) ))
+        (( remaining_ms > 0 )) || die 'readiness timed out'
+      fi
       [[ -s "$message_path" ]] && die "$(<"$message_path")"
       die 'readiness failed'
     fi
