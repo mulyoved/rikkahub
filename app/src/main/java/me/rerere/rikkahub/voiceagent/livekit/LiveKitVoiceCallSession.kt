@@ -361,7 +361,7 @@ internal class LiveKitVoiceCallSession(
                 failExperimental("LiveKit experimental voice call disconnected")
             }
             is LiveKitRoomEvent.ParticipantDisconnected -> {
-                if (event.participantIdentity == details.agentParticipantIdentity) {
+                if (event.participantIdentity == details.agentParticipantIdentity && reconnectingStartNanos == null) {
                     reconnectWatchdogJob?.cancel()
                     failExperimental(
                         message = "LiveKit worker participant disconnected",

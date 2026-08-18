@@ -266,6 +266,35 @@ class LiveKitVoiceCallSessionTest {
     }
 
     @Test
+    fun `worker participant departure during transport reconnect defers to reconnect outcome`() = runTest {
+        val automationRuntime = SessionRecordingAutomationRuntime()
+        val fixture = fixture(automationRuntime = automationRuntime)
+        fixture.session.start()
+        runCurrent()
+        fixture.room.emit(LiveKitRoomEvent.Data(AGENT_IDENTITY, READY_TOPIC, readyJson()))
+        runCurrent()
+
+        fixture.room.emit(LiveKitRoomEvent.Reconnecting)
+        fixture.room.emit(LiveKitRoomEvent.ParticipantDisconnected(AGENT_IDENTITY))
+        runCurrent()
+
+        assertEquals(VoiceSessionStatus.Reconnecting, fixture.session.state.value.session)
+        assertTrue("Route lease must remain active during reconnect", fixture.session.isRouteUsable)
+        assertFalse(
+            automationRuntime.events.any {
+                it.name == VoiceAutomationEventName.FAILURE &&
+                    it.failureCategory == "WORKER_UNAVAILABLE"
+            },
+        )
+
+        fixture.room.emit(LiveKitRoomEvent.Reconnected)
+        runCurrent()
+        assertEquals(VoiceSessionStatus.Connected, fixture.session.state.value.session)
+
+        fixture.session.cleanupOperation.run(VoiceAgentCleanupMode.Immediate)
+    }
+
+    @Test
     fun `autonomous failure cleanup does not block the session Main dispatcher`() = runTest {
         val mainDispatcher = Executors.newSingleThreadExecutor().asCoroutineDispatcher()
         val cleanupDispatcher = Executors.newSingleThreadExecutor().asCoroutineDispatcher()
