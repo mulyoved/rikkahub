@@ -152,11 +152,32 @@ internal class VoiceAgentCallServiceLifecycle(
 
     fun endCallIfMatches(expected: VoiceAgentBoundCallIdentity): Boolean {
         if (endJobTracker.job?.isActive == true) return false
-        val admission = controller.endIfMatches(expected) ?: return false
+        val admission = controller.endIfMatches(expected)
+        if (admission == null) {
+            stopRejectedBoundEndIfIdle(expected)
+            return false
+        }
         return launchEnd(
             endingIdentity = ActiveVoiceAgentIdentity(expected.conversationId, expected.transport),
             admittedResult = admission.result,
         )
+    }
+
+    private fun stopRejectedBoundEndIfIdle(expected: VoiceAgentBoundCallIdentity) {
+        if (hasHostedCall()) return
+        runCatching {
+            runVoiceAgentCleanupStages(
+                {
+                    host.startForeground(
+                        expected.conversationId.toString(),
+                        expected.transport,
+                        controller.state.value.copy(call = VoiceCallStatus.Ending),
+                    )
+                },
+                host::stopForeground,
+                host::stopSelf,
+            )
+        }.exceptionOrNull()?.let(::reportFailureSafely)
     }
 
     private fun launchEnd(

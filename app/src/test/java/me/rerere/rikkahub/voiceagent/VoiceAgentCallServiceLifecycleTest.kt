@@ -668,6 +668,34 @@ class VoiceAgentCallServiceLifecycleTest {
     }
 
     @Test
+    fun `rejected bound end foregrounds and stops a newly created idle service`() = runTest {
+        val expected = VoiceAgentBoundCallIdentity(
+            Uuid.random(),
+            VoiceAgentTransport.LiveKitExperimental,
+            VoiceAgentAutomationBinding(RUN_HASH_A, COMPARISON_HASH_A),
+        )
+        val controller = RecordingServiceController()
+        val host = RecordingLifecycleHost()
+        val scope = CoroutineScope(coroutineContext + SupervisorJob())
+        val lifecycle = VoiceAgentCallServiceLifecycle(controller, scope, host)
+        try {
+            assertFalse(lifecycle.endCallIfMatches(expected))
+
+            assertEquals(listOf(expected), controller.boundEndIdentities)
+            assertEquals(
+                listOf("startForeground", "stopForeground", "stopSelf"),
+                host.events,
+            )
+            assertEquals(listOf(expected.conversationId.toString()), host.foregroundConversationIds)
+            assertEquals(listOf(expected.transport), host.foregroundTransports)
+            assertTrue(host.foregroundStates.single().call is VoiceCallStatus.Ending)
+            assertEquals(0, controller.endCalls)
+        } finally {
+            scope.cancel()
+        }
+    }
+
+    @Test
     fun `end failure reports exact error then stops matching generation`() = runTest {
         val failure = IllegalStateException("cleanup token=secret")
         val controller = RecordingServiceController(
