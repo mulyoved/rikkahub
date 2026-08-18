@@ -1310,6 +1310,8 @@ else
   printf absent
 fi
 ' "$LATEST_TRACE_PATH" </dev/null 2>/dev/null)" || die 'trace readback failed'
+  probe="${probe//$'\r'/}"
+  probe="${probe//$'\n'/}"
   case "$probe" in
     absent)
       TRACE_POINTER_PRESENT=0
@@ -1696,6 +1698,8 @@ read_package_stopped_state() {
   fi
   row="$(adb_read shell cmd package list packages --user "$ANDROID_USER_ID" \
     -U --show-stopped "$PACKAGE" 2>/dev/null)" || return 2
+  row="${row//$'\r'/}"
+  row="${row//$'\n'/}"
   if [[ "$row" == "package:$PACKAGE stopped=$expected uid:$PACKAGE_UID" ]]; then
     return 0
   fi

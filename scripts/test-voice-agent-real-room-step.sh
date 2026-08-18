@@ -833,7 +833,14 @@ if command == [
         print(f"package:{EXPECTED_PACKAGE} uid:{state['package_uid']}")
     else:
         stopped = "true" if state.get("package_stopped") else "false"
-        print(f"package:{EXPECTED_PACKAGE} stopped={stopped} uid:{state['package_uid']}")
+        ending = "\r\n" if (
+            os.environ.get("FAKE_ADB_STOPPED_ROW_CRLF") == "1"
+            and state.get("force_stop_observed")
+        ) else "\n"
+        print(
+            f"package:{EXPECTED_PACKAGE} stopped={stopped} uid:{state['package_uid']}",
+            end=ending,
+        )
     raise SystemExit(0)
 if command == [
     "shell", "cmd", "package", "list", "packages", "--user",
@@ -949,7 +956,8 @@ if run_as_tail is not None:
             print("ready")
             raise SystemExit(0)
         if "voice-step-trace-probe" in script:
-            print("present")
+            ending = "\r\n" if os.environ.get("FAKE_ADB_TRACE_PROBE_CRLF") == "1" else "\n"
+            print("present", end=ending)
             raise SystemExit(0)
         if "voice-step-create-owned-directory" in script:
             remote_dir, ownership = tail[-2:]
@@ -1878,6 +1886,7 @@ PY
   unset FAKE_ADB_INCLUDE_SPEC_A_FAILURE FAKE_ADB_AUTOMATION_PROGRESS
   unset FAKE_ADB_PREOPEN_REPLACE_CAPTURE_SOURCE
   unset FAKE_ADB_EXIT_MATCH FAKE_ADB_EXIT_STATUS
+  unset FAKE_ADB_TRACE_PROBE_CRLF FAKE_ADB_STOPPED_ROW_CRLF
   unset FAKE_ADB_START_DOES_NOT_ACTIVATE FAKE_ADB_START_RETAINS_TRACE
   unset FAKE_ADB_CALL_ACTIVE_VISIBLE_AFTER
   unset FAKE_ADB_CHMOD_MATCH FAKE_ADB_CHMOD_PATH
@@ -3833,6 +3842,16 @@ assert b'newline=$(printf "\\nx") || exit 1' in stage_script
 assert b'newline=${newline%x}' in stage_script
 assert b'"$owner$newline"[0-9a-f]' in stage_script
 PY
+  pass
+
+  reset_fake
+  rm -f -- "$state"
+  export FAKE_ADB_TRACE_PROBE_CRLF=1
+  run_helper start --state "$state" --mdev-owner OWNER_SECRET_123 \
+    --package me.rerere.rikkahub.debug --conversation-id CONVERSATION_SECRET_123 \
+    --run-hash "sha256:$(printf 'a%.0s' {1..64})" \
+    --comparison-hash "sha256:$(printf 'b%.0s' {1..64})" --fixture "$fixture"
+  assert_exact_output $'voice-step.status=ok\nvoice-step.operation=start\nvoice-step.call=active'
   pass
 
   reset_fake
@@ -6763,6 +6782,7 @@ PY
   rm -f -- "$state" "$finalization" "$cleanup_output"
   write_valid_state "$state"
   write_finalization "$finalization"
+  export FAKE_ADB_STOPPED_ROW_CRLF=1
   run_helper end --state "$state" --finalization "$finalization" \
     --cleanup-output "$cleanup_output"
   assert_exact_output $'voice-step.status=ok\nvoice-step.operation=end\nvoice-step.outcome=complete'
