@@ -331,6 +331,52 @@ class LiveKitVoiceCallSessionTest {
     }
 
     @Test
+    fun `autonomous failure cleanup survives session scope cancellation before dispatch`() = runTest {
+        val cleanupExecutor = Executors.newSingleThreadExecutor()
+        val cleanupDispatcher = cleanupExecutor.asCoroutineDispatcher()
+        val sessionScope = CoroutineScope(SupervisorJob() + StandardTestDispatcher(testScheduler))
+        val releaseDispatcher = CountDownLatch(1)
+        val dispatcherBlocked = CountDownLatch(1)
+        val cleanupCompleted = CountDownLatch(1)
+        cleanupExecutor.execute {
+            dispatcherBlocked.countDown()
+            check(releaseDispatcher.await(5, TimeUnit.SECONDS)) {
+                "cleanup dispatcher release timed out"
+            }
+        }
+        assertTrue("cleanup dispatcher was not blocked", dispatcherBlocked.await(5, TimeUnit.SECONDS))
+
+        val fixture = fixture(
+            connectFailure = IllegalStateException("connect failed"),
+            sessionScope = sessionScope,
+            cleanupDispatcher = cleanupDispatcher,
+            roomLifecycleObserver = { stage ->
+                if (stage == "close") cleanupCompleted.countDown()
+            },
+        )
+        try {
+            fixture.session.start()
+            runCurrent()
+            assertTrue(fixture.session.state.value.session is VoiceSessionStatus.Error)
+
+            sessionScope.cancel()
+            runCurrent()
+            releaseDispatcher.countDown()
+
+            assertTrue(
+                "autonomous cleanup was cancelled before it reached the room",
+                cleanupCompleted.await(5, TimeUnit.SECONDS),
+            )
+            assertEquals(1, fixture.room.disconnectCalls)
+            assertEquals(1, fixture.room.closeCalls)
+        } finally {
+            releaseDispatcher.countDown()
+            sessionScope.cancel()
+            cleanupDispatcher.close()
+        }
+    }
+
+    @Test
     fun `closed fallback session reports its route unusable`() = runTest {
         val session = LiveKitVoiceCallSession(
             details = details(),

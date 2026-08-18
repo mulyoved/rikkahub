@@ -414,7 +414,7 @@ internal class LiveKitVoiceCallSession(
                 error = message,
             )
         }
-        scope.launch(cleanupDispatcher) {
+        scope.launch(cleanupDispatcher + NonCancellable) {
             when (val result = cleanupOperation.run(VoiceAgentCleanupMode.Immediate)) {
                 VoiceAgentCleanupResult.Completed -> appendDiagnostic("livekit_call_ended", "experimental_failure")
                 is VoiceAgentCleanupResult.Failed -> appendDiagnostic(
