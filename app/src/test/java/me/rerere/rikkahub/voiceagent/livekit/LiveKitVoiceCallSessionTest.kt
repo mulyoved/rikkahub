@@ -1554,16 +1554,16 @@ private class FakeLiveKitRoomFacade(
 
     override fun disconnect() {
         lifecycle += "disconnect"
-        lifecycleObserver("disconnect")
         disconnectCalls += 1
+        lifecycleObserver("disconnect")
         disconnectFailure?.let { throw it }
         connected = false
     }
 
     override fun close() {
         lifecycle += "close"
-        lifecycleObserver("close")
         closeCalls += 1
+        lifecycleObserver("close")
         closeFailure?.let { throw it }
     }
 }

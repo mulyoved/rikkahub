@@ -43,6 +43,8 @@ import me.rerere.rikkahub.voiceagent.recovery.HermesRecoveryWorkScheduler
 import me.rerere.rikkahub.voiceagent.recovery.HermesRecoveryWorker
 import me.rerere.rikkahub.voiceagent.recovery.HermesRelayRegistry
 import me.rerere.rikkahub.voiceagent.recovery.HermesTerminalCommitter
+import me.rerere.rikkahub.voiceagent.recovery.RecoveryClock
+import me.rerere.rikkahub.voiceagent.recovery.SystemRecoveryClock
 import me.rerere.rikkahub.voiceagent.recovery.WorkManagerHermesRecoveryWorkScheduler
 import me.rerere.rikkahub.voiceagent.recovery.hermesRecoveryRequest
 import me.rerere.rikkahub.voiceagent.notification.AllowHermesNotificationPost
@@ -230,6 +232,10 @@ val dataSourceModule = module {
         )
     }
 
+    single<RecoveryClock> {
+        SystemRecoveryClock
+    }
+
     single<HermesNotificationPostGate> {
         AllowHermesNotificationPost
     }
@@ -269,6 +275,7 @@ val dataSourceModule = module {
             scheduler = get(),
             poster = get(),
             admission = get(),
+            clock = get(),
         )
     }
 

@@ -288,4 +288,117 @@ class HermesTelemetrySinkTest {
         assertTrue(snapshotDecisionMissing.toLogDetail().contains("ownerCheck=missing"))
         assertTrue(snapshotDecisionMismatch.toLogDetail().contains("ownerCheck=mismatch"))
     }
+
+    @Test
+    fun `notification telemetry events redact sentinels and serialize categorical admission, post, retry, suppression, tap, and dismiss`() {
+        val promptSentinel = "PROMPT_SECRET_SENTINEL_1111"
+        val answerSentinel = "ANSWER_SECRET_SENTINEL_2222"
+        val errorSentinel = "ERROR_SECRET_SENTINEL_3333"
+        val accessTokenSentinel = "ACCESS_TOKEN_SECRET_SENTINEL_4444"
+        val ownerHashSentinel = "OWNER_HASH_SECRET_SENTINEL_5555"
+        val correlationSentinel = "CORRELATION_SECRET_SENTINEL_6666"
+        val routeSentinel = "https://secret.endpoint.domain.com/secret/path/7777"
+        val rawConversationId = "conv-raw-id-999"
+
+        val sentinels = listOf(
+            promptSentinel,
+            answerSentinel,
+            errorSentinel,
+            accessTokenSentinel,
+            ownerHashSentinel,
+            correlationSentinel,
+            routeSentinel,
+            rawConversationId,
+        )
+
+        val admissionEvent = HermesRecoveryTelemetryEvent.NotificationAdmission.create(
+            conversationId = rawConversationId,
+            disposition = "pending_post",
+            context = "recovery",
+        )
+        val postEvent = HermesRecoveryTelemetryEvent.NotificationPost.create(
+            conversationId = rawConversationId,
+            attemptOrdinal = 1,
+        )
+        val retryEvent = HermesRecoveryTelemetryEvent.NotificationRetry.create(
+            conversationId = rawConversationId,
+            attemptOrdinal = 1,
+            nextAttemptDelayMs = 60_000L,
+        )
+        val suppressionEvent = HermesRecoveryTelemetryEvent.NotificationSuppression.create(
+            conversationId = rawConversationId,
+            reason = "post_failure_exhausted",
+        )
+        val tapEvent = HermesRecoveryTelemetryEvent.NotificationTap.create(
+            conversationId = rawConversationId,
+        )
+        val dismissEvent = HermesRecoveryTelemetryEvent.NotificationDismiss.create(
+            conversationId = rawConversationId,
+        )
+
+        val notificationEvents: List<HermesRecoveryTelemetryEvent> = listOf(
+            admissionEvent,
+            postEvent,
+            retryEvent,
+            suppressionEvent,
+            tapEvent,
+            dismissEvent,
+        )
+
+        val s = sink()
+        for (event in notificationEvents) {
+            val json = event.toJson()
+            val logDetail = event.toLogDetail()
+
+            // Verify none of the raw sentinels appear in json or log detail
+            for (sentinel in sentinels) {
+                assertTrue("Sentinel $sentinel must not appear in JSON: $json", !json.contains(sentinel))
+                assertTrue("Sentinel $sentinel must not appear in logDetail: $logDetail", !logDetail.contains(sentinel))
+            }
+
+            s.writeRecoveryEvent(event)
+        }
+
+        // Verify categorical json serialization
+        assertTrue(admissionEvent.toJson().contains("\"type\":\"notification_admission\""))
+        assertTrue(admissionEvent.toJson().contains("\"disposition\":\"pending_post\""))
+        assertTrue(admissionEvent.toJson().contains("\"context\":\"recovery\""))
+
+        assertTrue(postEvent.toJson().contains("\"type\":\"notification_post\""))
+        assertTrue(postEvent.toJson().contains("\"attemptOrdinal\":1"))
+
+        assertTrue(retryEvent.toJson().contains("\"type\":\"notification_retry\""))
+        assertTrue(retryEvent.toJson().contains("\"attemptOrdinal\":1"))
+        assertTrue(retryEvent.toJson().contains("\"nextAttemptDelayMs\":60000"))
+
+        assertTrue(suppressionEvent.toJson().contains("\"type\":\"notification_suppression\""))
+        assertTrue(suppressionEvent.toJson().contains("\"reason\":\"post_failure_exhausted\""))
+
+        assertTrue(tapEvent.toJson().contains("\"type\":\"notification_tap\""))
+
+        assertTrue(dismissEvent.toJson().contains("\"type\":\"notification_dismiss\""))
+
+        // Verify log details
+        assertTrue(admissionEvent.toLogDetail().contains("type=notification_admission"))
+        assertTrue(admissionEvent.toLogDetail().contains("disposition=pending_post"))
+        assertTrue(admissionEvent.toLogDetail().contains("context=recovery"))
+        assertTrue(postEvent.toLogDetail().contains("type=notification_post"))
+        assertTrue(postEvent.toLogDetail().contains("attemptOrdinal=1"))
+        assertTrue(retryEvent.toLogDetail().contains("type=notification_retry"))
+        assertTrue(retryEvent.toLogDetail().contains("attemptOrdinal=1"))
+        assertTrue(retryEvent.toLogDetail().contains("nextAttemptDelayMs=60000"))
+        assertTrue(suppressionEvent.toLogDetail().contains("type=notification_suppression"))
+        assertTrue(suppressionEvent.toLogDetail().contains("reason=post_failure_exhausted"))
+        assertTrue(tapEvent.toLogDetail().contains("type=notification_tap"))
+        assertTrue(dismissEvent.toLogDetail().contains("type=notification_dismiss"))
+
+        // Verify diagnostics recorded
+        val names = diagnosticNames()
+        assertTrue("hermes_recovery_notification_admission" in names)
+        assertTrue("hermes_recovery_notification_post" in names)
+        assertTrue("hermes_recovery_notification_retry" in names)
+        assertTrue("hermes_recovery_notification_suppression" in names)
+        assertTrue("hermes_recovery_notification_tap" in names)
+        assertTrue("hermes_recovery_notification_dismiss" in names)
+    }
 }

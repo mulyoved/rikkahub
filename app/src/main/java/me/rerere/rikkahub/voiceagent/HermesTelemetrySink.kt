@@ -281,6 +281,162 @@ sealed class HermesRecoveryTelemetryEvent {
         override fun toLogDetail(): String =
             "type=terminal_commit conversationHash=$conversationHash jobHash=$jobHash status=$status disposition=$disposition"
     }
+
+    data class NotificationAdmission(
+        val conversationHash: String,
+        val disposition: String,
+        val context: String,
+    ) : HermesRecoveryTelemetryEvent() {
+        override val eventType: String get() = "notification_admission"
+
+        companion object {
+            fun create(
+                conversationId: String,
+                disposition: String,
+                context: String,
+            ): NotificationAdmission = NotificationAdmission(
+                conversationHash = hashIdentifier(conversationId),
+                disposition = disposition,
+                context = context,
+            )
+        }
+
+        override fun toJson(): String = buildJsonObject {
+            put("type", "notification_admission")
+            put("conversationHash", conversationHash)
+            put("disposition", disposition)
+            put("context", context)
+        }.toString()
+
+        override fun toLogDetail(): String =
+            "type=notification_admission conversationHash=$conversationHash disposition=$disposition context=$context"
+    }
+
+    data class NotificationPost(
+        val conversationHash: String,
+        val attemptOrdinal: Int,
+    ) : HermesRecoveryTelemetryEvent() {
+        override val eventType: String get() = "notification_post"
+
+        companion object {
+            fun create(
+                conversationId: String,
+                attemptOrdinal: Int,
+            ): NotificationPost = NotificationPost(
+                conversationHash = hashIdentifier(conversationId),
+                attemptOrdinal = attemptOrdinal,
+            )
+        }
+
+        override fun toJson(): String = buildJsonObject {
+            put("type", "notification_post")
+            put("conversationHash", conversationHash)
+            put("attemptOrdinal", attemptOrdinal)
+        }.toString()
+
+        override fun toLogDetail(): String =
+            "type=notification_post conversationHash=$conversationHash attemptOrdinal=$attemptOrdinal"
+    }
+
+    data class NotificationRetry(
+        val conversationHash: String,
+        val attemptOrdinal: Int,
+        val nextAttemptDelayMs: Long,
+    ) : HermesRecoveryTelemetryEvent() {
+        override val eventType: String get() = "notification_retry"
+
+        companion object {
+            fun create(
+                conversationId: String,
+                attemptOrdinal: Int,
+                nextAttemptDelayMs: Long,
+            ): NotificationRetry = NotificationRetry(
+                conversationHash = hashIdentifier(conversationId),
+                attemptOrdinal = attemptOrdinal,
+                nextAttemptDelayMs = nextAttemptDelayMs,
+            )
+        }
+
+        override fun toJson(): String = buildJsonObject {
+            put("type", "notification_retry")
+            put("conversationHash", conversationHash)
+            put("attemptOrdinal", attemptOrdinal)
+            put("nextAttemptDelayMs", nextAttemptDelayMs)
+        }.toString()
+
+        override fun toLogDetail(): String =
+            "type=notification_retry conversationHash=$conversationHash attemptOrdinal=$attemptOrdinal nextAttemptDelayMs=$nextAttemptDelayMs"
+    }
+
+    data class NotificationSuppression(
+        val conversationHash: String,
+        val reason: String,
+    ) : HermesRecoveryTelemetryEvent() {
+        override val eventType: String get() = "notification_suppression"
+
+        companion object {
+            fun create(
+                conversationId: String,
+                reason: String,
+            ): NotificationSuppression = NotificationSuppression(
+                conversationHash = hashIdentifier(conversationId),
+                reason = reason,
+            )
+        }
+
+        override fun toJson(): String = buildJsonObject {
+            put("type", "notification_suppression")
+            put("conversationHash", conversationHash)
+            put("reason", reason)
+        }.toString()
+
+        override fun toLogDetail(): String =
+            "type=notification_suppression conversationHash=$conversationHash reason=$reason"
+    }
+
+    data class NotificationTap(
+        val conversationHash: String,
+    ) : HermesRecoveryTelemetryEvent() {
+        override val eventType: String get() = "notification_tap"
+
+        companion object {
+            fun create(
+                conversationId: String,
+            ): NotificationTap = NotificationTap(
+                conversationHash = hashIdentifier(conversationId),
+            )
+        }
+
+        override fun toJson(): String = buildJsonObject {
+            put("type", "notification_tap")
+            put("conversationHash", conversationHash)
+        }.toString()
+
+        override fun toLogDetail(): String =
+            "type=notification_tap conversationHash=$conversationHash"
+    }
+
+    data class NotificationDismiss(
+        val conversationHash: String,
+    ) : HermesRecoveryTelemetryEvent() {
+        override val eventType: String get() = "notification_dismiss"
+
+        companion object {
+            fun create(
+                conversationId: String,
+            ): NotificationDismiss = NotificationDismiss(
+                conversationHash = hashIdentifier(conversationId),
+            )
+        }
+
+        override fun toJson(): String = buildJsonObject {
+            put("type", "notification_dismiss")
+            put("conversationHash", conversationHash)
+        }.toString()
+
+        override fun toLogDetail(): String =
+            "type=notification_dismiss conversationHash=$conversationHash"
+    }
 }
 
 private fun hashIdentifier(value: String): String =
