@@ -11,9 +11,11 @@ import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonObject
 import me.rerere.rikkahub.utils.JsonInstant
 import me.rerere.rikkahub.voiceagent.livekit.LiveKitSessionDetails
 import me.rerere.rikkahub.voiceagent.livekit.LiveKitSessionRequest
+import me.rerere.rikkahub.voiceagent.recovery.HermesRecoveryHttpResponse
 import me.rerere.rikkahub.voiceagent.telemetry.VoiceTraceContext
 import okhttp3.Call
 import okhttp3.Callback
@@ -273,6 +275,22 @@ class HermesVoiceApi internal constructor(
                 .delete()
                 .build()
         )
+
+    internal suspend fun executeRecoveryJobRequest(
+        jobId: String,
+        cancel: Boolean,
+    ): HermesRecoveryHttpResponse = withContext(Dispatchers.IO) {
+        val builder = requestBuilder("/api/mobile/hermes/jobs/$jobId")
+        val request = if (cancel) builder.delete().build() else builder.get().build()
+        transport.execute(request).use { response ->
+            val raw = response.body.string()
+            HermesRecoveryHttpResponse(
+                statusCode = response.code,
+                ownerHash = response.header("X-Hermes-Owner-Hash"),
+                payload = runCatching { json.parseToJsonElement(raw).jsonObject }.getOrNull(),
+            )
+        }
+    }
 
     private suspend inline fun <reified Req, reified Res> postJson(path: String, body: Req): Res =
         executeJson(

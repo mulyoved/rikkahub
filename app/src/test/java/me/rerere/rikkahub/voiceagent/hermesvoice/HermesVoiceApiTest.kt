@@ -8,6 +8,7 @@ import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
@@ -1155,6 +1156,82 @@ class HermesVoiceApiTest {
             )
         }
     }
+
+    @Test
+    fun `executeRecoveryJobRequest sends GET or DELETE and captures owner header`() = runBlocking {
+        var seenGetRequest: Request? = null
+        val getTransport = transportFor { request: Request ->
+            seenGetRequest = request
+            responseFor(
+                request = request,
+                code = 200,
+                headers = mapOf<String, String>("X-Hermes-Owner-Hash" to "sha256:owner_poll"),
+                body = """{"jobId":"j1","status":"running"}""",
+            )
+        }
+        val api = HermesVoiceApi(
+            baseUrl = "https://hermes-voice.example.test",
+            credentials = HermesVoiceCredentials(deviceApiKey = "dev-key"),
+            transport = getTransport,
+        )
+
+        val getResponse = api.executeRecoveryJobRequest("j1", cancel = false)
+
+        val getReq = requireNotNull(seenGetRequest)
+        assertEquals("GET", getReq.method)
+        assertEquals("/api/mobile/hermes/jobs/j1", getReq.url.encodedPath)
+        assertEquals(200, getResponse.statusCode)
+        assertEquals("sha256:owner_poll", getResponse.ownerHash)
+        assertNotNull(getResponse.payload)
+
+        var seenDeleteRequest: Request? = null
+        val deleteTransport = transportFor { request: Request ->
+            seenDeleteRequest = request
+            responseFor(
+                request = request,
+                code = 200,
+                headers = mapOf<String, String>("X-Hermes-Owner-Hash" to "sha256:owner_cancel"),
+                body = """{"jobId":"j1","status":"canceled"}""",
+            )
+        }
+        val deleteApi = HermesVoiceApi(
+            baseUrl = "https://hermes-voice.example.test",
+            credentials = HermesVoiceCredentials(deviceApiKey = "dev-key"),
+            transport = deleteTransport,
+        )
+
+        val deleteResponse = deleteApi.executeRecoveryJobRequest("j1", cancel = true)
+
+        val deleteReq = requireNotNull(seenDeleteRequest)
+        assertEquals("DELETE", deleteReq.method)
+        assertEquals("/api/mobile/hermes/jobs/j1", deleteReq.url.encodedPath)
+        assertEquals(200, deleteResponse.statusCode)
+        assertEquals("sha256:owner_cancel", deleteResponse.ownerHash)
+        assertNotNull(deleteResponse.payload)
+    }
+
+    @Test
+    fun `executeRecoveryJobRequest returns raw status and body on HTTP error without throwing`() = runBlocking {
+        val errorTransport = transportFor { request: Request ->
+            responseFor(
+                request = request,
+                code = 404,
+                headers = mapOf<String, String>("X-Hermes-Owner-Hash" to "sha256:owner_error"),
+                body = """{"jobId":"j1","status":"expired"}""",
+            )
+        }
+        val api = HermesVoiceApi(
+            baseUrl = "https://hermes-voice.example.test",
+            credentials = HermesVoiceCredentials(deviceApiKey = "dev-key"),
+            transport = errorTransport,
+        )
+
+        val response = api.executeRecoveryJobRequest("j1", cancel = false)
+
+        assertEquals(404, response.statusCode)
+        assertEquals("sha256:owner_error", response.ownerHash)
+        assertNotNull(response.payload)
+    }
 }
 
 private fun transportFor(handler: (Request) -> Response): HermesVoiceHttpTransport =
@@ -1166,15 +1243,18 @@ private fun responseFor(
     request: Request,
     code: Int = 200,
     message: String = "OK",
+    headers: Map<String, String> = emptyMap(),
     body: String,
-): Response =
-    Response.Builder()
+): Response {
+    val builder = Response.Builder()
         .request(request)
         .protocol(Protocol.HTTP_1_1)
         .code(code)
         .message(message)
         .body(body.toResponseBody())
-        .build()
+    headers.forEach { (name, value) -> builder.addHeader(name, value) }
+    return builder.build()
+}
 
 private fun okhttp3.RequestBody?.bodyToUtf8(): String {
     if (this == null) return ""

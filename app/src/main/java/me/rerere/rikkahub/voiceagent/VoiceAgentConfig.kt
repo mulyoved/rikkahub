@@ -112,15 +112,6 @@ class VoiceAgentConfigResolver(
             ?.takeIf { it.isNotBlank() }
     }
 
-    private fun String.toHermesVoiceBaseUrl(): String {
-        return trim()
-            .trimEnd('/')
-            .removeSuffix("/api/mobile")
-            .removeSuffix("/api/openai/v1")
-            .removeSuffix("/openai/v1")
-            .removeSuffix("/v1")
-    }
-
     companion object {
         const val DEFAULT_VOICE_MODEL_ID = "gemini-flash"
         const val HERMES_VOICE_BASE_URL_HEADER = "X-Hermes-Voice-Base-Url"
@@ -128,4 +119,14 @@ class VoiceAgentConfigResolver(
         const val CLOUDFLARE_ACCESS_CLIENT_ID_HEADER = "CF-Access-Client-Id"
         const val CLOUDFLARE_ACCESS_CLIENT_SECRET_HEADER = "CF-Access-Client-Secret"
     }
+}
+
+internal fun String.toHermesVoiceBaseUrl(): String {
+    return trim()
+        .trimEnd('/')
+        .removeSuffix("/api/mobile")
+        .removeSuffix("/api/openai/v1")
+        .removeSuffix("/openai/v1")
+        .removeSuffix("/v1")
+        .trimEnd('/')
 }
