@@ -3,11 +3,13 @@ package me.rerere.rikkahub
 import androidx.navigation3.runtime.NavKey
 import me.rerere.rikkahub.data.model.Folder
 import me.rerere.rikkahub.data.model.Conversation
+import me.rerere.rikkahub.voiceagent.notification.ACTION_OPEN_HERMES_RESULT
 import me.rerere.rikkahub.web.NotFoundException
 import me.rerere.rikkahub.web.routes.requireCurrentAssistant
 import me.rerere.rikkahub.voiceagent.VoiceAgentTransport
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Assert.assertThrows
@@ -105,6 +107,59 @@ class RouteActivityIntentTest {
 
         assertTrue(handled)
         assertEquals(listOf(directVoiceAgentScreen(voiceConversationId)), backStack)
+    }
+
+    @Test
+    fun `hermes result action routes to chat with exact conversation id from extra`() {
+        val conversationId = "0e822879-5558-45c9-b3dd-8637db28ce17"
+        val screen = hermesResultIntentScreen(
+            action = ACTION_OPEN_HERMES_RESULT,
+            conversationId = conversationId,
+            dataUriString = null,
+        )
+
+        assertEquals(Screen.Chat(id = conversationId), screen)
+    }
+
+    @Test
+    fun `hermes result action routes to chat with conversation id from data uri`() {
+        val conversationId = "0e822879-5558-45c9-b3dd-8637db28ce17"
+        val dataUri = "rikkahub://hermes-result/conversation/$conversationId"
+        val screen = hermesResultIntentScreen(
+            action = ACTION_OPEN_HERMES_RESULT,
+            conversationId = null,
+            dataUriString = dataUri,
+        )
+
+        assertEquals(Screen.Chat(id = conversationId), screen)
+    }
+
+    @Test
+    fun `hermes result action ignores mismatched action`() {
+        val conversationId = "0e822879-5558-45c9-b3dd-8637db28ce17"
+        val screen = hermesResultIntentScreen(
+            action = "android.intent.action.VIEW",
+            conversationId = conversationId,
+            dataUriString = null,
+        )
+
+        assertNull(screen)
+    }
+
+    @Test
+    fun `incoming intent opens chat when hermes result action is present`() {
+        val conversationId = "0e822879-5558-45c9-b3dd-8637db28ce17"
+        val backStack = mutableListOf<NavKey>(directVoiceAgentScreen("other-conv"))
+
+        val handled = backStack.openIncomingIntent(
+            voiceConversationId = null,
+            conversationId = null,
+            action = ACTION_OPEN_HERMES_RESULT,
+            hermesConversationId = conversationId,
+        )
+
+        assertTrue(handled)
+        assertEquals(listOf(Screen.Chat(id = conversationId)), backStack)
     }
 
     private fun directVoiceAgentScreen(conversationId: String) = Screen.VoiceAgent(

@@ -971,6 +971,7 @@ private class CoordinatorFakeDAO : HermesRecoveryDAO {
     override suspend fun update(entry: HermesRecoveryEntity) {
         storage[entry.recoveryKey] = entry
     }
+    override suspend fun markPostedSeen(conversationId: String, changedAt: Long): Int = 0
     override suspend fun deleteOrphans(): Int = 0
 }
 

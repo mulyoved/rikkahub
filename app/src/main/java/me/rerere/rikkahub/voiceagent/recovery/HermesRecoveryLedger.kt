@@ -88,6 +88,10 @@ internal class HermesRecoveryLedger(
         return dao.deleteOrphans()
     }
 
+    suspend fun markPostedSeen(conversationId: Uuid, seenAt: Long): Int {
+        return dao.markPostedSeen(conversationId.toString(), seenAt)
+    }
+
     private fun validate(entry: HermesRecoveryEntry) {
         if (entry.recoveryState == HermesRecoveryState.Active) {
             requireNotNull(entry.originalVoiceSessionHash) { "originalVoiceSessionHash required for Active state" }

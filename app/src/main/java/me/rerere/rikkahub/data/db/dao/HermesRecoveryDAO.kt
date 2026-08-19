@@ -38,4 +38,7 @@ internal interface HermesRecoveryDAO {
 
     @Query("DELETE FROM hermes_recovery WHERE conversation_id NOT IN (SELECT id FROM conversationentity)")
     suspend fun deleteOrphans(): Int
+
+    @Query("UPDATE hermes_recovery SET notification_disposition = 'Seen', notification_disposition_changed_at = :changedAt WHERE conversation_id = :conversationId AND notification_disposition = 'Posted'")
+    suspend fun markPostedSeen(conversationId: String, changedAt: Long): Int
 }

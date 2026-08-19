@@ -26,6 +26,10 @@ import me.rerere.rikkahub.utils.JsonInstant
 import java.time.Instant
 import kotlin.uuid.Uuid
 
+fun interface ConversationDeletionObserver {
+    fun onConversationDeleted(conversationId: Uuid)
+}
+
 class ConversationRepository(
     private val conversationDAO: ConversationDAO,
     private val messageNodeDAO: MessageNodeDAO,
@@ -33,6 +37,7 @@ class ConversationRepository(
     private val database: AppDatabase,
     private val filesManager: FilesManager,
     private val messageFtsManager: MessageFtsManager,
+    private val deletionObservers: List<ConversationDeletionObserver> = emptyList(),
 ) {
     companion object {
         private const val PAGE_SIZE = 20
@@ -338,6 +343,9 @@ class ConversationRepository(
             conversationDAO.delete(
                 conversationToConversationEntity(conversation)
             )
+        }
+        deletionObservers.forEach { observer ->
+            runCatching { observer.onConversationDeleted(conversation.id) }
         }
         filesManager.deleteChatFiles(fullConversation.files)
     }

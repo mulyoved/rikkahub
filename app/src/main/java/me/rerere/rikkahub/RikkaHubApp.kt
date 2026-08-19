@@ -37,6 +37,7 @@ import me.rerere.rikkahub.service.WebServerService
 import me.rerere.rikkahub.utils.CrashHandler
 import me.rerere.rikkahub.utils.DatabaseUtil
 import me.rerere.rikkahub.data.repository.WorkspaceRepository
+import me.rerere.rikkahub.voiceagent.notification.HERMES_TASK_RESULTS_CHANNEL_ID
 import me.rerere.rikkahub.voiceagent.recovery.HermesRecoveryCoordinator
 import me.rerere.rikkahub.voiceagent.recovery.RecoveryTrigger
 import me.rerere.rikkahub.voiceagent.recovery.hermesEndpointConfigurationHash
@@ -258,6 +259,16 @@ class RikkaHubApp : Application() {
             .setDescription("Ongoing Voice Agent call status")
             .build()
         notificationManager.createNotificationChannel(voiceAgentChannel)
+
+        val hermesTaskResultsChannel = NotificationChannelCompat
+            .Builder(
+                HERMES_TASK_RESULTS_CHANNEL_ID,
+                NotificationManagerCompat.IMPORTANCE_DEFAULT,
+            )
+            .setName("Hermes Task Results")
+            .setDescription("Notifications for completed background Hermes tasks")
+            .build()
+        notificationManager.createNotificationChannel(hermesTaskResultsChannel)
     }
 
     override fun onTerminate() {

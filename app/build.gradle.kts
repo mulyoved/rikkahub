@@ -211,6 +211,9 @@ android {
     androidResources {
         generateLocaleConfig = true
     }
+    lint {
+        disable += setOf("MissingTranslation")
+    }
     packaging {
         jniLibs {
             useLegacyPackaging = true

@@ -45,12 +45,18 @@ import me.rerere.rikkahub.voiceagent.recovery.HermesRelayRegistry
 import me.rerere.rikkahub.voiceagent.recovery.HermesTerminalCommitter
 import me.rerere.rikkahub.voiceagent.recovery.WorkManagerHermesRecoveryWorkScheduler
 import me.rerere.rikkahub.voiceagent.recovery.hermesRecoveryRequest
+import me.rerere.rikkahub.voiceagent.notification.AllowHermesNotificationPost
+import me.rerere.rikkahub.voiceagent.notification.HermesNotificationAcknowledger
 import me.rerere.rikkahub.voiceagent.notification.HermesNotificationDeliveryCoordinator
+import me.rerere.rikkahub.voiceagent.notification.HermesNotificationPostGate
 import me.rerere.rikkahub.voiceagent.notification.HermesNotificationPoster
 import me.rerere.rikkahub.voiceagent.notification.HermesNotificationWorkRequestFactory
 import me.rerere.rikkahub.voiceagent.notification.HermesNotificationWorkScheduler
 import me.rerere.rikkahub.voiceagent.notification.HermesNotificationWorker
+import me.rerere.rikkahub.voiceagent.notification.HermesResultNotifier
+import me.rerere.rikkahub.voiceagent.notification.HermesResultNotifierInterface
 import me.rerere.rikkahub.voiceagent.notification.WorkManagerHermesNotificationWorkScheduler
+import me.rerere.rikkahub.data.repository.ConversationDeletionObserver
 import me.rerere.rikkahub.voiceagent.notification.hermesNotificationRequest
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -224,9 +230,36 @@ val dataSourceModule = module {
         )
     }
 
+    single<HermesNotificationPostGate> {
+        AllowHermesNotificationPost
+    }
+
+    single<HermesResultNotifier> {
+        HermesResultNotifier(
+            context = get(),
+            postGate = get(),
+        )
+    }
+
+    single<HermesResultNotifierInterface> {
+        get<HermesResultNotifier>()
+    }
+
     single<HermesNotificationPoster> {
-        HermesNotificationPoster { _ ->
-            // Replaced in Task 12 by HermesResultNotifier
+        get<HermesResultNotifier>()
+    }
+
+    single {
+        HermesNotificationAcknowledger(
+            ledger = get(),
+            notifier = get<HermesResultNotifierInterface>(),
+        )
+    }
+
+    single<ConversationDeletionObserver> {
+        val notifier = get<HermesResultNotifier>()
+        ConversationDeletionObserver { conversationId ->
+            notifier.cancel(conversationId)
         }
     }
 

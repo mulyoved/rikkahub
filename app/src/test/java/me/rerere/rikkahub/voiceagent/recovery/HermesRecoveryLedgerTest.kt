@@ -503,6 +503,13 @@ class HermesRecoveryLedgerTest {
         // pendingNotificationConversationIds
         val convIds = ledger.pendingNotificationConversationIds()
         assertEquals(listOf(conv1, conv2), convIds)
+
+        // markPostedSeen transitions Posted to Seen
+        val updatedCount = ledger.markPostedSeen(conv1, 5000L)
+        assertEquals(1, updatedCount)
+        val updatedPosted = ledger.find("k-posted")!!
+        assertEquals(HermesNotificationDisposition.Seen, updatedPosted.notificationDisposition)
+        assertEquals(5000L, updatedPosted.notificationDispositionChangedAt)
     }
 
     private class RecordingAtomicGateway(
@@ -589,6 +596,20 @@ class HermesRecoveryLedgerTest {
 
         override suspend fun update(entry: HermesRecoveryEntity) {
             storage[entry.recoveryKey] = entry
+        }
+
+        override suspend fun markPostedSeen(conversationId: String, changedAt: Long): Int {
+            var count = 0
+            for ((key, value) in storage) {
+                if (value.conversationId == conversationId && value.notificationDisposition == "Posted") {
+                    storage[key] = value.copy(
+                        notificationDisposition = "Seen",
+                        notificationDispositionChangedAt = changedAt,
+                    )
+                    count++
+                }
+            }
+            return count
         }
 
         override suspend fun deleteOrphans(): Int = 0

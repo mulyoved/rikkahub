@@ -134,6 +134,8 @@ class HermesRecoveryCoordinatorTest {
             storage[entry.recoveryKey] = entry
         }
 
+        override suspend fun markPostedSeen(conversationId: String, changedAt: Long): Int = 0
+
         override suspend fun deleteOrphans(): Int {
             deleteOrphansCallCount++
             return 0

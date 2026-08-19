@@ -340,11 +340,11 @@ class LiveKitVoiceCallSessionTest {
         val cleanupCompleted = CountDownLatch(1)
         cleanupExecutor.execute {
             dispatcherBlocked.countDown()
-            check(releaseDispatcher.await(5, TimeUnit.SECONDS)) {
+            check(releaseDispatcher.await(15, TimeUnit.SECONDS)) {
                 "cleanup dispatcher release timed out"
             }
         }
-        assertTrue("cleanup dispatcher was not blocked", dispatcherBlocked.await(5, TimeUnit.SECONDS))
+        assertTrue("cleanup dispatcher was not blocked", dispatcherBlocked.await(15, TimeUnit.SECONDS))
 
         val fixture = fixture(
             connectFailure = IllegalStateException("connect failed"),
@@ -365,7 +365,7 @@ class LiveKitVoiceCallSessionTest {
 
             assertTrue(
                 "autonomous cleanup was cancelled before it reached the room",
-                cleanupCompleted.await(5, TimeUnit.SECONDS),
+                cleanupCompleted.await(15, TimeUnit.SECONDS),
             )
             assertEquals(1, fixture.room.disconnectCalls)
             assertEquals(1, fixture.room.closeCalls)

@@ -137,6 +137,14 @@
       android:name="com.yalantis.ucrop.UCropActivity"
       android:theme="@style/Theme.AppCompat.Light.NoActionBar" />
 
+    <receiver
+      android:name=".voiceagent.notification.HermesNotificationDismissReceiver"
+      android:exported="false">
+      <intent-filter>
+        <action android:name="me.rerere.rikkahub.action.DISMISS_HERMES_RESULT" />
+      </intent-filter>
+    </receiver>
+
     <service
       android:name=".service.WebServerService"
       android:exported="false"

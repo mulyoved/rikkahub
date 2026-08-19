@@ -9,8 +9,6 @@ import me.rerere.rikkahub.voiceagent.VoiceAgentTransport
 import me.rerere.rikkahub.voiceagent.recovery.HermesNotificationDisposition
 import kotlin.uuid.Uuid
 
-internal const val HERMES_TASK_RESULTS_CHANNEL_ID = "hermes_task_results"
-
 internal enum class TerminalObservationContext {
     ConnectedRelay,
     Recovery,

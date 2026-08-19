@@ -133,6 +133,9 @@ import me.rerere.rikkahub.voiceagent.VoiceAgentRoute
 import me.rerere.rikkahub.voiceagent.VoiceAgentCallContract
 import me.rerere.rikkahub.voiceagent.VoiceAgentTransport
 import me.rerere.rikkahub.voiceagent.decodeVoiceAgentNotificationRouteFields
+import me.rerere.rikkahub.voiceagent.notification.ACTION_OPEN_HERMES_RESULT
+import me.rerere.rikkahub.voiceagent.notification.HermesNotificationAcknowledger
+import kotlinx.coroutines.launch
 import okhttp3.OkHttpClient
 import org.koin.android.ext.android.inject
 import org.koin.compose.koinInject
@@ -140,6 +143,30 @@ import kotlin.uuid.Uuid
 
 private const val TAG = "RouteActivity"
 private const val EXTRA_CONVERSATION_ID = "conversationId"
+
+internal fun decodeHermesResultConversationId(
+    action: String?,
+    conversationId: String?,
+    dataUriString: String?,
+): String? {
+    if (action != ACTION_OPEN_HERMES_RESULT) return null
+    return conversationId?.trim()?.takeIf { it.isNotEmpty() }
+        ?: dataUriString?.let { uri ->
+            runCatching {
+                val lastSegment = uri.substringAfterLast('/')
+                Uuid.parse(lastSegment).toString()
+            }.getOrNull()
+        }
+}
+
+internal fun hermesResultIntentScreen(
+    action: String?,
+    conversationId: String?,
+    dataUriString: String? = null,
+): Screen.Chat? {
+    val id = decodeHermesResultConversationId(action, conversationId, dataUriString) ?: return null
+    return conversationIntentScreen(id)
+}
 
 internal fun conversationIntentScreen(conversationId: String?): Screen.Chat? {
     return conversationId?.trim()
@@ -187,12 +214,21 @@ internal fun MutableList<NavKey>.openIncomingIntent(
     voiceConversationId: String?,
     voiceTransportWireName: String? = null,
     conversationId: String?,
-): Boolean = openVoiceAgentIntent(voiceConversationId, voiceTransportWireName) ||
-    openConversationIntent(conversationId)
+    action: String? = null,
+    hermesConversationId: String? = null,
+): Boolean {
+    if (openVoiceAgentIntent(voiceConversationId, voiceTransportWireName)) return true
+    if (action == ACTION_OPEN_HERMES_RESULT && hermesConversationId != null) {
+        return openConversationIntent(hermesConversationId)
+    }
+    return openConversationIntent(conversationId)
+}
 
 class RouteActivity : ComponentActivity() {
     private val okHttpClient by inject<OkHttpClient>()
     private val settingsStore by inject<SettingsStore>()
+    private val appScope by inject<AppScope>()
+    private val hermesAcknowledger by inject<HermesNotificationAcknowledger>()
     private var navStack: MutableList<NavKey>? = null
 
     // Volume key listener registry — last registered handler wins
@@ -215,6 +251,7 @@ class RouteActivity : ComponentActivity() {
         enableEdgeToEdge()
         disableNavigationBarContrast()
         super.onCreate(savedInstanceState)
+        handleHermesAcknowledgement(intent)
         if (CrashHandler.hasCrashed(this)) {
             startActivity(Intent(this, SafeModeActivity::class.java))
             finish()
@@ -279,9 +316,30 @@ class RouteActivity : ComponentActivity() {
         }
     }
 
+    private fun handleHermesAcknowledgement(intent: Intent?) {
+        val hermesConvId = decodeHermesResultConversationId(
+            action = intent?.action,
+            conversationId = intent?.getStringExtra(EXTRA_CONVERSATION_ID),
+            dataUriString = intent?.dataString,
+        )
+        if (hermesConvId != null) {
+            runCatching { Uuid.parse(hermesConvId) }.getOrNull()?.let { uuid ->
+                appScope.launch {
+                    hermesAcknowledger.acknowledgeConversation(uuid)
+                }
+            }
+        }
+    }
+
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
+        handleHermesAcknowledgement(intent)
+        val hermesConvId = decodeHermesResultConversationId(
+            action = intent.action,
+            conversationId = intent.getStringExtra(EXTRA_CONVERSATION_ID),
+            dataUriString = intent.dataString,
+        )
         navStack?.openIncomingIntent(
             voiceConversationId = intent.getStringExtra(
                 VoiceAgentCallContract.EXTRA_ROUTE_VOICE_AGENT_CONVERSATION_ID,
@@ -290,6 +348,8 @@ class RouteActivity : ComponentActivity() {
                 VoiceAgentCallContract.EXTRA_ROUTE_VOICE_AGENT_TRANSPORT,
             ),
             conversationId = intent.getStringExtra(EXTRA_CONVERSATION_ID),
+            action = intent.action,
+            hermesConversationId = hermesConvId,
         )
     }
 
@@ -322,6 +382,11 @@ class RouteActivity : ComponentActivity() {
                 VoiceAgentCallContract.EXTRA_ROUTE_VOICE_AGENT_TRANSPORT,
             ),
         )
+            ?: hermesResultIntentScreen(
+                action = intent?.action,
+                conversationId = intent?.getStringExtra(EXTRA_CONVERSATION_ID),
+                dataUriString = intent?.dataString,
+            )
             ?: conversationIntentScreen(intent?.getStringExtra(EXTRA_CONVERSATION_ID))
             ?: Screen.Chat(
                 id = if (readBooleanPreference("create_new_conversation_on_start", true)) {

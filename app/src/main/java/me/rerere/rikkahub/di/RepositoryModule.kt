@@ -4,6 +4,7 @@ import android.content.Context
 import me.rerere.rikkahub.data.files.FileFolders
 import me.rerere.rikkahub.data.files.FilesManager
 import me.rerere.rikkahub.data.files.SkillManager
+import me.rerere.rikkahub.data.repository.ConversationDeletionObserver
 import me.rerere.rikkahub.data.repository.ConversationRepository
 import me.rerere.rikkahub.data.repository.FavoriteRepository
 import me.rerere.rikkahub.data.repository.FolderRepository
@@ -22,7 +23,15 @@ import java.io.File
 
 val repositoryModule = module {
     single {
-        ConversationRepository(get(), get(), get(), get(), get(), get())
+        ConversationRepository(
+            conversationDAO = get(),
+            messageNodeDAO = get(),
+            favoriteDAO = get(),
+            database = get(),
+            filesManager = get(),
+            messageFtsManager = get(),
+            deletionObservers = listOfNotNull(getOrNull<ConversationDeletionObserver>()),
+        )
     }
 
     single {
