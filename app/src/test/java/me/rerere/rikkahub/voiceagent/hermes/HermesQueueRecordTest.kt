@@ -8,6 +8,7 @@ import me.rerere.ai.ui.UIMessage
 import me.rerere.ai.ui.UIMessagePart
 import me.rerere.rikkahub.data.model.Conversation
 import me.rerere.rikkahub.voiceagent.VoiceAgentToolNames
+import me.rerere.rikkahub.voiceagent.persistence.VOICE_SESSION_ID_KEY
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -23,6 +24,9 @@ class HermesQueueRecordTest {
         jobId: String? = "job-1",
         answer: String? = if (status == HermesQueueStatus.Complete) "the answer" else null,
         error: String? = if (status.isTerminal && status != HermesQueueStatus.Complete) "boom" else null,
+        voiceSessionId: String? = null,
+        acceptingOwnerHash: String? = null,
+        endpointBindingHash: String? = null,
     ) = HermesQueueRecord(
         callId = "call-1",
         jobId = jobId,
@@ -33,6 +37,9 @@ class HermesQueueRecordTest {
         announcement = announcement,
         createdAt = "2026-07-08T00:00:00Z",
         updatedAt = "2026-07-08T00:00:01Z",
+        voiceSessionId = voiceSessionId,
+        acceptingOwnerHash = acceptingOwnerHash,
+        endpointBindingHash = endpointBindingHash,
     )
 
     private fun HermesQueueRecord.toToolPart(): UIMessagePart.Tool = UIMessagePart.Tool(
@@ -42,7 +49,10 @@ class HermesQueueRecordTest {
         output = listOfNotNull(
             (answer ?: error)?.let { UIMessagePart.Text(it, metadata = null) }
         ),
-        metadata = toMetadata(nowIso = updatedAt ?: "2026-07-08T00:00:01Z"),
+        metadata = buildJsonObject {
+            toMetadata(nowIso = updatedAt ?: "2026-07-08T00:00:01Z").forEach { (k, v) -> put(k, v) }
+            voiceSessionId?.let { put(VOICE_SESSION_ID_KEY, it) }
+        },
     )
 
     // --- round-trip property ---
@@ -67,6 +77,26 @@ class HermesQueueRecordTest {
     fun `round-trips a null jobId`() {
         val original = record(status = HermesQueueStatus.Pending, jobId = null)
         assertEquals(original, HermesQueueRecord.fromToolPart(original.toToolPart()))
+    }
+
+    @Test
+    fun `round-trips recovery correlation metadata`() {
+        val original = record(
+            voiceSessionId = "session-123",
+            acceptingOwnerHash = "owner-hash-abc",
+            endpointBindingHash = "binding-hash-xyz",
+        )
+        val parsed = HermesQueueRecord.fromToolPart(original.toToolPart())
+        assertEquals(original, parsed)
+    }
+
+    @Test
+    fun `omitted recovery correlation metadata defaults to null`() {
+        val original = record()
+        val parsed = HermesQueueRecord.fromToolPart(original.toToolPart())
+        assertNull(parsed?.voiceSessionId)
+        assertNull(parsed?.acceptingOwnerHash)
+        assertNull(parsed?.endpointBindingHash)
     }
 
     // --- clean-break fallback (the announced-default rule, single home) ---

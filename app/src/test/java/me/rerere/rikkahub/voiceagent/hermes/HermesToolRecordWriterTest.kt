@@ -186,6 +186,37 @@ class HermesToolRecordWriterTest {
         assertEquals("announced", metadata[HERMES_TOOL_ANNOUNCEMENT_KEY]!!.jsonPrimitive.content)
     }
 
+    @Test
+    fun `upsert preserves recovery correlation metadata when later upsert omits them`() {
+        val initial = writer.upsertHermesTool(
+            conversation = emptyConversation(),
+            callId = "call-1",
+            prompt = "prompt",
+            status = VoiceToolRecordStatus.Queued,
+            sessionId = "session-1",
+            jobId = "job-1",
+            acceptingOwnerHash = "owner-hash-1",
+            endpointBindingHash = "endpoint-hash-1",
+        )
+        val initialRecord = initial.hermesQueueRecords().single()
+        assertEquals("session-1", initialRecord.voiceSessionId)
+        assertEquals("owner-hash-1", initialRecord.acceptingOwnerHash)
+        assertEquals("endpoint-hash-1", initialRecord.endpointBindingHash)
+
+        val updated = writer.upsertHermesTool(
+            conversation = initial,
+            callId = "call-1",
+            prompt = "prompt",
+            status = VoiceToolRecordStatus.Running,
+            jobId = "job-1",
+        )
+        val updatedRecord = updated.hermesQueueRecords().single()
+        assertEquals("session-1", updatedRecord.voiceSessionId)
+        assertEquals("owner-hash-1", updatedRecord.acceptingOwnerHash)
+        assertEquals("endpoint-hash-1", updatedRecord.endpointBindingHash)
+        assertEquals(HermesQueueStatus.Running, updatedRecord.status)
+    }
+
     // --- ported from VoiceConversationPersisterTest per the Task 1 inventory (rows 1-36) ---
     // Rows that contradicted a semantic pin are noted inline and marked obsolete in the
     // inventory rather than ported; the new pinned behavior they were replaced by is the

@@ -11,6 +11,7 @@ import kotlinx.serialization.json.put
 import me.rerere.ai.ui.UIMessagePart
 import me.rerere.rikkahub.data.model.Conversation
 import me.rerere.rikkahub.voiceagent.VoiceAgentToolNames
+import me.rerere.rikkahub.voiceagent.persistence.VOICE_SESSION_ID_KEY
 
 const val HERMES_TOOL_STATUS_KEY = "voice_tool_status"
 const val HERMES_TOOL_JOB_ID_KEY = "voice_tool_job_id"
@@ -23,6 +24,8 @@ const val HERMES_ARGUMENT_HASH_KEY = "voice_argument_hash"
 const val HERMES_RESULT_HASH_KEY = "voice_result_hash"
 const val HERMES_PRODUCER_KEY = "voice_producer"
 const val HERMES_PRODUCER = "hermes"
+const val HERMES_ACCEPTING_OWNER_HASH_KEY = "voice_accepting_owner_hash"
+const val HERMES_ENDPOINT_BINDING_HASH_KEY = "voice_endpoint_binding_hash"
 
 enum class HermesQueueStatus(val wireName: String) {
     Pending("pending"),
@@ -86,6 +89,9 @@ data class HermesQueueRecord(
     val argumentHash: String? = null,
     val resultHash: String? = null,
     val producer: String? = null,
+    val voiceSessionId: String? = null,
+    val acceptingOwnerHash: String? = null,
+    val endpointBindingHash: String? = null,
 ) {
     val resultAnnounced: Boolean
         get() = announcement == HermesAnnouncementState.Announced
@@ -147,6 +153,8 @@ data class HermesQueueRecord(
         argumentHash?.let { put(HERMES_ARGUMENT_HASH_KEY, it) }
         resultHash?.let { put(HERMES_RESULT_HASH_KEY, it) }
         producer?.let { put(HERMES_PRODUCER_KEY, it) }
+        acceptingOwnerHash?.let { put(HERMES_ACCEPTING_OWNER_HASH_KEY, it) }
+        endpointBindingHash?.let { put(HERMES_ENDPOINT_BINDING_HASH_KEY, it) }
     }
 
     companion object {
@@ -184,6 +192,9 @@ data class HermesQueueRecord(
                 argumentHash = metadata.stringOrNull(HERMES_ARGUMENT_HASH_KEY),
                 resultHash = metadata.stringOrNull(HERMES_RESULT_HASH_KEY),
                 producer = metadata.stringOrNull(HERMES_PRODUCER_KEY),
+                voiceSessionId = metadata.stringOrNull(VOICE_SESSION_ID_KEY),
+                acceptingOwnerHash = metadata.stringOrNull(HERMES_ACCEPTING_OWNER_HASH_KEY),
+                endpointBindingHash = metadata.stringOrNull(HERMES_ENDPOINT_BINDING_HASH_KEY),
             )
         }
 

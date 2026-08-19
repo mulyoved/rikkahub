@@ -17,8 +17,18 @@ import me.rerere.rikkahub.voiceagent.persistence.VoiceTranscriptPersister
 internal enum class HermesQueuePersistenceResult {
     Mutated,
     Equivalent,
+    Stale,
     Conflict,
 }
+
+internal data class ValidatedHermesRecoverySnapshot(
+    val jobId: String,
+    val callId: String,
+    val status: HermesQueueStatus,
+    val answer: String?,
+    val error: String?,
+    val resultHash: String?,
+)
 
 class HermesQueueStore(
     private val conversationStore: VoiceConversationStore,
@@ -167,6 +177,74 @@ class HermesQueueStore(
                         argumentHash = argumentHash,
                         resultHash = resultHash,
                         producer = producer,
+                    )
+                    updated to HermesQueuePersistenceResult.Mutated
+                }
+            }
+        }
+    }
+
+    internal suspend fun persistValidatedRecoverySnapshot(
+        snapshot: ValidatedHermesRecoverySnapshot,
+    ): HermesQueuePersistenceResult {
+        val sessionId = persistenceSessionId()
+        return updateWithResult { conversation ->
+            val existing = conversation.hermesQueueRecords()
+                .lastOrNull { it.matchesIdentity(callId = snapshot.callId, jobId = snapshot.jobId) }
+                ?: conversation.hermesQueueRecords()
+                    .lastOrNull { it.callId == snapshot.callId && it.mayAdoptJobId(snapshot.status) }
+
+            when {
+                existing?.status?.isTerminal == true -> {
+                    if (!snapshot.status.isTerminal) {
+                        conversation to HermesQueuePersistenceResult.Stale
+                    } else if (existing.hasEquivalentTerminal(
+                            status = snapshot.status,
+                            answer = snapshot.answer,
+                            error = snapshot.error,
+                            resultHash = snapshot.resultHash,
+                        )
+                    ) {
+                        conversation to HermesQueuePersistenceResult.Equivalent
+                    } else {
+                        conversation to HermesQueuePersistenceResult.Conflict
+                    }
+                }
+
+                existing != null && !snapshot.status.isTerminal -> {
+                    when {
+                        snapshot.status == existing.status ->
+                            conversation to HermesQueuePersistenceResult.Equivalent
+
+                        snapshot.status.activeMonotonicRank > existing.status.activeMonotonicRank -> {
+                            val updated = writer.upsertHermesTool(
+                                conversation = conversation,
+                                callId = snapshot.callId,
+                                prompt = existing.prompt,
+                                status = snapshot.toVoiceToolRecordStatus(),
+                                sessionId = sessionId,
+                                jobId = snapshot.jobId,
+                                announceOnWrite = false,
+                                resultHash = snapshot.resultHash,
+                            )
+                            updated to HermesQueuePersistenceResult.Mutated
+                        }
+
+                        else ->
+                            conversation to HermesQueuePersistenceResult.Stale
+                    }
+                }
+
+                else -> {
+                    val updated = writer.upsertHermesTool(
+                        conversation = conversation,
+                        callId = snapshot.callId,
+                        prompt = existing?.prompt.orEmpty(),
+                        status = snapshot.toVoiceToolRecordStatus(),
+                        sessionId = sessionId,
+                        jobId = snapshot.jobId,
+                        announceOnWrite = false,
+                        resultHash = snapshot.resultHash,
                     )
                     updated to HermesQueuePersistenceResult.Mutated
                 }
@@ -404,21 +482,59 @@ class HermesQueueStore(
             this.producer == producer
 
     private fun HermesQueueRecord.hasEquivalentTerminal(
-        status: VoiceToolRecordStatus,
+        status: HermesQueueStatus,
+        answer: String?,
+        error: String?,
         resultHash: String?,
     ): Boolean {
-        if (this.status != status.queueStatus || this.resultHash != resultHash) return false
+        if (this.status != status || this.resultHash != resultHash) return false
         return when (status) {
-            is VoiceToolRecordStatus.Complete -> answer == status.answer && error == null
-            is VoiceToolRecordStatus.Failed -> answer == null && error == status.message
-            is VoiceToolRecordStatus.Expired -> answer == null && error == status.message
-            is VoiceToolRecordStatus.Canceled -> answer == null && error == status.message
-            VoiceToolRecordStatus.Pending,
-            VoiceToolRecordStatus.Queued,
-            VoiceToolRecordStatus.Running,
-                -> false
+            HermesQueueStatus.Complete -> this.answer == answer && this.error == null
+            HermesQueueStatus.Failed,
+            HermesQueueStatus.Expired,
+            HermesQueueStatus.Canceled -> this.answer == null && this.error == error
+            HermesQueueStatus.Pending,
+            HermesQueueStatus.Queued,
+            HermesQueueStatus.Running -> false
         }
     }
+
+    private fun HermesQueueRecord.hasEquivalentTerminal(
+        status: VoiceToolRecordStatus,
+        resultHash: String?,
+    ): Boolean = hasEquivalentTerminal(
+        status = status.queueStatus,
+        answer = (status as? VoiceToolRecordStatus.Complete)?.answer,
+        error = when (status) {
+            is VoiceToolRecordStatus.Failed -> status.message
+            is VoiceToolRecordStatus.Expired -> status.message
+            is VoiceToolRecordStatus.Canceled -> status.message
+            else -> null
+        },
+        resultHash = resultHash,
+    )
+
+    private val HermesQueueStatus.activeMonotonicRank: Int
+        get() = when (this) {
+            HermesQueueStatus.Pending -> 0
+            HermesQueueStatus.Queued -> 1
+            HermesQueueStatus.Running -> 2
+            HermesQueueStatus.Complete,
+            HermesQueueStatus.Failed,
+            HermesQueueStatus.Expired,
+            HermesQueueStatus.Canceled -> 3
+        }
+
+    private fun ValidatedHermesRecoverySnapshot.toVoiceToolRecordStatus(): VoiceToolRecordStatus =
+        when (status) {
+            HermesQueueStatus.Pending -> VoiceToolRecordStatus.Pending
+            HermesQueueStatus.Queued -> VoiceToolRecordStatus.Queued
+            HermesQueueStatus.Running -> VoiceToolRecordStatus.Running
+            HermesQueueStatus.Complete -> VoiceToolRecordStatus.Complete(answer.orEmpty())
+            HermesQueueStatus.Failed -> VoiceToolRecordStatus.Failed(error.orEmpty())
+            HermesQueueStatus.Expired -> VoiceToolRecordStatus.Expired(error.orEmpty())
+            HermesQueueStatus.Canceled -> VoiceToolRecordStatus.Canceled(error.orEmpty())
+        }
 
     private fun kotlinx.serialization.json.JsonObject.stringOrNull(key: String): String? =
         (this[key] as? JsonPrimitive)?.contentOrNull
