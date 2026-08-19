@@ -445,13 +445,10 @@ class HermesQueueStore(
         transform: (Conversation) -> Pair<Conversation, T>,
     ): T {
         return updateMutex.withLock {
-            var result: T? = null
-            conversationStore.update { conversation ->
-                val (updatedConversation, transformResult) = transform(conversation)
-                result = transformResult
-                updatedConversation
-            }
-            requireNotNull(result)
+            conversationStore.updateAtomically(
+                transform = transform,
+                commit = {},
+            )
         }
     }
 

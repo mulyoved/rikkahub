@@ -684,7 +684,10 @@ class FakeVoiceConversationStore(
     private val failedUpdates = mutableListOf<Throwable>()
     override val conversation: StateFlow<Conversation> = MutableStateFlow(initialConversation)
 
-    override suspend fun update(transform: (Conversation) -> Conversation) {
+    override suspend fun <T> updateAtomically(
+        transform: (Conversation) -> Pair<Conversation, T>,
+        commit: suspend (T) -> Unit,
+    ): T {
         val blockedBeforeUpdate = synchronized(blockedUpdates) { blockedUpdates.removeFirstOrNull() }
         if (blockedBeforeUpdate != null) {
             blockedBeforeUpdate.started.countDown()
@@ -692,7 +695,9 @@ class FakeVoiceConversationStore(
         }
         synchronized(failedUpdates) { failedUpdates.removeFirstOrNull() }?.let { throw it }
         val flow = conversation as MutableStateFlow<Conversation>
-        flow.value = transform(flow.value)
+        val (updated, result) = transform(flow.value)
+        commit(result)
+        flow.value = updated
         synchronized(updates) {
             updates += flow.value
         }
@@ -701,6 +706,7 @@ class FakeVoiceConversationStore(
             blockedAfterUpdate.started.countDown()
             blockedAfterUpdate.release.await(500, TimeUnit.MILLISECONDS)
         }
+        return result
     }
 
     fun blockNextUpdate(): BlockedUpdate {

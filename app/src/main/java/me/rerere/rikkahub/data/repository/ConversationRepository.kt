@@ -288,12 +288,16 @@ class ConversationRepository(
         indexConversation(conversation)
     }
 
-    internal suspend fun insertConversationPrimary(conversation: Conversation) {
+    internal suspend fun insertConversationPrimary(
+        conversation: Conversation,
+        primaryTransaction: suspend () -> Unit = {},
+    ) {
         database.withTransaction {
             conversationDAO.insert(
                 conversationToConversationEntity(conversation)
             )
             saveMessageNodes(conversation.id.toString(), conversation.messageNodes)
+            primaryTransaction()
         }
     }
 
@@ -302,7 +306,10 @@ class ConversationRepository(
         indexConversation(conversation)
     }
 
-    internal suspend fun updateConversationPrimary(conversation: Conversation) {
+    internal suspend fun updateConversationPrimary(
+        conversation: Conversation,
+        primaryTransaction: suspend () -> Unit = {},
+    ) {
         database.withTransaction {
             conversationDAO.update(
                 conversationToConversationEntity(conversation)
@@ -310,6 +317,7 @@ class ConversationRepository(
             // 删除旧的节点，插入新的节点
             messageNodeDAO.deleteByConversation(conversation.id.toString())
             saveMessageNodes(conversation.id.toString(), conversation.messageNodes)
+            primaryTransaction()
         }
     }
 

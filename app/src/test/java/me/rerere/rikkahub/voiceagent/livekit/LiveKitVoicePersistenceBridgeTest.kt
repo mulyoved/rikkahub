@@ -587,10 +587,16 @@ private class RecordingVoiceConversationStore(
 
     override val conversation: StateFlow<Conversation> = state
 
-    override suspend fun update(transform: (Conversation) -> Conversation) {
+    override suspend fun <T> updateAtomically(
+        transform: (Conversation) -> Pair<Conversation, T>,
+        commit: suspend (T) -> Unit,
+    ): T {
         updateStarted.complete(Unit)
         if (blockUpdates) releaseUpdate.await()
-        state.value = transform(state.value)
+        val (updated, result) = transform(state.value)
+        commit(result)
+        state.value = updated
+        return result
     }
 }
 

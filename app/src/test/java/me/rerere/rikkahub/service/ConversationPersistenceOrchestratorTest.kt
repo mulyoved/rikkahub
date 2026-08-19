@@ -117,16 +117,24 @@ class ConversationPersistenceOrchestratorTest {
             return result
         }
 
-        override suspend fun insertPrimary(conversation: Conversation) {
+        override suspend fun insertPrimary(
+            conversation: Conversation,
+            primaryTransaction: suspend () -> Unit,
+        ) {
             events += "insert"
             primaryConversation = conversation
             primaryFailure?.let { throw it }
+            primaryTransaction()
         }
 
-        override suspend fun updatePrimary(conversation: Conversation) {
+        override suspend fun updatePrimary(
+            conversation: Conversation,
+            primaryTransaction: suspend () -> Unit,
+        ) {
             events += "update"
             primaryConversation = conversation
             primaryFailure?.let { throw it }
+            primaryTransaction()
         }
 
         override fun synchronizeSession(conversationId: Uuid, conversation: Conversation) {

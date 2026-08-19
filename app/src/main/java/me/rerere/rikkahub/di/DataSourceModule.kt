@@ -147,6 +147,14 @@ val dataSourceModule = module {
     }
 
     single {
+        get<AppDatabase>().hermesRecoveryDao()
+    }
+
+    single {
+        me.rerere.rikkahub.voiceagent.recovery.HermesRecoveryLedger(get())
+    }
+
+    single {
         MessageFtsManager(get())
     }
 

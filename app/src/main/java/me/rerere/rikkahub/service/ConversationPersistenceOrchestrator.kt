@@ -13,9 +13,15 @@ internal interface ConversationPersistenceGateway {
         postPrimary: suspend (T) -> Unit,
     ): T
 
-    suspend fun insertPrimary(conversation: Conversation)
+    suspend fun insertPrimary(
+        conversation: Conversation,
+        primaryTransaction: suspend () -> Unit = {},
+    )
 
-    suspend fun updatePrimary(conversation: Conversation)
+    suspend fun updatePrimary(
+        conversation: Conversation,
+        primaryTransaction: suspend () -> Unit = {},
+    )
 
     fun synchronizeSession(conversationId: Uuid, conversation: Conversation)
 
@@ -35,6 +41,7 @@ internal class ConversationPersistenceOrchestrator(
         conversationId: Uuid,
         conversation: Conversation,
         preservePersistedLocation: Boolean,
+        primaryTransaction: suspend () -> Unit = {},
     ) {
         gateway.serialize(
             conversationId = conversationId,
@@ -49,9 +56,9 @@ internal class ConversationPersistenceOrchestrator(
                     conversation
                 }
                 if (persistedLocation.exists) {
-                    gateway.updatePrimary(normalized)
+                    gateway.updatePrimary(normalized, primaryTransaction)
                 } else {
-                    gateway.insertPrimary(normalized)
+                    gateway.insertPrimary(normalized, primaryTransaction)
                 }
                 normalized
             },

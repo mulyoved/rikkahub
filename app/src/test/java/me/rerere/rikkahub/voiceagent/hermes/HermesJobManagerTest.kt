@@ -2671,7 +2671,10 @@ private class SnapshotBeforeBlockConversationStore(
     private var blockedUpdate: BlockedSnapshotUpdate? = null
     override val conversation: StateFlow<Conversation> = MutableStateFlow(initialConversation)
 
-    override suspend fun update(transform: (Conversation) -> Conversation) {
+    override suspend fun <T> updateAtomically(
+        transform: (Conversation) -> Pair<Conversation, T>,
+        commit: suspend (T) -> Unit,
+    ): T {
         val flow = conversation as MutableStateFlow<Conversation>
         val snapshot = flow.value
         val blocked = synchronized(lock) {
@@ -2681,7 +2684,10 @@ private class SnapshotBeforeBlockConversationStore(
             blocked.started.complete(Unit)
             blocked.release.await()
         }
-        flow.value = transform(snapshot)
+        val (updated, result) = transform(snapshot)
+        commit(result)
+        flow.value = updated
+        return result
     }
 
     fun blockNextUpdate(): BlockedSnapshotUpdate {

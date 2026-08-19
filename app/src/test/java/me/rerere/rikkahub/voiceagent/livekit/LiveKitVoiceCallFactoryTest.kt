@@ -480,9 +480,15 @@ private class RecordingFactoryConversationStore(
     var updateCalls = 0
     var closeCalls = 0
 
-    override suspend fun update(transform: (Conversation) -> Conversation) {
+    override suspend fun <T> updateAtomically(
+        transform: (Conversation) -> Pair<Conversation, T>,
+        commit: suspend (T) -> Unit,
+    ): T {
         updateCalls += 1
-        mutableConversation.value = transform(mutableConversation.value)
+        val (updated, result) = transform(mutableConversation.value)
+        commit(result)
+        mutableConversation.value = updated
+        return result
     }
 
     override fun close() {

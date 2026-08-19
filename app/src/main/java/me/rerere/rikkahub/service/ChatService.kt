@@ -169,12 +169,18 @@ class ChatService(
                 postPrimary = postPrimary,
             )
 
-            override suspend fun insertPrimary(conversation: Conversation) {
-                conversationRepo.insertConversationPrimary(conversation)
+            override suspend fun insertPrimary(
+                conversation: Conversation,
+                primaryTransaction: suspend () -> Unit,
+            ) {
+                conversationRepo.insertConversationPrimary(conversation, primaryTransaction)
             }
 
-            override suspend fun updatePrimary(conversation: Conversation) {
-                conversationRepo.updateConversationPrimary(conversation)
+            override suspend fun updatePrimary(
+                conversation: Conversation,
+                primaryTransaction: suspend () -> Unit,
+            ) {
+                conversationRepo.updateConversationPrimary(conversation, primaryTransaction)
             }
 
             override fun synchronizeSession(conversationId: Uuid, conversation: Conversation) {
@@ -1028,6 +1034,26 @@ class ChatService(
         )
     }
 
+    suspend fun <T> saveConversationAtomically(
+        conversationId: Uuid,
+        transform: (Conversation) -> Pair<Conversation, T>,
+        commit: suspend (T) -> Unit,
+    ): T {
+        var commitResult: T? = null
+        val current = getConversationFlow(conversationId).value
+        val (updatedConversation, result) = transform(current)
+        commitResult = result
+        persistConversation(
+            conversationId = conversationId,
+            conversation = updatedConversation,
+            preservePersistedLocation = true,
+            primaryTransaction = {
+                commit(result)
+            },
+        )
+        return requireNotNull(commitResult)
+    }
+
     internal suspend fun moveConversationToAssistant(
         conversationId: Uuid,
         conversation: Conversation,
@@ -1047,11 +1073,13 @@ class ChatService(
         conversationId: Uuid,
         conversation: Conversation,
         preservePersistedLocation: Boolean,
+        primaryTransaction: suspend () -> Unit = {},
     ) {
         conversationPersistence.persist(
             conversationId = conversationId,
             conversation = conversation,
             preservePersistedLocation = preservePersistedLocation,
+            primaryTransaction = primaryTransaction,
         )
     }
 

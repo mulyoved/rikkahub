@@ -15,7 +15,19 @@ import kotlin.uuid.Uuid
 
 interface VoiceConversationStore {
     val conversation: StateFlow<Conversation>
-    suspend fun update(transform: (Conversation) -> Conversation)
+
+    suspend fun <T> updateAtomically(
+        transform: (Conversation) -> Pair<Conversation, T>,
+        commit: suspend (T) -> Unit,
+    ): T
+
+    suspend fun update(transform: (Conversation) -> Conversation) {
+        updateAtomically(
+            transform = { conversation -> transform(conversation) to Unit },
+            commit = {},
+        )
+    }
+
     fun close() = Unit
 }
 
@@ -25,8 +37,14 @@ class InMemoryVoiceConversationStore(
     private val conversationFlow = MutableStateFlow(initialConversation)
     override val conversation: StateFlow<Conversation> = conversationFlow
 
-    override suspend fun update(transform: (Conversation) -> Conversation) {
-        conversationFlow.value = transform(conversationFlow.value)
+    override suspend fun <T> updateAtomically(
+        transform: (Conversation) -> Pair<Conversation, T>,
+        commit: suspend (T) -> Unit,
+    ): T {
+        val (updated, result) = transform(conversationFlow.value)
+        commit(result)
+        conversationFlow.value = updated
+        return result
     }
 }
 
@@ -37,9 +55,12 @@ class SynchronizedVoiceConversationStore(
 
     override val conversation: StateFlow<Conversation> = delegate.conversation
 
-    override suspend fun update(transform: (Conversation) -> Conversation) {
-        lock.withLock {
-            delegate.update(transform)
+    override suspend fun <T> updateAtomically(
+        transform: (Conversation) -> Pair<Conversation, T>,
+        commit: suspend (T) -> Unit,
+    ): T {
+        return lock.withLock {
+            delegate.updateAtomically(transform, commit)
         }
     }
 
@@ -60,9 +81,15 @@ class ChatServiceVoiceConversationStore(
 
     override val conversation: StateFlow<Conversation> = chatService.getConversationFlow(conversationId)
 
-    override suspend fun update(transform: (Conversation) -> Conversation) {
-        val updatedConversation = transform(chatService.getConversationFlow(conversationId).value)
-        chatService.saveConversation(conversationId = conversationId, conversation = updatedConversation)
+    override suspend fun <T> updateAtomically(
+        transform: (Conversation) -> Pair<Conversation, T>,
+        commit: suspend (T) -> Unit,
+    ): T {
+        return chatService.saveConversationAtomically(
+            conversationId = conversationId,
+            transform = transform,
+            commit = commit,
+        )
     }
 
     override fun close() {

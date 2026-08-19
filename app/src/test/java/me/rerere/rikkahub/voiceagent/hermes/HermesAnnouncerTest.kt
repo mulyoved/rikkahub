@@ -761,9 +761,12 @@ class HermesAnnouncerTest {
     ) : VoiceConversationStore {
         override val conversation: StateFlow<Conversation> get() = delegate.conversation
 
-        override suspend fun update(transform: (Conversation) -> Conversation) {
+        override suspend fun <T> updateAtomically(
+            transform: (Conversation) -> Pair<Conversation, T>,
+            commit: suspend (T) -> Unit,
+        ): T {
             yield()
-            delegate.update(transform)
+            return delegate.updateAtomically(transform, commit)
         }
     }
 
@@ -787,7 +790,10 @@ class HermesAnnouncerTest {
                 return delegate.conversation
             }
 
-        override suspend fun update(transform: (Conversation) -> Conversation) = delegate.update(transform)
+        override suspend fun <T> updateAtomically(
+            transform: (Conversation) -> Pair<Conversation, T>,
+            commit: suspend (T) -> Unit,
+        ): T = delegate.updateAtomically(transform, commit)
     }
 
     /** Runs one synchronous callback immediately before the next durable-state value read. */
@@ -806,7 +812,10 @@ class HermesAnnouncerTest {
             nextRead = block
         }
 
-        override suspend fun update(transform: (Conversation) -> Conversation) = delegate.update(transform)
+        override suspend fun <T> updateAtomically(
+            transform: (Conversation) -> Pair<Conversation, T>,
+            commit: suspend (T) -> Unit,
+        ): T = delegate.updateAtomically(transform, commit)
     }
 
     /** A conversation store whose first [update] throws, then delegates normally. */
@@ -816,12 +825,15 @@ class HermesAnnouncerTest {
         private var thrown = false
         override val conversation: StateFlow<Conversation> get() = delegate.conversation
 
-        override suspend fun update(transform: (Conversation) -> Conversation) {
+        override suspend fun <T> updateAtomically(
+            transform: (Conversation) -> Pair<Conversation, T>,
+            commit: suspend (T) -> Unit,
+        ): T {
             if (!thrown) {
                 thrown = true
                 throw IllegalStateException("mark boom")
             }
-            delegate.update(transform)
+            return delegate.updateAtomically(transform, commit)
         }
     }
 
