@@ -1,6 +1,7 @@
 package me.rerere.rikkahub.voiceagent.recovery
 
 import kotlinx.coroutines.flow.first
+import me.rerere.ai.provider.ProviderSetting
 import me.rerere.rikkahub.data.datastore.Settings
 import me.rerere.rikkahub.data.datastore.SettingsStore
 import me.rerere.rikkahub.data.model.Conversation
@@ -10,6 +11,7 @@ import me.rerere.rikkahub.voiceagent.hermesvoice.HermesVoiceApi
 import me.rerere.rikkahub.voiceagent.hermesvoice.HermesVoiceHttpTransport
 import me.rerere.rikkahub.voiceagent.telemetry.sha256Hex
 import me.rerere.rikkahub.voiceagent.toHermesVoiceBaseUrl
+import me.rerere.rikkahub.voiceagent.voiceConfigurationStateIdentity
 
 internal data class ResolvedHermesRecoveryEndpoint(
     val endpointBindingHash: String,
@@ -24,6 +26,32 @@ internal fun hermesEndpointBindingHash(normalizedBaseUrl: String): String =
             HERMES_SERVER_DEFAULT_PROFILE,
         ).joinToString("\n")
     )
+
+internal fun hermesEndpointConfigurationHash(settings: Settings): String {
+    val providerStrings = settings.providers.map { provider ->
+        val openAi = provider as? ProviderSetting.OpenAI
+        listOf(
+            provider.id.toString(),
+            provider.name,
+            openAi?.baseUrl.orEmpty(),
+            openAi?.apiKey.orEmpty(),
+            openAi?.chatCompletionsPath.orEmpty(),
+        ).joinToString("|")
+    }
+    val assistantStrings = settings.assistants.map { assistant ->
+        val headers = assistant.customHeaders.joinToString(",") { "${it.name}=${it.value}" }
+        listOf(
+            assistant.id.toString(),
+            assistant.chatModelId?.toString().orEmpty(),
+            headers,
+        ).joinToString("|")
+    }
+    val values = mutableListOf<String>()
+    values.add(settings.chatModelId.toString())
+    values.addAll(providerStrings)
+    values.addAll(assistantStrings)
+    return voiceConfigurationStateIdentity("hermes-endpoint-config-v1", *values.toTypedArray())
+}
 
 internal fun recoverySha256(value: String): String = sha256Hex(value)
 

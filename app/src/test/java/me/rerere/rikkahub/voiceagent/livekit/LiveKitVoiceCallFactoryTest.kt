@@ -31,8 +31,17 @@ import me.rerere.rikkahub.voiceagent.VoiceAgentTransport
 import me.rerere.rikkahub.voiceagent.audio.VoiceAudioRouteOwner
 import me.rerere.rikkahub.voiceagent.hermesvoice.HermesVoiceHttpException
 import me.rerere.rikkahub.voiceagent.orchestratorRequest
+import me.rerere.rikkahub.voiceagent.recovery.AcceptedHermesBinding
+import me.rerere.rikkahub.voiceagent.recovery.HermesRecoveryCoordinator
+import me.rerere.rikkahub.voiceagent.recovery.HermesRecoveryLedger
+import me.rerere.rikkahub.voiceagent.recovery.HermesTerminalCommitter
+import me.rerere.rikkahub.voiceagent.recovery.RecoveryOutcome
+import me.rerere.rikkahub.voiceagent.recovery.RecoveryTrigger
+import me.rerere.rikkahub.voiceagent.recovery.hermesEndpointBindingHash
 import me.rerere.rikkahub.voiceagent.telemetry.VoiceTraceContext
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -418,6 +427,64 @@ class LiveKitVoiceCallFactoryTest {
         }
     }
 
+    @Test
+    fun `captures endpoint binding hash at session creation and uses it even if settings change before job accepted`() = runTest {
+        val endpointA = "https://endpoint-a.example.com/api"
+        val endpointB = "https://endpoint-b.example.com/api"
+        val initialRequest = request()
+        val requestA = initialRequest.copy(
+            config = initialRequest.config.copy(hermesVoiceBaseUrl = endpointA),
+        )
+
+        var capturedBinding: AcceptedHermesBinding? = null
+        val fakeCoordinator = object : HermesRecoveryCoordinator {
+            override suspend fun registerAccepted(binding: AcceptedHermesBinding): String {
+                capturedBinding = binding
+                return "recovery-key-1"
+            }
+            override fun onPersistedRelayEvent(recoveryKey: String) = Unit
+            override fun onCallEnded(voiceSessionId: String) = Unit
+            override suspend fun requestCancellation(recoveryKey: String) = Unit
+            override suspend fun reconcile(recoveryKey: String, trigger: RecoveryTrigger): RecoveryOutcome = RecoveryOutcome.Success
+            override suspend fun reactivateConversation(conversationId: Uuid, trigger: RecoveryTrigger) = Unit
+            override suspend fun reactivateDormant(trigger: RecoveryTrigger) = Unit
+            override suspend fun repairAll() = Unit
+            override suspend fun repairConversation(conversationId: Uuid) = Unit
+        }
+
+        val room = InertLiveKitRoomFacade()
+        val factory = factory(
+            sessionDetailsFactory = { _, _ -> factoryDetails() },
+            roomFactory = { room },
+            coordinator = fakeCoordinator,
+        )
+
+        val result = factory.createOwned(requestA, OrchestratorFakeRoute().lease, backgroundScope)
+        val session = (result as VoiceAgentSessionCreationResult.Created).session
+        session.start()
+        runCurrent()
+
+        // Settings change to endpoint B before job accepted
+        val expectedEventHash = "sha256:${"7".repeat(64)}"
+        val acceptedPayload = acceptedEventJson(
+            userTurnId = "turn_lifetime_test",
+            requestHash = expectedEventHash,
+        )
+
+        val ack = room.invoke(
+            method = LIVEKIT_PERSISTENCE_RPC,
+            caller = factoryDetails().agentParticipantIdentity,
+            payload = acceptedPayload,
+        )
+
+        assertEquals("persisted", parseLiveKitPersistenceAck(ack)?.status)
+        assertNotNull("registerAccepted must have been called", capturedBinding)
+        assertEquals(hermesEndpointBindingHash(endpointA), capturedBinding!!.endpointBindingHash)
+        assertNotEquals(hermesEndpointBindingHash(endpointB), capturedBinding!!.endpointBindingHash)
+        assertEquals("turn_lifetime_test", capturedBinding!!.originatingUserTurnId)
+        assertEquals(expectedEventHash, capturedBinding!!.requestHash)
+    }
+
     private fun factory(
         sessionDetailsFactory: suspend (
             me.rerere.rikkahub.voiceagent.VoiceAgentCallRequest,
@@ -429,6 +496,9 @@ class LiveKitVoiceCallFactoryTest {
         },
         artifactWriterFactory: (File, VoiceTraceContext, CoroutineScope) -> VoiceE2EArtifactWriter =
             { _, _, _ -> VoiceE2EArtifactWriter.disabled() },
+        coordinator: HermesRecoveryCoordinator? = null,
+        terminalCommitter: HermesTerminalCommitter? = null,
+        ledger: HermesRecoveryLedger? = null,
         noBackupFilesDir: File = File("build/tmp/livekit-factory-test"),
         timeoutMillis: Long = 1_000,
     ) = LiveKitVoiceCallFactory(
@@ -445,6 +515,9 @@ class LiveKitVoiceCallFactoryTest {
         roomFactory = roomFactory,
         conversationStoreFactory = conversationStoreFactory,
         artifactWriterFactory = artifactWriterFactory,
+        coordinator = coordinator,
+        terminalCommitter = terminalCommitter,
+        ledger = ledger,
         sessionCreationTimeoutMillis = timeoutMillis,
     )
 
@@ -521,10 +594,13 @@ private val SESSION_BINDING = LiveKitSessionCorrelationBinding(
 
 private fun hash(character: Char): String = "sha256:" + character.toString().repeat(64)
 
-private fun acceptedEventJson(): String =
+private fun acceptedEventJson(
+    userTurnId: String = "turn_1",
+    requestHash: String = "sha256:${"2".repeat(64)}",
+): String =
     CanonicalVoiceExperienceJson.encodeObject(
         Json.parseToJsonElement(
-            """{"version":1,"voiceSessionId":"lvs_1","eventId":"evt_accepted","kind":"job_accepted","observedAt":"2026-07-30T12:00:00Z","userTurnId":"turn_1","requestHash":"sha256:${"2".repeat(64)}","toolCallId":"call_1","argumentHash":"sha256:${"1".repeat(64)}","jobId":"hj_1","ownerHash":"${SESSION_BINDING.ownerHash}","conversationHash":"${SESSION_BINDING.conversationHash}","voiceSessionHash":"${SESSION_BINDING.voiceSessionHash}","roomHash":"${SESSION_BINDING.roomHash}","traceHash":"${SESSION_BINDING.traceHash}","prompt":"private question"}"""
+            """{"version":1,"voiceSessionId":"lvs_1","eventId":"evt_accepted","kind":"job_accepted","observedAt":"2026-07-30T12:00:00Z","userTurnId":"$userTurnId","requestHash":"$requestHash","toolCallId":"call_1","argumentHash":"sha256:${"1".repeat(64)}","jobId":"hj_1","ownerHash":"${SESSION_BINDING.ownerHash}","conversationHash":"${SESSION_BINDING.conversationHash}","voiceSessionHash":"${SESSION_BINDING.voiceSessionHash}","roomHash":"${SESSION_BINDING.roomHash}","traceHash":"${SESSION_BINDING.traceHash}","prompt":"private question"}"""
         ).jsonObject,
     )
 

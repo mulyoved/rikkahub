@@ -258,6 +258,7 @@ class HermesTerminalCommitterTest {
         val throwingDao = object : HermesRecoveryDAO {
             override suspend fun find(recoveryKey: String): HermesRecoveryEntity? = null
             override suspend fun active(): List<HermesRecoveryEntity> = emptyList()
+            override suspend fun dormant(): List<HermesRecoveryEntity> = emptyList()
             override suspend fun forConversation(conversationId: String): List<HermesRecoveryEntity> = emptyList()
             override suspend fun insert(entry: HermesRecoveryEntity): Long = 1L
             override suspend fun update(entry: HermesRecoveryEntity) {
@@ -369,6 +370,9 @@ private class FakeHermesRecoveryDAODouble : HermesRecoveryDAO {
 
     override suspend fun active(): List<HermesRecoveryEntity> =
         storage.values.filter { it.recoveryState == HermesRecoveryState.Active.name }
+
+    override suspend fun dormant(): List<HermesRecoveryEntity> =
+        storage.values.filter { it.recoveryState == HermesRecoveryState.Dormant.name }
 
     override suspend fun forConversation(conversationId: String): List<HermesRecoveryEntity> =
         storage.values.filter { it.conversationId == conversationId }

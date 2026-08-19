@@ -107,6 +107,8 @@ import me.rerere.rikkahub.utils.base64Decode
 import me.rerere.rikkahub.utils.isAllowedFileType
 import me.rerere.rikkahub.utils.navigateToChatPage
 import me.rerere.rikkahub.voiceagent.VoiceSessionDebugDisplay
+import me.rerere.rikkahub.voiceagent.recovery.HermesRecoveryCoordinator
+import me.rerere.rikkahub.voiceagent.recovery.RecoveryTrigger
 import org.koin.androidx.compose.koinViewModel
 import org.koin.compose.koinInject
 import org.koin.core.parameter.parametersOf
@@ -121,8 +123,13 @@ fun ChatPage(id: Uuid, text: String?, files: List<Uri>, nodeId: Uuid? = null) {
         }
     )
     val filesManager: FilesManager = koinInject()
+    val recoveryCoordinator: HermesRecoveryCoordinator = koinInject()
     val navController = LocalNavController.current
     val scope = rememberCoroutineScope()
+
+    LaunchedEffect(id) {
+        recoveryCoordinator.reactivateConversation(id, RecoveryTrigger.ConversationOpened)
+    }
 
     val setting by vm.settings.collectAsStateWithLifecycle()
     val conversation by vm.conversation.collectAsStateWithLifecycle()

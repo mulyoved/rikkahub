@@ -4,6 +4,7 @@ import androidx.room.Room
 import androidx.room.RoomDatabase
 import androidx.sqlite.db.SupportSQLiteDatabase
 import android.content.Context
+import androidx.work.WorkManager
 import io.ktor.client.HttpClient
 import io.ktor.client.engine.okhttp.OkHttp
 import io.ktor.http.HttpHeaders
@@ -34,14 +35,26 @@ import me.rerere.rikkahub.data.ai.mcp.McpManager
 import me.rerere.rikkahub.data.sync.webdav.WebDavSync
 import me.rerere.search.SearchService
 import me.rerere.rikkahub.data.sync.S3Sync
+import me.rerere.rikkahub.voiceagent.recovery.HermesRecoveryCoordinator
+import me.rerere.rikkahub.voiceagent.recovery.HermesRecoveryEndpointResolver
+import me.rerere.rikkahub.voiceagent.recovery.HermesRecoveryLedger
+import me.rerere.rikkahub.voiceagent.recovery.HermesRecoveryWorkRequestFactory
+import me.rerere.rikkahub.voiceagent.recovery.HermesRecoveryWorkScheduler
+import me.rerere.rikkahub.voiceagent.recovery.HermesRecoveryWorker
+import me.rerere.rikkahub.voiceagent.recovery.HermesRelayRegistry
+import me.rerere.rikkahub.voiceagent.recovery.HermesTerminalCommitter
+import me.rerere.rikkahub.voiceagent.recovery.WorkManagerHermesRecoveryWorkScheduler
+import me.rerere.rikkahub.voiceagent.recovery.hermesRecoveryRequest
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.logging.HttpLoggingInterceptor
+import org.koin.androidx.workmanager.dsl.worker
 import org.koin.dsl.module
 import retrofit2.Retrofit
 import retrofit2.converter.kotlinx.serialization.asConverterFactory
 import java.util.Locale
 import java.util.concurrent.TimeUnit
+import kotlin.uuid.Uuid
 
 val dataSourceModule = module {
     single {
@@ -151,7 +164,56 @@ val dataSourceModule = module {
     }
 
     single {
-        me.rerere.rikkahub.voiceagent.recovery.HermesRecoveryLedger(get())
+        HermesRecoveryLedger(get())
+    }
+
+    single {
+        HermesRelayRegistry()
+    }
+
+    single {
+        HermesRecoveryEndpointResolver(settingsStore = get())
+    }
+
+    single {
+        HermesTerminalCommitter(ledger = get())
+    }
+
+    single<HermesRecoveryWorkRequestFactory> {
+        HermesRecoveryWorkRequestFactory { spec ->
+            hermesRecoveryRequest<HermesRecoveryWorker>(spec)
+        }
+    }
+
+    single<HermesRecoveryWorkScheduler> {
+        WorkManagerHermesRecoveryWorkScheduler(
+            workManager = WorkManager.getInstance(get()),
+            requestFactory = get(),
+        )
+    }
+
+    worker {
+        HermesRecoveryWorker(
+            context = get(),
+            workerParams = get(),
+            coordinator = get(),
+        )
+    }
+
+    single<HermesRecoveryCoordinator> {
+        val conversationDao: me.rerere.rikkahub.data.db.dao.ConversationDAO = get()
+        HermesRecoveryCoordinator(
+            ledger = get(),
+            scheduler = get(),
+            relayRegistry = get(),
+            endpointResolver = get(),
+            chatService = get(),
+            terminalCommitter = get(),
+            coroutineScope = get<me.rerere.rikkahub.AppScope>(),
+            conversationIdsProvider = {
+                conversationDao.getAllIds().map { Uuid.parse(it) }
+            },
+        )
     }
 
     single {

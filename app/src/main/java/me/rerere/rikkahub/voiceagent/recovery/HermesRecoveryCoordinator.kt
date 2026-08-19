@@ -59,6 +59,7 @@ internal interface HermesRecoveryCoordinator {
     suspend fun requestCancellation(recoveryKey: String)
     suspend fun reconcile(recoveryKey: String, trigger: RecoveryTrigger): RecoveryOutcome
     suspend fun reactivateConversation(conversationId: Uuid, trigger: RecoveryTrigger)
+    suspend fun reactivateDormant(trigger: RecoveryTrigger = RecoveryTrigger.ConfigurationChanged)
     suspend fun repairAll()
     suspend fun repairConversation(conversationId: Uuid)
 
@@ -391,6 +392,14 @@ internal class DefaultHermesRecoveryCoordinator(
                 )
                 scheduler.preempt(entry.recoveryKey, Duration.ZERO)
             }
+        }
+    }
+
+    override suspend fun reactivateDormant(trigger: RecoveryTrigger) {
+        val dormantEntries = ledger.dormant()
+        val distinctConversationIds = dormantEntries.map { it.conversationId }.distinct()
+        for (convId in distinctConversationIds) {
+            reactivateConversation(convId, trigger)
         }
     }
 

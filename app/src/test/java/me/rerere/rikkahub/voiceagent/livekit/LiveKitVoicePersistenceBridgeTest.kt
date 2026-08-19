@@ -10,14 +10,28 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import me.rerere.ai.core.MessageRole
 import me.rerere.ai.ui.UIMessagePart
+import me.rerere.rikkahub.data.db.dao.HermesRecoveryDAO
+import me.rerere.rikkahub.data.db.entity.HermesRecoveryEntity
 import me.rerere.rikkahub.data.model.Conversation
 import me.rerere.rikkahub.voiceagent.VoiceConversationStore
 import me.rerere.rikkahub.voiceagent.hermes.HermesQueueStore
 import me.rerere.rikkahub.voiceagent.hermes.HermesToolRecordWriter
 import me.rerere.rikkahub.voiceagent.hermes.hermesQueueRecords
 import me.rerere.rikkahub.voiceagent.persistence.VoiceTranscriptPersister
+import me.rerere.rikkahub.voiceagent.recovery.HermesNotificationDisposition
+import me.rerere.rikkahub.voiceagent.recovery.HermesRecoveryCoordinator
+import me.rerere.rikkahub.voiceagent.recovery.HermesRecoveryEndpointResolver
+import me.rerere.rikkahub.voiceagent.recovery.HermesRecoveryLedger
+import me.rerere.rikkahub.voiceagent.recovery.HermesRecoveryState
+import me.rerere.rikkahub.voiceagent.recovery.HermesRecoveryWorkScheduler
+import me.rerere.rikkahub.voiceagent.recovery.HermesRelayRegistry
+import me.rerere.rikkahub.voiceagent.recovery.HermesTerminalCommitter
+import me.rerere.rikkahub.voiceagent.recovery.RecoveryClock
+import me.rerere.rikkahub.voiceagent.recovery.ResolvedHermesRecoveryEndpoint
+import me.rerere.rikkahub.voiceagent.recovery.hermesRecoveryKey
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.time.Instant
@@ -554,10 +568,171 @@ class LiveKitVoicePersistenceBridgeTest {
         )
     }
 
+    @Test
+    fun `acceptance follows exact order validate, commit, enqueue, ack, renew lease`() = runTest {
+        val clock = BridgeTestClock()
+        val callOrder = mutableListOf<String>()
+        val store = OrderTrackingVoiceConversationStore(callOrder)
+        val scheduler = OrderTrackingScheduler(callOrder)
+        val fakeDao = CoordinatorFakeDAO()
+        val ledger = HermesRecoveryLedger(fakeDao)
+        val registry = OrderTrackingRelayRegistry(callOrder, clock)
+        val coordinator = HermesRecoveryCoordinator(
+            ledger = ledger,
+            scheduler = scheduler,
+            relayRegistry = registry,
+            endpointResolver = HermesRecoveryEndpointResolver(null),
+            conversationStoreProvider = { store },
+            clock = clock,
+        )
+        val bridge = bridge(
+            store = store,
+            coordinator = coordinator,
+            acceptingEndpointBindingHash = "test-endpoint-hash",
+        )
+
+        val ack = bridge.handle(AGENT_IDENTITY, acceptedEventJson())
+
+        assertEquals("persisted", parseLiveKitPersistenceAck(ack)!!.status)
+        assertEquals(
+            listOf(
+                "conversation_commit",
+                "scheduler_ensure",
+                "lease_renew",
+            ),
+            callOrder,
+        )
+        // Ledger entry committed
+        val entry = ledger.find(hermesRecoveryKey(store.conversation.value.id, "call_1", "hj_1"))
+        assertNotNull(entry)
+        assertEquals(HermesRecoveryState.Active, entry!!.recoveryState)
+    }
+
+    @Test
+    fun `enqueue failure after Room commit throws without returning ack leaving ledger repairable`() = runTest {
+        val clock = BridgeTestClock()
+        val store = RecordingVoiceConversationStore()
+        val fakeDao = CoordinatorFakeDAO()
+        val ledger = HermesRecoveryLedger(fakeDao)
+        val failingScheduler = object : HermesRecoveryWorkScheduler {
+            override suspend fun ensure(recoveryKey: String, delay: kotlin.time.Duration) {
+                throw IllegalStateException("WorkManager enqueue failed")
+            }
+            override suspend fun preempt(recoveryKey: String, delay: kotlin.time.Duration) = Unit
+            override suspend fun continueAfterCurrent(recoveryKey: String, delay: kotlin.time.Duration) = Unit
+            override suspend fun cancel(recoveryKey: String) = Unit
+        }
+        val coordinator = HermesRecoveryCoordinator(
+            ledger = ledger,
+            scheduler = failingScheduler,
+            relayRegistry = HermesRelayRegistry(clock = clock),
+            endpointResolver = HermesRecoveryEndpointResolver(null),
+            conversationStoreProvider = { store },
+            clock = clock,
+        )
+        val bridge = bridge(
+            store = store,
+            coordinator = coordinator,
+            acceptingEndpointBindingHash = "test-endpoint-hash",
+        )
+
+        val thrown = runCatching {
+            bridge.handle(AGENT_IDENTITY, acceptedEventJson())
+        }.exceptionOrNull()
+
+        assertNotNull(thrown)
+        assertTrue(thrown is IllegalStateException)
+        assertEquals("WorkManager enqueue failed", thrown!!.message)
+
+        // The record was committed in conversation store and ledger, so it is repairable on startup
+        val records = store.conversation.value.hermesQueueRecords()
+        assertEquals(1, records.size)
+        val entry = ledger.find(hermesRecoveryKey(store.conversation.value.id, "call_1", "hj_1"))
+        assertNotNull(entry)
+        assertEquals(HermesRecoveryState.Active, entry!!.recoveryState)
+    }
+
+    @Test
+    fun `terminal event uses terminal committer and marks ledger Finished with SuppressedNotEnabled`() = runTest {
+        val clock = BridgeTestClock()
+        val store = RecordingVoiceConversationStore()
+        val fakeDao = CoordinatorFakeDAO()
+        val ledger = HermesRecoveryLedger(fakeDao)
+        val terminalCommitter = HermesTerminalCommitter(ledger, clock = clock)
+        val coordinator = HermesRecoveryCoordinator(
+            ledger = ledger,
+            scheduler = FakeScheduler(),
+            relayRegistry = HermesRelayRegistry(clock = clock),
+            endpointResolver = HermesRecoveryEndpointResolver(null),
+            conversationStoreProvider = { store },
+            terminalCommitter = terminalCommitter,
+            clock = clock,
+        )
+        val bridge = bridge(
+            store = store,
+            coordinator = coordinator,
+            terminalCommitter = terminalCommitter,
+            ledger = ledger,
+            acceptingEndpointBindingHash = "test-endpoint-hash",
+        )
+
+        bridge.handle(AGENT_IDENTITY, acceptedEventJson())
+        val key = hermesRecoveryKey(store.conversation.value.id, "call_1", "hj_1")
+        val activeEntry = ledger.find(key)!!
+        assertEquals(HermesRecoveryState.Active, activeEntry.recoveryState)
+        assertEquals(HermesNotificationDisposition.Undecided, activeEntry.notificationDisposition)
+
+        bridge.handle(AGENT_IDENTITY, succeededEventJson(answer = "Hermes answer"))
+
+        val finishedEntry = ledger.find(key)!!
+        assertEquals(HermesRecoveryState.Finished, finishedEntry.recoveryState)
+        assertEquals(HermesNotificationDisposition.SuppressedNotEnabled, finishedEntry.notificationDisposition)
+        assertNotNull(finishedEntry.terminalCommittedAt)
+    }
+
+    @Test
+    fun `bridge uses constructor fixed accepting hash and never calls current endpoint resolver during acceptance`() = runTest {
+        val clock = BridgeTestClock()
+        val store = RecordingVoiceConversationStore()
+        val fakeDao = CoordinatorFakeDAO()
+        val ledger = HermesRecoveryLedger(fakeDao)
+        var resolverCallCount = 0
+        val resolver = object : HermesRecoveryEndpointResolver(null) {
+            override suspend fun resolve(conversation: Conversation): ResolvedHermesRecoveryEndpoint? {
+                resolverCallCount++
+                return null
+            }
+        }
+        val coordinator = HermesRecoveryCoordinator(
+            ledger = ledger,
+            scheduler = FakeScheduler(),
+            relayRegistry = HermesRelayRegistry(clock = clock),
+            endpointResolver = resolver,
+            conversationStoreProvider = { store },
+            clock = clock,
+        )
+        val fixedAcceptingHash = "hash-from-constructor-endpoint-a"
+        val bridge = bridge(
+            store = store,
+            coordinator = coordinator,
+            acceptingEndpointBindingHash = fixedAcceptingHash,
+        )
+
+        bridge.handle(AGENT_IDENTITY, acceptedEventJson())
+
+        assertEquals(0, resolverCallCount)
+        val entry = ledger.find(hermesRecoveryKey(store.conversation.value.id, "call_1", "hj_1"))!!
+        assertEquals(fixedAcceptingHash, entry.originalEndpointHash)
+    }
+
     private fun bridge(
         store: VoiceConversationStore,
         evidence: VoiceExperienceEvidenceSink = RecordingEvidenceSink(),
         queuePersistenceSessionId: String? = VOICE_SESSION_ID,
+        acceptingEndpointBindingHash: String = "test-endpoint-hash",
+        coordinator: HermesRecoveryCoordinator? = null,
+        terminalCommitter: HermesTerminalCommitter? = null,
+        ledger: HermesRecoveryLedger? = null,
     ): LiveKitVoicePersistenceBridge {
         val transcriptPersister = VoiceTranscriptPersister()
         return LiveKitVoicePersistenceBridge(
@@ -573,6 +748,10 @@ class LiveKitVoicePersistenceBridgeTest {
             transcriptPersister = transcriptPersister,
             conversationStore = store,
             evidence = evidence,
+            acceptingEndpointBindingHash = acceptingEndpointBindingHash,
+            coordinator = coordinator,
+            terminalCommitter = terminalCommitter,
+            ledger = ledger,
             now = { Instant.parse(PERSISTED_AT) },
         )
     }
@@ -724,3 +903,78 @@ private const val ANSWER_ONE_HASH =
     "sha256:83331a5e274ed68d54e09fd859e39f92c0e833301485dbef3cfc216f778db5bd"
 
 private fun hash(character: Char): String = "sha256:" + character.toString().repeat(64)
+
+private class OrderTrackingVoiceConversationStore(
+    private val callOrder: MutableList<String>,
+) : VoiceConversationStore {
+    private val state = MutableStateFlow(Conversation.ofId(Uuid.random()))
+    override val conversation: StateFlow<Conversation> = state
+
+    override suspend fun <T> updateAtomically(
+        transform: (Conversation) -> Pair<Conversation, T>,
+        commit: suspend (T) -> Unit,
+    ): T {
+        val (updated, result) = transform(state.value)
+        commit(result)
+        callOrder.add("conversation_commit")
+        state.value = updated
+        return result
+    }
+}
+
+private class OrderTrackingScheduler(
+    private val callOrder: MutableList<String>,
+) : HermesRecoveryWorkScheduler {
+    override suspend fun ensure(recoveryKey: String, delay: kotlin.time.Duration) {
+        callOrder.add("scheduler_ensure")
+    }
+    override suspend fun preempt(recoveryKey: String, delay: kotlin.time.Duration) = Unit
+    override suspend fun continueAfterCurrent(recoveryKey: String, delay: kotlin.time.Duration) = Unit
+    override suspend fun cancel(recoveryKey: String) = Unit
+}
+
+private class BridgeTestClock(val time: Long = 1000L) : RecoveryClock {
+    override fun epochMillis(): Long = time
+    override fun elapsedRealtimeMillis(): Long = time
+}
+
+private class OrderTrackingRelayRegistry(
+    private val callOrder: MutableList<String>,
+    clock: RecoveryClock,
+) : HermesRelayRegistry(clock = clock) {
+    override fun renew(recoveryKey: String, duration: kotlin.time.Duration) {
+        super.renew(recoveryKey, duration)
+        callOrder.add("lease_renew")
+    }
+}
+
+private class CoordinatorFakeDAO : HermesRecoveryDAO {
+    val storage = mutableMapOf<String, HermesRecoveryEntity>()
+    override suspend fun find(key: String): HermesRecoveryEntity? = storage[key]
+    override suspend fun active(): List<HermesRecoveryEntity> =
+        storage.values.filter { it.recoveryState == HermesRecoveryState.Active.name }
+    override suspend fun dormant(): List<HermesRecoveryEntity> =
+        storage.values.filter { it.recoveryState == HermesRecoveryState.Dormant.name }
+    override suspend fun forConversation(conversationId: String): List<HermesRecoveryEntity> =
+        storage.values.filter { it.conversationId == conversationId }
+    override suspend fun insert(entry: HermesRecoveryEntity): Long {
+        if (storage.containsKey(entry.recoveryKey)) return -1L
+        storage[entry.recoveryKey] = entry
+        return 1L
+    }
+    override suspend fun update(entry: HermesRecoveryEntity) {
+        storage[entry.recoveryKey] = entry
+    }
+    override suspend fun deleteOrphans(): Int = 0
+}
+
+private class FakeScheduler : HermesRecoveryWorkScheduler {
+    val ensured = mutableMapOf<String, kotlin.time.Duration>()
+    override suspend fun ensure(recoveryKey: String, delay: kotlin.time.Duration) {
+        ensured[recoveryKey] = delay
+    }
+    override suspend fun preempt(recoveryKey: String, delay: kotlin.time.Duration) = Unit
+    override suspend fun continueAfterCurrent(recoveryKey: String, delay: kotlin.time.Duration) = Unit
+    override suspend fun cancel(recoveryKey: String) = Unit
+}
+

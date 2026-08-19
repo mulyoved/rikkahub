@@ -22,6 +22,9 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.drop
+import kotlinx.coroutines.flow.map
 import me.rerere.common.android.appTempFolder
 import com.whl.quickjs.android.QuickJSLoader
 import me.rerere.rikkahub.di.appModule
@@ -34,6 +37,9 @@ import me.rerere.rikkahub.service.WebServerService
 import me.rerere.rikkahub.utils.CrashHandler
 import me.rerere.rikkahub.utils.DatabaseUtil
 import me.rerere.rikkahub.data.repository.WorkspaceRepository
+import me.rerere.rikkahub.voiceagent.recovery.HermesRecoveryCoordinator
+import me.rerere.rikkahub.voiceagent.recovery.RecoveryTrigger
+import me.rerere.rikkahub.voiceagent.recovery.hermesEndpointConfigurationHash
 import me.rerere.workspace.WorkspaceManager
 import org.koin.android.ext.android.get
 import org.koin.android.ext.koin.androidContext
@@ -89,7 +95,30 @@ class RikkaHubApp : Application() {
         // Increment launch count
         incrementLaunchCount()
 
+        // Init Hermes recovery
+        initHermesRecovery()
+
         // Composer.setDiagnosticStackTraceMode(ComposeStackTraceMode.Auto)
+    }
+
+    private fun initHermesRecovery() {
+        get<AppScope>().launch {
+            runCatching {
+                val coordinator = get<HermesRecoveryCoordinator>()
+                coordinator.repairAll()
+
+                val settingsStore = get<SettingsStore>()
+                settingsStore.settingsFlow
+                    .map { settings -> hermesEndpointConfigurationHash(settings) }
+                    .distinctUntilChanged()
+                    .drop(1)
+                    .collect {
+                        coordinator.reactivateDormant(RecoveryTrigger.ConfigurationChanged)
+                    }
+            }.onFailure {
+                Log.e(TAG, "Hermes recovery initialization failed", it)
+            }
+        }
     }
 
     private fun incrementLaunchCount() {

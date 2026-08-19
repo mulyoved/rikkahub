@@ -24,6 +24,10 @@ import me.rerere.rikkahub.voiceagent.hermesvoice.HermesVoiceTraceHeaders
 import me.rerere.rikkahub.voiceagent.hermes.HermesQueueStore
 import me.rerere.rikkahub.voiceagent.hermes.HermesToolRecordWriter
 import me.rerere.rikkahub.voiceagent.persistence.VoiceTranscriptPersister
+import me.rerere.rikkahub.voiceagent.recovery.HermesRecoveryCoordinator
+import me.rerere.rikkahub.voiceagent.recovery.HermesRecoveryLedger
+import me.rerere.rikkahub.voiceagent.recovery.HermesTerminalCommitter
+import me.rerere.rikkahub.voiceagent.recovery.hermesEndpointBindingHash
 import me.rerere.rikkahub.voiceagent.telemetry.NoOpVoiceObservability
 import me.rerere.rikkahub.voiceagent.telemetry.VoiceLatencyTelemetryCoordinator
 import me.rerere.rikkahub.voiceagent.telemetry.VoiceObservability
@@ -38,6 +42,9 @@ import kotlin.uuid.Uuid
 internal class LiveKitVoiceCallFactory internal constructor(
     private val context: Context,
     private val chatService: ChatService? = null,
+    private val coordinator: HermesRecoveryCoordinator? = null,
+    private val terminalCommitter: HermesTerminalCommitter? = null,
+    private val ledger: HermesRecoveryLedger? = null,
     private val observability: VoiceObservability = NoOpVoiceObservability,
     private val traceContextFactory: () -> VoiceTraceContext = ::newVoiceTraceContext,
     private val sessionDetailsFactory: suspend (VoiceAgentCallRequest, VoiceTraceContext) -> LiveKitSessionDetails =
@@ -67,10 +74,16 @@ internal class LiveKitVoiceCallFactory internal constructor(
     constructor(
         context: Context,
         chatService: ChatService,
+        coordinator: HermesRecoveryCoordinator? = null,
+        terminalCommitter: HermesTerminalCommitter? = null,
+        ledger: HermesRecoveryLedger? = null,
         observability: VoiceObservability = NoOpVoiceObservability,
     ) : this(
         context = context,
         chatService = chatService,
+        coordinator = coordinator,
+        terminalCommitter = terminalCommitter,
+        ledger = ledger,
         observability = observability,
         traceContextFactory = ::newVoiceTraceContext,
     )
@@ -97,6 +110,9 @@ internal class LiveKitVoiceCallFactory internal constructor(
         var artifactWriter: VoiceE2EArtifactWriter? = null
         var resourcesTransferred = false
         return try {
+            val acceptingEndpointBindingHash = hermesEndpointBindingHash(
+                request.config.hermesVoiceBaseUrl,
+            )
             captureSource = VoiceCaptureFixtureArming.claimSource(request.captureFixtureToken)
                 .getOrElse { cause ->
                     throw LiveKitExperimentalVoiceCallException(
@@ -130,11 +146,17 @@ internal class LiveKitVoiceCallFactory internal constructor(
                 transcriptPersister = transcriptPersister,
                 conversationStore = conversationStore,
                 evidence = VoiceExperienceEvidenceWriter(artifactWriter),
+                acceptingEndpointBindingHash = acceptingEndpointBindingHash,
+                coordinator = coordinator,
+                terminalCommitter = terminalCommitter,
+                ledger = ledger,
             )
             persistenceBridge.initialize()
             val persistenceOwner = LiveKitPersistenceResources(
+                voiceSessionId = details.voiceSessionId,
                 bridge = persistenceBridge,
                 artifactWriter = artifactWriter,
+                coordinator = coordinator,
             )
             val room = roomFactory()
             val telemetryCoordinator = VoiceLatencyTelemetryCoordinator(
@@ -206,8 +228,10 @@ internal class LiveKitVoiceCallFactory internal constructor(
 }
 
 private class LiveKitPersistenceResources(
+    private val voiceSessionId: String,
     private val bridge: LiveKitPersistenceOwner,
     private val artifactWriter: VoiceE2EArtifactWriter,
+    private val coordinator: HermesRecoveryCoordinator? = null,
 ) : LiveKitPersistenceOwner {
     override suspend fun drain() {
         bridge.drain()
@@ -215,6 +239,7 @@ private class LiveKitPersistenceResources(
     }
 
     override fun close() {
+        coordinator?.onCallEnded(voiceSessionId)
         bridge.close()
     }
 }

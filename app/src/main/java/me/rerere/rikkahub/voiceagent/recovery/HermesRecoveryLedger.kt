@@ -53,6 +53,10 @@ internal class HermesRecoveryLedger(
         return dao.active().map { it.toEntry() }
     }
 
+    suspend fun dormant(): List<HermesRecoveryEntry> {
+        return dao.dormant().map { it.toEntry() }
+    }
+
     suspend fun forConversation(conversationId: Uuid): List<HermesRecoveryEntry> {
         return dao.forConversation(conversationId.toString()).map { it.toEntry() }
     }

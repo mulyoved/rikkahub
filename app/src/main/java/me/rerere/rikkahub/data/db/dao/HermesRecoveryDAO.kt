@@ -15,6 +15,9 @@ internal interface HermesRecoveryDAO {
     @Query("SELECT * FROM hermes_recovery WHERE recovery_state = 'Active'")
     suspend fun active(): List<HermesRecoveryEntity>
 
+    @Query("SELECT * FROM hermes_recovery WHERE recovery_state = 'Dormant'")
+    suspend fun dormant(): List<HermesRecoveryEntity>
+
     @Query("SELECT * FROM hermes_recovery WHERE conversation_id = :conversationId")
     suspend fun forConversation(conversationId: String): List<HermesRecoveryEntity>
 

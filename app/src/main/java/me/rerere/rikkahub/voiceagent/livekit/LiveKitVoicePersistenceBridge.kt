@@ -11,6 +11,11 @@ import me.rerere.rikkahub.voiceagent.hermes.HermesQueueStore
 import me.rerere.rikkahub.voiceagent.hermes.HermesQueueStatus
 import me.rerere.rikkahub.voiceagent.hermes.VoiceToolRecordStatus
 import me.rerere.rikkahub.voiceagent.persistence.VoiceTranscriptPersister
+import me.rerere.rikkahub.voiceagent.recovery.AcceptedHermesBinding
+import me.rerere.rikkahub.voiceagent.recovery.HermesRecoveryCoordinator
+import me.rerere.rikkahub.voiceagent.recovery.HermesRecoveryLedger
+import me.rerere.rikkahub.voiceagent.recovery.HermesTerminalCommitter
+import me.rerere.rikkahub.voiceagent.recovery.hermesRecoveryKey
 
 internal fun interface VoiceExperienceEvidenceSink {
     suspend fun append(event: LiveKitVoiceExperienceEvent)
@@ -33,6 +38,10 @@ internal class LiveKitVoicePersistenceBridge(
     private val transcriptPersister: VoiceTranscriptPersister,
     private val conversationStore: VoiceConversationStore,
     private val evidence: VoiceExperienceEvidenceSink = VoiceExperienceEvidenceSink.NoOp,
+    private val acceptingEndpointBindingHash: String,
+    private val coordinator: HermesRecoveryCoordinator? = null,
+    private val terminalCommitter: HermesTerminalCommitter? = null,
+    private val ledger: HermesRecoveryLedger? = null,
     private val now: () -> Instant = Instant::now,
 ) : LiveKitPersistenceOwner {
     private val mutex = Mutex()
@@ -100,13 +109,26 @@ internal class LiveKitVoicePersistenceBridge(
         require(CanonicalVoiceExperienceJson.isCanonicalInstant(persistedAt)) {
             "LiveKit persistence acknowledgement timestamp is not canonical"
         }
-        LiveKitPersistenceAck(
+        val ack = LiveKitPersistenceAck(
             version = 1,
             voiceSessionId = voiceSessionId,
             eventId = event.eventId,
             status = "persisted",
             persistedAt = persistedAt,
         ).canonicalJson()
+
+        val recoveryKey = when (event) {
+            is LiveKitVoiceExperienceEvent.JobAccepted ->
+                hermesRecoveryKey(conversationStore.conversation.value.id, event.toolCallId, event.jobId)
+            is LiveKitVoiceExperienceEvent.JobState ->
+                hermesRecoveryKey(conversationStore.conversation.value.id, event.toolCallId, event.jobId)
+            is LiveKitVoiceExperienceEvent.Delivery ->
+                hermesRecoveryKey(conversationStore.conversation.value.id, event.toolCallId, event.jobId)
+            else -> null
+        }
+        recoveryKey?.let { coordinator?.onPersistedRelayEvent(it) }
+
+        ack
     }
 
     override suspend fun drain() {
@@ -115,6 +137,7 @@ internal class LiveKitVoicePersistenceBridge(
 
     override fun close() {
         if (closed.compareAndSet(false, true)) {
+            coordinator?.onCallEnded(voiceSessionId)
             conversationStore.close()
         }
     }
@@ -122,16 +145,44 @@ internal class LiveKitVoicePersistenceBridge(
     private suspend fun persist(event: LiveKitVoiceExperienceEvent) {
         when (event) {
             is LiveKitVoiceExperienceEvent.SessionBinding -> Unit
-            is LiveKitVoiceExperienceEvent.JobAccepted ->
-                queueStore.persistLiveKitAcceptance(
-                    callId = event.toolCallId,
-                    prompt = event.prompt,
-                    jobId = event.jobId,
-                    originatingUserTurnId = event.userTurnId,
-                    requestHash = event.requestHash,
-                    argumentHash = event.argumentHash,
-                    producer = HERMES_PRODUCER,
-                ).requireNonConflicting("LiveKit Hermes acceptance conflicts with persisted record")
+            is LiveKitVoiceExperienceEvent.JobAccepted -> {
+                if (coordinator != null) {
+                    val observedInstant = runCatching { Instant.parse(event.observedAt) }.getOrNull()
+                        ?: now()
+                    val binding = AcceptedHermesBinding(
+                        conversationId = conversationStore.conversation.value.id,
+                        callId = event.toolCallId,
+                        jobId = event.jobId,
+                        prompt = event.prompt,
+                        producer = HERMES_PRODUCER,
+                        originatingUserTurnId = event.userTurnId,
+                        requestHash = event.requestHash,
+                        voiceSessionId = voiceSessionId,
+                        argumentHash = event.argumentHash,
+                        acceptingOwnerHash = expectedCorrelation.ownerHash,
+                        endpointBindingHash = acceptingEndpointBindingHash,
+                        acceptedAtEpochMillis = observedInstant.toEpochMilli(),
+                    )
+                    try {
+                        coordinator.registerAccepted(binding)
+                    } catch (e: Exception) {
+                        if (e is IllegalStateException && e.message?.contains("conflict", ignoreCase = true) == true) {
+                            throw IllegalArgumentException("LiveKit Hermes acceptance conflicts with persisted record", e)
+                        }
+                        throw e
+                    }
+                } else {
+                    queueStore.persistLiveKitAcceptance(
+                        callId = event.toolCallId,
+                        prompt = event.prompt,
+                        jobId = event.jobId,
+                        originatingUserTurnId = event.userTurnId,
+                        requestHash = event.requestHash,
+                        argumentHash = event.argumentHash,
+                        producer = HERMES_PRODUCER,
+                    ).requireNonConflicting("LiveKit Hermes acceptance conflicts with persisted record")
+                }
+            }
 
             is LiveKitVoiceExperienceEvent.JobState -> persistJobState(event)
             is LiveKitVoiceExperienceEvent.Transcript -> persistTranscript(event)
@@ -259,16 +310,38 @@ internal class LiveKitVoicePersistenceBridge(
         event: LiveKitVoiceExperienceEvent.JobState,
         status: VoiceToolRecordStatus,
     ) {
-        queueStore.persistLiveKitTerminal(
-            callId = event.toolCallId,
-            status = status,
-            jobId = event.jobId,
-            originatingUserTurnId = event.userTurnId,
-            requestHash = event.requestHash,
-            argumentHash = event.argumentHash,
-            resultHash = event.resultHash,
-            producer = HERMES_PRODUCER,
-        ).requireNonConflicting("LiveKit Hermes terminal state conflicts with persisted record")
+        val recoveryKey = hermesRecoveryKey(
+            conversationStore.conversation.value.id,
+            event.toolCallId,
+            event.jobId,
+        )
+        val entry = ledger?.find(recoveryKey)
+        val result = if (terminalCommitter != null && entry != null) {
+            terminalCommitter.commitLiveKitTerminal(
+                queueStore = queueStore,
+                entry = entry,
+                callId = event.toolCallId,
+                status = status,
+                jobId = event.jobId,
+                originatingUserTurnId = event.userTurnId,
+                requestHash = event.requestHash,
+                argumentHash = event.argumentHash,
+                resultHash = event.resultHash,
+                producer = HERMES_PRODUCER,
+            )
+        } else {
+            queueStore.persistLiveKitTerminal(
+                callId = event.toolCallId,
+                status = status,
+                jobId = event.jobId,
+                originatingUserTurnId = event.userTurnId,
+                requestHash = event.requestHash,
+                argumentHash = event.argumentHash,
+                resultHash = event.resultHash,
+                producer = HERMES_PRODUCER,
+            )
+        }
+        result.requireNonConflicting("LiveKit Hermes terminal state conflicts with persisted record")
     }
 
     private suspend fun persistTranscript(event: LiveKitVoiceExperienceEvent.Transcript) {

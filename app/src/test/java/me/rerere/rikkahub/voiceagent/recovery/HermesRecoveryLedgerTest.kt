@@ -514,6 +514,9 @@ class HermesRecoveryLedgerTest {
         override suspend fun active(): List<HermesRecoveryEntity> =
             storage.values.filter { it.recoveryState == "Active" }
 
+        override suspend fun dormant(): List<HermesRecoveryEntity> =
+            storage.values.filter { it.recoveryState == "Dormant" }
+
         override suspend fun forConversation(conversationId: String): List<HermesRecoveryEntity> =
             storage.values.filter { it.conversationId == conversationId }
 

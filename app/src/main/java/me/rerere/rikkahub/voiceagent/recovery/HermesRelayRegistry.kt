@@ -4,7 +4,7 @@ import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 
-internal class HermesRelayRegistry(
+internal open class HermesRelayRegistry(
     private val clock: RecoveryClock = SystemRecoveryClock,
     private val leaseDuration: Duration = DEFAULT_LEASE_DURATION,
 ) {
@@ -15,18 +15,18 @@ internal class HermesRelayRegistry(
     private val leases = mutableMapOf<String, Long>()
     private val lock = Any()
 
-    fun acquire(recoveryKey: String, duration: Duration = leaseDuration) {
+    open fun acquire(recoveryKey: String, duration: Duration = leaseDuration) {
         val expiry = clock.elapsedRealtimeMillis() + duration.inWholeMilliseconds
         synchronized(lock) {
             leases[recoveryKey] = expiry
         }
     }
 
-    fun renew(recoveryKey: String, duration: Duration = leaseDuration) {
+    open fun renew(recoveryKey: String, duration: Duration = leaseDuration) {
         acquire(recoveryKey, duration)
     }
 
-    fun remainingLease(recoveryKey: String): Duration? {
+    open fun remainingLease(recoveryKey: String): Duration? {
         val now = clock.elapsedRealtimeMillis()
         val expiry = synchronized(lock) {
             leases[recoveryKey]
@@ -43,17 +43,17 @@ internal class HermesRelayRegistry(
         }
     }
 
-    fun isLeaseActive(recoveryKey: String): Boolean {
+    open fun isLeaseActive(recoveryKey: String): Boolean {
         return remainingLease(recoveryKey) != null
     }
 
-    fun invalidate(recoveryKey: String) {
+    open fun invalidate(recoveryKey: String) {
         synchronized(lock) {
             leases.remove(recoveryKey)
         }
     }
 
-    fun invalidateAll() {
+    open fun invalidateAll() {
         synchronized(lock) {
             leases.clear()
         }
