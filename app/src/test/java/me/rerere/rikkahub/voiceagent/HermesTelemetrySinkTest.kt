@@ -119,4 +119,173 @@ class HermesTelemetrySinkTest {
         assertEquals(VoiceE2EArtifact.HermesAnswer, artifacts.single().first)
         assertEquals("a", artifacts.single().second)
     }
+
+    @Test
+    fun `owner check evaluation emits only match missing or mismatch`() {
+        assertEquals(HermesOwnerCheck.Match, HermesOwnerCheck.evaluate("owner-123", "owner-123"))
+        assertEquals("match", HermesOwnerCheck.Match.wireName)
+
+        assertEquals(HermesOwnerCheck.Missing, HermesOwnerCheck.evaluate("owner-123", null))
+        assertEquals(HermesOwnerCheck.Missing, HermesOwnerCheck.evaluate(null, "owner-123"))
+        assertEquals(HermesOwnerCheck.Missing, HermesOwnerCheck.evaluate("", "owner-123"))
+        assertEquals(HermesOwnerCheck.Missing, HermesOwnerCheck.evaluate("owner-123", "   "))
+        assertEquals("missing", HermesOwnerCheck.Missing.wireName)
+
+        assertEquals(HermesOwnerCheck.Mismatch, HermesOwnerCheck.evaluate("owner-123", "owner-456"))
+        assertEquals("mismatch", HermesOwnerCheck.Mismatch.wireName)
+    }
+
+    @Test
+    fun `recovery telemetry event builders redact sentinels and serialize only categorical wire fields`() {
+        val promptSentinel = "PROMPT_SECRET_SENTINEL_1111"
+        val answerSentinel = "ANSWER_SECRET_SENTINEL_2222"
+        val errorSentinel = "ERROR_SECRET_SENTINEL_3333"
+        val accessTokenSentinel = "ACCESS_TOKEN_SECRET_SENTINEL_4444"
+        val ownerHashSentinel = "OWNER_HASH_SECRET_SENTINEL_5555"
+        val correlationSentinel = "CORRELATION_SECRET_SENTINEL_6666"
+        val routeSentinel = "https://secret.endpoint.domain.com/secret/path/7777"
+        val rawConversationId = "conv-raw-id-123"
+        val rawCallId = "call-raw-id-456"
+        val rawJobId = "job-raw-id-789"
+        val rawSessionId = "session-raw-id-012"
+        val rawRecoveryKey = "recovery-key-raw-345"
+
+        val sentinels = listOf(
+            promptSentinel,
+            answerSentinel,
+            errorSentinel,
+            accessTokenSentinel,
+            ownerHashSentinel,
+            correlationSentinel,
+            routeSentinel,
+            rawConversationId,
+            rawCallId,
+            rawJobId,
+            rawSessionId,
+            rawRecoveryKey,
+        )
+
+        val regEvent = HermesRecoveryTelemetryEvent.RegistrationRepair.create(
+            kind = "registration",
+            conversationId = rawConversationId,
+            callId = rawCallId,
+            jobId = rawJobId,
+            trigger = "CallEnded",
+            outcome = "registered",
+        )
+        val repairEvent = HermesRecoveryTelemetryEvent.RegistrationRepair.create(
+            kind = "repair",
+            conversationId = rawConversationId,
+            callId = rawCallId,
+            jobId = rawJobId,
+            trigger = "StartupRepair",
+            outcome = "repaired",
+        )
+        val relayAcquireEvent = HermesRecoveryTelemetryEvent.RelayAction.create(
+            action = "acquire",
+            conversationId = rawConversationId,
+            callId = rawCallId,
+            jobId = rawJobId,
+            voiceSessionId = rawSessionId,
+        )
+        val relayReleaseEvent = HermesRecoveryTelemetryEvent.RelayAction.create(
+            action = "release",
+            conversationId = rawConversationId,
+            callId = rawCallId,
+            jobId = rawJobId,
+            voiceSessionId = rawSessionId,
+        )
+        val relayTakeoverEvent = HermesRecoveryTelemetryEvent.RelayAction.create(
+            action = "takeover",
+            conversationId = rawConversationId,
+            callId = rawCallId,
+            jobId = rawJobId,
+            voiceSessionId = rawSessionId,
+        )
+        val pollOpEvent = HermesRecoveryTelemetryEvent.OperationClass.create(
+            operation = "poll",
+            callId = rawCallId,
+            jobId = rawJobId,
+            classification = "active",
+            httpStatus = 200,
+        )
+        val cancelOpEvent = HermesRecoveryTelemetryEvent.OperationClass.create(
+            operation = "cancel",
+            callId = rawCallId,
+            jobId = rawJobId,
+            classification = "cancelled",
+            httpStatus = 200,
+        )
+        val dormantEvent = HermesRecoveryTelemetryEvent.DormantReason.create(
+            conversationId = rawConversationId,
+            jobId = rawJobId,
+            recoveryKey = rawRecoveryKey,
+            reason = "auth_unavailable",
+        )
+        val snapshotDecisionMatch = HermesRecoveryTelemetryEvent.SnapshotDecision.create(
+            callId = rawCallId,
+            jobId = rawJobId,
+            decision = "valid",
+            ownerCheck = HermesOwnerCheck.evaluate("expected-owner", "expected-owner"),
+            status = "succeeded",
+        )
+        val snapshotDecisionMissing = HermesRecoveryTelemetryEvent.SnapshotDecision.create(
+            callId = rawCallId,
+            jobId = rawJobId,
+            decision = "dormant",
+            ownerCheck = HermesOwnerCheck.evaluate("expected-owner", null),
+            status = "expired",
+        )
+        val snapshotDecisionMismatch = HermesRecoveryTelemetryEvent.SnapshotDecision.create(
+            callId = rawCallId,
+            jobId = rawJobId,
+            decision = "dormant",
+            ownerCheck = HermesOwnerCheck.evaluate("expected-owner", "other-owner"),
+            status = "failed",
+        )
+        val terminalCommitEvent = HermesRecoveryTelemetryEvent.TerminalCommit.create(
+            conversationId = rawConversationId,
+            jobId = rawJobId,
+            status = "succeeded",
+            disposition = "suppressed_not_enabled",
+        )
+
+        val events: List<HermesRecoveryTelemetryEvent> = listOf(
+            regEvent,
+            repairEvent,
+            relayAcquireEvent,
+            relayReleaseEvent,
+            relayTakeoverEvent,
+            pollOpEvent,
+            cancelOpEvent,
+            dormantEvent,
+            snapshotDecisionMatch,
+            snapshotDecisionMissing,
+            snapshotDecisionMismatch,
+            terminalCommitEvent,
+        )
+
+        val s = sink()
+        for (event in events) {
+            val json = event.toJson()
+            val logDetail = event.toLogDetail()
+
+            // Verify none of the raw sentinels appear in json or log detail
+            for (sentinel in sentinels) {
+                assertTrue("Sentinel $sentinel must not appear in JSON: $json", !json.contains(sentinel))
+                assertTrue("Sentinel $sentinel must not appear in logDetail: $logDetail", !logDetail.contains(sentinel))
+            }
+
+            // Write through sink and verify no throw and recorded
+            s.writeRecoveryEvent(event)
+        }
+
+        // Verify owner check strings in snapshot decision events
+        assertTrue(snapshotDecisionMatch.toJson().contains("\"ownerCheck\":\"match\""))
+        assertTrue(snapshotDecisionMissing.toJson().contains("\"ownerCheck\":\"missing\""))
+        assertTrue(snapshotDecisionMismatch.toJson().contains("\"ownerCheck\":\"mismatch\""))
+        assertTrue(snapshotDecisionMatch.toLogDetail().contains("ownerCheck=match"))
+        assertTrue(snapshotDecisionMissing.toLogDetail().contains("ownerCheck=missing"))
+        assertTrue(snapshotDecisionMismatch.toLogDetail().contains("ownerCheck=mismatch"))
+    }
 }

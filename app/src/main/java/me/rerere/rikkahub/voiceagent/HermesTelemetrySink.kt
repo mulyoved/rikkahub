@@ -1,5 +1,7 @@
 package me.rerere.rikkahub.voiceagent
 
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
 import me.rerere.rikkahub.voiceagent.hermes.HermesJobCompletion
 import me.rerere.rikkahub.voiceagent.hermes.HermesJobFailure
 import me.rerere.rikkahub.voiceagent.hermes.HermesPollFailure
@@ -7,12 +9,290 @@ import me.rerere.rikkahub.voiceagent.hermes.HermesQueueEvent
 import me.rerere.rikkahub.voiceagent.telemetry.HermesTelemetryLogSanitizer
 import me.rerere.rikkahub.voiceagent.telemetry.HermesToolResponseHash
 import me.rerere.rikkahub.voiceagent.telemetry.VoiceDiagnostics
+import java.security.MessageDigest
+
+/**
+ * Result of comparing an incoming/persisted owner hash against the expected owner identity.
+ * Emits strictly categorical values: [Match], [Missing], or [Mismatch].
+ * Raw owner identifiers and secret hashes are never serialized to logs or telemetry.
+ */
+enum class HermesOwnerCheck(val wireName: String) {
+    Match("match"),
+    Missing("missing"),
+    Mismatch("mismatch");
+
+    companion object {
+        fun evaluate(expectedOwnerHash: String?, actualOwnerHash: String?): HermesOwnerCheck {
+            val expected = expectedOwnerHash?.trim()
+            val actual = actualOwnerHash?.trim()
+            return when {
+                expected.isNullOrBlank() || actual.isNullOrBlank() -> Missing
+                expected == actual -> Match
+                else -> Mismatch
+            }
+        }
+    }
+}
+
+/**
+ * Redacted, categorical recovery telemetry events.
+ *
+ * Operational Notes:
+ * 1. Force-Stop Relaunch: Android force-stop terminates active recovery work and suppresses
+ *    scheduled WorkManager tasks until the app is explicitly relaunched by the user. On next
+ *    launch, [me.rerere.rikkahub.voiceagent.recovery.HermesRecoveryCoordinator.repairAll]
+ *    runs startup repair to discover and reconcile all pending recovery ledger entries.
+ * 2. WorkManager Best-Effort Timing: Recovery delays (e.g., 30 seconds, 5 minutes, 30 minutes)
+ *    represent minimum scheduling targets, not rigid real-time guarantees. Device battery state,
+ *    Doze mode, and system background policies govern actual invocation timing.
+ * 3. Server Restart / Eviction Tombstone: Server restarts or memory evictions generate expired
+ *    tombstones or missing job responses. When authenticated owner proofs match, the reconciler
+ *    maps these to [me.rerere.rikkahub.voiceagent.hermes.HermesQueueStatus.Expired], or to
+ *    [me.rerere.rikkahub.voiceagent.recovery.HermesDormantReason.AuthUnavailable] if owner proof is
+ *    missing/mismatched, strictly preserving task truth without fabricating false outcomes.
+ * 4. Manual Explicit Retry: Explicit user-initiated retries bypass scheduled backoff delays,
+ *    re-evaluating current credentials and triggering an immediate single-operation poll or cancel.
+ */
+sealed class HermesRecoveryTelemetryEvent {
+    abstract val eventType: String
+    abstract fun toJson(): String
+    abstract fun toLogDetail(): String
+
+    data class RegistrationRepair(
+        val kind: String,
+        val conversationHash: String,
+        val callHash: String,
+        val jobHash: String,
+        val trigger: String,
+        val outcome: String,
+    ) : HermesRecoveryTelemetryEvent() {
+        override val eventType: String get() = "registration_repair"
+
+        companion object {
+            fun create(
+                kind: String,
+                conversationId: String,
+                callId: String,
+                jobId: String,
+                trigger: String,
+                outcome: String,
+            ): RegistrationRepair = RegistrationRepair(
+                kind = kind,
+                conversationHash = hashIdentifier(conversationId),
+                callHash = hashIdentifier(callId),
+                jobHash = hashIdentifier(jobId),
+                trigger = trigger,
+                outcome = outcome,
+            )
+        }
+
+        override fun toJson(): String = buildJsonObject {
+            put("type", "registration_repair")
+            put("kind", kind)
+            put("conversationHash", conversationHash)
+            put("callHash", callHash)
+            put("jobHash", jobHash)
+            put("trigger", trigger)
+            put("outcome", outcome)
+        }.toString()
+
+        override fun toLogDetail(): String =
+            "type=registration_repair kind=$kind conversationHash=$conversationHash callHash=$callHash jobHash=$jobHash trigger=$trigger outcome=$outcome"
+    }
+
+    data class RelayAction(
+        val action: String,
+        val conversationHash: String,
+        val callHash: String,
+        val jobHash: String,
+        val sessionHash: String,
+    ) : HermesRecoveryTelemetryEvent() {
+        override val eventType: String get() = "relay_action"
+
+        companion object {
+            fun create(
+                action: String,
+                conversationId: String,
+                callId: String,
+                jobId: String,
+                voiceSessionId: String,
+            ): RelayAction = RelayAction(
+                action = action,
+                conversationHash = hashIdentifier(conversationId),
+                callHash = hashIdentifier(callId),
+                jobHash = hashIdentifier(jobId),
+                sessionHash = hashIdentifier(voiceSessionId),
+            )
+        }
+
+        override fun toJson(): String = buildJsonObject {
+            put("type", "relay_action")
+            put("action", action)
+            put("conversationHash", conversationHash)
+            put("callHash", callHash)
+            put("jobHash", jobHash)
+            put("sessionHash", sessionHash)
+        }.toString()
+
+        override fun toLogDetail(): String =
+            "type=relay_action action=$action conversationHash=$conversationHash callHash=$callHash jobHash=$jobHash sessionHash=$sessionHash"
+    }
+
+    data class OperationClass(
+        val operation: String,
+        val callHash: String,
+        val jobHash: String,
+        val classification: String,
+        val httpStatus: Int? = null,
+    ) : HermesRecoveryTelemetryEvent() {
+        override val eventType: String get() = "operation_class"
+
+        companion object {
+            fun create(
+                operation: String,
+                callId: String,
+                jobId: String,
+                classification: String,
+                httpStatus: Int? = null,
+            ): OperationClass = OperationClass(
+                operation = operation,
+                callHash = hashIdentifier(callId),
+                jobHash = hashIdentifier(jobId),
+                classification = classification,
+                httpStatus = httpStatus,
+            )
+        }
+
+        override fun toJson(): String = buildJsonObject {
+            put("type", "operation_class")
+            put("operation", operation)
+            put("callHash", callHash)
+            put("jobHash", jobHash)
+            put("classification", classification)
+            httpStatus?.let { put("httpStatus", it) }
+        }.toString()
+
+        override fun toLogDetail(): String =
+            "type=operation_class operation=$operation callHash=$callHash jobHash=$jobHash classification=$classification httpStatus=${httpStatus ?: "none"}"
+    }
+
+    data class DormantReason(
+        val conversationHash: String,
+        val jobHash: String,
+        val recoveryKeyHash: String,
+        val reason: String,
+    ) : HermesRecoveryTelemetryEvent() {
+        override val eventType: String get() = "dormant_reason"
+
+        companion object {
+            fun create(
+                conversationId: String,
+                jobId: String,
+                recoveryKey: String,
+                reason: String,
+            ): DormantReason = DormantReason(
+                conversationHash = hashIdentifier(conversationId),
+                jobHash = hashIdentifier(jobId),
+                recoveryKeyHash = hashIdentifier(recoveryKey),
+                reason = reason,
+            )
+        }
+
+        override fun toJson(): String = buildJsonObject {
+            put("type", "dormant_reason")
+            put("conversationHash", conversationHash)
+            put("jobHash", jobHash)
+            put("recoveryKeyHash", recoveryKeyHash)
+            put("reason", reason)
+        }.toString()
+
+        override fun toLogDetail(): String =
+            "type=dormant_reason conversationHash=$conversationHash jobHash=$jobHash recoveryKeyHash=$recoveryKeyHash reason=$reason"
+    }
+
+    data class SnapshotDecision(
+        val callHash: String,
+        val jobHash: String,
+        val decision: String,
+        val ownerCheck: HermesOwnerCheck,
+        val status: String,
+    ) : HermesRecoveryTelemetryEvent() {
+        override val eventType: String get() = "snapshot_decision"
+
+        companion object {
+            fun create(
+                callId: String,
+                jobId: String,
+                decision: String,
+                ownerCheck: HermesOwnerCheck,
+                status: String,
+            ): SnapshotDecision = SnapshotDecision(
+                callHash = hashIdentifier(callId),
+                jobHash = hashIdentifier(jobId),
+                decision = decision,
+                ownerCheck = ownerCheck,
+                status = status,
+            )
+        }
+
+        override fun toJson(): String = buildJsonObject {
+            put("type", "snapshot_decision")
+            put("callHash", callHash)
+            put("jobHash", jobHash)
+            put("decision", decision)
+            put("ownerCheck", ownerCheck.wireName)
+            put("status", status)
+        }.toString()
+
+        override fun toLogDetail(): String =
+            "type=snapshot_decision callHash=$callHash jobHash=$jobHash decision=$decision ownerCheck=${ownerCheck.wireName} status=$status"
+    }
+
+    data class TerminalCommit(
+        val conversationHash: String,
+        val jobHash: String,
+        val status: String,
+        val disposition: String,
+    ) : HermesRecoveryTelemetryEvent() {
+        override val eventType: String get() = "terminal_commit"
+
+        companion object {
+            fun create(
+                conversationId: String,
+                jobId: String,
+                status: String,
+                disposition: String,
+            ): TerminalCommit = TerminalCommit(
+                conversationHash = hashIdentifier(conversationId),
+                jobHash = hashIdentifier(jobId),
+                status = status,
+                disposition = disposition,
+            )
+        }
+
+        override fun toJson(): String = buildJsonObject {
+            put("type", "terminal_commit")
+            put("conversationHash", conversationHash)
+            put("jobHash", jobHash)
+            put("status", status)
+            put("disposition", disposition)
+        }.toString()
+
+        override fun toLogDetail(): String =
+            "type=terminal_commit conversationHash=$conversationHash jobHash=$jobHash status=$status disposition=$disposition"
+    }
+}
+
+private fun hashIdentifier(value: String): String =
+    MessageDigest.getInstance("SHA-256")
+        .digest(value.toByteArray(Charsets.UTF_8))
+        .joinToString("") { "%02x".format(it) }
 
 /**
  * E2E artifact and hash/log sinks for Hermes job telemetry. Pure sinks: no
  * coordinator state, every entry point is safe against throwing log/artifact
- * destinations. The single consumer for [HermesQueueEvent] from both producers
- * (HermesJobManager job events and session-bridge send events).
+ * destinations. The single consumer for [HermesQueueEvent] and [HermesRecoveryTelemetryEvent]
+ * from both producers.
  */
 class HermesTelemetrySink(
     private val diagnostics: VoiceDiagnostics,
@@ -66,6 +346,16 @@ class HermesTelemetrySink(
             artifact = VoiceE2EArtifact.HermesEvents,
             content = event.toJson(),
             callId = event.callId,
+        )
+    }
+
+    fun writeRecoveryEvent(event: HermesRecoveryTelemetryEvent) {
+        val detail = event.toLogDetail()
+        logQueueEventSafely(detail)
+        diagnostics.record("hermes_recovery_${event.eventType}", detail)
+        artifactSink.writeArtifactSafely(
+            artifact = VoiceE2EArtifact.HermesEvents,
+            content = event.toJson(),
         )
     }
 
