@@ -32,6 +32,8 @@ import me.rerere.rikkahub.voiceagent.VoiceAgentTelecomAdapter
 import me.rerere.rikkahub.voiceagent.VoiceAgentTelecomCallRegistry
 import me.rerere.rikkahub.voiceagent.VoiceAgentTelecomGateway
 import me.rerere.rikkahub.voiceagent.livekit.LiveKitVoiceCallFactory
+import me.rerere.rikkahub.voiceagent.notification.DefaultHermesNotificationAdmission
+import me.rerere.rikkahub.voiceagent.notification.HermesNotificationAdmission
 import me.rerere.rikkahub.voiceagent.automation.DefaultVoiceAutomationRuntime
 import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationEventInput
 import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationEventName
@@ -221,6 +223,14 @@ val appModule = module {
 
     single<VoiceAgentCallServiceController> {
         get<VoiceAgentCallOrchestrator>()
+    }
+
+    single<HermesNotificationAdmission> {
+        val controller: VoiceAgentCallServiceController = get()
+        DefaultHermesNotificationAdmission(
+            context = get(),
+            activeCallIdentity = { controller.activeIdentity.value },
+        )
     }
 
     single {

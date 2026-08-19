@@ -176,7 +176,7 @@ val dataSourceModule = module {
     }
 
     single {
-        HermesTerminalCommitter(ledger = get())
+        HermesTerminalCommitter(ledger = get(), admission = get())
     }
 
     single<HermesRecoveryWorkRequestFactory> {

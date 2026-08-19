@@ -16,6 +16,9 @@ import me.rerere.rikkahub.voiceagent.hermes.ValidatedHermesRecoverySnapshot
 import me.rerere.rikkahub.voiceagent.hermes.VoiceToolRecordStatus
 import me.rerere.rikkahub.voiceagent.hermes.hermesQueueRecords
 import me.rerere.rikkahub.voiceagent.persistence.VoiceTranscriptPersister
+import me.rerere.rikkahub.voiceagent.notification.HermesNotificationAdmission
+import me.rerere.rikkahub.voiceagent.notification.TerminalObservationContext
+import kotlin.time.Duration.Companion.minutes
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
@@ -360,6 +363,253 @@ class HermesTerminalCommitterTest {
 
         val secondResult = committer.commitTerminal(queueStore, entry, snapshot2)
         assertEquals(HermesQueuePersistenceResult.Conflict, secondResult)
+    }
+
+    @Test
+    fun `commitTerminal with PendingPost admission writes PendingPost and 15-minute deadline and outbox fields`() = runTest {
+        val admission = HermesNotificationAdmission { _, _ -> HermesNotificationDisposition.PendingPost }
+        val committerWithPending = HermesTerminalCommitter(ledger = ledger, admission = admission, clock = clock)
+
+        val (convStore, queueStore) = setupStoreWithQueuedRecord()
+        queueStore.persistActive(
+            callId = callId,
+            prompt = "Compute data",
+            status = VoiceToolRecordStatus.Queued,
+            jobId = jobId,
+        )
+
+        val entry = createDefaultActiveEntry().copy(notificationDisposition = HermesNotificationDisposition.Undecided)
+        ledger.insert(entry)
+
+        val snapshot = ValidatedHermesRecoverySnapshot(
+            jobId = jobId,
+            callId = callId,
+            status = HermesQueueStatus.Complete,
+            answer = "Completed result",
+            error = null,
+            resultHash = "sha256:result_hash_abc",
+        )
+
+        clock.currentEpoch = 6000L
+        val result = committerWithPending.commitTerminal(
+            queueStore = queueStore,
+            entry = entry,
+            snapshot = snapshot,
+        )
+
+        assertEquals(HermesQueuePersistenceResult.Mutated, result)
+
+        val updatedLedger = ledger.find(recoveryKey)!!
+        assertEquals(HermesRecoveryState.Finished, updatedLedger.recoveryState)
+        assertEquals(HermesNotificationDisposition.PendingPost, updatedLedger.notificationDisposition)
+        assertEquals(6000L, updatedLedger.notificationDispositionChangedAt)
+        assertEquals(6000L, updatedLedger.terminalCommittedAt)
+        assertEquals(6000L + 15.minutes.inWholeMilliseconds, updatedLedger.terminalDeadlineAt)
+        assertEquals(6000L, updatedLedger.notificationNextAttemptAt)
+        assertEquals(0, updatedLedger.notificationAttemptCount)
+        assertNull(updatedLedger.cancelRequestedAt)
+        assertEquals(6000L, updatedLedger.lastAttemptAt)
+    }
+
+    @Test
+    fun `commitTerminal with SuppressedForeground admission writes suppressed disposition and null outbox deadlines`() = runTest {
+        val admission = HermesNotificationAdmission { _, _ -> HermesNotificationDisposition.SuppressedForeground }
+        val committerWithSuppressed = HermesTerminalCommitter(ledger = ledger, admission = admission, clock = clock)
+
+        val (convStore, queueStore) = setupStoreWithQueuedRecord()
+        queueStore.persistActive(
+            callId = callId,
+            prompt = "Compute data",
+            status = VoiceToolRecordStatus.Queued,
+            jobId = jobId,
+        )
+
+        val entry = createDefaultActiveEntry().copy(notificationDisposition = HermesNotificationDisposition.Undecided)
+        ledger.insert(entry)
+
+        val snapshot = ValidatedHermesRecoverySnapshot(
+            jobId = jobId,
+            callId = callId,
+            status = HermesQueueStatus.Complete,
+            answer = "Completed result",
+            error = null,
+            resultHash = "sha256:result_hash_abc",
+        )
+
+        clock.currentEpoch = 6000L
+        val result = committerWithSuppressed.commitTerminal(
+            queueStore = queueStore,
+            entry = entry,
+            snapshot = snapshot,
+        )
+
+        assertEquals(HermesQueuePersistenceResult.Mutated, result)
+
+        val updatedLedger = ledger.find(recoveryKey)!!
+        assertEquals(HermesRecoveryState.Finished, updatedLedger.recoveryState)
+        assertEquals(HermesNotificationDisposition.SuppressedForeground, updatedLedger.notificationDisposition)
+        assertEquals(6000L, updatedLedger.notificationDispositionChangedAt)
+        assertEquals(6000L, updatedLedger.terminalCommittedAt)
+        assertNull(updatedLedger.terminalDeadlineAt)
+        assertNull(updatedLedger.notificationNextAttemptAt)
+        assertEquals(0, updatedLedger.notificationAttemptCount)
+    }
+
+    @Test
+    fun `commitLiveKitTerminal passes ConnectedRelay observation to admission`() = runTest {
+        var observedContext: TerminalObservationContext? = null
+        val admission = HermesNotificationAdmission { _, observation ->
+            observedContext = observation
+            if (observation == TerminalObservationContext.ConnectedRelay) {
+                HermesNotificationDisposition.SuppressedInCall
+            } else {
+                HermesNotificationDisposition.PendingPost
+            }
+        }
+        val committerWithAdmission = HermesTerminalCommitter(ledger = ledger, admission = admission, clock = clock)
+
+        val (convStore, queueStore) = setupStoreWithQueuedRecord()
+        queueStore.persistActive(
+            callId = callId,
+            prompt = "Compute data",
+            status = VoiceToolRecordStatus.Queued,
+            jobId = jobId,
+            originatingUserTurnId = "turn-1",
+            requestHash = "req-hash",
+            argumentHash = "arg-hash",
+            producer = HERMES_PRODUCER,
+        )
+
+        val entry = createDefaultActiveEntry().copy(notificationDisposition = HermesNotificationDisposition.Undecided)
+        ledger.insert(entry)
+
+        clock.currentEpoch = 6000L
+        val result = committerWithAdmission.commitLiveKitTerminal(
+            queueStore = queueStore,
+            entry = entry,
+            callId = callId,
+            status = VoiceToolRecordStatus.Complete(answer = "result"),
+            jobId = jobId,
+            originatingUserTurnId = "turn-1",
+            requestHash = "req-hash",
+            argumentHash = "arg-hash",
+            resultHash = "res-hash",
+            producer = HERMES_PRODUCER,
+        )
+
+        assertEquals(HermesQueuePersistenceResult.Mutated, result)
+        assertEquals(TerminalObservationContext.ConnectedRelay, observedContext)
+
+        val updatedLedger = ledger.find(recoveryKey)!!
+        assertEquals(HermesRecoveryState.Finished, updatedLedger.recoveryState)
+        assertEquals(HermesNotificationDisposition.SuppressedInCall, updatedLedger.notificationDisposition)
+        assertEquals(6000L, updatedLedger.terminalCommittedAt)
+        assertNull(updatedLedger.terminalDeadlineAt)
+        assertNull(updatedLedger.notificationNextAttemptAt)
+    }
+
+    @Test
+    fun `pre-Outcome-2 SuppressedNotEnabled row preserves existing disposition without re-evaluating admission`() = runTest {
+        var admissionCalled = false
+        val admission = HermesNotificationAdmission { _, _ ->
+            admissionCalled = true
+            HermesNotificationDisposition.PendingPost
+        }
+        val committerWithAdmission = HermesTerminalCommitter(ledger = ledger, admission = admission, clock = clock)
+
+        val (convStore, queueStore) = setupStoreWithQueuedRecord()
+        queueStore.persistActive(
+            callId = callId,
+            prompt = "Compute data",
+            status = VoiceToolRecordStatus.Queued,
+            jobId = jobId,
+        )
+
+        val preOutcome2Entry = createDefaultActiveEntry().copy(
+            notificationDisposition = HermesNotificationDisposition.SuppressedNotEnabled,
+            notificationDispositionChangedAt = 3000L,
+        )
+        ledger.insert(preOutcome2Entry)
+
+        val snapshot = ValidatedHermesRecoverySnapshot(
+            jobId = jobId,
+            callId = callId,
+            status = HermesQueueStatus.Complete,
+            answer = "Completed result",
+            error = null,
+            resultHash = "sha256:result_hash_abc",
+        )
+
+        clock.currentEpoch = 6000L
+        val result = committerWithAdmission.commitTerminal(
+            queueStore = queueStore,
+            entry = preOutcome2Entry,
+            snapshot = snapshot,
+        )
+
+        assertEquals(HermesQueuePersistenceResult.Mutated, result)
+        assertTrue(!admissionCalled)
+
+        val updatedLedger = ledger.find(recoveryKey)!!
+        assertEquals(HermesRecoveryState.Finished, updatedLedger.recoveryState)
+        assertEquals(HermesNotificationDisposition.SuppressedNotEnabled, updatedLedger.notificationDisposition)
+        assertEquals(3000L, updatedLedger.notificationDispositionChangedAt)
+        assertNull(updatedLedger.terminalDeadlineAt)
+        assertNull(updatedLedger.notificationNextAttemptAt)
+    }
+
+    @Test
+    fun `non-Undecided PendingPost entry preserves existing disposition and timestamps`() = runTest {
+        var admissionCalled = false
+        val admission = HermesNotificationAdmission { _, _ ->
+            admissionCalled = true
+            HermesNotificationDisposition.SuppressedForeground
+        }
+        val committerWithAdmission = HermesTerminalCommitter(ledger = ledger, admission = admission, clock = clock)
+
+        val (convStore, queueStore) = setupStoreWithQueuedRecord()
+        queueStore.persistActive(
+            callId = callId,
+            prompt = "Compute data",
+            status = VoiceToolRecordStatus.Queued,
+            jobId = jobId,
+        )
+
+        val existingPendingEntry = createDefaultActiveEntry().copy(
+            notificationDisposition = HermesNotificationDisposition.PendingPost,
+            notificationDispositionChangedAt = 3000L,
+            terminalDeadlineAt = 3000L + 15.minutes.inWholeMilliseconds,
+            notificationNextAttemptAt = 3000L,
+            notificationAttemptCount = 1,
+        )
+        ledger.insert(existingPendingEntry)
+
+        val snapshot = ValidatedHermesRecoverySnapshot(
+            jobId = jobId,
+            callId = callId,
+            status = HermesQueueStatus.Complete,
+            answer = "Completed result",
+            error = null,
+            resultHash = "sha256:result_hash_abc",
+        )
+
+        clock.currentEpoch = 6000L
+        val result = committerWithAdmission.commitTerminal(
+            queueStore = queueStore,
+            entry = existingPendingEntry,
+            snapshot = snapshot,
+        )
+
+        assertEquals(HermesQueuePersistenceResult.Mutated, result)
+        assertTrue(!admissionCalled)
+
+        val updatedLedger = ledger.find(recoveryKey)!!
+        assertEquals(HermesRecoveryState.Finished, updatedLedger.recoveryState)
+        assertEquals(HermesNotificationDisposition.PendingPost, updatedLedger.notificationDisposition)
+        assertEquals(3000L, updatedLedger.notificationDispositionChangedAt)
+        assertEquals(3000L + 15.minutes.inWholeMilliseconds, updatedLedger.terminalDeadlineAt)
+        assertEquals(3000L, updatedLedger.notificationNextAttemptAt)
+        assertEquals(1, updatedLedger.notificationAttemptCount)
     }
 }
 
