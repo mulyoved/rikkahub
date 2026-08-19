@@ -61,6 +61,18 @@ internal class HermesRecoveryLedger(
         return dao.forConversation(conversationId.toString()).map { it.toEntry() }
     }
 
+    suspend fun pendingNotifications(conversationId: Uuid): List<HermesRecoveryEntry> {
+        return dao.pendingForConversation(conversationId.toString()).map { it.toEntry() }
+    }
+
+    suspend fun allPendingNotifications(): List<HermesRecoveryEntry> {
+        return dao.allPendingNotifications().map { it.toEntry() }
+    }
+
+    suspend fun pendingNotificationConversationIds(): List<Uuid> {
+        return dao.pendingNotificationConversationIds().map { Uuid.parse(it) }
+    }
+
     suspend fun insert(entry: HermesRecoveryEntry): Boolean {
         validate(entry)
         val rowId = dao.insert(entry.toEntity())

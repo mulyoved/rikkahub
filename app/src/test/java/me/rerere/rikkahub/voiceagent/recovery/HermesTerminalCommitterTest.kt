@@ -17,7 +17,9 @@ import me.rerere.rikkahub.voiceagent.hermes.VoiceToolRecordStatus
 import me.rerere.rikkahub.voiceagent.hermes.hermesQueueRecords
 import me.rerere.rikkahub.voiceagent.persistence.VoiceTranscriptPersister
 import me.rerere.rikkahub.voiceagent.notification.HermesNotificationAdmission
+import me.rerere.rikkahub.voiceagent.notification.HermesNotificationWorkScheduler
 import me.rerere.rikkahub.voiceagent.notification.TerminalObservationContext
+import kotlin.time.Duration
 import kotlin.time.Duration.Companion.minutes
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
@@ -259,10 +261,13 @@ class HermesTerminalCommitterTest {
     @Test
     fun `commitTerminal rollback when ledger update throws leaves conversation unchanged`() = runTest {
         val throwingDao = object : HermesRecoveryDAO {
-            override suspend fun find(recoveryKey: String): HermesRecoveryEntity? = null
+            override suspend fun find(key: String): HermesRecoveryEntity? = null
             override suspend fun active(): List<HermesRecoveryEntity> = emptyList()
             override suspend fun dormant(): List<HermesRecoveryEntity> = emptyList()
             override suspend fun forConversation(conversationId: String): List<HermesRecoveryEntity> = emptyList()
+            override suspend fun pendingForConversation(conversationId: String): List<HermesRecoveryEntity> = emptyList()
+            override suspend fun allPendingNotifications(): List<HermesRecoveryEntity> = emptyList()
+            override suspend fun pendingNotificationConversationIds(): List<String> = emptyList()
             override suspend fun insert(entry: HermesRecoveryEntity): Long = 1L
             override suspend fun update(entry: HermesRecoveryEntity) {
                 throw IllegalStateException("Ledger update DB crash")
@@ -611,12 +616,152 @@ class HermesTerminalCommitterTest {
         assertEquals(3000L, updatedLedger.notificationNextAttemptAt)
         assertEquals(1, updatedLedger.notificationAttemptCount)
     }
+
+    @Test
+    fun `commitTerminal with PendingPost invokes notificationScheduler replaceForEarliestDue`() = runTest {
+        val fakeScheduler = CommitterFakeNotificationScheduler()
+        val admission = HermesNotificationAdmission { _, _ -> HermesNotificationDisposition.PendingPost }
+        val committerWithScheduler = HermesTerminalCommitter(
+            ledger = ledger,
+            admission = admission,
+            clock = clock,
+            notificationScheduler = fakeScheduler,
+        )
+
+        val (convStore, queueStore) = setupStoreWithQueuedRecord()
+        queueStore.persistActive(
+            callId = callId,
+            prompt = "Compute data",
+            status = VoiceToolRecordStatus.Queued,
+            jobId = jobId,
+        )
+
+        val entry = createDefaultActiveEntry().copy(notificationDisposition = HermesNotificationDisposition.Undecided)
+        ledger.insert(entry)
+
+        val snapshot = ValidatedHermesRecoverySnapshot(
+            jobId = jobId,
+            callId = callId,
+            status = HermesQueueStatus.Complete,
+            answer = "Completed result",
+            error = null,
+            resultHash = "sha256:result_hash_abc",
+        )
+
+        val result = committerWithScheduler.commitTerminal(
+            queueStore = queueStore,
+            entry = entry,
+            snapshot = snapshot,
+        )
+
+        assertEquals(HermesQueuePersistenceResult.Mutated, result)
+        assertEquals(listOf(conversationId), fakeScheduler.replacedConversations)
+    }
+
+    @Test
+    fun `commitTerminal with PendingPost when notificationScheduler throws still completes successfully`() = runTest {
+        val throwingScheduler = object : HermesNotificationWorkScheduler {
+            override suspend fun replaceForEarliestDue(conversationId: Uuid, delay: Duration) {
+                throw IllegalStateException("WorkManager database error")
+            }
+            override suspend fun continueAfterCurrent(conversationId: Uuid, delay: Duration) = Unit
+            override suspend fun cancel(conversationId: Uuid) = Unit
+        }
+        val admission = HermesNotificationAdmission { _, _ -> HermesNotificationDisposition.PendingPost }
+        val committerWithThrowingScheduler = HermesTerminalCommitter(
+            ledger = ledger,
+            admission = admission,
+            clock = clock,
+            notificationScheduler = throwingScheduler,
+        )
+
+        val (convStore, queueStore) = setupStoreWithQueuedRecord()
+        queueStore.persistActive(
+            callId = callId,
+            prompt = "Compute data",
+            status = VoiceToolRecordStatus.Queued,
+            jobId = jobId,
+        )
+
+        val entry = createDefaultActiveEntry().copy(notificationDisposition = HermesNotificationDisposition.Undecided)
+        ledger.insert(entry)
+
+        val snapshot = ValidatedHermesRecoverySnapshot(
+            jobId = jobId,
+            callId = callId,
+            status = HermesQueueStatus.Complete,
+            answer = "Completed result",
+            error = null,
+            resultHash = "sha256:result_hash_abc",
+        )
+
+        val result = committerWithThrowingScheduler.commitTerminal(
+            queueStore = queueStore,
+            entry = entry,
+            snapshot = snapshot,
+        )
+
+        assertEquals(HermesQueuePersistenceResult.Mutated, result)
+        val updatedLedger = ledger.find(recoveryKey)!!
+        assertEquals(HermesRecoveryState.Finished, updatedLedger.recoveryState)
+        assertEquals(HermesNotificationDisposition.PendingPost, updatedLedger.notificationDisposition)
+    }
+
+    @Test
+    fun `commitTerminal with SuppressedForeground does not invoke notificationScheduler`() = runTest {
+        val fakeScheduler = CommitterFakeNotificationScheduler()
+        val admission = HermesNotificationAdmission { _, _ -> HermesNotificationDisposition.SuppressedForeground }
+        val committerWithScheduler = HermesTerminalCommitter(
+            ledger = ledger,
+            admission = admission,
+            clock = clock,
+            notificationScheduler = fakeScheduler,
+        )
+
+        val (convStore, queueStore) = setupStoreWithQueuedRecord()
+        queueStore.persistActive(
+            callId = callId,
+            prompt = "Compute data",
+            status = VoiceToolRecordStatus.Queued,
+            jobId = jobId,
+        )
+
+        val entry = createDefaultActiveEntry().copy(notificationDisposition = HermesNotificationDisposition.Undecided)
+        ledger.insert(entry)
+
+        val snapshot = ValidatedHermesRecoverySnapshot(
+            jobId = jobId,
+            callId = callId,
+            status = HermesQueueStatus.Complete,
+            answer = "Completed result",
+            error = null,
+            resultHash = "sha256:result_hash_abc",
+        )
+
+        val result = committerWithScheduler.commitTerminal(
+            queueStore = queueStore,
+            entry = entry,
+            snapshot = snapshot,
+        )
+
+        assertEquals(HermesQueuePersistenceResult.Mutated, result)
+        assertTrue(fakeScheduler.replacedConversations.isEmpty())
+    }
+}
+
+private class CommitterFakeNotificationScheduler : HermesNotificationWorkScheduler {
+    val replacedConversations = mutableListOf<Uuid>()
+    override suspend fun replaceForEarliestDue(conversationId: Uuid, delay: Duration) {
+        replacedConversations.add(conversationId)
+    }
+    override suspend fun continueAfterCurrent(conversationId: Uuid, delay: Duration) = Unit
+    override suspend fun cancel(conversationId: Uuid) = Unit
 }
 
 private class FakeHermesRecoveryDAODouble : HermesRecoveryDAO {
     private val storage = mutableMapOf<String, HermesRecoveryEntity>()
 
-    override suspend fun find(recoveryKey: String): HermesRecoveryEntity? = storage[recoveryKey]
+    override suspend fun find(key: String): HermesRecoveryEntity? = storage[key]
 
     override suspend fun active(): List<HermesRecoveryEntity> =
         storage.values.filter { it.recoveryState == HermesRecoveryState.Active.name }
@@ -626,6 +771,15 @@ private class FakeHermesRecoveryDAODouble : HermesRecoveryDAO {
 
     override suspend fun forConversation(conversationId: String): List<HermesRecoveryEntity> =
         storage.values.filter { it.conversationId == conversationId }
+
+    override suspend fun pendingForConversation(conversationId: String): List<HermesRecoveryEntity> =
+        storage.values.filter { it.conversationId == conversationId && it.notificationDisposition == HermesNotificationDisposition.PendingPost.name }
+
+    override suspend fun allPendingNotifications(): List<HermesRecoveryEntity> =
+        storage.values.filter { it.notificationDisposition == HermesNotificationDisposition.PendingPost.name }
+
+    override suspend fun pendingNotificationConversationIds(): List<String> =
+        storage.values.filter { it.notificationDisposition == HermesNotificationDisposition.PendingPost.name }.map { it.conversationId }.distinct()
 
     override suspend fun insert(entry: HermesRecoveryEntity): Long {
         if (storage.containsKey(entry.recoveryKey)) return -1L

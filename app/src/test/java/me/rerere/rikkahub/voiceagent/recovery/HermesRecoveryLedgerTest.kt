@@ -453,6 +453,58 @@ class HermesRecoveryLedgerTest {
         assertEquals(HermesRecoveryState.Active, found?.recoveryState)
     }
 
+    @Test
+    fun `pending notification queries return matching entries and conversation IDs`() = runTest {
+        val dao = FakeHermesRecoveryDAO()
+        val ledger = HermesRecoveryLedger(dao)
+
+        val conv1 = Uuid.parse("00000000-0000-0000-0000-000000000001")
+        val conv2 = Uuid.parse("00000000-0000-0000-0000-000000000002")
+
+        fun createEntry(convId: Uuid, recoveryKey: String, disposition: HermesNotificationDisposition): HermesRecoveryEntry = HermesRecoveryEntry(
+            recoveryKey = recoveryKey,
+            conversationId = convId,
+            callId = "call-$recoveryKey",
+            jobId = "job-$recoveryKey",
+            producer = "hermes",
+            originalVoiceSessionHash = "hash-session",
+            originalArgumentHash = "hash-arg",
+            originalOwnerHash = "hash-owner",
+            originalEndpointHash = "hash-ep",
+            acceptedAt = 1000L,
+            automaticDeadlineAt = 2000L,
+            recoveryState = HermesRecoveryState.Finished,
+            dormantReason = null,
+            lastAttemptAt = 1000L,
+            cancelRequestedAt = null,
+            notificationDisposition = disposition,
+            notificationDispositionChangedAt = 1000L,
+        )
+
+        val pending1 = createEntry(conv1, "k-p1", HermesNotificationDisposition.PendingPost)
+        val pending2 = createEntry(conv1, "k-p2", HermesNotificationDisposition.PendingPost)
+        val posted = createEntry(conv1, "k-posted", HermesNotificationDisposition.Posted)
+        val pendingConv2 = createEntry(conv2, "k-p3", HermesNotificationDisposition.PendingPost)
+
+        ledger.insert(pending1)
+        ledger.insert(pending2)
+        ledger.insert(posted)
+        ledger.insert(pendingConv2)
+
+        // pendingNotifications for conv1
+        val conv1Pending = ledger.pendingNotifications(conv1)
+        assertEquals(2, conv1Pending.size)
+        assertTrue(conv1Pending.all { it.notificationDisposition == HermesNotificationDisposition.PendingPost })
+
+        // allPendingNotifications
+        val allPending = ledger.allPendingNotifications()
+        assertEquals(3, allPending.size)
+
+        // pendingNotificationConversationIds
+        val convIds = ledger.pendingNotificationConversationIds()
+        assertEquals(listOf(conv1, conv2), convIds)
+    }
+
     private class RecordingAtomicGateway(
         private val persistedLocation: PersistedConversationFolder,
         private val writeFailure: Throwable? = null,
@@ -519,6 +571,15 @@ class HermesRecoveryLedgerTest {
 
         override suspend fun forConversation(conversationId: String): List<HermesRecoveryEntity> =
             storage.values.filter { it.conversationId == conversationId }
+
+        override suspend fun pendingForConversation(conversationId: String): List<HermesRecoveryEntity> =
+            storage.values.filter { it.conversationId == conversationId && it.notificationDisposition == "PendingPost" }
+
+        override suspend fun allPendingNotifications(): List<HermesRecoveryEntity> =
+            storage.values.filter { it.notificationDisposition == "PendingPost" }
+
+        override suspend fun pendingNotificationConversationIds(): List<String> =
+            storage.values.filter { it.notificationDisposition == "PendingPost" }.map { it.conversationId }.distinct()
 
         override suspend fun insert(entry: HermesRecoveryEntity): Long {
             if (storage.containsKey(entry.recoveryKey)) return -1L

@@ -5,6 +5,7 @@ import me.rerere.rikkahub.voiceagent.hermes.HermesQueueStore
 import me.rerere.rikkahub.voiceagent.hermes.ValidatedHermesRecoverySnapshot
 import me.rerere.rikkahub.voiceagent.hermes.VoiceToolRecordStatus
 import me.rerere.rikkahub.voiceagent.notification.HermesNotificationAdmission
+import me.rerere.rikkahub.voiceagent.notification.HermesNotificationWorkScheduler
 import me.rerere.rikkahub.voiceagent.notification.TerminalObservationContext
 import kotlin.time.Duration.Companion.minutes
 
@@ -14,6 +15,7 @@ internal class HermesTerminalCommitter(
         HermesNotificationDisposition.SuppressedNotEnabled
     },
     private val clock: RecoveryClock = SystemRecoveryClock,
+    private val notificationScheduler: HermesNotificationWorkScheduler? = null,
 ) {
     constructor(
         ledger: HermesRecoveryLedger,
@@ -24,6 +26,7 @@ internal class HermesTerminalCommitter(
             HermesNotificationDisposition.SuppressedNotEnabled
         },
         clock = clock,
+        notificationScheduler = null,
     )
 
     suspend fun commitTerminal(
@@ -35,7 +38,7 @@ internal class HermesTerminalCommitter(
         val now = clock.epochMillis()
         val updatedEntry = prepareTerminalEntry(entry, now, observation)
 
-        return queueStore.persistValidatedRecoverySnapshot(
+        val result = queueStore.persistValidatedRecoverySnapshot(
             snapshot = snapshot,
             commit = { persistenceResult ->
                 if (persistenceResult != HermesQueuePersistenceResult.Conflict &&
@@ -45,6 +48,20 @@ internal class HermesTerminalCommitter(
                 }
             },
         )
+
+        if (result != HermesQueuePersistenceResult.Conflict &&
+            result != HermesQueuePersistenceResult.Stale
+        ) {
+            if (updatedEntry.notificationDisposition == HermesNotificationDisposition.PendingPost) {
+                try {
+                    notificationScheduler?.replaceForEarliestDue(entry.conversationId)
+                } catch (e: Exception) {
+                    // scheduling failure leaves durable pending truth for startup repair
+                }
+            }
+        }
+
+        return result
     }
 
     suspend fun commitLiveKitTerminal(
@@ -63,7 +80,7 @@ internal class HermesTerminalCommitter(
         val now = clock.epochMillis()
         val updatedEntry = prepareTerminalEntry(entry, now, observation)
 
-        return queueStore.persistLiveKitTerminal(
+        val result = queueStore.persistLiveKitTerminal(
             callId = callId,
             status = status,
             jobId = jobId,
@@ -80,6 +97,20 @@ internal class HermesTerminalCommitter(
                 }
             },
         )
+
+        if (result != HermesQueuePersistenceResult.Conflict &&
+            result != HermesQueuePersistenceResult.Stale
+        ) {
+            if (updatedEntry.notificationDisposition == HermesNotificationDisposition.PendingPost) {
+                try {
+                    notificationScheduler?.replaceForEarliestDue(entry.conversationId)
+                } catch (e: Exception) {
+                    // scheduling failure leaves durable pending truth for startup repair
+                }
+            }
+        }
+
+        return result
     }
 
     private fun prepareTerminalEntry(

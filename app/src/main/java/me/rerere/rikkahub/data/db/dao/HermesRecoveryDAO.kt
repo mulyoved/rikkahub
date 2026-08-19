@@ -21,6 +21,15 @@ internal interface HermesRecoveryDAO {
     @Query("SELECT * FROM hermes_recovery WHERE conversation_id = :conversationId")
     suspend fun forConversation(conversationId: String): List<HermesRecoveryEntity>
 
+    @Query("SELECT * FROM hermes_recovery WHERE conversation_id = :conversationId AND notification_disposition = 'PendingPost'")
+    suspend fun pendingForConversation(conversationId: String): List<HermesRecoveryEntity>
+
+    @Query("SELECT * FROM hermes_recovery WHERE notification_disposition = 'PendingPost'")
+    suspend fun allPendingNotifications(): List<HermesRecoveryEntity>
+
+    @Query("SELECT DISTINCT conversation_id FROM hermes_recovery WHERE notification_disposition = 'PendingPost'")
+    suspend fun pendingNotificationConversationIds(): List<String>
+
     @Insert(onConflict = OnConflictStrategy.IGNORE)
     suspend fun insert(entry: HermesRecoveryEntity): Long
 

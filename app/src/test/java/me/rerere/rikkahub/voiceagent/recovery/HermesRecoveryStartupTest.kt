@@ -22,7 +22,11 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.hours
+import kotlin.time.Duration.Companion.milliseconds
+import kotlin.time.Duration.Companion.minutes
+import kotlin.time.Duration.Companion.seconds
 import kotlin.uuid.Uuid
+import me.rerere.rikkahub.voiceagent.notification.HermesNotificationWorkScheduler
 
 class HermesRecoveryStartupTest {
 
@@ -40,6 +44,15 @@ class HermesRecoveryStartupTest {
 
         override suspend fun forConversation(conversationId: String): List<HermesRecoveryEntity> =
             storage.values.filter { it.conversationId == conversationId }
+
+        override suspend fun pendingForConversation(conversationId: String): List<HermesRecoveryEntity> =
+            storage.values.filter { it.conversationId == conversationId && it.notificationDisposition == HermesNotificationDisposition.PendingPost.name }
+
+        override suspend fun allPendingNotifications(): List<HermesRecoveryEntity> =
+            storage.values.filter { it.notificationDisposition == HermesNotificationDisposition.PendingPost.name }
+
+        override suspend fun pendingNotificationConversationIds(): List<String> =
+            storage.values.filter { it.notificationDisposition == HermesNotificationDisposition.PendingPost.name }.map { it.conversationId }.distinct()
 
         override suspend fun insert(entry: HermesRecoveryEntity): Long {
             if (storage.containsKey(entry.recoveryKey)) return -1L
@@ -357,4 +370,92 @@ class HermesRecoveryStartupTest {
         assertEquals(HermesDormantReason.AuthUnavailable, updatedAuth2.dormantReason)
         assertFalse(scheduler.preempted.containsKey("key-auth-conv2"))
     }
+
+    @Test
+    fun `repairAll suppresses expired notification outbox rows and calls notificationScheduler replaceForEarliestDue for valid pending`() = runTest {
+        val dao = TestDAO()
+        val ledger = HermesRecoveryLedger(dao)
+        val scheduler = TestScheduler()
+        val clock = TestClock(now = 100_000L)
+        val notifScheduler = StartupFakeNotificationScheduler()
+
+        // Expired pending row (committed at 0, deadline at 15m = 900_000, now is 1_000_000)
+        clock.now = 1_000_000L
+        val expiredPending = HermesRecoveryEntry(
+            recoveryKey = "key-expired-pending",
+            conversationId = conversationId1,
+            callId = "c-exp",
+            jobId = "j-exp",
+            producer = HERMES_PRODUCER,
+            originalVoiceSessionHash = "s",
+            originalArgumentHash = "a",
+            originalOwnerHash = "o",
+            originalEndpointHash = "e",
+            acceptedAt = 0L,
+            automaticDeadlineAt = 86400000L,
+            recoveryState = HermesRecoveryState.Finished,
+            lastAttemptAt = 0L,
+            terminalCommittedAt = 0L,
+            terminalDeadlineAt = 900_000L,
+            notificationDisposition = HermesNotificationDisposition.PendingPost,
+            notificationDispositionChangedAt = 0L,
+            notificationNextAttemptAt = 0L,
+        )
+
+        // Valid pending row (committed at 950_000, deadline at 950k + 15m, nextAttempt at 1_010_000)
+        val validPending = HermesRecoveryEntry(
+            recoveryKey = "key-valid-pending",
+            conversationId = conversationId2,
+            callId = "c-val",
+            jobId = "j-val",
+            producer = HERMES_PRODUCER,
+            originalVoiceSessionHash = "s",
+            originalArgumentHash = "a",
+            originalOwnerHash = "o",
+            originalEndpointHash = "e",
+            acceptedAt = 950_000L,
+            automaticDeadlineAt = 950_000L + 86400000L,
+            recoveryState = HermesRecoveryState.Finished,
+            lastAttemptAt = 950_000L,
+            terminalCommittedAt = 950_000L,
+            terminalDeadlineAt = 950_000L + 15.minutes.inWholeMilliseconds,
+            notificationDisposition = HermesNotificationDisposition.PendingPost,
+            notificationDispositionChangedAt = 950_000L,
+            notificationNextAttemptAt = 1_010_000L,
+        )
+
+        ledger.insert(expiredPending)
+        ledger.insert(validPending)
+
+        val coordinator = HermesRecoveryCoordinator(
+            ledger = ledger,
+            scheduler = scheduler,
+            relayRegistry = HermesRelayRegistry(clock),
+            endpointResolver = HermesRecoveryEndpointResolver(null),
+            conversationStoreProvider = { id -> InMemoryVoiceConversationStore(Conversation.ofId(id)) },
+            clock = clock,
+            notificationScheduler = notifScheduler,
+        )
+
+        coordinator.repairAll()
+
+        // Expired row suppressed to SuppressedPostFailure
+        val updatedExpired = ledger.find("key-expired-pending")!!
+        assertEquals(HermesNotificationDisposition.SuppressedPostFailure, updatedExpired.notificationDisposition)
+        assertNull(updatedExpired.notificationNextAttemptAt)
+
+        // Valid pending scheduled with REPLACE and delay = 1_010_000 - 1_000_000 = 10_000ms
+        assertEquals(1, notifScheduler.replaceCalls.size)
+        assertEquals(conversationId2, notifScheduler.replaceCalls[0].first)
+        assertEquals(10_000L.milliseconds, notifScheduler.replaceCalls[0].second)
+    }
+}
+
+private class StartupFakeNotificationScheduler : HermesNotificationWorkScheduler {
+    val replaceCalls = mutableListOf<Pair<Uuid, Duration>>()
+    override suspend fun replaceForEarliestDue(conversationId: Uuid, delay: Duration) {
+        replaceCalls.add(conversationId to delay)
+    }
+    override suspend fun continueAfterCurrent(conversationId: Uuid, delay: Duration) = Unit
+    override suspend fun cancel(conversationId: Uuid) = Unit
 }

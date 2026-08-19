@@ -16,9 +16,12 @@ import me.rerere.rikkahub.voiceagent.hermes.HermesToolRecordWriter
 import me.rerere.rikkahub.voiceagent.hermes.hermesQueueRecords
 import me.rerere.rikkahub.voiceagent.hermes.latestByHermesDurableIdentity
 import me.rerere.rikkahub.voiceagent.livekit.voiceSha256
+import me.rerere.rikkahub.voiceagent.notification.HermesNotificationWorkScheduler
 import me.rerere.rikkahub.voiceagent.persistence.VoiceTranscriptPersister
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.hours
+import kotlin.time.Duration.Companion.milliseconds
+import kotlin.time.Duration.Companion.minutes
 import kotlin.time.Duration.Companion.seconds
 import kotlin.uuid.Uuid
 
@@ -78,6 +81,7 @@ internal interface HermesRecoveryCoordinator {
             transcriptPersister: VoiceTranscriptPersister = VoiceTranscriptPersister(),
             coroutineScope: CoroutineScope = CoroutineScope(Dispatchers.Default + SupervisorJob()),
             conversationIdsProvider: (suspend () -> List<Uuid>)? = null,
+            notificationScheduler: HermesNotificationWorkScheduler? = null,
         ): HermesRecoveryCoordinator = DefaultHermesRecoveryCoordinator(
             ledger = ledger,
             scheduler = scheduler,
@@ -92,6 +96,7 @@ internal interface HermesRecoveryCoordinator {
             transcriptPersister = transcriptPersister,
             coroutineScope = coroutineScope,
             conversationIdsProvider = conversationIdsProvider,
+            notificationScheduler = notificationScheduler,
         )
     }
 }
@@ -110,6 +115,7 @@ internal class DefaultHermesRecoveryCoordinator(
     private val transcriptPersister: VoiceTranscriptPersister,
     private val coroutineScope: CoroutineScope,
     private val conversationIdsProvider: (suspend () -> List<Uuid>)?,
+    private val notificationScheduler: HermesNotificationWorkScheduler? = null,
 ) : HermesRecoveryCoordinator {
 
     private fun getConversationStore(conversationId: Uuid): VoiceConversationStore {
@@ -471,6 +477,32 @@ internal class DefaultHermesRecoveryCoordinator(
         for (entry in activeEntries) {
             val delay = HermesRecoveryCadence.nextDelay(entry.acceptedAt, now) ?: Duration.ZERO
             scheduler.ensure(entry.recoveryKey, delay)
+        }
+
+        val pendingNotifications = ledger.allPendingNotifications()
+        val validPendingByConversation = mutableMapOf<Uuid, MutableList<HermesRecoveryEntry>>()
+
+        for (entry in pendingNotifications) {
+            val deadline = entry.terminalDeadlineAt
+                ?: (entry.terminalCommittedAt?.let { it + 15.minutes.inWholeMilliseconds })
+                ?: (entry.acceptedAt + 15.minutes.inWholeMilliseconds)
+            if (now >= deadline) {
+                ledger.update(
+                    entry.copy(
+                        notificationDisposition = HermesNotificationDisposition.SuppressedPostFailure,
+                        notificationDispositionChangedAt = now,
+                        notificationNextAttemptAt = null,
+                    ),
+                )
+            } else {
+                validPendingByConversation.getOrPut(entry.conversationId) { mutableListOf() }.add(entry)
+            }
+        }
+
+        for ((convId, entries) in validPendingByConversation) {
+            val earliestNext = entries.mapNotNull { it.notificationNextAttemptAt }.minOrNull() ?: now
+            val delay = maxOf(0L, earliestNext - now).milliseconds
+            notificationScheduler?.replaceForEarliestDue(convId, delay)
         }
 
         val conversationIds = conversationIdsProvider?.invoke() ?: emptyList()

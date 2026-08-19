@@ -957,6 +957,12 @@ private class CoordinatorFakeDAO : HermesRecoveryDAO {
         storage.values.filter { it.recoveryState == HermesRecoveryState.Dormant.name }
     override suspend fun forConversation(conversationId: String): List<HermesRecoveryEntity> =
         storage.values.filter { it.conversationId == conversationId }
+    override suspend fun pendingForConversation(conversationId: String): List<HermesRecoveryEntity> =
+        storage.values.filter { it.conversationId == conversationId && it.notificationDisposition == "PendingPost" }
+    override suspend fun allPendingNotifications(): List<HermesRecoveryEntity> =
+        storage.values.filter { it.notificationDisposition == "PendingPost" }
+    override suspend fun pendingNotificationConversationIds(): List<String> =
+        storage.values.filter { it.notificationDisposition == "PendingPost" }.map { it.conversationId }.distinct()
     override suspend fun insert(entry: HermesRecoveryEntity): Long {
         if (storage.containsKey(entry.recoveryKey)) return -1L
         storage[entry.recoveryKey] = entry

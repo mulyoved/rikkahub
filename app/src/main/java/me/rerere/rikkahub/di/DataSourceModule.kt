@@ -45,6 +45,13 @@ import me.rerere.rikkahub.voiceagent.recovery.HermesRelayRegistry
 import me.rerere.rikkahub.voiceagent.recovery.HermesTerminalCommitter
 import me.rerere.rikkahub.voiceagent.recovery.WorkManagerHermesRecoveryWorkScheduler
 import me.rerere.rikkahub.voiceagent.recovery.hermesRecoveryRequest
+import me.rerere.rikkahub.voiceagent.notification.HermesNotificationDeliveryCoordinator
+import me.rerere.rikkahub.voiceagent.notification.HermesNotificationPoster
+import me.rerere.rikkahub.voiceagent.notification.HermesNotificationWorkRequestFactory
+import me.rerere.rikkahub.voiceagent.notification.HermesNotificationWorkScheduler
+import me.rerere.rikkahub.voiceagent.notification.HermesNotificationWorker
+import me.rerere.rikkahub.voiceagent.notification.WorkManagerHermesNotificationWorkScheduler
+import me.rerere.rikkahub.voiceagent.notification.hermesNotificationRequest
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.logging.HttpLoggingInterceptor
@@ -176,7 +183,11 @@ val dataSourceModule = module {
     }
 
     single {
-        HermesTerminalCommitter(ledger = get(), admission = get())
+        HermesTerminalCommitter(
+            ledger = get(),
+            admission = get(),
+            notificationScheduler = get(),
+        )
     }
 
     single<HermesRecoveryWorkRequestFactory> {
@@ -200,6 +211,42 @@ val dataSourceModule = module {
         )
     }
 
+    single<HermesNotificationWorkRequestFactory> {
+        HermesNotificationWorkRequestFactory { spec ->
+            hermesNotificationRequest<HermesNotificationWorker>(spec)
+        }
+    }
+
+    single<HermesNotificationWorkScheduler> {
+        WorkManagerHermesNotificationWorkScheduler(
+            workManager = WorkManager.getInstance(get()),
+            requestFactory = get(),
+        )
+    }
+
+    single<HermesNotificationPoster> {
+        HermesNotificationPoster { _ ->
+            // Replaced in Task 12 by HermesResultNotifier
+        }
+    }
+
+    single {
+        HermesNotificationDeliveryCoordinator(
+            ledger = get(),
+            scheduler = get(),
+            poster = get(),
+            admission = get(),
+        )
+    }
+
+    worker {
+        HermesNotificationWorker(
+            context = get(),
+            workerParams = get(),
+            coordinator = get(),
+        )
+    }
+
     single<HermesRecoveryCoordinator> {
         val conversationDao: me.rerere.rikkahub.data.db.dao.ConversationDAO = get()
         HermesRecoveryCoordinator(
@@ -213,6 +260,7 @@ val dataSourceModule = module {
             conversationIdsProvider = {
                 conversationDao.getAllIds().map { Uuid.parse(it) }
             },
+            notificationScheduler = get(),
         )
     }
 
