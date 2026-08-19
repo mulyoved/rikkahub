@@ -1,6 +1,7 @@
 package me.rerere.rikkahub.voiceagent.livekit
 
 import android.content.Context
+import android.media.AudioManager
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.TimeoutCancellationException
@@ -14,6 +15,9 @@ import me.rerere.rikkahub.voiceagent.VoiceAgentRouteLease
 import me.rerere.rikkahub.voiceagent.VoiceAgentSessionCreationResult
 import me.rerere.rikkahub.voiceagent.VoiceConversationStore
 import me.rerere.rikkahub.voiceagent.VoiceE2EArtifactWriter
+import me.rerere.rikkahub.voiceagent.audio.AndroidDirectBluetoothCaptureOperations
+import me.rerere.rikkahub.voiceagent.audio.DirectBluetoothCaptureCapability
+import me.rerere.rikkahub.voiceagent.audio.SystemDirectBluetoothCaptureCapability
 import me.rerere.rikkahub.voiceagent.audio.VoiceAudioRouteOwner
 import me.rerere.rikkahub.voiceagent.audio.VoiceCaptureFixtureArming
 import me.rerere.rikkahub.voiceagent.audio.VoiceCaptureSource
@@ -70,6 +74,12 @@ internal class LiveKitVoiceCallFactory internal constructor(
     private val artifactWriterFactory: (File, VoiceTraceContext, CoroutineScope) -> VoiceE2EArtifactWriter =
         ::createDefaultVoiceE2EArtifactWriter,
     private val sessionCreationTimeoutMillis: Long = DEFAULT_LIVEKIT_SESSION_CREATION_TIMEOUT_MS,
+    private val bluetoothCaptureProvider: () -> DirectBluetoothCaptureCapability? = {
+        val audioManager = context.getSystemService(AudioManager::class.java)
+        SystemDirectBluetoothCaptureCapability(
+            AndroidDirectBluetoothCaptureOperations(context, audioManager),
+        )
+    },
 ) : VoiceAgentCallFactory {
     constructor(
         context: Context,
@@ -178,6 +188,7 @@ internal class LiveKitVoiceCallFactory internal constructor(
                 persistenceOwner = persistenceOwner,
                 observability = observability,
                 telemetryCoordinator = telemetryCoordinator,
+                bluetoothCaptureProvider = bluetoothCaptureProvider,
             )
             resourcesTransferred = true
             VoiceAgentSessionCreationResult.Created(session)

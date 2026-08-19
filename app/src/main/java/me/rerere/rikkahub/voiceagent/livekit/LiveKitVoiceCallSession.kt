@@ -32,6 +32,8 @@ import me.rerere.rikkahub.voiceagent.VoiceAgentUiState
 import me.rerere.rikkahub.voiceagent.VoiceAudioStatus
 import me.rerere.rikkahub.voiceagent.VoiceDiagnosticLine
 import me.rerere.rikkahub.voiceagent.VoiceSessionStatus
+import me.rerere.rikkahub.voiceagent.audio.DirectBluetoothCaptureCapability
+import me.rerere.rikkahub.voiceagent.audio.DirectBluetoothCaptureLease
 import me.rerere.rikkahub.voiceagent.audio.VoiceCaptureFixtureSource
 import me.rerere.rikkahub.voiceagent.audio.VoiceCaptureSource
 import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationAudioProbe
@@ -74,6 +76,7 @@ internal class LiveKitVoiceCallSession(
     private val observability: VoiceObservability = NoOpVoiceObservability,
     private val monotonicNanos: () -> Long = ::defaultMonotonicNanos,
     private val telemetryCoordinator: VoiceLatencyTelemetryCoordinator? = null,
+    private val bluetoothCaptureProvider: () -> DirectBluetoothCaptureCapability? = { null },
 ) : RouteOwnedManagedVoiceCallSession {
     private val registeredRpcMethods = buildMap {
         require(LIVEKIT_PERSISTENCE_RPC !in rpcMethods) {
@@ -102,6 +105,7 @@ internal class LiveKitVoiceCallSession(
     private var eventJob: Job? = null
     private var connectionJob: Job? = null
     private var microphoneJob: Job? = null
+    private var activeBluetoothLease: DirectBluetoothCaptureLease? = null
     private var automationRuntime: VoiceAutomationRuntime? = null
     private var automationRunHash: String? = null
     private val automationCallBecameActive = AtomicBoolean(false)
@@ -133,6 +137,7 @@ internal class LiveKitVoiceCallSession(
         automationAudioActivation = { automationAudioActivation },
         captureSource = captureSource,
         recordCallStopped = ::recordAutomationCallStopped,
+        retireBluetoothLease = ::retireBluetoothLease,
     )
 
     override fun start() {
@@ -266,6 +271,11 @@ internal class LiveKitVoiceCallSession(
                     if (isReconnecting) false else desiredMicrophoneEnabled
                 }
                 try {
+                    if (requested) {
+                        ensureBluetoothLeasePrepared()
+                    } else {
+                        retireBluetoothLease()
+                    }
                     if (!room.setMicrophoneEnabled(requested)) {
                         appendDiagnostic("livekit_microphone_failed", "publication_rejected")
                         failExperimental("LiveKit experimental microphone control failed")
@@ -286,6 +296,47 @@ internal class LiveKitVoiceCallSession(
                 }
                 if (requested == currentTarget) break
             }
+        }
+    }
+
+    private suspend fun ensureBluetoothLeasePrepared() {
+        var leaseToPrepare: DirectBluetoothCaptureLease? = null
+        synchronized(microphoneStateLock) {
+            if (activeBluetoothLease == null && !closed.get()) {
+                activeBluetoothLease = runCatching { bluetoothCaptureProvider()?.acquire() }
+                    .onFailure {
+                        appendDiagnostic(
+                            "livekit_bluetooth_acquire_failed",
+                            it::class.simpleName ?: "unknown",
+                        )
+                    }
+                    .getOrNull()
+                leaseToPrepare = activeBluetoothLease
+            }
+        }
+        try {
+            leaseToPrepare?.prepare()
+        } catch (cancellation: CancellationException) {
+            throw cancellation
+        } catch (error: Throwable) {
+            appendDiagnostic(
+                "livekit_bluetooth_prepare_failed",
+                error::class.simpleName ?: "unknown",
+            )
+        }
+    }
+
+    private fun retireBluetoothLease() {
+        val lease = synchronized(microphoneStateLock) {
+            activeBluetoothLease.also { activeBluetoothLease = null }
+        }
+        try {
+            lease?.retire()
+        } catch (error: Throwable) {
+            appendDiagnostic(
+                "livekit_bluetooth_retire_failed",
+                error::class.simpleName ?: "unknown",
+            )
         }
     }
 
@@ -498,11 +549,13 @@ private class LiveKitCleanupOperation(
     private val automationAudioActivation: () -> AutoCloseable?,
     private val captureSource: VoiceCaptureSource,
     private val recordCallStopped: () -> Unit,
+    private val retireBluetoothLease: () -> Unit,
 ) : JoinedCleanupOperation() {
     private var routeCompleted = false
     private var connectionJobCompleted = false
     private var eventJobCompleted = false
     private var microphoneJobCompleted = false
+    private var bluetoothLeaseCompleted = false
     private var persistenceDrainCompleted = persistenceOwner == null
     private var rpcWorkCompleted = false
     private var persistenceOwnerCompleted = persistenceOwner == null
@@ -524,6 +577,7 @@ private class LiveKitCleanupOperation(
                     failures,
                 )
                 captureSourceCompleted = cleanCaptureSource(captureSourceCompleted, failures)
+                cleanBluetoothLease(failures)
                 retireRoute(failures)
                 connectionJobCompleted = cleanJob(connectionJob(), connectionJobCompleted, failures)
                 eventJobCompleted = cleanJob(eventJob(), eventJobCompleted, failures)
@@ -542,6 +596,16 @@ private class LiveKitCleanupOperation(
             failures.add(cancellation)
         }
         return failures.outcome()
+    }
+
+    private fun cleanBluetoothLease(failures: CleanupAttemptFailures) {
+        if (bluetoothLeaseCompleted) return
+        try {
+            retireBluetoothLease()
+            bluetoothLeaseCompleted = true
+        } catch (error: Throwable) {
+            failures.add(error)
+        }
     }
 
     private fun retireRoute(failures: CleanupAttemptFailures) {

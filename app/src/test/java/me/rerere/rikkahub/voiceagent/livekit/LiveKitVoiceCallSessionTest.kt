@@ -41,6 +41,8 @@ import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationRunBinding
 import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationRunState
 import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationRuntime
 import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationStatus
+import me.rerere.rikkahub.voiceagent.audio.DirectBluetoothCaptureCapability
+import me.rerere.rikkahub.voiceagent.audio.DirectBluetoothCaptureLease
 import me.rerere.rikkahub.voiceagent.audio.VoiceCaptureFixture
 import me.rerere.rikkahub.voiceagent.audio.VoiceCaptureFixtureArming
 import me.rerere.rikkahub.voiceagent.audio.VoiceCaptureSource
@@ -1398,6 +1400,40 @@ class LiveKitVoiceCallSessionTest {
         assertTrue((timeoutStatus as VoiceSessionStatus.Error).message.contains("timed out", ignoreCase = true))
     }
 
+    @Test
+    fun `session acquires and prepares bluetooth lease when microphone is active and releases on mute and cleanup`() = runTest {
+        val bluetooth = TestBluetoothCaptureCapability()
+        val fixture = fixture(
+            bluetoothCaptureProvider = { bluetooth },
+        )
+
+        fixture.session.start()
+        runCurrent()
+        fixture.room.emit(LiveKitRoomEvent.Connected)
+        runCurrent()
+
+        assertEquals(1, bluetooth.acquireCalls)
+        assertEquals(1, bluetooth.leases.size)
+        assertTrue(bluetooth.leases.single().prepared)
+        assertFalse(bluetooth.leases.single().retired)
+
+        fixture.session.setMuted(true)
+        runCurrent()
+        assertTrue(bluetooth.leases.single().retired)
+
+        fixture.session.setMuted(false)
+        runCurrent()
+        assertEquals(2, bluetooth.acquireCalls)
+        assertEquals(2, bluetooth.leases.size)
+        assertTrue(bluetooth.leases.last().prepared)
+        assertFalse(bluetooth.leases.last().retired)
+
+        val cleanup = fixture.session.cleanupOperation.run(VoiceAgentCleanupMode.Immediate)
+        runCurrent()
+        assertEquals(VoiceAgentCleanupResult.Completed, cleanup)
+        assertTrue(bluetooth.leases.last().retired)
+    }
+
     private fun kotlinx.coroutines.test.TestScope.fixture(
         rpcMethods: Map<String, suspend (LiveKitRpcInvocation) -> String> = emptyMap(),
         persistenceHandler: (suspend (callerIdentity: String, payload: String) -> String)? = null,
@@ -1414,6 +1450,7 @@ class LiveKitVoiceCallSessionTest {
         roomLifecycleObserver: (String) -> Unit = {},
         observability: VoiceObservability = NoOpVoiceObservability,
         monotonicNanos: () -> Long = { System.nanoTime() },
+        bluetoothCaptureProvider: () -> DirectBluetoothCaptureCapability? = { null },
     ): SessionFixture {
         val room = FakeLiveKitRoomFacade(
             connectFailure = connectFailure,
@@ -1440,6 +1477,7 @@ class LiveKitVoiceCallSessionTest {
                 captureSource = captureSource,
                 observability = observability,
                 monotonicNanos = monotonicNanos,
+                bluetoothCaptureProvider = bluetoothCaptureProvider,
             ),
             room = room,
             route = route,
@@ -1747,3 +1785,25 @@ private const val AUTOMATION_COMPARISON_HASH =
     "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 private const val REPLACEMENT_AUTOMATION_RUN_HASH =
     "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+private class TestBluetoothCaptureCapability : DirectBluetoothCaptureCapability {
+    var acquireCalls = 0
+    val leases = mutableListOf<TestBluetoothCaptureLease>()
+
+    override fun acquire(): DirectBluetoothCaptureLease {
+        acquireCalls++
+        return TestBluetoothCaptureLease().also { leases += it }
+    }
+}
+
+private class TestBluetoothCaptureLease : DirectBluetoothCaptureLease {
+    var prepared = false
+    var retired = false
+
+    override suspend fun prepare() {
+        prepared = true
+    }
+
+    override fun retire() {
+        retired = true
+    }
+}
