@@ -92,9 +92,10 @@ class HermesQueueStore(
         requestHash: String,
         argumentHash: String,
         producer: String,
+        commit: suspend (HermesQueuePersistenceResult) -> Unit = {},
     ): HermesQueuePersistenceResult {
         val sessionId = persistenceSessionId()
-        return updateWithResult { conversation ->
+        return updateWithResult(commit = commit) { conversation ->
             val existing = conversation.hermesQueueRecords()
                 .lastOrNull { it.matchesIdentity(callId = callId, jobId = jobId) }
             when {
@@ -136,9 +137,10 @@ class HermesQueueStore(
         argumentHash: String,
         resultHash: String?,
         producer: String,
+        commit: suspend (HermesQueuePersistenceResult) -> Unit = {},
     ): HermesQueuePersistenceResult {
         val sessionId = persistenceSessionId()
-        return updateWithResult { conversation ->
+        return updateWithResult(commit = commit) { conversation ->
             val existing = conversation.hermesQueueRecords()
                 .lastOrNull { it.matchesIdentity(callId = callId, jobId = jobId) }
             when {
@@ -186,9 +188,10 @@ class HermesQueueStore(
 
     internal suspend fun persistValidatedRecoverySnapshot(
         snapshot: ValidatedHermesRecoverySnapshot,
+        commit: suspend (HermesQueuePersistenceResult) -> Unit = {},
     ): HermesQueuePersistenceResult {
         val sessionId = persistenceSessionId()
-        return updateWithResult { conversation ->
+        return updateWithResult(commit = commit) { conversation ->
             val existing = conversation.hermesQueueRecords()
                 .lastOrNull { it.matchesIdentity(callId = snapshot.callId, jobId = snapshot.jobId) }
                 ?: conversation.hermesQueueRecords()
@@ -442,12 +445,13 @@ class HermesQueueStore(
     }
 
     private suspend fun <T> updateWithResult(
+        commit: suspend (T) -> Unit = {},
         transform: (Conversation) -> Pair<Conversation, T>,
     ): T {
         return updateMutex.withLock {
             conversationStore.updateAtomically(
                 transform = transform,
-                commit = {},
+                commit = commit,
             )
         }
     }

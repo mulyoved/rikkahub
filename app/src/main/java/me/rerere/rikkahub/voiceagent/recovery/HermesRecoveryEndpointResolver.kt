@@ -27,17 +27,17 @@ internal fun hermesEndpointBindingHash(normalizedBaseUrl: String): String =
 
 internal fun recoverySha256(value: String): String = sha256Hex(value)
 
-internal class HermesRecoveryEndpointResolver(
+internal open class HermesRecoveryEndpointResolver(
     private val settingsStore: SettingsStore? = null,
     private val configResolver: VoiceAgentConfigResolver = VoiceAgentConfigResolver(),
     private val transport: HermesVoiceHttpTransport? = null,
 ) {
-    suspend fun resolve(conversation: Conversation): ResolvedHermesRecoveryEndpoint? {
+    open suspend fun resolve(conversation: Conversation): ResolvedHermesRecoveryEndpoint? {
         val settings = settingsStore?.settingsFlow?.first() ?: return null
         return resolve(settings = settings, conversation = conversation)
     }
 
-    fun resolve(settings: Settings, conversation: Conversation): ResolvedHermesRecoveryEndpoint? {
+    open fun resolve(settings: Settings, conversation: Conversation): ResolvedHermesRecoveryEndpoint? {
         val configResult = configResolver.resolve(settings = settings, conversation = conversation)
         if (configResult !is VoiceAgentConfigResult.Available) {
             return null
