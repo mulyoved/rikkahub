@@ -95,6 +95,7 @@ internal class LiveKitVoiceCallSession(
     private val closed = AtomicBoolean(false)
     private val lifecycleLock = Any()
     private val microphoneStateLock = Any()
+    private val microphonePublicationActive = AtomicBoolean(false)
     private val rpcAdmission = LiveKitRpcAdmission()
     private val ready = CompletableDeferred<Unit>()
     private val roomConnected = CompletableDeferred<Unit>()
@@ -140,6 +141,7 @@ internal class LiveKitVoiceCallSession(
         workerParticipantIdentity = details.agentParticipantIdentity,
         automationAudioActivation = { automationAudioActivation },
         captureSource = captureSource,
+        microphonePublicationActive = { microphonePublicationActive.get() },
         recordCallStopped = ::recordAutomationCallStopped,
         retireBluetoothLease = ::retireBluetoothLease,
     )
@@ -285,6 +287,7 @@ internal class LiveKitVoiceCallSession(
                         failExperimental("LiveKit experimental microphone control failed")
                         return
                     }
+                    microphonePublicationActive.set(requested)
                 } catch (cancellation: CancellationException) {
                     throw cancellation
                 } catch (error: Throwable) {
@@ -554,6 +557,7 @@ private class LiveKitCleanupOperation(
     private val workerParticipantIdentity: String,
     private val automationAudioActivation: () -> AutoCloseable?,
     private val captureSource: VoiceCaptureSource,
+    private val microphonePublicationActive: () -> Boolean,
     private val recordCallStopped: () -> Unit,
     private val retireBluetoothLease: () -> Unit,
 ) : JoinedCleanupOperation() {
@@ -590,7 +594,9 @@ private class LiveKitCleanupOperation(
                     microphonePublicationCompleted,
                     failures,
                 )
-                notifyWorkerEnded(mode, failures)
+                if (microphonePublicationCompleted) {
+                    notifyWorkerEnded(mode, failures)
+                }
                 cleanBluetoothLease(failures)
                 retireRoute(failures)
                 connectionJobCompleted = cleanJob(connectionJob(), connectionJobCompleted, failures)
@@ -715,7 +721,7 @@ private class LiveKitCleanupOperation(
         completed: Boolean,
         failures: CleanupAttemptFailures,
     ): Boolean {
-        if (completed || !roomConnected.isCompleted) return true
+        if (completed || !microphonePublicationActive() || !roomConnected.isCompleted) return true
         return try {
             withTimeout(LIVEKIT_END_RPC_TIMEOUT_MS) {
                 check(room.setMicrophoneEnabled(false)) {
@@ -787,6 +793,7 @@ private class LiveKitCleanupOperation(
             disconnectCompleted ||
             !automationAudioCompleted ||
             !jobsCompleted() ||
+            !microphonePublicationCompleted ||
             !rpcWorkCompleted ||
             !persistenceOwnerCompleted ||
             pendingRpcMethods.isNotEmpty()

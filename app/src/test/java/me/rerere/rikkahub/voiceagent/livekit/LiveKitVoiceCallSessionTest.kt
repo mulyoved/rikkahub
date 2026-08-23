@@ -928,6 +928,33 @@ class LiveKitVoiceCallSessionTest {
     }
 
     @Test
+    fun `microphone disable failure preserves the room for a retry`() = runTest {
+        val fixture = fixture()
+        fixture.session.start()
+        runCurrent()
+        fixture.room.microphoneResult = false
+
+        val first = fixture.session.cleanupOperation.run(VoiceAgentCleanupMode.GracefulEnd)
+
+        assertTrue(first is VoiceAgentCleanupResult.Failed)
+        assertTrue(fixture.room.rpcCalls.isEmpty())
+        assertEquals(0, fixture.room.disconnectCalls)
+        assertEquals(0, fixture.room.closeCalls)
+
+        fixture.room.microphoneResult = true
+        assertEquals(
+            VoiceAgentCleanupResult.Completed,
+            fixture.session.cleanupOperation.run(VoiceAgentCleanupMode.GracefulEnd),
+        )
+        assertEquals(
+            listOf(Triple(AGENT_IDENTITY, LIVEKIT_END_RPC, "")),
+            fixture.room.rpcCalls,
+        )
+        assertEquals(1, fixture.room.disconnectCalls)
+        assertEquals(1, fixture.room.closeCalls)
+    }
+
+    @Test
     fun `non-graceful cleanup leaves worker reconnect handling unchanged`() = runTest {
         listOf(
             VoiceAgentCleanupMode.Immediate,
