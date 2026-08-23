@@ -54,7 +54,9 @@ import org.koin.core.context.GlobalContext
 
 internal const val LIVEKIT_READY_TOPIC = "voice.ready.v1"
 internal const val LIVEKIT_INTERRUPT_RPC = "voice.interrupt"
+internal const val LIVEKIT_END_RPC = "voice.end"
 internal const val LIVEKIT_PERSISTENCE_RPC = "voice.persist.v1"
+private const val LIVEKIT_END_RPC_TIMEOUT_MS = 2_000L
 
 internal class LiveKitVoiceCallSession(
     private val details: LiveKitSessionDetails,
@@ -126,14 +128,16 @@ internal class LiveKitVoiceCallSession(
         get() = !closed.get() && routeLease.isUsable
     override val cleanupOperation: VoiceAgentCleanupOperation = LiveKitCleanupOperation(
         routeLease = routeLease,
-        requestClose = { requestCloseForCleanup() },
-        connectionJob = { connectionJob },
+            requestClose = { requestCloseForCleanup() },
+            roomConnected = roomConnected,
+            connectionJob = { connectionJob },
         eventJob = { eventJob },
         microphoneJob = { microphoneJob },
         rpcAdmission = rpcAdmission,
         rpcMethods = registeredRpcMethods.keys,
         persistenceOwner = persistenceOwner,
         room = room,
+        workerParticipantIdentity = details.agentParticipantIdentity,
         automationAudioActivation = { automationAudioActivation },
         captureSource = captureSource,
         recordCallStopped = ::recordAutomationCallStopped,
@@ -539,6 +543,7 @@ internal class LiveKitVoiceCallSession(
 private class LiveKitCleanupOperation(
     private val routeLease: VoiceAgentRouteLease,
     private val requestClose: () -> Unit,
+    private val roomConnected: CompletableDeferred<Unit>,
     private val connectionJob: () -> Job?,
     private val eventJob: () -> Job?,
     private val microphoneJob: () -> Job?,
@@ -546,6 +551,7 @@ private class LiveKitCleanupOperation(
     rpcMethods: Set<String>,
     private val persistenceOwner: LiveKitPersistenceOwner?,
     private val room: LiveKitRoomFacade,
+    private val workerParticipantIdentity: String,
     private val automationAudioActivation: () -> AutoCloseable?,
     private val captureSource: VoiceCaptureSource,
     private val recordCallStopped: () -> Unit,
@@ -561,6 +567,7 @@ private class LiveKitCleanupOperation(
     private var persistenceOwnerCompleted = persistenceOwner == null
     private var automationAudioCompleted = false
     private var captureSourceCompleted = false
+    private var workerEndNotificationHandled = false
     private val pendingRpcMethods = rpcMethods.toMutableSet()
     private var disconnectCompleted = false
     private var closeCompleted = false
@@ -571,6 +578,7 @@ private class LiveKitCleanupOperation(
         requestClose()
         try {
             withContext(NonCancellable) {
+                notifyWorkerEnded(mode, failures)
                 automationAudioCompleted = cleanAutomationAudio(
                     automationAudioActivation(),
                     automationAudioCompleted,
@@ -596,6 +604,36 @@ private class LiveKitCleanupOperation(
             failures.add(cancellation)
         }
         return failures.outcome()
+    }
+
+    private suspend fun notifyWorkerEnded(
+        mode: VoiceAgentCleanupMode,
+        failures: CleanupAttemptFailures,
+    ) {
+        if (workerEndNotificationHandled) return
+        if (mode != VoiceAgentCleanupMode.GracefulEnd) {
+            workerEndNotificationHandled = true
+            return
+        }
+        try {
+            rpcAdmission.quiesce()
+        } catch (error: Throwable) {
+            failures.add(error)
+            return
+        }
+        workerEndNotificationHandled = true
+        try {
+            withTimeout(LIVEKIT_END_RPC_TIMEOUT_MS) {
+                roomConnected.await()
+                room.performRpc(
+                    destination = workerParticipantIdentity,
+                    method = LIVEKIT_END_RPC,
+                    payload = "",
+                )
+            }
+        } catch (_: Throwable) {
+            // Local cleanup must continue when the worker is already unavailable.
+        }
     }
 
     private fun cleanBluetoothLease(failures: CleanupAttemptFailures) {
@@ -748,7 +786,8 @@ private class LiveKitCleanupOperation(
         connectionJobCompleted && eventJobCompleted && microphoneJobCompleted
 
     override fun hasUnfinishedStages(): Boolean =
-        !automationAudioCompleted ||
+        !workerEndNotificationHandled ||
+            !automationAudioCompleted ||
             !captureSourceCompleted ||
             !routeCompleted ||
             !jobsCompleted() ||
