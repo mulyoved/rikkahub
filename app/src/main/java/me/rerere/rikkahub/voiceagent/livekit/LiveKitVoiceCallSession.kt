@@ -282,7 +282,11 @@ internal class LiveKitVoiceCallSession(
                     } else {
                         retireBluetoothLease()
                     }
+                    if (requested) {
+                        microphonePublicationActive.set(true)
+                    }
                     if (!room.setMicrophoneEnabled(requested)) {
+                        if (requested) microphonePublicationActive.set(false)
                         appendDiagnostic("livekit_microphone_failed", "publication_rejected")
                         failExperimental("LiveKit experimental microphone control failed")
                         return
@@ -291,6 +295,7 @@ internal class LiveKitVoiceCallSession(
                 } catch (cancellation: CancellationException) {
                     throw cancellation
                 } catch (error: Throwable) {
+                    if (requested) microphonePublicationActive.set(false)
                     appendDiagnostic("livekit_microphone_failed", error::class.simpleName ?: "unknown")
                     failExperimental("LiveKit experimental microphone control failed")
                     return
