@@ -766,6 +766,298 @@ class LiveKitVoiceCallSessionTest {
     }
 
     @Test
+    fun `graceful cleanup notifies the worker before disconnecting the room`() = runTest {
+        val fixture = fixture()
+        fixture.session.start()
+        runCurrent()
+
+        assertEquals(
+            VoiceAgentCleanupResult.Completed,
+            fixture.session.cleanupOperation.run(VoiceAgentCleanupMode.GracefulEnd),
+        )
+
+        assertEquals(
+            listOf(Triple(AGENT_IDENTITY, "voice.end", "")),
+            fixture.room.rpcCalls,
+        )
+        assertTrue(
+            fixture.room.lifecycle.indexOf("perform-rpc-finished") <
+                fixture.room.lifecycle.indexOf("disconnect"),
+        )
+    }
+
+    @Test
+    fun `graceful cleanup waits for room connection before notifying the worker`() = runTest {
+        val fixture = fixture()
+        val connectGate = CompletableDeferred<Unit>()
+        fixture.room.connectGate = connectGate
+        fixture.session.start()
+        runCurrent()
+
+        val cleanup = async {
+            fixture.session.cleanupOperation.run(VoiceAgentCleanupMode.GracefulEnd)
+        }
+        runCurrent()
+
+        assertTrue(fixture.room.rpcCalls.isEmpty())
+        assertFalse(cleanup.isCompleted)
+
+        connectGate.complete(Unit)
+        runCurrent()
+
+        assertEquals(VoiceAgentCleanupResult.Completed, cleanup.await())
+        assertEquals(
+            listOf(Triple(AGENT_IDENTITY, "voice.end", "")),
+            fixture.room.rpcCalls,
+        )
+    }
+
+    @Test
+    fun `graceful cleanup stops microphone capture before awaiting worker notification`() = runTest {
+        VoiceCaptureFixtureArming.clearForTest()
+        val token = VoiceCaptureFixtureArming.arm(
+            initial = VoiceCaptureFixture("initial.pcm", byteArrayOf(1), 1, 0),
+            staged = listOf(VoiceCaptureFixture("next.pcm", byteArrayOf(2), 1, 0)),
+        )
+        val captureSource = VoiceCaptureFixtureArming.claim(token).getOrThrow()
+        val fixture = fixture(captureSource = captureSource)
+        val rpcGate = CompletableDeferred<Unit>()
+        fixture.room.performRpcGate = rpcGate
+
+        try {
+            fixture.session.start()
+            runCurrent()
+            assertTrue(fixture.room.sdkMicrophoneEnabled)
+
+            val cleanup = async {
+                fixture.session.cleanupOperation.run(VoiceAgentCleanupMode.GracefulEnd)
+            }
+            runCurrent()
+
+            assertFalse(cleanup.isCompleted)
+            assertFalse(fixture.room.sdkMicrophoneEnabled)
+            assertFalse(VoiceCaptureFixtureArming.trigger(token, "next.pcm").accepted)
+
+            rpcGate.complete(Unit)
+            runCurrent()
+            assertEquals(VoiceAgentCleanupResult.Completed, cleanup.await())
+        } finally {
+            VoiceCaptureFixtureArming.clearForTest()
+        }
+    }
+
+    @Test
+    fun `graceful cleanup quiesces admitted RPCs before notifying the worker`() = runTest {
+        val fixture = fixture()
+        val rpcGate = CompletableDeferred<Unit>()
+        val rpcTerminationGate = CompletableDeferred<Unit>()
+        fixture.room.performRpcGate = rpcGate
+        fixture.room.performRpcTerminationGate = rpcTerminationGate
+        fixture.session.start()
+        runCurrent()
+
+        fixture.session.interrupt()
+        runCurrent()
+        assertEquals(
+            listOf(Triple(AGENT_IDENTITY, INTERRUPT_RPC, "")),
+            fixture.room.rpcCalls,
+        )
+
+        val cleanup = async {
+            fixture.session.cleanupOperation.run(VoiceAgentCleanupMode.GracefulEnd)
+        }
+        runCurrent()
+        assertFalse(cleanup.isCompleted)
+        assertEquals(
+            listOf(Triple(AGENT_IDENTITY, INTERRUPT_RPC, "")),
+            fixture.room.rpcCalls,
+        )
+
+        rpcGate.complete(Unit)
+        rpcTerminationGate.complete(Unit)
+        runCurrent()
+
+        assertEquals(VoiceAgentCleanupResult.Completed, cleanup.await())
+        assertEquals(
+            listOf(
+                Triple(AGENT_IDENTITY, INTERRUPT_RPC, ""),
+                Triple(AGENT_IDENTITY, "voice.end", ""),
+            ),
+            fixture.room.rpcCalls,
+        )
+    }
+
+    @Test
+    fun `graceful cleanup bounds worker notification when inbound RPC stays admitted`() = runTest {
+        val handlerEntered = CompletableDeferred<Unit>()
+        val handlerGate = CompletableDeferred<Unit>()
+        val fixture = fixture(
+            rpcMethods = mapOf(
+                "stuck.rpc" to {
+                    handlerEntered.complete(Unit)
+                    handlerGate.await()
+                    "done"
+                },
+            ),
+        )
+        fixture.session.start()
+        runCurrent()
+
+        val invocation = async {
+            fixture.room.invoke("stuck.rpc", AGENT_IDENTITY, "")
+        }
+        handlerEntered.await()
+
+        val cleanup = async {
+            fixture.session.cleanupOperation.run(VoiceAgentCleanupMode.GracefulEnd)
+        }
+        runCurrent()
+        advanceTimeBy(2_000)
+        runCurrent()
+
+        assertFalse(cleanup.isCompleted)
+        assertEquals(1, fixture.route.retirementCalls)
+        assertTrue(fixture.room.rpcCalls.isEmpty())
+
+        handlerGate.complete(Unit)
+        runCurrent()
+
+        assertEquals("done", invocation.await())
+        assertEquals(VoiceAgentCleanupResult.Completed, cleanup.await())
+        assertTrue(fixture.room.rpcCalls.isEmpty())
+    }
+
+    @Test
+    fun `microphone disable failure preserves the room for a retry`() = runTest {
+        val fixture = fixture()
+        fixture.session.start()
+        runCurrent()
+        fixture.room.microphoneResult = false
+
+        val first = fixture.session.cleanupOperation.run(VoiceAgentCleanupMode.GracefulEnd)
+
+        assertTrue(first is VoiceAgentCleanupResult.Failed)
+        assertTrue(fixture.room.rpcCalls.isEmpty())
+        assertEquals(0, fixture.room.disconnectCalls)
+        assertEquals(0, fixture.room.closeCalls)
+
+        fixture.room.microphoneResult = true
+        assertEquals(
+            VoiceAgentCleanupResult.Completed,
+            fixture.session.cleanupOperation.run(VoiceAgentCleanupMode.GracefulEnd),
+        )
+        assertEquals(
+            listOf(Triple(AGENT_IDENTITY, LIVEKIT_END_RPC, "")),
+            fixture.room.rpcCalls,
+        )
+        assertEquals(1, fixture.room.disconnectCalls)
+        assertEquals(1, fixture.room.closeCalls)
+    }
+
+    @Test
+    fun `microphone disable timeout is a retryable failure`() = runTest {
+        val fixture = fixture()
+        fixture.session.start()
+        runCurrent()
+        val microphoneGate = CompletableDeferred<Unit>()
+        fixture.room.microphoneGate = microphoneGate
+
+        val cleanup = async {
+            fixture.session.cleanupOperation.run(VoiceAgentCleanupMode.GracefulEnd)
+        }
+        runCurrent()
+        advanceTimeBy(2_000)
+        runCurrent()
+
+        assertTrue(cleanup.isCompleted)
+        assertTrue(cleanup.await() is VoiceAgentCleanupResult.Failed)
+        assertTrue(fixture.room.rpcCalls.isEmpty())
+        assertEquals(0, fixture.room.disconnectCalls)
+        assertEquals(0, fixture.room.closeCalls)
+    }
+
+    @Test
+    fun `immediate cleanup disconnects when microphone disable fails`() = runTest {
+        val fixture = fixture()
+        fixture.session.start()
+        runCurrent()
+        fixture.room.microphoneResult = false
+
+        val result = fixture.session.cleanupOperation.run(VoiceAgentCleanupMode.Immediate)
+
+        assertTrue(result is VoiceAgentCleanupResult.Failed)
+        assertEquals(1, fixture.room.disconnectCalls)
+        assertEquals(1, fixture.room.closeCalls)
+    }
+
+    @Test
+    fun `non-graceful cleanup leaves worker reconnect handling unchanged`() = runTest {
+        listOf(
+            VoiceAgentCleanupMode.Immediate,
+            VoiceAgentCleanupMode.Replacement,
+        ).forEach { mode ->
+            val fixture = fixture()
+            fixture.session.start()
+            runCurrent()
+
+            assertEquals(
+                VoiceAgentCleanupResult.Completed,
+                fixture.session.cleanupOperation.run(mode),
+            )
+            assertEquals(emptyList<Triple<String, String, String>>(), fixture.room.rpcCalls)
+        }
+    }
+
+    @Test
+    fun `failed graceful notification remains best effort and is not retried`() = runTest {
+        val fixture = fixture()
+        fixture.room.performRpcFailure = IllegalStateException("worker unavailable")
+        fixture.session.start()
+        runCurrent()
+
+        assertEquals(
+            VoiceAgentCleanupResult.Completed,
+            fixture.session.cleanupOperation.run(VoiceAgentCleanupMode.GracefulEnd),
+        )
+        assertEquals(
+            VoiceAgentCleanupResult.Completed,
+            fixture.session.cleanupOperation.run(VoiceAgentCleanupMode.GracefulEnd),
+        )
+        assertEquals(
+            listOf(Triple(AGENT_IDENTITY, "voice.end", "")),
+            fixture.room.rpcCalls,
+        )
+        assertEquals(1, fixture.room.disconnectCalls)
+        assertEquals(1, fixture.room.closeCalls)
+    }
+
+    @Test
+    fun `graceful notification timeout cannot hold local cleanup open`() = runTest {
+        val fixture = fixture()
+        val rpcGate = CompletableDeferred<Unit>()
+        fixture.room.performRpcGate = rpcGate
+        fixture.session.start()
+        runCurrent()
+
+        val cleanup = async {
+            fixture.session.cleanupOperation.run(VoiceAgentCleanupMode.GracefulEnd)
+        }
+        runCurrent()
+        assertFalse(cleanup.isCompleted)
+
+        advanceTimeBy(2_000)
+        runCurrent()
+        val completedByTimeout = cleanup.isCompleted
+        rpcGate.complete(Unit)
+        runCurrent()
+
+        assertTrue(completedByTimeout)
+        assertEquals(VoiceAgentCleanupResult.Completed, cleanup.await())
+        assertEquals(1, fixture.room.disconnectCalls)
+        assertEquals(1, fixture.room.closeCalls)
+    }
+
+    @Test
     fun `cleanup retries failed stages without repeating completed stages`() = runTest {
         val fixture = fixture(
             rpcMethods = mapOf("hermes.job.accepted" to { "persisted" }),
@@ -1525,6 +1817,7 @@ private class FakeLiveKitRoomFacade(
     var microphoneFailure: Throwable? = null
     var performRpcGate: CompletableDeferred<Unit>? = null
     var performRpcTerminationGate: CompletableDeferred<Unit>? = null
+    var performRpcFailure: Throwable? = null
     var sdkMicrophoneEnabled = false
 
     suspend fun emit(event: LiveKitRoomEvent) {
@@ -1569,6 +1862,7 @@ private class FakeLiveKitRoomFacade(
         rpcCalls += Triple(destination, method, payload)
         return try {
             performRpcGate?.await()
+            performRpcFailure?.let { throw it }
             "ok"
         } finally {
             withContext(NonCancellable) {

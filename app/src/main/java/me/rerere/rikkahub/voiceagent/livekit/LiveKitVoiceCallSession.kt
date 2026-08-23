@@ -54,7 +54,9 @@ import org.koin.core.context.GlobalContext
 
 internal const val LIVEKIT_READY_TOPIC = "voice.ready.v1"
 internal const val LIVEKIT_INTERRUPT_RPC = "voice.interrupt"
+internal const val LIVEKIT_END_RPC = "voice.end"
 internal const val LIVEKIT_PERSISTENCE_RPC = "voice.persist.v1"
+private const val LIVEKIT_END_RPC_TIMEOUT_MS = 2_000L
 
 internal class LiveKitVoiceCallSession(
     private val details: LiveKitSessionDetails,
@@ -93,6 +95,7 @@ internal class LiveKitVoiceCallSession(
     private val closed = AtomicBoolean(false)
     private val lifecycleLock = Any()
     private val microphoneStateLock = Any()
+    private val microphonePublicationActive = AtomicBoolean(false)
     private val rpcAdmission = LiveKitRpcAdmission()
     private val ready = CompletableDeferred<Unit>()
     private val roomConnected = CompletableDeferred<Unit>()
@@ -127,6 +130,7 @@ internal class LiveKitVoiceCallSession(
     override val cleanupOperation: VoiceAgentCleanupOperation = LiveKitCleanupOperation(
         routeLease = routeLease,
         requestClose = { requestCloseForCleanup() },
+        roomConnected = roomConnected,
         connectionJob = { connectionJob },
         eventJob = { eventJob },
         microphoneJob = { microphoneJob },
@@ -134,8 +138,10 @@ internal class LiveKitVoiceCallSession(
         rpcMethods = registeredRpcMethods.keys,
         persistenceOwner = persistenceOwner,
         room = room,
+        workerParticipantIdentity = details.agentParticipantIdentity,
         automationAudioActivation = { automationAudioActivation },
         captureSource = captureSource,
+        microphonePublicationActive = { microphonePublicationActive.get() },
         recordCallStopped = ::recordAutomationCallStopped,
         retireBluetoothLease = ::retireBluetoothLease,
     )
@@ -276,14 +282,20 @@ internal class LiveKitVoiceCallSession(
                     } else {
                         retireBluetoothLease()
                     }
+                    if (requested) {
+                        microphonePublicationActive.set(true)
+                    }
                     if (!room.setMicrophoneEnabled(requested)) {
+                        if (requested) microphonePublicationActive.set(false)
                         appendDiagnostic("livekit_microphone_failed", "publication_rejected")
                         failExperimental("LiveKit experimental microphone control failed")
                         return
                     }
+                    microphonePublicationActive.set(requested)
                 } catch (cancellation: CancellationException) {
                     throw cancellation
                 } catch (error: Throwable) {
+                    if (requested) microphonePublicationActive.set(false)
                     appendDiagnostic("livekit_microphone_failed", error::class.simpleName ?: "unknown")
                     failExperimental("LiveKit experimental microphone control failed")
                     return
@@ -539,6 +551,7 @@ internal class LiveKitVoiceCallSession(
 private class LiveKitCleanupOperation(
     private val routeLease: VoiceAgentRouteLease,
     private val requestClose: () -> Unit,
+    private val roomConnected: CompletableDeferred<Unit>,
     private val connectionJob: () -> Job?,
     private val eventJob: () -> Job?,
     private val microphoneJob: () -> Job?,
@@ -546,8 +559,10 @@ private class LiveKitCleanupOperation(
     rpcMethods: Set<String>,
     private val persistenceOwner: LiveKitPersistenceOwner?,
     private val room: LiveKitRoomFacade,
+    private val workerParticipantIdentity: String,
     private val automationAudioActivation: () -> AutoCloseable?,
     private val captureSource: VoiceCaptureSource,
+    private val microphonePublicationActive: () -> Boolean,
     private val recordCallStopped: () -> Unit,
     private val retireBluetoothLease: () -> Unit,
 ) : JoinedCleanupOperation() {
@@ -555,12 +570,14 @@ private class LiveKitCleanupOperation(
     private var connectionJobCompleted = false
     private var eventJobCompleted = false
     private var microphoneJobCompleted = false
+    private var microphonePublicationCompleted = false
     private var bluetoothLeaseCompleted = false
     private var persistenceDrainCompleted = persistenceOwner == null
     private var rpcWorkCompleted = false
     private var persistenceOwnerCompleted = persistenceOwner == null
     private var automationAudioCompleted = false
     private var captureSourceCompleted = false
+    private var workerEndNotificationHandled = false
     private val pendingRpcMethods = rpcMethods.toMutableSet()
     private var disconnectCompleted = false
     private var closeCompleted = false
@@ -577,11 +594,24 @@ private class LiveKitCleanupOperation(
                     failures,
                 )
                 captureSourceCompleted = cleanCaptureSource(captureSourceCompleted, failures)
+                microphoneJobCompleted = cleanJob(microphoneJob(), microphoneJobCompleted, failures)
+                microphonePublicationCompleted = cleanMicrophonePublication(
+                    microphonePublicationCompleted,
+                    failures,
+                )
+                if (
+                    !microphonePublicationCompleted &&
+                    mode != VoiceAgentCleanupMode.GracefulEnd
+                ) {
+                    microphonePublicationCompleted = true
+                }
+                if (microphonePublicationCompleted) {
+                    notifyWorkerEnded(mode, failures)
+                }
                 cleanBluetoothLease(failures)
                 retireRoute(failures)
                 connectionJobCompleted = cleanJob(connectionJob(), connectionJobCompleted, failures)
                 eventJobCompleted = cleanJob(eventJob(), eventJobCompleted, failures)
-                microphoneJobCompleted = cleanJob(microphoneJob(), microphoneJobCompleted, failures)
                 rpcWorkCompleted = cleanRpcWork(rpcWorkCompleted, failures)
                 drainPersistenceOwner(failures)
                 unregisterRpcMethods(
@@ -596,6 +626,41 @@ private class LiveKitCleanupOperation(
             failures.add(cancellation)
         }
         return failures.outcome()
+    }
+
+    private suspend fun notifyWorkerEnded(
+        mode: VoiceAgentCleanupMode,
+        failures: CleanupAttemptFailures,
+    ) {
+        if (workerEndNotificationHandled) return
+        if (mode != VoiceAgentCleanupMode.GracefulEnd) {
+            workerEndNotificationHandled = true
+            return
+        }
+        try {
+            withTimeout(LIVEKIT_END_RPC_TIMEOUT_MS) {
+                rpcAdmission.quiesce()
+            }
+        } catch (_: TimeoutCancellationException) {
+            workerEndNotificationHandled = true
+            return
+        } catch (error: Throwable) {
+            failures.add(error)
+            return
+        }
+        workerEndNotificationHandled = true
+        try {
+            withTimeout(LIVEKIT_END_RPC_TIMEOUT_MS) {
+                roomConnected.await()
+                room.performRpc(
+                    destination = workerParticipantIdentity,
+                    method = LIVEKIT_END_RPC,
+                    payload = "",
+                )
+            }
+        } catch (_: Throwable) {
+            // Local cleanup must continue when the worker is already unavailable.
+        }
     }
 
     private fun cleanBluetoothLease(failures: CleanupAttemptFailures) {
@@ -663,6 +728,32 @@ private class LiveKitCleanupOperation(
         }
     }
 
+    private suspend fun cleanMicrophonePublication(
+        completed: Boolean,
+        failures: CleanupAttemptFailures,
+    ): Boolean {
+        if (completed || !microphonePublicationActive() || !roomConnected.isCompleted) return true
+        return try {
+            withTimeout(LIVEKIT_END_RPC_TIMEOUT_MS) {
+                check(room.setMicrophoneEnabled(false)) {
+                    "LiveKit microphone disable was rejected"
+                }
+            }
+            true
+        } catch (error: TimeoutCancellationException) {
+            failures.add(
+                IllegalStateException(
+                    "Timed out disabling the LiveKit microphone publication",
+                    error,
+                ),
+            )
+            false
+        } catch (error: Throwable) {
+            failures.add(error)
+            false
+        }
+    }
+
     private suspend fun drainPersistenceOwner(failures: CleanupAttemptFailures) {
         if (persistenceDrainCompleted || !rpcWorkCompleted) return
         try {
@@ -721,6 +812,7 @@ private class LiveKitCleanupOperation(
             disconnectCompleted ||
             !automationAudioCompleted ||
             !jobsCompleted() ||
+            !microphonePublicationCompleted ||
             !rpcWorkCompleted ||
             !persistenceOwnerCompleted ||
             pendingRpcMethods.isNotEmpty()
@@ -748,10 +840,12 @@ private class LiveKitCleanupOperation(
         connectionJobCompleted && eventJobCompleted && microphoneJobCompleted
 
     override fun hasUnfinishedStages(): Boolean =
-        !automationAudioCompleted ||
+        !workerEndNotificationHandled ||
+            !automationAudioCompleted ||
             !captureSourceCompleted ||
             !routeCompleted ||
             !jobsCompleted() ||
+            !microphonePublicationCompleted ||
             !persistenceDrainCompleted ||
             !rpcWorkCompleted ||
             !persistenceOwnerCompleted ||
