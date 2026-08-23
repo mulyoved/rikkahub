@@ -813,6 +813,38 @@ class LiveKitVoiceCallSessionTest {
     }
 
     @Test
+    fun `graceful cleanup stops microphone capture before awaiting worker notification`() = runTest {
+        VoiceCaptureFixtureArming.clearForTest()
+        val token = VoiceCaptureFixtureArming.arm(
+            initial = VoiceCaptureFixture("initial.pcm", byteArrayOf(1), 1, 0),
+            staged = listOf(VoiceCaptureFixture("next.pcm", byteArrayOf(2), 1, 0)),
+        )
+        val captureSource = VoiceCaptureFixtureArming.claim(token).getOrThrow()
+        val fixture = fixture(captureSource = captureSource)
+        val rpcGate = CompletableDeferred<Unit>()
+        fixture.room.performRpcGate = rpcGate
+
+        try {
+            fixture.session.start()
+            runCurrent()
+
+            val cleanup = async {
+                fixture.session.cleanupOperation.run(VoiceAgentCleanupMode.GracefulEnd)
+            }
+            runCurrent()
+
+            assertFalse(cleanup.isCompleted)
+            assertFalse(VoiceCaptureFixtureArming.trigger(token, "next.pcm").accepted)
+
+            rpcGate.complete(Unit)
+            runCurrent()
+            assertEquals(VoiceAgentCleanupResult.Completed, cleanup.await())
+        } finally {
+            VoiceCaptureFixtureArming.clearForTest()
+        }
+    }
+
+    @Test
     fun `graceful cleanup quiesces admitted RPCs before notifying the worker`() = runTest {
         val fixture = fixture()
         val rpcGate = CompletableDeferred<Unit>()

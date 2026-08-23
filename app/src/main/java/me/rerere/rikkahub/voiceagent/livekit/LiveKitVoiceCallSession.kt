@@ -578,18 +578,18 @@ private class LiveKitCleanupOperation(
         requestClose()
         try {
             withContext(NonCancellable) {
-                notifyWorkerEnded(mode, failures)
                 automationAudioCompleted = cleanAutomationAudio(
                     automationAudioActivation(),
                     automationAudioCompleted,
                     failures,
                 )
                 captureSourceCompleted = cleanCaptureSource(captureSourceCompleted, failures)
+                microphoneJobCompleted = cleanJob(microphoneJob(), microphoneJobCompleted, failures)
+                notifyWorkerEnded(mode, failures)
                 cleanBluetoothLease(failures)
                 retireRoute(failures)
                 connectionJobCompleted = cleanJob(connectionJob(), connectionJobCompleted, failures)
                 eventJobCompleted = cleanJob(eventJob(), eventJobCompleted, failures)
-                microphoneJobCompleted = cleanJob(microphoneJob(), microphoneJobCompleted, failures)
                 rpcWorkCompleted = cleanRpcWork(rpcWorkCompleted, failures)
                 drainPersistenceOwner(failures)
                 unregisterRpcMethods(
