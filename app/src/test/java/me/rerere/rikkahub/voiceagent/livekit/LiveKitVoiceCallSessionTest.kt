@@ -827,6 +827,7 @@ class LiveKitVoiceCallSessionTest {
         try {
             fixture.session.start()
             runCurrent()
+            assertTrue(fixture.room.sdkMicrophoneEnabled)
 
             val cleanup = async {
                 fixture.session.cleanupOperation.run(VoiceAgentCleanupMode.GracefulEnd)
@@ -834,6 +835,7 @@ class LiveKitVoiceCallSessionTest {
             runCurrent()
 
             assertFalse(cleanup.isCompleted)
+            assertFalse(fixture.room.sdkMicrophoneEnabled)
             assertFalse(VoiceCaptureFixtureArming.trigger(token, "next.pcm").accepted)
 
             rpcGate.complete(Unit)

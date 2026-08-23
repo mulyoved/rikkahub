@@ -561,6 +561,7 @@ private class LiveKitCleanupOperation(
     private var connectionJobCompleted = false
     private var eventJobCompleted = false
     private var microphoneJobCompleted = false
+    private var microphonePublicationCompleted = false
     private var bluetoothLeaseCompleted = false
     private var persistenceDrainCompleted = persistenceOwner == null
     private var rpcWorkCompleted = false
@@ -585,6 +586,10 @@ private class LiveKitCleanupOperation(
                 )
                 captureSourceCompleted = cleanCaptureSource(captureSourceCompleted, failures)
                 microphoneJobCompleted = cleanJob(microphoneJob(), microphoneJobCompleted, failures)
+                microphonePublicationCompleted = cleanMicrophonePublication(
+                    microphonePublicationCompleted,
+                    failures,
+                )
                 notifyWorkerEnded(mode, failures)
                 cleanBluetoothLease(failures)
                 retireRoute(failures)
@@ -706,6 +711,24 @@ private class LiveKitCleanupOperation(
         }
     }
 
+    private suspend fun cleanMicrophonePublication(
+        completed: Boolean,
+        failures: CleanupAttemptFailures,
+    ): Boolean {
+        if (completed || !roomConnected.isCompleted) return true
+        return try {
+            withTimeout(LIVEKIT_END_RPC_TIMEOUT_MS) {
+                check(room.setMicrophoneEnabled(false)) {
+                    "LiveKit microphone disable was rejected"
+                }
+            }
+            true
+        } catch (error: Throwable) {
+            failures.add(error)
+            false
+        }
+    }
+
     private suspend fun drainPersistenceOwner(failures: CleanupAttemptFailures) {
         if (persistenceDrainCompleted || !rpcWorkCompleted) return
         try {
@@ -796,6 +819,7 @@ private class LiveKitCleanupOperation(
             !captureSourceCompleted ||
             !routeCompleted ||
             !jobsCompleted() ||
+            !microphonePublicationCompleted ||
             !persistenceDrainCompleted ||
             !rpcWorkCompleted ||
             !persistenceOwnerCompleted ||
