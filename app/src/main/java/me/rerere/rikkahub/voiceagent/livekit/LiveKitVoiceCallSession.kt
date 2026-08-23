@@ -616,7 +616,12 @@ private class LiveKitCleanupOperation(
             return
         }
         try {
-            rpcAdmission.quiesce()
+            withTimeout(LIVEKIT_END_RPC_TIMEOUT_MS) {
+                rpcAdmission.quiesce()
+            }
+        } catch (_: TimeoutCancellationException) {
+            workerEndNotificationHandled = true
+            return
         } catch (error: Throwable) {
             failures.add(error)
             return

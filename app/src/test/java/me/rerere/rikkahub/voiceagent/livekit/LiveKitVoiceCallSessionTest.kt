@@ -854,6 +854,46 @@ class LiveKitVoiceCallSessionTest {
     }
 
     @Test
+    fun `graceful cleanup bounds worker notification when inbound RPC stays admitted`() = runTest {
+        val handlerEntered = CompletableDeferred<Unit>()
+        val handlerGate = CompletableDeferred<Unit>()
+        val fixture = fixture(
+            rpcMethods = mapOf(
+                "stuck.rpc" to {
+                    handlerEntered.complete(Unit)
+                    handlerGate.await()
+                    "done"
+                },
+            ),
+        )
+        fixture.session.start()
+        runCurrent()
+
+        val invocation = async {
+            fixture.room.invoke("stuck.rpc", AGENT_IDENTITY, "")
+        }
+        handlerEntered.await()
+
+        val cleanup = async {
+            fixture.session.cleanupOperation.run(VoiceAgentCleanupMode.GracefulEnd)
+        }
+        runCurrent()
+        advanceTimeBy(2_000)
+        runCurrent()
+
+        assertFalse(cleanup.isCompleted)
+        assertEquals(1, fixture.route.retirementCalls)
+        assertTrue(fixture.room.rpcCalls.isEmpty())
+
+        handlerGate.complete(Unit)
+        runCurrent()
+
+        assertEquals("done", invocation.await())
+        assertEquals(VoiceAgentCleanupResult.Completed, cleanup.await())
+        assertTrue(fixture.room.rpcCalls.isEmpty())
+    }
+
+    @Test
     fun `non-graceful cleanup leaves worker reconnect handling unchanged`() = runTest {
         listOf(
             VoiceAgentCleanupMode.Immediate,
