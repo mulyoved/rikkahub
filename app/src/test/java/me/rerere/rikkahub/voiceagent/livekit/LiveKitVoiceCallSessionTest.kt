@@ -977,6 +977,20 @@ class LiveKitVoiceCallSessionTest {
     }
 
     @Test
+    fun `immediate cleanup disconnects when microphone disable fails`() = runTest {
+        val fixture = fixture()
+        fixture.session.start()
+        runCurrent()
+        fixture.room.microphoneResult = false
+
+        val result = fixture.session.cleanupOperation.run(VoiceAgentCleanupMode.Immediate)
+
+        assertTrue(result is VoiceAgentCleanupResult.Failed)
+        assertEquals(1, fixture.room.disconnectCalls)
+        assertEquals(1, fixture.room.closeCalls)
+    }
+
+    @Test
     fun `non-graceful cleanup leaves worker reconnect handling unchanged`() = runTest {
         listOf(
             VoiceAgentCleanupMode.Immediate,

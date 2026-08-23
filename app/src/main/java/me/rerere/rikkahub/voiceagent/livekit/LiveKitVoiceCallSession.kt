@@ -594,6 +594,12 @@ private class LiveKitCleanupOperation(
                     microphonePublicationCompleted,
                     failures,
                 )
+                if (
+                    !microphonePublicationCompleted &&
+                    mode != VoiceAgentCleanupMode.GracefulEnd
+                ) {
+                    microphonePublicationCompleted = true
+                }
                 if (microphonePublicationCompleted) {
                     notifyWorkerEnded(mode, failures)
                 }
