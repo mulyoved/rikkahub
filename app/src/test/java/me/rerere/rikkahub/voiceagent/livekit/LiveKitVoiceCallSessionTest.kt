@@ -955,6 +955,28 @@ class LiveKitVoiceCallSessionTest {
     }
 
     @Test
+    fun `microphone disable timeout is a retryable failure`() = runTest {
+        val fixture = fixture()
+        fixture.session.start()
+        runCurrent()
+        val microphoneGate = CompletableDeferred<Unit>()
+        fixture.room.microphoneGate = microphoneGate
+
+        val cleanup = async {
+            fixture.session.cleanupOperation.run(VoiceAgentCleanupMode.GracefulEnd)
+        }
+        runCurrent()
+        advanceTimeBy(2_000)
+        runCurrent()
+
+        assertTrue(cleanup.isCompleted)
+        assertTrue(cleanup.await() is VoiceAgentCleanupResult.Failed)
+        assertTrue(fixture.room.rpcCalls.isEmpty())
+        assertEquals(0, fixture.room.disconnectCalls)
+        assertEquals(0, fixture.room.closeCalls)
+    }
+
+    @Test
     fun `non-graceful cleanup leaves worker reconnect handling unchanged`() = runTest {
         listOf(
             VoiceAgentCleanupMode.Immediate,

@@ -729,6 +729,14 @@ private class LiveKitCleanupOperation(
                 }
             }
             true
+        } catch (error: TimeoutCancellationException) {
+            failures.add(
+                IllegalStateException(
+                    "Timed out disabling the LiveKit microphone publication",
+                    error,
+                ),
+            )
+            false
         } catch (error: Throwable) {
             failures.add(error)
             false
