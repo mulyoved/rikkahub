@@ -128,9 +128,9 @@ internal class LiveKitVoiceCallSession(
         get() = !closed.get() && routeLease.isUsable
     override val cleanupOperation: VoiceAgentCleanupOperation = LiveKitCleanupOperation(
         routeLease = routeLease,
-            requestClose = { requestCloseForCleanup() },
-            roomConnected = roomConnected,
-            connectionJob = { connectionJob },
+        requestClose = { requestCloseForCleanup() },
+        roomConnected = roomConnected,
+        connectionJob = { connectionJob },
         eventJob = { eventJob },
         microphoneJob = { microphoneJob },
         rpcAdmission = rpcAdmission,
