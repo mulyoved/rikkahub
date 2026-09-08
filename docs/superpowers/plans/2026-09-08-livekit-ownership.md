@@ -182,6 +182,45 @@ pnpm test:e2e
 ./gradlew connectedDebugAndroidTest
 ```
 
+### Candidate pair evidence, 2026-09-08
+
+- Android implementation revision: `8c3bccff9a29440113201857282b73862b39f8b7`.
+- Python candidate revision: `709b7a53d2efa650b30d88d04a05b4ba9a17839b`.
+- Android copied packet and canonical Agora2 packet SHA-256:
+  `add066d20b216ef4d7ca28764b54a7756f7f7d4f4a47d2f28e542cb7d935e595`.
+  No shared-contract mismatch is pending.
+- `ANDROID_HOME=/home/muly/Android/Sdk ./gradlew :app:testDebugUnitTest --tests '*LiveKitVoiceExperienceContractsTest' --tests '*LiveKitVoicePersistenceBridgeTest' --tests '*LiveKitVoiceCallFactoryTest' --tests '*LiveKitVoiceCallSessionTest' --tests '*HermesQueueStoreTest' --tests '*VoiceTranscriptPersisterTest' --tests '*HermesNotificationDeliveryCoordinatorTest' --tests '*HermesRecoveryStartupTest'`:
+  passed.
+- `ANDROID_HOME=/home/muly/Android/Sdk ./gradlew test`: passed.
+- `ANDROID_HOME=/home/muly/Android/Sdk ./gradlew lint`: passed.
+- `ANDROID_HOME=/home/muly/Android/Sdk ./gradlew assembleDebug`: passed at the Android implementation revision.
+- `ANDROID_HOME=/home/muly/Android/Sdk ./gradlew connectedDebugAndroidTest`: Android test artifacts compiled, then
+  the command failed because no device was connected. The assigned provider reports emulator lane `5554` quarantined
+  offline and the phone/tablet lanes missing. Device acceptance waits for external lane restoration; do not retry or
+  take over a lane from this Change.
+- `ANDROID_HOME=/home/muly/Android/Sdk ./gradlew assembleRelease`: failed at
+  `:app:processReleaseGoogleServices` because the available ignored configuration contains only the debug client and
+  has no client for the release application ID `me.rerere.rikkahub`. An isolated snapshot of exact base
+  `e0f42337d8a2dbc07002d21daf2e49b1e56300e1` produced the same failure with
+  `ANDROID_HOME=/home/muly/Android/Sdk "$snapshot_dir/gradlew" -p "$snapshot_dir" :app:processReleaseGoogleServices`.
+  The standalone source repository
+  has no root or release `google-services.json`; CI writes `app/google-services.json` from `GOOGLE_SERVICES_JSON` and
+  separately supplies the release keystore and signing configuration. No local release credentials were manufactured,
+  and the application ID and Google Services plugin remain unchanged.
+- Debug APK handoff for the Android implementation revision:
+  - `app/build/outputs/apk/debug/app-arm64-v8a-debug.apk`: package `me.rerere.rikkahub.debug`, version code `172`,
+    version name `2.4.5`, native code `arm64-v8a`, SHA-256
+    `4c8e51003ef17d022b09103bca7427dd8f15839a1cbc5cdd5d52c3b487bec070`.
+  - `app/build/outputs/apk/debug/app-universal-debug.apk`: package `me.rerere.rikkahub.debug`, version code `172`,
+    version name `2.4.5`, native code `arm64-v8a` and `x86_64`, SHA-256
+    `01ba9a4652c7fc21e9becda50eda4320c4a361153b235a21d5c05f492ab61dd2`.
+  - `app/build/outputs/apk/debug/app-x86_64-debug.apk`: package `me.rerere.rikkahub.debug`, version code `172`,
+    version name `2.4.5`, native code `x86_64`, SHA-256
+    `7f3017e4db0d0b98eef60ea756cabd0cec01d7ef31979e4872f4e0c7e1ab741f`.
+- Remaining combined gates: CI release assembly with its authorized Firebase/signing inputs, restored-device
+  instrumentation, paired real-call acceptance at the revisions above, existing-conversation readback, independent
+  boundary acceptance, manager-owned architectural acceptance, and the single combined campaign audit.
+
 After those pass:
 
 - Run the packet corpus through both production decoders and compare the copied-file SHA-256.
