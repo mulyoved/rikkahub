@@ -76,6 +76,28 @@ class LiveKitVoiceExperienceContractsTest {
 
         assertNull(context.decode(duplicate))
     }
+
+    @Test
+    fun `explicit null transcript grounding is rejected`() {
+        val corpus = contractCorpus()
+        val context = corpus.decoderContext()
+        val transcript = corpus.getValue("positive").jsonArray
+            .first { element ->
+                element.jsonObject.getValue("name").jsonPrimitive.content == "transcript"
+            }
+            .jsonObject
+            .getValue("json")
+            .jsonPrimitive
+            .content
+        val explicitNullGrounding = transcript
+            .replace(Regex("\"groundedJobId\":\"[^\"]+\""), "\"groundedJobId\":null")
+            .replace(
+                Regex("\"groundedResultHash\":\"[^\"]+\""),
+                "\"groundedResultHash\":null",
+            )
+
+        assertNull(context.decode(explicitNullGrounding))
+    }
 }
 
 private data class DecoderContext(

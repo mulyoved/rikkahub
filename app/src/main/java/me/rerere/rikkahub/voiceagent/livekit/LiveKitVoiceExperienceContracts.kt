@@ -4,6 +4,7 @@ import java.security.MessageDigest
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.encodeToJsonElement
 import kotlinx.serialization.json.jsonObject
@@ -221,6 +222,7 @@ private inline fun <reified T> decodeExact(
 ): T? {
     if (!objectValue.keys.containsAll(requiredKeys)) return null
     if (!requiredKeys.plus(optionalKeys).containsAll(objectValue.keys)) return null
+    if (objectValue.values.any { it is JsonNull }) return null
     val decoded = runCatching {
         LIVEKIT_EXPERIENCE_JSON.decodeFromString<T>(payload)
     }.getOrNull() ?: return null
