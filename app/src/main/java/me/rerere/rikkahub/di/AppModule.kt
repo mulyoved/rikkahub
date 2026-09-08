@@ -131,9 +131,6 @@ val appModule = module {
         LiveKitVoiceCallFactory(
             context = get(),
             chatService = get(),
-            coordinator = get(),
-            terminalCommitter = get(),
-            ledger = get(),
             observability = get(),
         )
     }

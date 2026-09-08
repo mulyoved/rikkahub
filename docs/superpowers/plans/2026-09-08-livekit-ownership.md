@@ -103,11 +103,11 @@ The corpus contains at least one canonical positive for every retained kind, reo
 
 **Tests:** Modify `LiveKitVoiceExperienceContractsTest.kt`, `LiveKitVoicePersistenceBridgeTest.kt`, `LiveKitVoiceCallFactoryTest.kt`, and `LiveKitVoiceCallSessionTest.kt`. Copy the packet under test resources. Retain focused coverage in `HermesQueueStoreTest.kt` and `VoiceTranscriptPersisterTest.kt`; retain shared notification/recovery tests rather than deleting them to satisfy the LiveKit cleanup.
 
-- [ ] Add failing corpus tests that use the Android production decoder and verify the packet's SHA-256 against the Agora2 handoff.
-- [ ] Add failing tests showing that valid events update ordinary history, equivalent duplicates do not duplicate records, conflicting duplicates fail, history failure stays inside the RPC handler, existing conversations remain readable, and LiveKit construction no longer needs recovery objects.
-- [ ] Implement only the Android consumer changes above. Do not alter the packet or add restart/disconnect reconciliation.
-- [ ] Run `./gradlew test --tests '*LiveKitVoiceExperienceContractsTest' --tests '*LiveKitVoicePersistenceBridgeTest' --tests '*LiveKitVoiceCallFactoryTest' --tests '*LiveKitVoiceCallSessionTest' --tests '*HermesQueueStoreTest' --tests '*VoiceTranscriptPersisterTest'`.
-- [ ] Commit and report the Android commit, copied-packet SHA-256, and any material contract mismatch to the Python owner before either side starts final cleanup.
+- [x] Add failing corpus tests that use the Android production decoder and verify the packet's SHA-256 against the Agora2 handoff.
+- [x] Add failing tests showing that valid events update ordinary history, equivalent duplicates do not duplicate records, conflicting duplicates fail, history failure stays inside the RPC handler, existing conversations remain readable, and LiveKit construction no longer needs recovery objects.
+- [x] Implement only the Android consumer changes above. Do not alter the packet or add restart/disconnect reconciliation.
+- [x] Run `./gradlew :app:testDebugUnitTest --tests '*LiveKitVoiceExperienceContractsTest' --tests '*LiveKitVoicePersistenceBridgeTest' --tests '*LiveKitVoiceCallFactoryTest' --tests '*LiveKitVoiceCallSessionTest' --tests '*HermesQueueStoreTest' --tests '*VoiceTranscriptPersisterTest'`.
+- [x] Commit and report the Android commit, copied-packet SHA-256, and any material contract mismatch to the Python owner before either side starts final cleanup.
 
 **Gate:** Android saves normal history without being part of backend acceptance or worker speech state, and the copied packet matches Agora2 byte-for-byte.
 
@@ -141,9 +141,9 @@ The corpus contains at least one canonical positive for every retained kind, reo
 
 ### Android cleanup
 
-- [ ] Remove LiveKit constructor parameters, fields, callbacks, cleanup stages, and tests that exist only for `HermesRecoveryCoordinator`, `HermesRecoveryLedger`, or `HermesTerminalCommitter` integration.
-- [ ] Preserve the shared recovery subsystem, Room schema, notification consumers, startup repair, conversation-open acknowledgement, and saved rows. Prove this with a consumer search plus retained shared tests.
-- [ ] Keep one visible LiveKit history owner and bounded call cleanup. A failed ordinary history write is observable but cannot fail or replay the call.
+- [x] Remove LiveKit constructor parameters, fields, callbacks, cleanup stages, and tests that exist only for `HermesRecoveryCoordinator`, `HermesRecoveryLedger`, or `HermesTerminalCommitter` integration.
+- [x] Preserve the shared recovery subsystem, Room schema, notification consumers, startup repair, conversation-open acknowledgement, and saved rows. Prove this with a consumer search plus retained shared tests.
+- [x] Keep one visible LiveKit history owner and bounded call cleanup. A failed ordinary history write is observable but cannot fail or replay the call.
 
 **Phase verification:**
 
@@ -157,7 +157,7 @@ bash scripts/test-hermes-voice-plugin.sh -- tests.test_jobs
 bash scripts/test-hermes-voice-plugin.sh -- tests.test_livekit_http_server
 
 # RikkaHub focused behavior, from its own worktree
-./gradlew test --tests '*LiveKitVoiceExperienceContractsTest' --tests '*LiveKitVoicePersistenceBridgeTest' --tests '*LiveKitVoiceCallFactoryTest' --tests '*LiveKitVoiceCallSessionTest' --tests '*HermesQueueStoreTest' --tests '*VoiceTranscriptPersisterTest' --tests '*HermesNotificationDeliveryCoordinatorTest' --tests '*HermesRecoveryStartupTest'
+./gradlew :app:testDebugUnitTest --tests '*LiveKitVoiceExperienceContractsTest' --tests '*LiveKitVoicePersistenceBridgeTest' --tests '*LiveKitVoiceCallFactoryTest' --tests '*LiveKitVoiceCallSessionTest' --tests '*HermesQueueStoreTest' --tests '*VoiceTranscriptPersisterTest' --tests '*HermesNotificationDeliveryCoordinatorTest' --tests '*HermesRecoveryStartupTest'
 ```
 
 **Gate:** No active-call state transition depends on Android persistence. No LiveKit Android caller knows the recovery ledger. Startup failures and repeated cleanup are bounded, visible, and do not double-close SDK-owned resources.

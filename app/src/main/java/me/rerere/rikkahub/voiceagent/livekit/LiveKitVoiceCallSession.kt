@@ -66,8 +66,8 @@ internal class LiveKitVoiceCallSession(
     private val scope: CoroutineScope,
     private val captureSource: VoiceCaptureSource = VoiceCaptureSource.Microphone,
     rpcMethods: Map<String, suspend (LiveKitRpcInvocation) -> String> = emptyMap(),
-    persistenceHandler: (suspend (LiveKitRpcInvocation) -> String)? = null,
-    private val persistenceOwner: LiveKitPersistenceOwner? = null,
+    historyHandler: (suspend (LiveKitRpcInvocation) -> String)? = null,
+    private val historyOwner: LiveKitHistoryOwner? = null,
     private val connectTimeoutMillis: Long = DEFAULT_LIVEKIT_CONNECT_TIMEOUT_MS,
     private val readyTimeoutMillis: Long = DEFAULT_LIVEKIT_READY_TIMEOUT_MS,
     private val cleanupDispatcher: CoroutineDispatcher = Dispatchers.Default,
@@ -82,10 +82,10 @@ internal class LiveKitVoiceCallSession(
 ) : RouteOwnedManagedVoiceCallSession {
     private val registeredRpcMethods = buildMap {
         require(LIVEKIT_PERSISTENCE_RPC !in rpcMethods) {
-            "$LIVEKIT_PERSISTENCE_RPC is owned by the persistence handler"
+            "$LIVEKIT_PERSISTENCE_RPC is owned by the history handler"
         }
         putAll(rpcMethods)
-        persistenceHandler?.let { handler ->
+        historyHandler?.let { handler ->
             put(LIVEKIT_PERSISTENCE_RPC, handler)
         }
     }
@@ -118,8 +118,8 @@ internal class LiveKitVoiceCallSession(
     init {
         require(connectTimeoutMillis > 0) { "connectTimeoutMillis must be positive" }
         require(readyTimeoutMillis > 0) { "readyTimeoutMillis must be positive" }
-        require((persistenceHandler == null) == (persistenceOwner == null)) {
-            "persistenceHandler and persistenceOwner must be provided together"
+        require((historyHandler == null) == (historyOwner == null)) {
+            "historyHandler and historyOwner must be provided together"
         }
     }
 
@@ -136,7 +136,7 @@ internal class LiveKitVoiceCallSession(
         microphoneJob = { microphoneJob },
         rpcAdmission = rpcAdmission,
         rpcMethods = registeredRpcMethods.keys,
-        persistenceOwner = persistenceOwner,
+        historyOwner = historyOwner,
         room = room,
         workerParticipantIdentity = details.agentParticipantIdentity,
         automationAudioActivation = { automationAudioActivation },
@@ -557,7 +557,7 @@ private class LiveKitCleanupOperation(
     private val microphoneJob: () -> Job?,
     private val rpcAdmission: LiveKitRpcAdmission,
     rpcMethods: Set<String>,
-    private val persistenceOwner: LiveKitPersistenceOwner?,
+    private val historyOwner: LiveKitHistoryOwner?,
     private val room: LiveKitRoomFacade,
     private val workerParticipantIdentity: String,
     private val automationAudioActivation: () -> AutoCloseable?,
@@ -572,9 +572,9 @@ private class LiveKitCleanupOperation(
     private var microphoneJobCompleted = false
     private var microphonePublicationCompleted = false
     private var bluetoothLeaseCompleted = false
-    private var persistenceDrainCompleted = persistenceOwner == null
+    private var historyDrainCompleted = historyOwner == null
     private var rpcWorkCompleted = false
-    private var persistenceOwnerCompleted = persistenceOwner == null
+    private var historyOwnerCompleted = historyOwner == null
     private var automationAudioCompleted = false
     private var captureSourceCompleted = false
     private var workerEndNotificationHandled = false
@@ -613,12 +613,12 @@ private class LiveKitCleanupOperation(
                 connectionJobCompleted = cleanJob(connectionJob(), connectionJobCompleted, failures)
                 eventJobCompleted = cleanJob(eventJob(), eventJobCompleted, failures)
                 rpcWorkCompleted = cleanRpcWork(rpcWorkCompleted, failures)
-                drainPersistenceOwner(failures)
+                drainHistoryOwner(failures)
                 unregisterRpcMethods(
-                    allowed = rpcWorkCompleted && persistenceDrainCompleted,
+                    allowed = rpcWorkCompleted && historyDrainCompleted,
                     failures = failures,
                 )
-                closePersistenceOwner(failures)
+                closeHistoryOwner(failures)
                 disconnectRoom(failures)
                 closeRoom(failures)
             }
@@ -754,11 +754,11 @@ private class LiveKitCleanupOperation(
         }
     }
 
-    private suspend fun drainPersistenceOwner(failures: CleanupAttemptFailures) {
-        if (persistenceDrainCompleted || !rpcWorkCompleted) return
+    private suspend fun drainHistoryOwner(failures: CleanupAttemptFailures) {
+        if (historyDrainCompleted || !rpcWorkCompleted) return
         try {
-            persistenceOwner?.drain()
-            persistenceDrainCompleted = true
+            historyOwner?.drain()
+            historyDrainCompleted = true
         } catch (error: Throwable) {
             failures.add(error)
         }
@@ -793,15 +793,15 @@ private class LiveKitCleanupOperation(
         }
     }
 
-    private fun closePersistenceOwner(failures: CleanupAttemptFailures) {
+    private fun closeHistoryOwner(failures: CleanupAttemptFailures) {
         if (
-            persistenceOwnerCompleted ||
+            historyOwnerCompleted ||
             !rpcWorkCompleted ||
-            !persistenceDrainCompleted
+            !historyDrainCompleted
         ) return
         try {
-            persistenceOwner?.close()
-            persistenceOwnerCompleted = true
+            historyOwner?.close()
+            historyOwnerCompleted = true
         } catch (error: Throwable) {
             failures.add(error)
         }
@@ -814,7 +814,7 @@ private class LiveKitCleanupOperation(
             !jobsCompleted() ||
             !microphonePublicationCompleted ||
             !rpcWorkCompleted ||
-            !persistenceOwnerCompleted ||
+            !historyOwnerCompleted ||
             pendingRpcMethods.isNotEmpty()
         ) return
         try {
@@ -846,9 +846,9 @@ private class LiveKitCleanupOperation(
             !routeCompleted ||
             !jobsCompleted() ||
             !microphonePublicationCompleted ||
-            !persistenceDrainCompleted ||
+            !historyDrainCompleted ||
             !rpcWorkCompleted ||
-            !persistenceOwnerCompleted ||
+            !historyOwnerCompleted ||
             pendingRpcMethods.isNotEmpty() ||
             !disconnectCompleted ||
             !closeCompleted

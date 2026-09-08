@@ -1,6 +1,5 @@
 package me.rerere.rikkahub.voiceagent.livekit
 
-import java.security.MessageDigest
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonPrimitive
@@ -12,29 +11,6 @@ import org.junit.Assert.fail
 import org.junit.Test
 
 class CanonicalVoiceExperienceJsonTest {
-    @Test
-    fun `golden corpus retains its exact UTF-8 bytes and every row round trips`() {
-        val bytes = javaClass.classLoader
-            .getResourceAsStream("voice-experience-canonical-v1.ndjson")
-            ?.use { it.readBytes() }
-            ?: error("canonical corpus is missing")
-        val hash = MessageDigest.getInstance("SHA-256")
-            .digest(bytes)
-            .joinToString(separator = "") { byte ->
-                byte.toInt().and(0xff).toString(16).padStart(2, '0')
-            }
-
-        assertEquals(
-            "sha256:06db9c679c58703aa65cab460c351d32d19e371dc0bda2aa5337f77be4fa5335",
-            "sha256:$hash",
-        )
-        assertTrue(bytes.last() == '\n'.code.toByte())
-        bytes.toString(Charsets.UTF_8).lineSequence().filter(String::isNotEmpty).forEach { row ->
-            val fields = Json.parseToJsonElement(row).jsonObject
-            assertEquals(row, CanonicalVoiceExperienceJson.encodeObject(fields))
-        }
-    }
-
     @Test
     fun `canonical encoder rejects null and noninteger number primitives`() {
         listOf(JsonNull, JsonPrimitive(1.5), JsonPrimitive(1e3)).forEach { value ->

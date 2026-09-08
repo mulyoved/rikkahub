@@ -4,12 +4,9 @@ import android.content.ContextWrapper
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
-import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.emptyFlow
-import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
@@ -19,8 +16,6 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.jsonObject
 import me.rerere.rikkahub.data.model.Conversation
 import me.rerere.rikkahub.voiceagent.VoiceConversationStore
-import me.rerere.rikkahub.voiceagent.VoiceE2EArtifact
-import me.rerere.rikkahub.voiceagent.VoiceE2EArtifactWriter
 import me.rerere.rikkahub.voiceagent.OrchestratorFakeRoute
 import me.rerere.rikkahub.voiceagent.SpyVoiceAgentRouteLease
 import me.rerere.rikkahub.voiceagent.VoiceAgentCleanupMode
@@ -28,28 +23,17 @@ import me.rerere.rikkahub.voiceagent.VoiceAgentCleanupResult
 import me.rerere.rikkahub.voiceagent.VoiceAgentRouteMetadata
 import me.rerere.rikkahub.voiceagent.VoiceAgentSessionCreationResult
 import me.rerere.rikkahub.voiceagent.VoiceAgentTransport
+import me.rerere.rikkahub.voiceagent.VoiceSessionStatus
 import me.rerere.rikkahub.voiceagent.audio.VoiceAudioRouteOwner
 import me.rerere.rikkahub.voiceagent.hermesvoice.HermesVoiceHttpException
 import me.rerere.rikkahub.voiceagent.orchestratorRequest
-import me.rerere.rikkahub.voiceagent.recovery.AcceptedHermesBinding
-import me.rerere.rikkahub.voiceagent.recovery.HermesRecoveryCoordinator
-import me.rerere.rikkahub.voiceagent.recovery.HermesRecoveryLedger
-import me.rerere.rikkahub.voiceagent.recovery.HermesTerminalCommitter
-import me.rerere.rikkahub.voiceagent.recovery.RecoveryOutcome
-import me.rerere.rikkahub.voiceagent.recovery.RecoveryTrigger
-import me.rerere.rikkahub.voiceagent.recovery.hermesEndpointBindingHash
 import me.rerere.rikkahub.voiceagent.telemetry.VoiceTraceContext
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertNotEquals
-import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.File
 import java.nio.file.Files
-import java.nio.file.StandardCopyOption
-import java.util.concurrent.CountDownLatch
-import java.util.concurrent.TimeUnit
 import kotlin.uuid.Uuid
 
 class LiveKitVoiceCallFactoryTest {
@@ -245,7 +229,7 @@ class LiveKitVoiceCallFactoryTest {
     }
 
     @Test
-    fun `created session persists worker events in its requested conversation store`() = runTest {
+    fun `created session owns ordinary history without recovery collaborators`() = runTest {
         val root = Files.createTempDirectory("livekit-factory-persistence").toFile()
         val room = InertLiveKitRoomFacade()
         val request = request()
@@ -271,7 +255,7 @@ class LiveKitVoiceCallFactoryTest {
                 payload = acceptedEventJson(),
             )
 
-            assertEquals("persisted", parseLiveKitPersistenceAck(ack)?.status)
+            assertEquals("", ack)
             assertEquals(1, store.updateCalls)
             assertEquals(
                 VoiceAgentCleanupResult.Completed,
@@ -281,6 +265,38 @@ class LiveKitVoiceCallFactoryTest {
         } finally {
             root.deleteRecursively()
         }
+    }
+
+    @Test
+    fun `history write failure stays in the RPC handler and call cleanup remains available`() = runTest {
+        val room = InertLiveKitRoomFacade()
+        val writeFailure = IllegalStateException("history write failed")
+        val store = RecordingFactoryConversationStore(request().conversationId, writeFailure)
+        val factory = factory(
+            sessionDetailsFactory = { _, _ -> factoryDetails() },
+            roomFactory = { room },
+            conversationStoreFactory = { store },
+        )
+        val result = factory.createOwned(request(), OrchestratorFakeRoute().lease, backgroundScope)
+        val session = (result as VoiceAgentSessionCreationResult.Created).session
+        session.start()
+        runCurrent()
+
+        val failure = runCatching {
+            room.invoke(
+                method = LIVEKIT_PERSISTENCE_RPC,
+                caller = factoryDetails().agentParticipantIdentity,
+                payload = acceptedEventJson(),
+            )
+        }.exceptionOrNull()
+
+        assertSame(writeFailure, failure)
+        assertTrue(session.state.value.session !is VoiceSessionStatus.Error)
+        assertEquals(
+            VoiceAgentCleanupResult.Completed,
+            session.cleanupOperation.run(VoiceAgentCleanupMode.Immediate),
+        )
+        assertEquals(1, store.closeCalls)
     }
 
     @Test
@@ -306,185 +322,6 @@ class LiveKitVoiceCallFactoryTest {
         }
     }
 
-    @Test
-    fun `room construction failure flushes and retires the enabled artifact writer`() = runTest {
-        val root = Files.createTempDirectory("livekit-factory-writer-retirement").toFile()
-        val writerJob = SupervisorJob()
-        val writerScope = CoroutineScope(writerJob + StandardTestDispatcher(testScheduler))
-        try {
-            val factory = factory(
-                sessionDetailsFactory = { _, _ -> factoryDetails() },
-                roomFactory = { throw IllegalStateException("room construction failed") },
-                artifactWriterFactory = { directory, trace, _ ->
-                    VoiceE2EArtifactWriter.create(
-                        enabled = true,
-                        rootDirectory = directory,
-                        traceId = trace.traceId,
-                        scope = writerScope,
-                    ).also { writer ->
-                        writer.write(
-                            VoiceE2EArtifact.VoiceExperienceEvents,
-                            """{"kind":"construction_failed"}""",
-                        )
-                    }
-                },
-                noBackupFilesDir = root,
-            )
-
-            val result = factory.createOwned(request(), OrchestratorFakeRoute().lease, writerScope)
-
-            assertTrue(result is VoiceAgentSessionCreationResult.FailedClean)
-            val lines = File(
-                root,
-                "voice-e2e/VA123456-0000000000000001/voice-experience-events.ndjson",
-            ).readLines()
-            assertEquals("""{"kind":"construction_failed"}""", lines.first())
-            assertEquals("session_binding", Json.parseToJsonElement(lines.last()).jsonObject["kind"]?.toString()?.trim('"'))
-            assertTrue(writerJob.children.none { it.isActive })
-        } finally {
-            writerScope.cancel()
-            root.deleteRecursively()
-        }
-    }
-
-    @Test
-    fun `immediate cleanup flushes persisted evidence before call scope cancellation`() = runTest {
-        val root = Files.createTempDirectory("livekit-immediate-evidence").toFile()
-        val callJob = SupervisorJob()
-        val callScope = CoroutineScope(callJob + StandardTestDispatcher(testScheduler))
-        val terminalWriteStarted = CountDownLatch(1)
-        val releaseTerminalWrite = CountDownLatch(1)
-        val room = InertLiveKitRoomFacade()
-        try {
-            val factory = factory(
-                sessionDetailsFactory = { _, _ -> factoryDetails() },
-                roomFactory = { room },
-                artifactWriterFactory = { directory, trace, _ ->
-                    VoiceE2EArtifactWriter.create(
-                        enabled = true,
-                        rootDirectory = directory,
-                        traceId = trace.traceId,
-                        scope = callScope,
-                        atomicMove = { source, target, _ ->
-                            if (target.fileName.toString() == "session.json") {
-                                terminalWriteStarted.countDown()
-                                check(releaseTerminalWrite.await(5, TimeUnit.SECONDS)) {
-                                    "terminal write release timed out"
-                                }
-                            }
-                            Files.move(source, target, StandardCopyOption.REPLACE_EXISTING)
-                        },
-                    ).also { writer ->
-                        writer.writeTerminalSessionJson("""{"status":"active"}""")
-                    }
-                },
-                noBackupFilesDir = root,
-            )
-            val result = factory.createOwned(
-                request(),
-                OrchestratorFakeRoute().lease,
-                callScope,
-            )
-            val session = (result as VoiceAgentSessionCreationResult.Created).session
-            assertTrue(terminalWriteStarted.await(5, TimeUnit.SECONDS))
-            session.start()
-
-            val ack = room.invoke(
-                method = LIVEKIT_PERSISTENCE_RPC,
-                caller = factoryDetails().agentParticipantIdentity,
-                payload = acceptedEventJson(),
-            )
-            val cleanup = async {
-                session.cleanupOperation.run(VoiceAgentCleanupMode.Immediate)
-            }
-            runCurrent()
-
-            assertEquals("persisted", parseLiveKitPersistenceAck(ack)?.status)
-            assertTrue("cleanup returned before evidence flush", !cleanup.isCompleted)
-
-            releaseTerminalWrite.countDown()
-            assertEquals(VoiceAgentCleanupResult.Completed, cleanup.await())
-            callScope.cancel()
-            runCurrent()
-
-            val traceDirectory = File(root, "voice-e2e/VA123456-0000000000000001")
-            val privateLines = File(traceDirectory, "voice-experience-private.ndjson").readLines()
-            assertEquals(2, privateLines.size)
-            assertEquals("session_binding", Json.parseToJsonElement(privateLines.first()).jsonObject["kind"]?.toString()?.trim('"'))
-            assertEquals(acceptedEventJson(), privateLines.last())
-            val sanitizedLines = File(traceDirectory, "voice-experience-events.ndjson").readLines()
-            assertEquals(2, sanitizedLines.size)
-            assertEquals(
-                listOf("session_binding", "job_accepted"),
-                sanitizedLines.map { line ->
-                    Json.parseToJsonElement(line).jsonObject["kind"]?.toString()?.trim('"')
-                },
-            )
-        } finally {
-            releaseTerminalWrite.countDown()
-            callScope.cancel()
-            root.deleteRecursively()
-        }
-    }
-
-    @Test
-    fun `captures endpoint binding hash at session creation and uses it even if settings change before job accepted`() = runTest {
-        val endpointA = "https://endpoint-a.example.com/api"
-        val endpointB = "https://endpoint-b.example.com/api"
-        val initialRequest = request()
-        val requestA = initialRequest.copy(
-            config = initialRequest.config.copy(hermesVoiceBaseUrl = endpointA),
-        )
-
-        var capturedBinding: AcceptedHermesBinding? = null
-        val fakeCoordinator = object : HermesRecoveryCoordinator {
-            override suspend fun registerAccepted(binding: AcceptedHermesBinding): String {
-                capturedBinding = binding
-                return "recovery-key-1"
-            }
-            override fun onPersistedRelayEvent(recoveryKey: String) = Unit
-            override fun onCallEnded(voiceSessionId: String) = Unit
-            override suspend fun requestCancellation(recoveryKey: String) = Unit
-            override suspend fun reconcile(recoveryKey: String, trigger: RecoveryTrigger): RecoveryOutcome = RecoveryOutcome.Success
-            override suspend fun reactivateConversation(conversationId: Uuid, trigger: RecoveryTrigger) = Unit
-            override suspend fun reactivateDormant(trigger: RecoveryTrigger) = Unit
-            override suspend fun repairAll() = Unit
-            override suspend fun repairConversation(conversationId: Uuid) = Unit
-        }
-
-        val room = InertLiveKitRoomFacade()
-        val factory = factory(
-            sessionDetailsFactory = { _, _ -> factoryDetails() },
-            roomFactory = { room },
-            coordinator = fakeCoordinator,
-        )
-
-        val result = factory.createOwned(requestA, OrchestratorFakeRoute().lease, backgroundScope)
-        val session = (result as VoiceAgentSessionCreationResult.Created).session
-        session.start()
-        runCurrent()
-
-        // Settings change to endpoint B before job accepted
-        val expectedEventHash = "sha256:${"7".repeat(64)}"
-        val acceptedPayload = acceptedEventJson(
-            userTurnId = "turn_lifetime_test",
-            requestHash = expectedEventHash,
-        )
-
-        val ack = room.invoke(
-            method = LIVEKIT_PERSISTENCE_RPC,
-            caller = factoryDetails().agentParticipantIdentity,
-            payload = acceptedPayload,
-        )
-
-        assertEquals("persisted", parseLiveKitPersistenceAck(ack)?.status)
-        assertNotNull("registerAccepted must have been called", capturedBinding)
-        assertEquals(hermesEndpointBindingHash(endpointA), capturedBinding!!.endpointBindingHash)
-        assertNotEquals(hermesEndpointBindingHash(endpointB), capturedBinding!!.endpointBindingHash)
-        assertEquals("turn_lifetime_test", capturedBinding!!.originatingUserTurnId)
-        assertEquals(expectedEventHash, capturedBinding!!.requestHash)
-    }
-
     private fun factory(
         sessionDetailsFactory: suspend (
             me.rerere.rikkahub.voiceagent.VoiceAgentCallRequest,
@@ -494,11 +331,6 @@ class LiveKitVoiceCallFactoryTest {
         conversationStoreFactory: (Uuid) -> VoiceConversationStore = {
             RecordingFactoryConversationStore(it)
         },
-        artifactWriterFactory: (File, VoiceTraceContext, CoroutineScope) -> VoiceE2EArtifactWriter =
-            { _, _, _ -> VoiceE2EArtifactWriter.disabled() },
-        coordinator: HermesRecoveryCoordinator? = null,
-        terminalCommitter: HermesTerminalCommitter? = null,
-        ledger: HermesRecoveryLedger? = null,
         noBackupFilesDir: File = File("build/tmp/livekit-factory-test"),
         timeoutMillis: Long = 1_000,
     ) = LiveKitVoiceCallFactory(
@@ -514,10 +346,6 @@ class LiveKitVoiceCallFactoryTest {
         sessionDetailsFactory = sessionDetailsFactory,
         roomFactory = roomFactory,
         conversationStoreFactory = conversationStoreFactory,
-        artifactWriterFactory = artifactWriterFactory,
-        coordinator = coordinator,
-        terminalCommitter = terminalCommitter,
-        ledger = ledger,
         sessionCreationTimeoutMillis = timeoutMillis,
     )
 
@@ -526,7 +354,6 @@ class LiveKitVoiceCallFactoryTest {
         transport = VoiceAgentTransport.LiveKitExperimental,
     )
 }
-
 private class InertLiveKitRoomFacade : LiveKitRoomFacade {
     override val events: Flow<LiveKitRoomEvent> = emptyFlow()
     override suspend fun connect(url: String, token: String) = Unit
@@ -547,6 +374,7 @@ private class InertLiveKitRoomFacade : LiveKitRoomFacade {
 
 private class RecordingFactoryConversationStore(
     conversationId: Uuid,
+    private val updateFailure: Throwable? = null,
 ) : VoiceConversationStore {
     private val mutableConversation = MutableStateFlow(Conversation.ofId(conversationId))
     override val conversation: StateFlow<Conversation> = mutableConversation
@@ -557,6 +385,7 @@ private class RecordingFactoryConversationStore(
         transform: (Conversation) -> Pair<Conversation, T>,
         commit: suspend (T) -> Unit,
     ): T {
+        updateFailure?.let { throw it }
         updateCalls += 1
         val (updated, result) = transform(mutableConversation.value)
         commit(result)

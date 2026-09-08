@@ -49,28 +49,6 @@ internal sealed interface LiveKitVoiceExperienceEvent {
     val observedAt: String
 
     @Serializable
-    data class SessionBinding(
-        override val version: Int,
-        override val voiceSessionId: String,
-        override val eventId: String,
-        override val kind: String,
-        override val observedAt: String,
-        val ownerHash: String,
-        val conversationHash: String,
-        val voiceSessionHash: String,
-        val roomHash: String,
-        val traceHash: String,
-    ) : LiveKitVoiceExperienceEvent {
-        fun correlation(): LiveKitJobCorrelation = LiveKitJobCorrelation(
-            ownerHash = ownerHash,
-            conversationHash = conversationHash,
-            voiceSessionHash = voiceSessionHash,
-            roomHash = roomHash,
-            traceHash = traceHash,
-        )
-    }
-
-    @Serializable
     data class JobAccepted(
         override val version: Int,
         override val voiceSessionId: String,
@@ -152,36 +130,16 @@ internal sealed interface LiveKitVoiceExperienceEvent {
         override val observedAt: String,
         val toolCallId: String,
         val jobId: String,
-        val assistantTurnId: String? = null,
-        val userSpeaking: Boolean? = null,
-        val agentSpeaking: Boolean? = null,
-    ) : LiveKitVoiceExperienceEvent
-
-    @Serializable
-    data class FollowUpCorrelation(
-        override val version: Int,
-        override val voiceSessionId: String,
-        override val eventId: String,
-        override val kind: String,
-        override val observedAt: String,
-        val followUpTurnId: String,
         val assistantTurnId: String,
-        val resultHash: String,
     ) : LiveKitVoiceExperienceEvent
 }
 
-@Serializable
-internal data class LiveKitPersistenceAck(
-    val version: Int,
-    val voiceSessionId: String,
-    val eventId: String,
-    val status: String,
-    val persistedAt: String,
-) {
-    fun canonicalJson(): String = canonicalVoiceExperienceJson(this)
-}
-
-internal fun parseLiveKitVoiceExperienceEvent(payload: String): LiveKitVoiceExperienceEvent? {
+internal fun parseLiveKitVoiceExperienceEvent(
+    payload: String,
+    expectedVoiceSessionId: String,
+    expectedCorrelation: LiveKitJobCorrelation,
+): LiveKitVoiceExperienceEvent? {
+    if (hasDuplicateTopLevelKeys(payload)) return null
     val objectValue = runCatching {
         LIVEKIT_EXPERIENCE_JSON.parseToJsonElement(payload).jsonObject
     }.getOrNull() ?: return null
@@ -223,65 +181,30 @@ internal fun parseLiveKitVoiceExperienceEvent(payload: String): LiveKitVoiceExpe
             optionalKeys = setOf("groundedJobId", "groundedResultHash"),
         )
 
-        "delivery_eligible",
-        "delivery_started",
-        "speech_started",
-            -> decodeExact<LiveKitVoiceExperienceEvent.Delivery>(
-                payload = payload,
-                objectValue = objectValue,
-                requiredKeys = BASE_EVENT_KEYS + DELIVERY_KEYS,
-            )
-
-        "delivery_blocked" -> decodeExact<LiveKitVoiceExperienceEvent.Delivery>(
-            payload = payload,
-            objectValue = objectValue,
-            requiredKeys = BASE_EVENT_KEYS + DELIVERY_KEYS + setOf("userSpeaking", "agentSpeaking"),
-        )
-
         "delivery_announced" -> decodeExact<LiveKitVoiceExperienceEvent.Delivery>(
             payload = payload,
             objectValue = objectValue,
             requiredKeys = BASE_EVENT_KEYS + DELIVERY_KEYS + "assistantTurnId",
         )
 
-        "follow_up_correlation" -> decodeExact<LiveKitVoiceExperienceEvent.FollowUpCorrelation>(
-            payload = payload,
-            objectValue = objectValue,
-            requiredKeys = BASE_EVENT_KEYS + FOLLOW_UP_CORRELATION_KEYS,
-        )
-
         else -> null
     } ?: return null
-    return event.takeIf { it.isValid() }
-}
-
-internal fun parseLiveKitPersistenceAck(payload: String): LiveKitPersistenceAck? {
-    val objectValue = runCatching {
-        LIVEKIT_EXPERIENCE_JSON.parseToJsonElement(payload).jsonObject
-    }.getOrNull() ?: return null
-    val ack = decodeExact<LiveKitPersistenceAck>(
-        payload = payload,
-        objectValue = objectValue,
-        requiredKeys = ACK_KEYS,
-    ) ?: return null
-    if (
-        ack.version != LIVEKIT_EXPERIENCE_VERSION ||
-        !ack.voiceSessionId.isLiveKitExperienceIdentifier() ||
-        !ack.eventId.isLiveKitExperienceIdentifier() ||
-        ack.status != LIVEKIT_PERSISTED_STATUS ||
-        !ack.persistedAt.isCanonicalUtcTimestamp()
-    ) return null
-    return ack
+    return event.takeIf {
+        it.isValid() &&
+            it.voiceSessionId == expectedVoiceSessionId &&
+            it.hasExpectedCorrelation(expectedCorrelation)
+    }
 }
 
 internal fun LiveKitVoiceExperienceEvent.canonicalJson(): String = when (this) {
-    is LiveKitVoiceExperienceEvent.SessionBinding -> canonicalVoiceExperienceJson(this)
     is LiveKitVoiceExperienceEvent.JobAccepted -> canonicalVoiceExperienceJson(this)
     is LiveKitVoiceExperienceEvent.JobState -> canonicalVoiceExperienceJson(this)
     is LiveKitVoiceExperienceEvent.Transcript -> canonicalVoiceExperienceJson(this)
     is LiveKitVoiceExperienceEvent.Delivery -> canonicalVoiceExperienceJson(this)
-    is LiveKitVoiceExperienceEvent.FollowUpCorrelation -> canonicalVoiceExperienceJson(this)
 }
+
+internal fun LiveKitVoiceExperienceEvent.semanticFingerprint(): String =
+    voiceSha256(canonicalJson())
 
 internal fun voiceSha256(text: String): String =
     "sha256:" + MessageDigest.getInstance("SHA-256")
@@ -301,8 +224,63 @@ private inline fun <reified T> decodeExact(
     val decoded = runCatching {
         LIVEKIT_EXPERIENCE_JSON.decodeFromString<T>(payload)
     }.getOrNull() ?: return null
-    if (canonicalVoiceExperienceJson(decoded) != payload) return null
     return decoded
+}
+
+private fun LiveKitVoiceExperienceEvent.hasExpectedCorrelation(
+    expected: LiveKitJobCorrelation,
+): Boolean {
+    return when (this) {
+        is LiveKitVoiceExperienceEvent.JobAccepted -> correlation() == expected
+        is LiveKitVoiceExperienceEvent.JobState -> correlation() == expected
+        else -> true
+    }
+}
+
+private fun hasDuplicateTopLevelKeys(payload: String): Boolean {
+    val keys = mutableSetOf<String>()
+    var nesting = 0
+    var expectingKey = false
+    var inString = false
+    var escaped = false
+    var keyStart = -1
+    var currentStringIsKey = false
+
+    payload.forEachIndexed { index, character ->
+        if (inString) {
+            when {
+                escaped -> escaped = false
+                character == '\\' -> escaped = true
+                character == '"' -> {
+                    inString = false
+                    if (currentStringIsKey) {
+                        val encodedKey = payload.substring(keyStart, index + 1)
+                        val key = runCatching {
+                            LIVEKIT_EXPERIENCE_JSON.decodeFromString<String>(encodedKey)
+                        }.getOrNull() ?: return false
+                        if (!keys.add(key)) return true
+                        expectingKey = false
+                    }
+                }
+            }
+        } else {
+            when (character) {
+                '{', '[' -> {
+                    nesting += 1
+                    if (nesting == 1 && character == '{') expectingKey = true
+                }
+
+                '}', ']' -> nesting -= 1
+                ',' -> if (nesting == 1) expectingKey = true
+                '"' -> {
+                    inString = true
+                    keyStart = index
+                    currentStringIsKey = nesting == 1 && expectingKey
+                }
+            }
+        }
+    }
+    return false
 }
 
 private fun LiveKitVoiceExperienceEvent.isValid(): Boolean {
@@ -313,11 +291,6 @@ private fun LiveKitVoiceExperienceEvent.isValid(): Boolean {
         !observedAt.isCanonicalUtcTimestamp()
     ) return false
     return when (this) {
-        is LiveKitVoiceExperienceEvent.SessionBinding ->
-            kind == "session_binding" &&
-                correlation().isValid(voiceSessionId) &&
-                eventId == "binding_" + voiceSessionHash.removePrefix("sha256:").take(24)
-
         is LiveKitVoiceExperienceEvent.JobAccepted ->
             kind == "job_accepted" &&
                 hasValidJobCorrelation() &&
@@ -357,30 +330,10 @@ private fun LiveKitVoiceExperienceEvent.isValid(): Boolean {
                 hasValidGrounding()
 
         is LiveKitVoiceExperienceEvent.Delivery ->
-            toolCallId.isLiveKitExperienceIdentifier() &&
+            kind == "delivery_announced" &&
+                toolCallId.isLiveKitExperienceIdentifier() &&
                 jobId.isLiveKitExperienceIdentifier() &&
-                when (kind) {
-                    "delivery_eligible",
-                    "delivery_started",
-                    "speech_started",
-                        -> assistantTurnId == null && userSpeaking == null && agentSpeaking == null
-
-                    "delivery_blocked" ->
-                        assistantTurnId == null && userSpeaking != null && agentSpeaking != null
-
-                    "delivery_announced" ->
-                        assistantTurnId?.isLiveKitExperienceIdentifier() == true &&
-                            userSpeaking == null &&
-                            agentSpeaking == null
-
-                    else -> false
-                }
-
-        is LiveKitVoiceExperienceEvent.FollowUpCorrelation ->
-            kind == "follow_up_correlation" &&
-                followUpTurnId.isLiveKitExperienceIdentifier() &&
-                assistantTurnId.isLiveKitExperienceIdentifier() &&
-                resultHash.isLiveKitExperienceHash()
+                assistantTurnId.isLiveKitExperienceIdentifier()
     }
 }
 
@@ -435,7 +388,6 @@ private fun JsonObject.string(key: String): String? =
     runCatching { getValue(key).jsonPrimitive.content }.getOrNull()
 
 private const val LIVEKIT_EXPERIENCE_VERSION = 1
-private const val LIVEKIT_PERSISTED_STATUS = "persisted"
 private const val MAX_FAILURE_REASON_LENGTH = 512
 private val TRANSCRIPT_ROLES = setOf("user", "assistant")
 private val BASE_EVENT_KEYS =
@@ -454,7 +406,3 @@ private val JOB_CORRELATION_KEYS =
         "traceHash",
     )
 private val DELIVERY_KEYS = setOf("toolCallId", "jobId")
-private val FOLLOW_UP_CORRELATION_KEYS =
-    setOf("followUpTurnId", "assistantTurnId", "resultHash")
-private val ACK_KEYS =
-    setOf("version", "voiceSessionId", "eventId", "status", "persistedAt")

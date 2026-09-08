@@ -29,8 +29,6 @@ import me.rerere.rikkahub.voiceagent.VoiceAgentCleanupMode
 import me.rerere.rikkahub.voiceagent.VoiceAgentCleanupResult
 import me.rerere.rikkahub.voiceagent.VoiceAudioStatus
 import me.rerere.rikkahub.voiceagent.VoiceSessionStatus
-import me.rerere.rikkahub.voiceagent.VoiceE2EArtifact
-import me.rerere.rikkahub.voiceagent.VoiceE2EArtifactWriter
 import me.rerere.rikkahub.voiceagent.orchestratorRequest
 import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationAudioProbe
 import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationCorrelationKind
@@ -418,7 +416,6 @@ class LiveKitVoiceCallSessionTest {
             },
             roomFactory = { FakeLiveKitRoomFacade() },
             conversationStoreFactory = { InMemoryVoiceConversationStore() },
-            artifactWriterFactory = { _, _, _ -> VoiceE2EArtifactWriter.disabled() },
         )
 
         try {
@@ -1090,10 +1087,10 @@ class LiveKitVoiceCallSessionTest {
 
     @Test
     fun `persistence RPC accepts only the expected worker and is drained before store close`() = runTest {
-        val persistence = RecordingPersistenceOwner()
+        val persistence = RecordingHistoryOwner()
         val fixture = fixture(
-            persistenceHandler = persistence::handle,
-            persistenceOwner = persistence,
+            historyHandler = persistence::handle,
+            historyOwner = persistence,
         )
         fixture.session.start()
         runCurrent()
@@ -1108,7 +1105,7 @@ class LiveKitVoiceCallSessionTest {
         val ack = handler(LiveKitRpcInvocation(AGENT_IDENTITY, acceptedEventJson()))
 
         assertTrue(wrongCallerFailure is IllegalArgumentException)
-        assertEquals("""{"status":"persisted"}""", ack)
+        assertEquals("", ack)
         assertEquals(listOf("evt_accepted"), persistence.events)
         assertEquals(
             VoiceAgentCleanupResult.Completed,
@@ -1125,13 +1122,13 @@ class LiveKitVoiceCallSessionTest {
     fun `immediate cleanup joins an admitted persistence handler before closing its owner`() = runTest {
         val handlerStarted = CompletableDeferred<Unit>()
         val handlerGate = CompletableDeferred<Unit>()
-        val persistence = RecordingPersistenceOwner(
+        val persistence = RecordingHistoryOwner(
             handlerStarted = handlerStarted,
             handlerGate = handlerGate,
         )
         val fixture = fixture(
-            persistenceHandler = persistence::handle,
-            persistenceOwner = persistence,
+            historyHandler = persistence::handle,
+            historyOwner = persistence,
         )
         fixture.session.start()
         runCurrent()
@@ -1154,7 +1151,7 @@ class LiveKitVoiceCallSessionTest {
         handlerGate.complete(Unit)
         runCurrent()
 
-        assertEquals("""{"status":"persisted"}""", invocation.await())
+        assertEquals("", invocation.await())
         assertEquals(VoiceAgentCleanupResult.Completed, cleanup.await())
         assertEquals(listOf("drain", "close"), persistence.lifecycle)
         assertEquals(listOf("evt_accepted"), persistence.events)
@@ -1164,14 +1161,14 @@ class LiveKitVoiceCallSessionTest {
     fun `graceful cleanup joins admitted work before entering persistence drain`() = runTest {
         val admittedBeforePersistence = CompletableDeferred<Unit>()
         val enterPersistence = CompletableDeferred<Unit>()
-        val persistence = RecordingPersistenceOwner()
+        val persistence = RecordingHistoryOwner()
         val fixture = fixture(
-            persistenceHandler = { callerIdentity, payload ->
+            historyHandler = { callerIdentity, payload ->
                 admittedBeforePersistence.complete(Unit)
                 enterPersistence.await()
                 persistence.handle(callerIdentity, payload)
             },
-            persistenceOwner = persistence,
+            historyOwner = persistence,
         )
         fixture.session.start()
         runCurrent()
@@ -1196,28 +1193,24 @@ class LiveKitVoiceCallSessionTest {
         enterPersistence.complete(Unit)
         runCurrent()
 
-        assertEquals("""{"status":"persisted"}""", invocation.await())
+        assertEquals("", invocation.await())
         assertEquals(VoiceAgentCleanupResult.Completed, cleanup.await())
         assertEquals(listOf("drain", "close"), persistence.lifecycle)
         assertFalse(fixture.room.rpcHandlers.containsKey(LIVEKIT_PERSISTENCE_RPC))
     }
 
     @Test
-    fun `call stopped follows RPC quiescence persistence drain artifact close and room close`() = runTest {
+    fun `call stopped follows RPC quiescence history drain and room close`() = runTest {
         val orderedStages = mutableListOf<String>()
         val handlerStarted = CompletableDeferred<Unit>()
         val handlerGate = CompletableDeferred<Unit>()
         val drainStarted = CompletableDeferred<Unit>()
         val drainGate = CompletableDeferred<Unit>()
-        val artifactCloseStarted = CompletableDeferred<Unit>()
-        val artifactCloseGate = CompletableDeferred<Unit>()
-        val persistence = RecordingPersistenceOwner(
+        val persistence = RecordingHistoryOwner(
             handlerStarted = handlerStarted,
             handlerGate = handlerGate,
             drainStarted = drainStarted,
             drainGate = drainGate,
-            artifactCloseStarted = artifactCloseStarted,
-            artifactCloseGate = artifactCloseGate,
             stageObserver = orderedStages::add,
         )
         val runtime = SessionRecordingAutomationRuntime { event ->
@@ -1226,8 +1219,8 @@ class LiveKitVoiceCallSessionTest {
             }
         }
         val fixture = fixture(
-            persistenceHandler = persistence::handle,
-            persistenceOwner = persistence,
+            historyHandler = persistence::handle,
+            historyOwner = persistence,
             automationRuntime = runtime,
             roomLifecycleObserver = { stage -> orderedStages += "room-$stage" },
         )
@@ -1261,25 +1254,16 @@ class LiveKitVoiceCallSessionTest {
         assertTrue(runtime.events.none { it.name == VoiceAutomationEventName.CALL_STOPPED })
 
         drainGate.complete(Unit)
-        artifactCloseStarted.await()
-
-        assertFalse(cleanup.isCompleted)
-        assertEquals(0, fixture.room.disconnectCalls)
-        assertTrue(runtime.events.none { it.name == VoiceAutomationEventName.CALL_STOPPED })
-
-        artifactCloseGate.complete(Unit)
         runCurrent()
 
-        assertEquals("""{"status":"persisted"}""", invocation.await())
+        assertEquals("", invocation.await())
         assertEquals(VoiceAgentCleanupResult.Completed, cleanup.await())
         assertEquals(
             listOf(
                 "rpc-finished",
-                "persistence-drain-started",
-                "persistence-drained",
-                "artifact-writer-close-started",
-                "artifact-writer-closed",
-                "persistence-owner-closed",
+                "history-drain-started",
+                "history-drained",
+                "history-owner-closed",
                 "room-disconnect",
                 "room-close",
                 "call-stopped",
@@ -1290,12 +1274,12 @@ class LiveKitVoiceCallSessionTest {
 
     @Test
     fun `failed persistence drain keeps owner and RPC open until a successful retry`() = runTest {
-        val persistence = RecordingPersistenceOwner()
-        val drainFailure = IllegalStateException("persistence drain failed")
+        val persistence = RecordingHistoryOwner()
+        val drainFailure = IllegalStateException("history drain failed")
         persistence.drainFailure = drainFailure
         val fixture = fixture(
-            persistenceHandler = persistence::handle,
-            persistenceOwner = persistence,
+            historyHandler = persistence::handle,
+            historyOwner = persistence,
         )
         fixture.session.start()
         runCurrent()
@@ -1317,68 +1301,7 @@ class LiveKitVoiceCallSessionTest {
     }
 
     @Test
-    fun `artifact filesystem failure prevents call stopped and run finalization`() = runTest {
-        val root = Files.createTempDirectory("livekit-artifact-write-failure").toFile()
-        try {
-            val writer = VoiceE2EArtifactWriter.create(
-                enabled = true,
-                rootDirectory = root,
-                scope = backgroundScope,
-            )
-            writer.drain()
-            val blocked = File(
-                root,
-                "voice-e2e/${VoiceE2EArtifact.VoiceExperiencePrivate.fileName}",
-            )
-            requireNotNull(blocked.parentFile).mkdirs()
-            assertTrue(blocked.mkdir())
-            writer(VoiceE2EArtifact.VoiceExperiencePrivate, """{"event":"private"}""")
-
-            var persistenceClosed = false
-            val persistenceOwner = object : LiveKitPersistenceOwner {
-                override suspend fun drain() {
-                    writer.close()
-                }
-
-                override fun close() {
-                    persistenceClosed = true
-                }
-            }
-            val runtime = SessionRecordingAutomationRuntime()
-            val fixture = fixture(
-                persistenceHandler = { _, _ -> """{"status":"persisted"}""" },
-                persistenceOwner = persistenceOwner,
-                automationRuntime = runtime,
-            )
-            fixture.session.start()
-            runCurrent()
-
-            val first = fixture.session.cleanupOperation.run(VoiceAgentCleanupMode.GracefulEnd)
-            val second = fixture.session.cleanupOperation.run(VoiceAgentCleanupMode.GracefulEnd)
-
-            assertTrue(first is VoiceAgentCleanupResult.Failed)
-            assertTrue(second is VoiceAgentCleanupResult.Failed)
-            assertSame(
-                (first as VoiceAgentCleanupResult.Failed).error.rootCause(),
-                (second as VoiceAgentCleanupResult.Failed).error.rootCause(),
-            )
-            assertFalse(persistenceClosed)
-            assertTrue(fixture.room.rpcHandlers.containsKey(LIVEKIT_PERSISTENCE_RPC))
-            assertEquals(0, fixture.room.disconnectCalls)
-            assertEquals(0, fixture.room.closeCalls)
-            assertTrue(runtime.events.none {
-                it.name in setOf(
-                    VoiceAutomationEventName.CALL_STOPPED,
-                    VoiceAutomationEventName.RUN_FINALIZED,
-                )
-            })
-        } finally {
-            root.deleteRecursively()
-        }
-    }
-
-    @Test
-    fun `reserved persistence RPC cannot be supplied without its owner`() = runTest {
+    fun `reserved history RPC cannot be supplied without its owner`() = runTest {
         val error = runCatching {
             fixture(
                 rpcMethods = mapOf(LIVEKIT_PERSISTENCE_RPC to { "forged-ack" }),
@@ -1728,8 +1651,8 @@ class LiveKitVoiceCallSessionTest {
 
     private fun kotlinx.coroutines.test.TestScope.fixture(
         rpcMethods: Map<String, suspend (LiveKitRpcInvocation) -> String> = emptyMap(),
-        persistenceHandler: (suspend (callerIdentity: String, payload: String) -> String)? = null,
-        persistenceOwner: LiveKitPersistenceOwner? = null,
+        historyHandler: (suspend (callerIdentity: String, payload: String) -> String)? = null,
+        historyOwner: LiveKitHistoryOwner? = null,
         connectFailure: Throwable? = null,
         readyTimeoutMillis: Long = 30_000,
         route: OrchestratorFakeRoute = OrchestratorFakeRoute(),
@@ -1757,10 +1680,10 @@ class LiveKitVoiceCallSessionTest {
                 routeLease = route.lease,
                 scope = sessionScope,
                 rpcMethods = rpcMethods,
-                persistenceHandler = persistenceHandler?.let { handler ->
+                historyHandler = historyHandler?.let { handler ->
                     { invocation -> handler(invocation.callerIdentity, invocation.payload) }
                 },
-                persistenceOwner = persistenceOwner,
+                historyOwner = historyOwner,
                 connectTimeoutMillis = 10_000,
                 readyTimeoutMillis = readyTimeoutMillis,
                 cleanupDispatcher = cleanupDispatcher,
@@ -1782,7 +1705,6 @@ class LiveKitVoiceCallSessionTest {
         val route: OrchestratorFakeRoute,
     )
 }
-
 private class FakeLiveKitRoomFacade(
     private val connectFailure: Throwable? = null,
     override val automationAudio: LiveKitAutomationAudioBinding = SessionAutomationAudioBinding(),
@@ -1900,15 +1822,13 @@ private class FakeLiveKitRoomFacade(
     }
 }
 
-private class RecordingPersistenceOwner(
+private class RecordingHistoryOwner(
     private val handlerStarted: CompletableDeferred<Unit>? = null,
     private val handlerGate: CompletableDeferred<Unit>? = null,
     private val drainStarted: CompletableDeferred<Unit>? = null,
     private val drainGate: CompletableDeferred<Unit>? = null,
-    private val artifactCloseStarted: CompletableDeferred<Unit>? = null,
-    private val artifactCloseGate: CompletableDeferred<Unit>? = null,
     private val stageObserver: (String) -> Unit = {},
-) : LiveKitPersistenceOwner {
+) : LiveKitHistoryOwner {
     val events = mutableListOf<String>()
     val lifecycle = mutableListOf<String>()
     var onDrain: () -> Unit = {}
@@ -1920,26 +1840,22 @@ private class RecordingPersistenceOwner(
         handlerGate?.await()
         events += requireNotNull(Regex(""""eventId":"([^"]+)"""").find(payload)).groupValues[1]
         stageObserver("rpc-finished")
-        return """{"status":"persisted"}"""
+        return ""
     }
 
     override suspend fun drain() {
         onDrain()
         drainFailure?.let { throw it }
-        stageObserver("persistence-drain-started")
+        stageObserver("history-drain-started")
         drainStarted?.complete(Unit)
         drainGate?.await()
         lifecycle += "drain"
-        stageObserver("persistence-drained")
-        stageObserver("artifact-writer-close-started")
-        artifactCloseStarted?.complete(Unit)
-        artifactCloseGate?.await()
-        stageObserver("artifact-writer-closed")
+        stageObserver("history-drained")
     }
 
     override fun close() {
         lifecycle += "close"
-        stageObserver("persistence-owner-closed")
+        stageObserver("history-owner-closed")
     }
 }
 
