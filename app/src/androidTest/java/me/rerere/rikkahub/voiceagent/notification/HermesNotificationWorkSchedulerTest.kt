@@ -93,8 +93,9 @@ class HermesNotificationWorkSchedulerTest {
         val firstId = initialInfos.first().id
         assertEquals(WorkInfo.State.ENQUEUED, initialInfos.first().state)
 
-        // Replace with immediate delay
-        scheduler.replaceForEarliestDue(testConversationId, 0.seconds)
+        // Replace with an earlier deferred delay so the synchronous test executor cannot finish it
+        // before the replacement identity and state are inspected.
+        scheduler.replaceForEarliestDue(testConversationId, 1.minutes)
         val replacedInfos = workManager.getWorkInfosForUniqueWork(workName).get()
         assertEquals(1, replacedInfos.size)
         val newId = replacedInfos.first().id

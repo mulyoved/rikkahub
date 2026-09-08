@@ -182,7 +182,7 @@ pnpm test:e2e
 ./gradlew connectedDebugAndroidTest
 ```
 
-### Candidate pair evidence, 2026-09-08
+### Candidate pair evidence at initial boundary review, 2026-09-08
 
 - Android implementation revision: `8c3bccff9a29440113201857282b73862b39f8b7`.
 - Python candidate revision: `709b7a53d2efa650b30d88d04a05b4ba9a17839b`.
@@ -221,9 +221,46 @@ pnpm test:e2e
   - `app/build/outputs/apk/debug/app-x86_64-debug.apk`: package `me.rerere.rikkahub.debug`, version code `172`,
     version name `2.4.5`, native code `x86_64`, SHA-256
     `7f3017e4db0d0b98eef60ea756cabd0cec01d7ef31979e4872f4e0c7e1ab741f`.
-- Remaining combined gates: restored-device instrumentation, paired real-call acceptance at the revisions above,
+- At this checkpoint, the remaining combined gates were restored-device instrumentation, paired real-call acceptance
+  at the revisions above,
   existing-conversation readback, independent boundary acceptance, manager-owned architectural acceptance, and the
   single combined campaign audit. Release assembly is waived for this campaign.
+
+### Android phone verification continuation, 2026-09-08
+
+- Android production revision under test: `dccdfd636fcebf3c20dadc72be3bff96d4408674`.
+- Python paired candidate requested for the retained real-call gate:
+  `f47f71014f5115b27a956bad97789d8c843f8130`.
+- Managed lane: `phone`. The manager-completed takeover was consumed by the first managed command, and all later ADB
+  and UI operations remained inside the assigned `mdev android` lane. The quarantined emulator and absent optional
+  tablet were not used.
+- A clean source rebuild passed `:app:validateVoiceAgentSentryDebug`, `:app:assembleDebug`, and
+  `:app:assembleDebugAndroidTest`. The installed data-preserving update retained the original first-install timestamp
+  and reported package `me.rerere.rikkahub.debug`, version code `172`, version name `2.4.5`.
+- Clean-build APK SHA-256 values for the Android production revision:
+  - arm64: `943e0bb9d3ca77ae34be8d7cd6a989b24392b51f4c7976a63d181b5e56abbfe6`
+  - universal: `96fea8cfad3cc282cadd85836d6694629d9a38a48e08fbe21d3a2be18b63c1f9`
+  - x86_64: `05bf6986872cfde9abbd55a25347867c0263ab0b1539f1edf47bd756793f9824`
+- The installed universal APK read back byte-for-byte as
+  `96fea8cfad3cc282cadd85836d6694629d9a38a48e08fbe21d3a2be18b63c1f9`. The installed instrumentation APK read
+  back byte-for-byte as `a1dfaffec45952cb00c7b92b16c215c5c402bf21475374399e2fe202b6e6ded4`.
+- Applicable phone instrumentation passed 22/22 tests on those exact installed artifacts. Because the secure phone
+  returns to its always-on locked display during the one-shot suite, that attempt passed 21 tests and left the Compose
+  status-card test without a visible hierarchy. The same status-card test passed immediately after a managed wake,
+  and the other 21 tests passed in one bounded runner invocation. No unlock, uninstall, clear-data, reset, or shared-host
+  mutation was used.
+- The one repaired instrumentation test now schedules its replacement one minute out instead of immediately. This
+  preserves the earlier-due `REPLACE` assertions while preventing WorkManager's synchronous test executor from
+  completing the success-only worker before its replacement identity and `ENQUEUED` state are inspected. The affected
+  class passed 5/5 tests on the phone. A fresh Luna/xhigh independent review returned `ship`, with no findings.
+- Paired real-call evidence is not claimed. The retained runbook requires a human physical Start tap and human audio
+  judgment; automation must not inject speech or judge the call. In addition, the Python review worktree currently has
+  uncommitted production changes beyond `f47f71014f5115b27a956bad97789d8c843f8130`, while the running local POC is
+  sourced outside that candidate worktree. Deploying or describing either as the exact requested Python candidate would
+  be false and would compete with the active Python owner.
+- Remaining combined gates: settle and read back the exact Python candidate, execute the human-observed paired calls
+  and existing-conversation check against the exact pair, accept the manager-owned combined thermonuclear audit and
+  architectural/campaign review, and obtain the final human merge decision. Release assembly remains waived.
 
 After those pass:
 
