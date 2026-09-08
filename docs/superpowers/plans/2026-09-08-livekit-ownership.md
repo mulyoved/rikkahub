@@ -262,6 +262,63 @@ pnpm test:e2e
   and existing-conversation check against the exact pair, accept the manager-owned combined thermonuclear audit and
   architectural/campaign review, and obtain the final human merge decision. Release assembly remains waived.
 
+### Android combined-audit repair continuation, 2026-09-08
+
+- The single combined campaign audit evaluated Python
+  `f47f71014f5115b27a956bad97789d8c843f8130` with Android runtime
+  `dccdfd636fcebf3c20dadc72be3bff96d4408674` and returned `fix-first`. Android findings 1, 2, 5, and 8 were accepted
+  and repaired at Android runtime revision `30cddf502ee56758c5845a415cfa931e9d286248`; no second combined audit was
+  run.
+- Orphan running, still-working, and terminal events now conflict instead of creating ordinary history with a blank
+  prompt. Acceptance, active-state, and terminal matching require the queue store's current `voiceSessionId` together
+  with the user-turn, request, argument, and producer correlations. Grounded transcripts require a completed result
+  owned by that same session. Existing best-effort history behavior remains: persistence failure is isolated from
+  Python admission and result presentation.
+- RPC quiescence and history draining now each have an explicit two-second bound. A quiescence timeout cancels admitted
+  inbound and outbound work and proceeds through RPC unregistration, history-owner close, room disconnect, and room
+  close while reporting the cleanup failure. An immediate drain failure still retains the established retry behavior;
+  only a timed-out drain transitions to the bounded close path.
+- The shared queue-store operations are now named `persistAccepted`, `persistCorrelatedActive`, and
+  `persistCorrelatedTerminal`; the connected-relay terminal committer uses the same neutral `commitTerminal` name.
+  `HermesRecoveryCoordinator` and `HermesTerminalCommitter` keep their existing nullable-session recovery behavior,
+  ledger transactions, notification observations, schema, and saved data. This is the authorized routine file-map
+  expansion for the audit repair; no Python, shared corpus, migration, or non-LiveKit recovery redesign was made.
+- TDD regressions failed first for orphan event persistence, cross-session record reuse, foreign-session grounding,
+  stuck admitted RPC quiescence, and stuck history drain. After the repair, the focused matrix passed 136 tests across
+  `LiveKitVoicePersistenceBridgeTest`, `LiveKitVoiceCallSessionTest`, `HermesQueueStoreTest`,
+  `HermesRecoveryCoordinatorTest`, `HermesTerminalCommitterTest`, `HermesRecoveryStartupTest`,
+  `HermesNotificationDeliveryCoordinatorTest`, and `VoiceTranscriptPersisterTest`.
+- `./gradlew test lint assembleDebug :app:assembleDebugAndroidTest` passed, followed by a clean forced
+  `:app:validateVoiceAgentSentryDebug :app:assembleDebug :app:assembleDebugAndroidTest` rebuild from `30cddf5`.
+  Release assembly remains waived. Clean-build SHA-256 values are:
+  - arm64: `210ded49eab91e791011302279e7c657d3ae408f9616eb282315798aa3afb5ca`
+  - universal: `4bf18aa5faa617711b811391815dee01ce94f3af41490085a024e60b3446cd6c`
+  - x86_64: `a58c984fed748f1b26b81343645145c14a7efe5f0433bfb081c3694cd1f52687`
+  - instrumentation: `a1dfaffec45952cb00c7b92b16c215c5c402bf21475374399e2fe202b6e6ded4`
+- The managed `phone` lane received a data-preserving update. Package readback remained
+  `me.rerere.rikkahub.debug`, version code `172`, version name `2.4.5`, with an unchanged first-install timestamp.
+  Device-side SHA-256 readback exactly matched the universal and instrumentation APKs above. All 21 non-Compose
+  instrumentation tests passed on these artifacts; the known always-on-display condition hid the Compose hierarchy in
+  the full invocation, and the status-card test then passed 1/1 immediately after a managed wake. This is 22/22
+  applicable tests on the repaired artifact. Managed `agent-device` also confirmed the installed debug package was
+  accessible and foregroundable. No takeover, unlock bypass, uninstall, clear-data, reset, reboot, host mutation,
+  tablet, or emulator was used.
+- The repaired Android artifact is prepared for paired acceptance. Python's retained evidence now records runtime
+  `b55977ff1bb8e349844ebeddf1aaee348ef0f8dc` under deployed source head
+  `0f796d9b30ffbb3ecb766f61fa22794fa7d7132d`, with evidence head
+  `bca32f8e7563f11dbb502f440dc2398bb891439f`; Android did not alter or restart that process. The paired calls are still
+  unclaimed because the retained runbook requires the human's one Start tap and visible/audio judgments against the
+  exact published pair.
+- A fresh native Luna/xhigh read-only correctness and maintainability follow-up reviewed
+  `43a2e6949e439c4b80a1b1a7abc2d0f19f8cd164..30cddf502ee56758c5845a415cfa931e9d286248` and returned
+  `ASTRA REVIEW: ship` with no findings. It confirmed orphan rejection, session-owned matching and grounding, bounded
+  cleanup, retry-safe completed-stage tracking, neutral shared naming, and unchanged recovery snapshot/schema behavior.
+  Residual risk is limited to deliberately non-cooperative external work outliving timeout-driven owner/room closure;
+  the automated stuck-work tests cover cooperative coroutine cancellation.
+- Remaining gates are the human-observed normal multi-request/out-of-order and interruption/cancel calls,
+  unchanged-existing-conversation and new-history confirmation, manager acceptance of the repaired combined
+  audit/campaign result, and the final human merge decision.
+
 After those pass:
 
 - Run the packet corpus through both production decoders and compare the copied-file SHA-256.
