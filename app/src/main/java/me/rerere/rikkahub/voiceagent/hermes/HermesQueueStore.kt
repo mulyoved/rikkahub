@@ -84,7 +84,7 @@ class HermesQueueStore(
         }
     }
 
-    internal suspend fun persistLiveKitAcceptance(
+    internal suspend fun persistAccepted(
         callId: String,
         prompt: String,
         jobId: String,
@@ -115,7 +115,8 @@ class HermesQueueStore(
                     updated to HermesQueuePersistenceResult.Mutated
                 }
 
-                existing.hasLiveKitProvenance(
+                existing.hasPersistenceProvenance(
+                    voiceSessionId = sessionId,
                     prompt = prompt,
                     originatingUserTurnId = originatingUserTurnId,
                     requestHash = requestHash,
@@ -128,7 +129,51 @@ class HermesQueueStore(
         }
     }
 
-    internal suspend fun persistLiveKitTerminal(
+    internal suspend fun persistCorrelatedActive(
+        callId: String,
+        status: VoiceToolRecordStatus,
+        jobId: String,
+        originatingUserTurnId: String,
+        requestHash: String,
+        argumentHash: String,
+        producer: String,
+    ): HermesQueuePersistenceResult {
+        require(!status.queueStatus.isTerminal) { "Active Hermes state cannot be terminal" }
+        val sessionId = persistenceSessionId()
+        return updateWithResult { conversation ->
+            val existing = conversation.hermesQueueRecords()
+                .lastOrNull { it.matchesIdentity(callId = callId, jobId = jobId) }
+            when {
+                existing == null || !existing.hasPersistenceCorrelation(
+                    voiceSessionId = sessionId,
+                    originatingUserTurnId = originatingUserTurnId,
+                    requestHash = requestHash,
+                    argumentHash = argumentHash,
+                    producer = producer,
+                ) -> conversation to HermesQueuePersistenceResult.Conflict
+
+                existing.status.isTerminal -> conversation to HermesQueuePersistenceResult.Stale
+                existing.status == status.queueStatus -> conversation to HermesQueuePersistenceResult.Equivalent
+                else -> {
+                    val updated = writer.upsertHermesTool(
+                        conversation = conversation,
+                        callId = callId,
+                        prompt = existing.prompt,
+                        status = status,
+                        sessionId = sessionId,
+                        jobId = jobId,
+                        originatingUserTurnId = originatingUserTurnId,
+                        requestHash = requestHash,
+                        argumentHash = argumentHash,
+                        producer = producer,
+                    )
+                    updated to HermesQueuePersistenceResult.Mutated
+                }
+            }
+        }
+    }
+
+    internal suspend fun persistCorrelatedTerminal(
         callId: String,
         status: VoiceToolRecordStatus,
         jobId: String,
@@ -139,13 +184,15 @@ class HermesQueueStore(
         producer: String,
         commit: suspend (HermesQueuePersistenceResult) -> Unit = {},
     ): HermesQueuePersistenceResult {
+        require(status.queueStatus.isTerminal) { "Terminal Hermes state must be terminal" }
         val sessionId = persistenceSessionId()
         return updateWithResult(commit = commit) { conversation ->
             val existing = conversation.hermesQueueRecords()
                 .lastOrNull { it.matchesIdentity(callId = callId, jobId = jobId) }
             when {
                 existing?.status?.isTerminal == true -> {
-                    val equivalent = existing.hasLiveKitCorrelation(
+                    val equivalent = existing.hasPersistenceCorrelation(
+                        voiceSessionId = sessionId,
                         originatingUserTurnId = originatingUserTurnId,
                         requestHash = requestHash,
                         argumentHash = argumentHash,
@@ -158,7 +205,8 @@ class HermesQueueStore(
                     }
                 }
 
-                existing != null && !existing.hasLiveKitCorrelation(
+                existing == null || !existing.hasPersistenceCorrelation(
+                    voiceSessionId = sessionId,
                     originatingUserTurnId = originatingUserTurnId,
                     requestHash = requestHash,
                     argumentHash = argumentHash,
@@ -169,7 +217,7 @@ class HermesQueueStore(
                     val updated = writer.upsertHermesTool(
                         conversation = conversation,
                         callId = callId,
-                        prompt = existing?.prompt.orEmpty(),
+                        prompt = existing.prompt,
                         status = status,
                         sessionId = sessionId,
                         jobId = jobId,
@@ -304,6 +352,17 @@ class HermesQueueStore(
                 }
             }
         }
+    }
+
+    internal fun hasCompletedResult(
+        jobId: String,
+        resultHash: String,
+        voiceSessionId: String,
+    ): Boolean = records().any { record ->
+        record.jobId == jobId &&
+            record.status == HermesQueueStatus.Complete &&
+            record.resultHash == resultHash &&
+            record.voiceSessionId == voiceSessionId
     }
 
     suspend fun persistActive(
@@ -456,7 +515,8 @@ class HermesQueueStore(
         }
     }
 
-    private fun HermesQueueRecord.hasLiveKitProvenance(
+    private fun HermesQueueRecord.hasPersistenceProvenance(
+        voiceSessionId: String?,
         prompt: String,
         originatingUserTurnId: String,
         requestHash: String,
@@ -464,20 +524,23 @@ class HermesQueueStore(
         producer: String,
     ): Boolean =
         this.prompt == prompt &&
-            hasLiveKitCorrelation(
+            hasPersistenceCorrelation(
+                voiceSessionId = voiceSessionId,
                 originatingUserTurnId = originatingUserTurnId,
                 requestHash = requestHash,
                 argumentHash = argumentHash,
                 producer = producer,
             )
 
-    private fun HermesQueueRecord.hasLiveKitCorrelation(
+    private fun HermesQueueRecord.hasPersistenceCorrelation(
+        voiceSessionId: String?,
         originatingUserTurnId: String,
         requestHash: String,
         argumentHash: String,
         producer: String,
     ): Boolean =
-        this.originatingUserTurnId == originatingUserTurnId &&
+        this.voiceSessionId == voiceSessionId &&
+            this.originatingUserTurnId == originatingUserTurnId &&
             this.requestHash == requestHash &&
             this.argumentHash == argumentHash &&
             this.producer == producer

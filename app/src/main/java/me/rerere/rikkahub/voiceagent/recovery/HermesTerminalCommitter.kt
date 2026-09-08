@@ -64,7 +64,7 @@ internal class HermesTerminalCommitter(
         return result
     }
 
-    suspend fun commitLiveKitTerminal(
+    suspend fun commitTerminal(
         queueStore: HermesQueueStore,
         entry: HermesRecoveryEntry,
         callId: String,
@@ -80,7 +80,7 @@ internal class HermesTerminalCommitter(
         val now = clock.epochMillis()
         val updatedEntry = prepareTerminalEntry(entry, now, observation)
 
-        val result = queueStore.persistLiveKitTerminal(
+        val result = queueStore.persistCorrelatedTerminal(
             callId = callId,
             status = status,
             jobId = jobId,

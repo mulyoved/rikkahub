@@ -1287,7 +1287,8 @@ class LiveKitVoiceCallSessionTest {
         val first = fixture.session.cleanupOperation.run(VoiceAgentCleanupMode.GracefulEnd)
 
         assertTrue(first is VoiceAgentCleanupResult.Failed)
-        assertSame(drainFailure, (first as VoiceAgentCleanupResult.Failed).error)
+        assertEquals(drainFailure::class, (first as VoiceAgentCleanupResult.Failed).error::class)
+        assertEquals(drainFailure.message, first.error.message)
         assertTrue(persistence.lifecycle.isEmpty())
         assertTrue(fixture.room.rpcHandlers.containsKey(LIVEKIT_PERSISTENCE_RPC))
 
@@ -1297,6 +1298,75 @@ class LiveKitVoiceCallSessionTest {
             fixture.session.cleanupOperation.run(VoiceAgentCleanupMode.GracefulEnd),
         )
         assertEquals(listOf("drain", "close"), persistence.lifecycle)
+        assertFalse(fixture.room.rpcHandlers.containsKey(LIVEKIT_PERSISTENCE_RPC))
+    }
+
+    @Test
+    fun `stuck admitted RPC is canceled and room closes after bounded quiescence`() = runTest {
+        val handlerStarted = CompletableDeferred<Unit>()
+        val handlerGate = CompletableDeferred<Unit>()
+        val fixture = fixture(
+            rpcMethods = mapOf(
+                "stuck.rpc" to {
+                    handlerStarted.complete(Unit)
+                    handlerGate.await()
+                    "done"
+                },
+            ),
+        )
+        fixture.session.start()
+        runCurrent()
+        val invocation = async { fixture.room.invoke("stuck.rpc", AGENT_IDENTITY, "") }
+        handlerStarted.await()
+
+        val cleanup = async {
+            fixture.session.cleanupOperation.run(VoiceAgentCleanupMode.Immediate)
+        }
+        runCurrent()
+        advanceTimeBy(2_000)
+        runCurrent()
+        val completedByTimeout = cleanup.isCompleted
+        handlerGate.complete(Unit)
+        runCurrent()
+
+        assertTrue(completedByTimeout)
+        assertTrue(cleanup.await() is VoiceAgentCleanupResult.Failed)
+        assertTrue(invocation.isCancelled)
+        assertEquals(1, fixture.room.disconnectCalls)
+        assertEquals(1, fixture.room.closeCalls)
+        assertFalse(fixture.room.rpcHandlers.containsKey("stuck.rpc"))
+    }
+
+    @Test
+    fun `stuck history drain closes its owner and room after bounded wait`() = runTest {
+        val drainStarted = CompletableDeferred<Unit>()
+        val drainGate = CompletableDeferred<Unit>()
+        val persistence = RecordingHistoryOwner(
+            drainStarted = drainStarted,
+            drainGate = drainGate,
+        )
+        val fixture = fixture(
+            historyHandler = persistence::handle,
+            historyOwner = persistence,
+        )
+        fixture.session.start()
+        runCurrent()
+
+        val cleanup = async {
+            fixture.session.cleanupOperation.run(VoiceAgentCleanupMode.Immediate)
+        }
+        drainStarted.await()
+        advanceTimeBy(2_000)
+        runCurrent()
+        val completedByTimeout = cleanup.isCompleted
+        drainGate.complete(Unit)
+        runCurrent()
+
+        assertTrue(completedByTimeout)
+        assertTrue(cleanup.await() is VoiceAgentCleanupResult.Failed)
+        assertEquals(listOf("close"), persistence.lifecycle)
+        assertEquals(1, fixture.room.disconnectCalls)
+        assertEquals(1, fixture.room.closeCalls)
         assertFalse(fixture.room.rpcHandlers.containsKey(LIVEKIT_PERSISTENCE_RPC))
     }
 

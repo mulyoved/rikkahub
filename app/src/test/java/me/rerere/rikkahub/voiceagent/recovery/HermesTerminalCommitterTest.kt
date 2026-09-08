@@ -462,7 +462,7 @@ class HermesTerminalCommitterTest {
     }
 
     @Test
-    fun `commitLiveKitTerminal passes ConnectedRelay observation to admission`() = runTest {
+    fun `commitTerminal passes ConnectedRelay observation to admission`() = runTest {
         var observedContext: TerminalObservationContext? = null
         val admission = HermesNotificationAdmission { _, observation ->
             observedContext = observation
@@ -490,7 +490,7 @@ class HermesTerminalCommitterTest {
         ledger.insert(entry)
 
         clock.currentEpoch = 6000L
-        val result = committerWithAdmission.commitLiveKitTerminal(
+        val result = committerWithAdmission.commitTerminal(
             queueStore = queueStore,
             entry = entry,
             callId = callId,

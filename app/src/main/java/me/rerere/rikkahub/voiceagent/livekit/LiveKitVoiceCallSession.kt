@@ -11,6 +11,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -57,6 +58,7 @@ internal const val LIVEKIT_INTERRUPT_RPC = "voice.interrupt"
 internal const val LIVEKIT_END_RPC = "voice.end"
 internal const val LIVEKIT_PERSISTENCE_RPC = "voice.persist.v1"
 private const val LIVEKIT_END_RPC_TIMEOUT_MS = 2_000L
+private const val LIVEKIT_CLEANUP_DRAIN_TIMEOUT_MS = 2_000L
 
 internal class LiveKitVoiceCallSession(
     private val details: LiveKitSessionDetails,
@@ -757,7 +759,17 @@ private class LiveKitCleanupOperation(
     private suspend fun drainHistoryOwner(failures: CleanupAttemptFailures) {
         if (historyDrainCompleted || !rpcWorkCompleted) return
         try {
-            historyOwner?.drain()
+            withTimeout(LIVEKIT_CLEANUP_DRAIN_TIMEOUT_MS) {
+                historyOwner?.drain()
+            }
+            historyDrainCompleted = true
+        } catch (error: TimeoutCancellationException) {
+            failures.add(
+                IllegalStateException(
+                    "Timed out draining LiveKit history persistence",
+                    error,
+                ),
+            )
             historyDrainCompleted = true
         } catch (error: Throwable) {
             failures.add(error)
@@ -785,7 +797,18 @@ private class LiveKitCleanupOperation(
     ): Boolean {
         if (completed) return true
         return try {
-            rpcAdmission.quiesce()
+            withTimeout(LIVEKIT_CLEANUP_DRAIN_TIMEOUT_MS) {
+                rpcAdmission.quiesce()
+            }
+            true
+        } catch (error: TimeoutCancellationException) {
+            rpcAdmission.cancelActiveWork()
+            failures.add(
+                IllegalStateException(
+                    "Timed out quiescing LiveKit RPC work",
+                    error,
+                ),
+            )
             true
         } catch (error: Throwable) {
             failures.add(error)
@@ -897,7 +920,10 @@ private class LiveKitRpcAdmission {
     }
 
     suspend fun <T> runInbound(block: suspend () -> T): T {
-        val work = LiveKitRpcWork.Inbound(CompletableDeferred())
+        val work = LiveKitRpcWork.Inbound(
+            job = currentCoroutineContext()[Job],
+            completion = CompletableDeferred(),
+        )
         synchronized(lock) {
             if (!accepting) throw LiveKitRpcAdmissionClosedException()
             activeWork += work
@@ -926,6 +952,19 @@ private class LiveKitRpcAdmission {
         }
     }
 
+    fun cancelActiveWork() {
+        val admittedWork = synchronized(lock) {
+            accepting = false
+            activeWork.toList().also { activeWork.clear() }
+        }
+        admittedWork.forEach { work ->
+            when (work) {
+                is LiveKitRpcWork.Outbound -> work.job.cancel()
+                is LiveKitRpcWork.Inbound -> work.job?.cancel()
+            }
+        }
+    }
+
     private fun complete(work: LiveKitRpcWork) {
         synchronized(lock) {
             activeWork.remove(work)
@@ -935,7 +974,10 @@ private class LiveKitRpcAdmission {
 
 private sealed interface LiveKitRpcWork {
     class Outbound(val job: Job) : LiveKitRpcWork
-    class Inbound(val completion: CompletableDeferred<Unit>) : LiveKitRpcWork
+    class Inbound(
+        val job: Job?,
+        val completion: CompletableDeferred<Unit>,
+    ) : LiveKitRpcWork
 }
 
 private class LiveKitRpcAdmissionClosedException :

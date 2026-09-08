@@ -8,9 +8,11 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.jsonObject
 import me.rerere.rikkahub.data.model.Conversation
 import me.rerere.rikkahub.voiceagent.VoiceConversationStore
+import me.rerere.rikkahub.voiceagent.hermes.HERMES_PRODUCER
 import me.rerere.rikkahub.voiceagent.hermes.HermesQueueStatus
 import me.rerere.rikkahub.voiceagent.hermes.HermesQueueStore
 import me.rerere.rikkahub.voiceagent.hermes.HermesToolRecordWriter
+import me.rerere.rikkahub.voiceagent.hermes.VoiceToolRecordStatus
 import me.rerere.rikkahub.voiceagent.hermes.hermesQueueRecords
 import me.rerere.rikkahub.voiceagent.persistence.VoiceTranscriptPersister
 import org.junit.Assert.assertEquals
@@ -131,7 +133,95 @@ class LiveKitVoicePersistenceBridgeTest {
         assertEquals(1, store.closeCalls)
         assertTrue(failure is IllegalArgumentException)
     }
+
+    @Test
+    fun `orphan job states do not create blank Hermes history`() = runTest {
+        val orphanEvents = listOf(
+            jobStateJson("job_running", "evt_running"),
+            jobStateJson("still_working", "evt_working"),
+            succeededEventJson("Hermes answer"),
+            jobStateJson("job_failed", "evt_failed", ",\"failureReason\":\"failed\""),
+            jobStateJson("job_expired", "evt_expired", ",\"failureReason\":\"expired\""),
+            jobStateJson("job_canceled", "evt_canceled", ",\"failureReason\":\"canceled\""),
+        )
+
+        orphanEvents.forEach { payload ->
+            val store = RecordingVoiceConversationStore()
+
+            val failure = runCatching { bridge(store).handle(AGENT_IDENTITY, payload) }.exceptionOrNull()
+
+            assertTrue(failure is IllegalArgumentException)
+            assertTrue(store.conversation.value.hermesQueueRecords().isEmpty())
+        }
+    }
+
+    @Test
+    fun `current session events cannot reuse a Hermes record owned by another session`() = runTest {
+        val initial = conversationWithHermesRecord(
+            voiceSessionId = "lvs_other",
+            status = VoiceToolRecordStatus.Queued,
+        )
+
+        listOf(
+            acceptedEventJson(),
+            jobStateJson("job_running", "evt_running"),
+            jobStateJson("still_working", "evt_working"),
+            succeededEventJson("Hermes answer"),
+        ).forEach { payload ->
+            val store = RecordingVoiceConversationStore(initial)
+
+            val failure = runCatching { bridge(store).handle(AGENT_IDENTITY, payload) }.exceptionOrNull()
+
+            assertTrue(failure is IllegalArgumentException)
+            val record = store.conversation.value.hermesQueueRecords().single()
+            assertEquals("lvs_other", record.voiceSessionId)
+            assertEquals(HermesQueueStatus.Queued, record.status)
+        }
+    }
+
+    @Test
+    fun `grounded transcript cannot use a completed result from another session`() = runTest {
+        val resultHash = voiceSha256("Hermes answer")
+        val initial = conversationWithHermesRecord(
+            voiceSessionId = "lvs_other",
+            status = VoiceToolRecordStatus.Complete("Hermes answer"),
+            resultHash = resultHash,
+        )
+        val store = RecordingVoiceConversationStore(initial)
+
+        val failure = runCatching {
+            bridge(store).handle(
+                AGENT_IDENTITY,
+                assistantTranscriptJson(
+                    text = "Spoken answer",
+                    groundedJobId = JOB_ID,
+                    groundedResultHash = resultHash,
+                ),
+            )
+        }.exceptionOrNull()
+
+        assertTrue(failure is IllegalArgumentException)
+        assertEquals(initial.currentMessages, store.conversation.value.currentMessages)
+    }
 }
+
+private fun conversationWithHermesRecord(
+    voiceSessionId: String,
+    status: VoiceToolRecordStatus,
+    resultHash: String? = null,
+): Conversation = HermesToolRecordWriter(nowIso = { "2026-09-08T12:00:09Z" }).upsertHermesTool(
+    conversation = Conversation.ofId(Uuid.random()),
+    callId = TOOL_CALL_ID,
+    prompt = "private question",
+    status = status,
+    sessionId = voiceSessionId,
+    jobId = JOB_ID,
+    originatingUserTurnId = "turn_1",
+    requestHash = REQUEST_HASH,
+    argumentHash = ARGUMENT_HASH,
+    resultHash = resultHash,
+    producer = HERMES_PRODUCER,
+)
 
 private fun bridge(store: VoiceConversationStore): LiveKitVoiceHistoryBridge {
     val transcriptPersister = VoiceTranscriptPersister()
