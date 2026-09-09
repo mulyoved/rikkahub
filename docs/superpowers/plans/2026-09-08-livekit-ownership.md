@@ -462,6 +462,47 @@ the later-completed-first and interruption claims require their earlier live che
 forced fault branches remain production-decoder corpus/focused-host evidence. None of this proves acoustic
 intelligibility.
 
+### Automated phone execution checkpoint, 2026-09-09
+
+- The debug history observer and revised real-room helper were published at Android harness source
+  `f188f6c22a985cdbd0ba142cd59a89bc025fa984`; the production runtime remains
+  `30cddf502ee56758c5845a415cfa931e9d286248`. The observer is `DUMP`-protected, requires the exact active run and
+  conversation, revalidates the same immutable run/lifecycle objects around its synchronous read, bounds both summary
+  lists to 48, and returns only allowlisted statuses, counts, and SHA-256 identities. The obsolete trace capture command
+  is no longer dispatched.
+- Focused receiver/snapshot/manifest JVM tests, the standalone LiveKit history contract, and 145 affected real-room
+  helper assertions passed. `:app:lintDebug`, `:app:assembleDebug`, and `:app:assembleDebugAndroidTest` passed. Fresh
+  Luna/xhigh review first found false optional-hash grounding, an oversized worst-case envelope, stale playback-epoch
+  selection, stale trace capture, malformed required-field handling, and overbroad cancellation wording; those were
+  repaired. A later call-owner race was also repaired with pre/post referential binding. The final affected review
+  returned `ASTRA REVIEW: ship` with no findings.
+- The exact universal APK built from `f188f6c2` has SHA-256
+  `66ad15b1b583a3373ec70ae14d61b97b0d8f417ed7367d5e852794f68b257cb2`; the instrumentation APK has SHA-256
+  `c36f6d2b1b06bcae30ad8964dac7b59b71ef76e2d5ade51b58eb7f61b0bc065f`. A data-preserving managed-phone update
+  succeeded, and package readback reported `me.rerere.rikkahub.debug`, version code `172`, version name `2.4.5`.
+  Pulled installed artifacts matched both build hashes byte-for-byte.
+- Immediately before the call, the Python proof passed at published head
+  `992b470fd8581a2eda1f1761dd7bad3cafd8fa41`, runtime
+  `b55977ff1bb8e349844ebeddf1aaee348ef0f8dc`, worker profile
+  `sha256:a9bfa9c962cefe411df90816c04e68cdb5a3faebebaee7896facf8dac79dddf9`, one online zero-restart process, and one
+  registration marker in the refreshed proof window. Both production corpus copies matched SHA-256
+  `add066d20b216ef4d7ca28764b54a7756f7f7d4f4a47d2f28e542cb7d935e595`.
+- One actual `livekit_experimental` automated canary reached the Active service state and its scoped sanitized snapshot
+  observed one `complete`/`announced` Hermes record. The first request completed before the required pending checkpoint,
+  so this attempt does **not** prove concurrent pending work, out-of-order completion, exact-once delivery, continuous
+  quiet time, interruption, requeue, cancellation, or isolation. Call finalization returned `complete`.
+- The first owned cleanup attempt exposed that Android's package query returns the instrumentation sibling before the
+  exact app. `read_package_stopped_state` now selects the exact package field, matching the existing identity reader.
+  The sibling-present end suite passed 33 assertions, a fresh Luna/xhigh review returned `ASTRA REVIEW: ship`, and the
+  idempotent cleanup retry completed. This host-only helper fix is published at evidence head
+  `cb97d0cf2d9f50367cba5133ff15399aae0f3e8c`; it does not change the installed APK.
+- After cleanup, `mdev android status` still showed this caller assigned to `phone` but remote ADB unavailable. No
+  takeover, reset, uninstall, clear-data, reboot, host lifecycle action, tablet, or emulator substitution was used.
+  The remaining machine gates are the documented concurrent/out-of-order, interruption/requeue, and
+  cancellation/isolation calls; normal-history and unchanged-existing-conversation UI inspection; and refreshed exact
+  pair/APK proof after the phone route returns. Human acoustic judgment, manager campaign acceptance, and the final
+  human merge decision also remain pending. Release assembly remains waived.
+
 After those pass:
 
 - Run the packet corpus through both production decoders and compare the copied-file SHA-256.
