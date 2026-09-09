@@ -319,6 +319,7 @@ run_status_operation() {
   local history_snapshot
   local boundary
   local evaluation_status
+  local conversation_hash
   local started=$SECONDS
   local -a status=()
   validate_runtime
@@ -328,12 +329,20 @@ run_status_operation() {
      "${status[2]}" == "$COMPARISON_HASH" &&
      "${status[3]}" == "$TRANSPORT_EXPECTED" ]] || die 'status binding mismatch'
   read_call_service_active
+  conversation_hash="$(python3 - "$CONVERSATION_ID" 2>/dev/null <<'PY'
+import hashlib
+import sys
+
+print("sha256:" + hashlib.sha256(sys.argv[1].encode()).hexdigest())
+PY
+)" || die 'conversation binding failed'
+  validate_hash "$conversation_hash" 'conversation hash'
   while true; do
     read_livekit_checkpoint_snapshots automation_snapshot history_snapshot
     set +e
     boundary="$(python3 "$REAL_ROOM_CONTRACT" --evaluate-livekit "$expectation" \
       "$automation_snapshot" "$history_snapshot" "$RUN_HASH" "$COMPARISON_HASH" \
-      2000 2>/dev/null)"
+      "$conversation_hash" 2000 2>/dev/null)"
     evaluation_status=$?
     set -e
     if (( evaluation_status == 0 )); then
@@ -373,15 +382,19 @@ read_livekit_history_snapshot() {
     register_temp_file "$snapshot_out"
     HISTORY_STATUS_TEMP_REGISTERED=1
   fi
-  python3 - "$snapshot_out" "$REAL_ROOM_CONTRACT" 2>/dev/null <<'PY' ||
+  python3 - "$snapshot_out" "$REAL_ROOM_CONTRACT" "$CONVERSATION_ID" 2>/dev/null <<'PY' ||
+import hashlib
 import importlib.util
 import sys
 
-path, module_path = sys.argv[1:]
+path, module_path, conversation_id = sys.argv[1:]
 spec = importlib.util.spec_from_file_location("voice_agent_real_room_contract", module_path)
 contract = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(contract)
-contract.parse_history_snapshot_bytes(open(path, "rb").read())
+snapshot = contract.parse_history_snapshot_bytes(open(path, "rb").read())
+expected_hash = "sha256:" + hashlib.sha256(conversation_id.encode()).hexdigest()
+if snapshot["conversationHash"] != expected_hash:
+    raise SystemExit(1)
 PY
     die 'history status unavailable'
 }

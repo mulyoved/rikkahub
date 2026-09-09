@@ -1200,7 +1200,9 @@ if command[:4] == ["shell", "am", "broadcast", "--user"]:
             complete(1, "status=error\nerror=invalid_state")
             raise SystemExit(0)
         history = {
-            "conversationHash": hash_value("c"),
+            "conversationHash": "sha256:" + hashlib.sha256(
+                state["conversation_id"].encode()
+            ).hexdigest(),
             "recordCount": 1,
             "transcriptCount": 0,
             "records": [{
@@ -5326,6 +5328,9 @@ expected_values = [
     "isolation_first_active",
     "isolation_two_distinct",
     "isolation_terminal_healthy",
+    "controlled_release_visible_playback_active",
+    "controlled_release_visible_playback_interrupted",
+    "controlled_final_history_observed",
 ]
 assert [value.value for value in contract.Expectation] == expected_values
 try:
@@ -5790,6 +5795,228 @@ mutated = [
     terminal_healthy[3],
 ]
 expect_failure("isolation_terminal_healthy", [], mutated, "isolation_healthy_order")
+
+
+def history_record(number, status, announcement, *, result=True):
+    record = {
+        "identityHash": digest(str(number)),
+        "status": status,
+        "announcement": announcement,
+        "sessionHash": digest("f"),
+        "requestHash": digest(chr(96 + number)),
+        "argumentHash": digest(chr(99 + number)),
+        "jobHash": digest(str(number + 3)),
+    }
+    if result:
+        record["resultHash"] = digest(str(number + 6))
+    return record
+
+
+def grounded_transcript(record):
+    return {
+        "role": "assistant",
+        "status": "complete",
+        "sessionHash": record["sessionHash"],
+        "groundedJobHash": record["jobHash"],
+        "groundedResultHash": record["resultHash"],
+    }
+
+
+def livekit_history(records, transcripts=()):
+    return {
+        "conversationHash": digest("c"),
+        "recordCount": len(records),
+        "transcriptCount": len(transcripts),
+        "records": records,
+        "transcripts": list(transcripts),
+    }
+
+
+def expect_livekit_pass(name, automation_rows, history):
+    contract.evaluate_livekit_checkpoint(
+        contract.Expectation(name), automation_rows, history, 2000, digest("c")
+    )
+
+
+def expect_livekit_failure(name, automation_rows, history, boundary):
+    try:
+        expect_livekit_pass(name, automation_rows, history)
+    except contract.ContractError as error:
+        assert error.boundary == boundary, (name, error.boundary, boundary)
+    else:
+        raise AssertionError(f"{name} accepted its decisive mutation")
+
+
+controlled_target = history_record(1, "canceled", "not_announced", result=False)
+controlled_second = history_record(2, "running", "not_announced", result=False)
+controlled_third = history_record(3, "complete", "not_announced")
+controlled_active_history = livekit_history(
+    [controlled_target, controlled_second, controlled_third]
+)
+controlled_active_automation = [automation(10, "playback_active", 3)]
+expect_livekit_pass(
+    "controlled_release_visible_playback_active",
+    controlled_active_automation,
+    controlled_active_history,
+)
+expect_livekit_failure(
+    "controlled_release_visible_playback_active",
+    [],
+    controlled_active_history,
+    "controlled_visible_playback_active",
+)
+expect_livekit_failure(
+    "controlled_release_visible_playback_active",
+    [
+        automation(10, "playback_active", 1),
+        automation(20, "dropout_started", 1),
+        automation(30, "dropout_ended", 2),
+        automation(40, "playback_active", 2),
+        automation(50, "playback_drained", 2),
+    ],
+    controlled_active_history,
+    "controlled_visible_playback_active",
+)
+mutated_records = [dict(record) for record in controlled_active_history["records"]]
+mutated_records[0]["status"] = "complete"
+expect_livekit_failure(
+    "controlled_release_visible_playback_active",
+    controlled_active_automation,
+    livekit_history(mutated_records),
+    "controlled_target_canceled",
+)
+
+controlled_interrupted_automation = controlled_active_automation + [
+    automation(20, "interrupt_started"),
+    automation(30, "playback_stopped", 3),
+]
+expect_livekit_pass(
+    "controlled_release_visible_playback_interrupted",
+    controlled_interrupted_automation,
+    controlled_active_history,
+)
+expect_livekit_failure(
+    "controlled_release_visible_playback_interrupted",
+    controlled_active_automation + [automation(20, "interrupt_started")],
+    controlled_active_history,
+    "controlled_visible_playback_interruption",
+)
+expect_livekit_failure(
+    "controlled_release_visible_playback_interrupted",
+    [
+        automation(10, "playback_active", 3),
+        automation(20, "playback_active", 4),
+        automation(30, "interrupt_started"),
+        automation(40, "playback_stopped", 3),
+    ],
+    controlled_active_history,
+    "controlled_visible_playback_interruption",
+)
+
+controlled_second_complete = history_record(2, "complete", "announced")
+controlled_third_announced = history_record(3, "complete", "announced")
+controlled_final_history = livekit_history(
+    [controlled_target, controlled_second_complete, controlled_third_announced],
+    [
+        grounded_transcript(controlled_third_announced),
+        grounded_transcript(controlled_second_complete),
+    ],
+)
+controlled_final_automation = [
+    automation(10, "playback_active", 3),
+    automation(20, "playback_written", 3, True),
+    automation(30, "interrupt_started"),
+    automation(40, "playback_stopped", 3),
+    automation(100, "playback_written", 4, False),
+    automation(2100, "playback_active", 4),
+    automation(2200, "playback_drained", 4),
+    automation(2300, "playback_active", 5),
+    automation(2400, "playback_drained", 5),
+]
+expect_livekit_pass(
+    "controlled_final_history_observed",
+    controlled_final_automation,
+    controlled_final_history,
+)
+expect_livekit_failure(
+    "controlled_final_history_observed",
+    controlled_final_automation,
+    livekit_history(
+        controlled_final_history["records"],
+        list(reversed(controlled_final_history["transcripts"])),
+    ),
+    "controlled_delivery_order",
+)
+expect_livekit_failure(
+    "controlled_final_history_observed",
+    controlled_final_automation,
+    livekit_history(
+        controlled_final_history["records"],
+        [
+            grounded_transcript(controlled_target | {
+                "resultHash": digest("z"),
+            }),
+            *controlled_final_history["transcripts"],
+        ],
+    ),
+    "controlled_target_not_grounded",
+)
+mutated_records = [dict(record) for record in controlled_final_history["records"]]
+mutated_records[1]["identityHash"] = mutated_records[0]["identityHash"]
+expect_livekit_failure(
+    "controlled_final_history_observed",
+    controlled_final_automation,
+    livekit_history(mutated_records, controlled_final_history["transcripts"]),
+    "controlled_distinct_ordinals",
+)
+
+mutated_records = [dict(record) for record in controlled_active_history["records"]]
+mutated_records[1]["status"] = "canceled"
+expect_livekit_failure(
+    "controlled_release_visible_playback_active",
+    controlled_active_automation,
+    livekit_history(mutated_records),
+    "controlled_second_held",
+)
+
+stale_recovery_automation = [
+    automation(10, "playback_active", 3),
+    automation(20, "interrupt_started"),
+    automation(30, "playback_stopped", 3),
+    automation(100, "playback_written", 2, False),
+    automation(2100, "playback_active", 2),
+    automation(2200, "playback_drained", 2),
+]
+expect_livekit_failure(
+    "controlled_final_history_observed",
+    stale_recovery_automation,
+    controlled_final_history,
+    "controlled_recovery_epoch",
+)
+
+wrong_epoch_quiet_automation = [
+    automation(10, "playback_active", 3),
+    automation(20, "interrupt_started"),
+    automation(30, "playback_stopped", 3),
+    automation(100, "playback_written", 5, False),
+    automation(2100, "playback_active", 4),
+    automation(2200, "playback_drained", 4),
+]
+expect_livekit_failure(
+    "controlled_final_history_observed",
+    wrong_epoch_quiet_automation,
+    controlled_final_history,
+    "controlled_recovery_quiet",
+)
+
+wrong_conversation_history = dict(controlled_final_history)
+wrong_conversation_history["conversationHash"] = digest("d")
+expect_livekit_failure(
+    "controlled_final_history_observed",
+    controlled_final_automation,
+    wrong_conversation_history,
+    "history_conversation_binding",
+)
 PY
   pass
 

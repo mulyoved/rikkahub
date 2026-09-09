@@ -26,6 +26,9 @@ class Expectation(enum.StrEnum):
     ISOLATION_FIRST_ACTIVE = "isolation_first_active"
     ISOLATION_TWO_DISTINCT = "isolation_two_distinct"
     ISOLATION_TERMINAL_HEALTHY = "isolation_terminal_healthy"
+    CONTROLLED_RELEASE_VISIBLE_PLAYBACK_ACTIVE = "controlled_release_visible_playback_active"
+    CONTROLLED_RELEASE_VISIBLE_PLAYBACK_INTERRUPTED = "controlled_release_visible_playback_interrupted"
+    CONTROLLED_FINAL_HISTORY_OBSERVED = "controlled_final_history_observed"
 
 
 LIVEKIT_EXPECTATIONS = {
@@ -38,6 +41,9 @@ LIVEKIT_EXPECTATIONS = {
     Expectation.ISOLATION_FIRST_ACTIVE,
     Expectation.ISOLATION_TWO_DISTINCT,
     Expectation.ISOLATION_TERMINAL_HEALTHY,
+    Expectation.CONTROLLED_RELEASE_VISIBLE_PLAYBACK_ACTIVE,
+    Expectation.CONTROLLED_RELEASE_VISIBLE_PLAYBACK_INTERRUPTED,
+    Expectation.CONTROLLED_FINAL_HISTORY_OBSERVED,
 }
 
 
@@ -454,6 +460,31 @@ def first_quiet_after_last_reset(
             and quiet_start is None
         ):
             quiet_start = row["monotonicMs"]
+    return quiet_start
+
+
+def _first_quiet_for_epoch(
+    automation: Sequence[dict[str, Any]],
+    epoch: int,
+    before_ms: int,
+) -> int | None:
+    quiet_start = None
+    for row in automation:
+        monotonic_ms = row.get("monotonicMs")
+        if type(monotonic_ms) is not int or monotonic_ms >= before_ms:
+            continue
+        name = row.get("name")
+        if name in QUIET_RESET_NAMES or (
+            name == "playback_written" and row.get("rmsActive") is True
+        ):
+            quiet_start = None
+        elif (
+            name == "playback_written"
+            and row.get("playbackEpoch") == epoch
+            and row.get("rmsActive") is False
+            and quiet_start is None
+        ):
+            quiet_start = monotonic_ms
     return quiet_start
 
 
@@ -968,20 +999,51 @@ def _grounded_once(history: Mapping[str, Any], record: Mapping[str, Any]) -> boo
     return len(matches) == 1
 
 
+def _controlled_records(history: Mapping[str, Any]) -> list[dict[str, Any]]:
+    records = _current_history_records(history)
+    _require(len(records) == 3, "controlled_three_ordinals")
+    for field in ("identityHash", "requestHash", "jobHash"):
+        values = [record.get(field) for record in records]
+        _require(
+            all(type(value) is str and HASH.fullmatch(value) is not None for value in values)
+            and len(set(values)) == 3,
+            "controlled_distinct_ordinals",
+        )
+    return records
+
+
+def _grounded_index(history: Mapping[str, Any], record: Mapping[str, Any]) -> int | None:
+    job_hash = record.get("jobHash")
+    result_hash = record.get("resultHash")
+    session_hash = record.get("sessionHash")
+    matches = [
+        index
+        for index, transcript in enumerate(history["transcripts"])
+        if transcript.get("role") == "assistant"
+        and transcript.get("status") == "complete"
+        and transcript.get("sessionHash") == session_hash
+        and transcript.get("groundedJobHash") == job_hash
+        and transcript.get("groundedResultHash") == result_hash
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
 def _active_playback_epoch(automation: Sequence[dict[str, Any]]) -> tuple[int, int] | None:
-    terminal_by_epoch = {
-        row.get("playbackEpoch")
-        for row in automation
-        if row.get("name") in PLAYBACK_TERMINAL_NAMES
-    }
     candidates = [
         (index, row["playbackEpoch"])
         for index, row in enumerate(automation)
         if row.get("name") == "playback_active"
         and type(row.get("playbackEpoch")) is int
-        and row["playbackEpoch"] not in terminal_by_epoch
     ]
-    return candidates[-1] if candidates else None
+    if not candidates:
+        return None
+    active_index, epoch = candidates[-1]
+    terminal = any(
+        row.get("name") in PLAYBACK_TERMINAL_NAMES
+        and row.get("playbackEpoch") == epoch
+        for row in automation[active_index + 1:]
+    )
+    return None if terminal else (active_index, epoch)
 
 
 def _interrupted_playback_epoch(
@@ -992,28 +1054,33 @@ def _interrupted_playback_epoch(
         if row.get("name") == "interrupt_started"
     ]
     for interrupt_index in reversed(interrupt_indices):
-        active_candidates = [
-            (index, row["playbackEpoch"])
-            for index, row in enumerate(automation[:interrupt_index])
-            if row.get("name") == "playback_active"
-            and type(row.get("playbackEpoch")) is int
-        ]
-        for active_index, epoch in reversed(active_candidates):
-            terminal_before_interrupt = any(
-                row.get("name") in PLAYBACK_TERMINAL_NAMES
-                and row.get("playbackEpoch") == epoch
-                for row in automation[active_index + 1:interrupt_index]
-            )
-            if terminal_before_interrupt:
-                continue
-            stopped_index = ordered_event(
-                automation,
-                "playback_stopped",
-                lambda row: row.get("playbackEpoch") == epoch,
-                interrupt_index,
-            )
-            if stopped_index is not None:
-                return active_index, epoch, interrupt_index, stopped_index
+        active = next(
+            (
+                (index, row["playbackEpoch"])
+                for index, row in reversed(list(enumerate(automation[:interrupt_index])))
+                if row.get("name") == "playback_active"
+                and type(row.get("playbackEpoch")) is int
+            ),
+            None,
+        )
+        if active is None:
+            continue
+        active_index, epoch = active
+        terminal_before_interrupt = any(
+            row.get("name") in PLAYBACK_TERMINAL_NAMES
+            and row.get("playbackEpoch") == epoch
+            for row in automation[active_index + 1:interrupt_index]
+        )
+        if terminal_before_interrupt:
+            continue
+        stopped_index = ordered_event(
+            automation,
+            "playback_stopped",
+            lambda row: row.get("playbackEpoch") == epoch,
+            interrupt_index,
+        )
+        if stopped_index is not None:
+            return active_index, epoch, interrupt_index, stopped_index
     return None
 
 
@@ -1022,9 +1089,17 @@ def evaluate_livekit_checkpoint(
     automation: Sequence[dict[str, Any]],
     history: Mapping[str, Any],
     quiet_ms: int,
+    expected_conversation_hash: str | None = None,
 ) -> None:
     expectation = Expectation(expectation)
     _require(type(quiet_ms) is int and quiet_ms >= 0, "quiet_threshold")
+    if expected_conversation_hash is not None:
+        _require(
+            type(expected_conversation_hash) is str
+            and HASH.fullmatch(expected_conversation_hash) is not None
+            and history.get("conversationHash") == expected_conversation_hash,
+            "history_conversation_binding",
+        )
     records = _current_history_records(history)
     terminal = {"complete", "failed", "expired", "canceled"}
 
@@ -1098,6 +1173,106 @@ def evaluate_livekit_checkpoint(
                  "isolation_target_terminal")
         _require(healthy["status"] == "complete" and healthy["announcement"] == "announced"
                  and _grounded_once(history, healthy), "isolation_healthy_announced")
+        return
+
+    if expectation in {
+        Expectation.CONTROLLED_RELEASE_VISIBLE_PLAYBACK_ACTIVE,
+        Expectation.CONTROLLED_RELEASE_VISIBLE_PLAYBACK_INTERRUPTED,
+    }:
+        target, second, third = _controlled_records(history)
+        _require(
+            target["status"] == "canceled"
+            and target["announcement"] != "announced"
+            and target.get("resultHash") is None,
+            "controlled_target_canceled",
+        )
+        _require(
+            second["status"] not in terminal and second["announcement"] != "announced",
+            "controlled_second_held",
+        )
+        _require(
+            third["status"] == "complete"
+            and third["announcement"] != "announced"
+            and type(third.get("resultHash")) is str,
+            "controlled_third_ready",
+        )
+        if expectation is Expectation.CONTROLLED_RELEASE_VISIBLE_PLAYBACK_ACTIVE:
+            _require(
+                _active_playback_epoch(automation) is not None,
+                "controlled_visible_playback_active",
+            )
+        else:
+            _require(
+                _interrupted_playback_epoch(automation) is not None,
+                "controlled_visible_playback_interruption",
+            )
+        return
+
+    if expectation is Expectation.CONTROLLED_FINAL_HISTORY_OBSERVED:
+        target, second, third = _controlled_records(history)
+        _require(
+            target["status"] == "canceled"
+            and target["announcement"] != "announced"
+            and target.get("resultHash") is None,
+            "controlled_target_canceled",
+        )
+        _require(
+            not any(
+                transcript.get("groundedJobHash") == target.get("jobHash")
+                for transcript in history["transcripts"]
+            ),
+            "controlled_target_not_grounded",
+        )
+        _require(
+            all(
+                record["status"] == "complete"
+                and record["announcement"] == "announced"
+                and _grounded_once(history, record)
+                for record in (second, third)
+            ),
+            "controlled_healthy_announced",
+        )
+        second_grounded = _grounded_index(history, second)
+        third_grounded = _grounded_index(history, third)
+        _require(
+            second_grounded is not None
+            and third_grounded is not None
+            and third_grounded < second_grounded,
+            "controlled_delivery_order",
+        )
+        interrupted = _interrupted_playback_epoch(automation)
+        _require(interrupted is not None, "controlled_interruption")
+        _, interrupted_epoch, _, stopped_index = interrupted
+        resumed = next(
+            (
+                (index, row)
+                for index, row in enumerate(automation)
+                if index > stopped_index
+                and row.get("name") == "playback_active"
+                and type(row.get("playbackEpoch")) is int
+                and row["playbackEpoch"] > interrupted_epoch
+            ),
+            None,
+        )
+        _require(resumed is not None, "controlled_recovery_epoch")
+        drained = ordered_event(
+            automation,
+            "playback_drained",
+            lambda row: row.get("playbackEpoch") == resumed[1].get("playbackEpoch"),
+            resumed[0],
+        )
+        _require(drained is not None, "controlled_recovery_epoch")
+        resumed_epoch = resumed[1]["playbackEpoch"]
+        quiet_start = _first_quiet_for_epoch(
+            automation,
+            resumed_epoch,
+            resumed[1]["monotonicMs"],
+        )
+        _require(
+            quiet_start is not None
+            and resumed[1]["monotonicMs"] - quiet_start >= quiet_ms,
+            "controlled_recovery_quiet",
+        )
         return
 
     raise ContractError("livekit_expectation")
@@ -1740,14 +1915,23 @@ def _main(arguments: Sequence[str]) -> int:
         if expectation not in LIVEKIT_EXPECTATIONS:
             return 2
         return 0
-    if len(arguments) == 7 and arguments[0] == "--evaluate-livekit":
-        _, expectation_value, automation_path, history_path, run_hash, comparison_hash, quiet_ms = arguments
+    if len(arguments) == 8 and arguments[0] == "--evaluate-livekit":
+        (
+            _, expectation_value, automation_path, history_path, run_hash,
+            comparison_hash, expected_conversation_hash, quiet_ms,
+        ) = arguments
         try:
             expectation = Expectation(expectation_value)
             _require(expectation in LIVEKIT_EXPECTATIONS, "livekit_expectation")
             automation = parse_automation_bytes(_read(automation_path), run_hash, comparison_hash)
             history = parse_history_snapshot_bytes(_read(history_path))
-            evaluate_livekit_checkpoint(expectation, automation, history, int(quiet_ms))
+            evaluate_livekit_checkpoint(
+                expectation,
+                automation,
+                history,
+                int(quiet_ms),
+                expected_conversation_hash,
+            )
         except (ValueError, ContractError) as error:
             boundary = error.boundary if isinstance(error, ContractError) else "livekit_expectation"
             print(boundary)

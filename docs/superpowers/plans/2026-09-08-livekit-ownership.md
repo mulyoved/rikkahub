@@ -555,16 +555,43 @@ intelligibility.
   `sha256:7c0886102ce2ebbea953bc8ba9b6f0a2b70adc2a991179eba97d2d9489f69128` with 23 nodes, six labels, and three values.
   Returning through the same hashed drawer row after the call produced the identical fingerprint and counts. The
   unchanged-existing-conversation UI gate is therefore satisfied without exporting unrelated history.
-- The remaining actual machine gates are a successful documented concurrent/out-of-order observation,
-  interruption/requeue observation, and successful cancellation/isolation observation. Natural inputs repeatedly
-  completed too quickly or in request order. Deterministic completion now requires the retained Python owner to launch
-  and re-attest the same local candidate with its existing `HERMES_LOCAL_RESULT_RELEASE_PLAN=3,2,1` plugin-visibility
-  wrapper. Android can then issue three substantive requests, cancel a held request, and interrupt an active released
-  delivery; Android must not restart or mutate that Python process itself. No production scheduler ordering changes are
-  requested.
-  Normal scoped history, exact pair/APK readback, and bounded shutdown have current phone evidence. Human acoustic
-  judgment, manager campaign acceptance, and the final human merge decision also remain pending. Release assembly
-  remains waived.
+- The retained Python owner published and attested the approved local-only observation wrapper at evidence head
+  `b3368f0ff99b8225cfbab8cff9de7251d424d247`, unchanged runtime
+  `b55977ff1bb8e349844ebeddf1aaee348ef0f8dc`, unchanged worker-profile SHA-256
+  `a9bfa9c962cefe411df90816c04e68cdb5a3faebebaee7896facf8dac79dddf9`, one online process with restart count one
+  and unstable count zero, one registration marker, zero connection retries, and exact
+  `HERMES_LOCAL_RESULT_RELEASE_PLAN=3,2,1` process binding. Android neither changed nor restarted that process.
+- Immediately before the controlled Start, managed-phone readback again matched package
+  `me.rerere.rikkahub.debug`, version code `172`, version name `2.4.5`, and the installed universal APK matched
+  SHA-256 `66ad15b1b583a3373ec70ae14d61b97b0d8f417ed7367d5e852794f68b257cb2` from Android harness source
+  `f188f6c22a985cdbd0ba142cd59a89bc025fa984`, with production runtime still `30cddf5`. Phone status, protected-path
+  checks, package identity, and automation preflight were healthy.
+- The controlled Start then failed before call activation and before any state file or Hermes request existed. A
+  second bounded retry with the existing private diagnostic produced only the sanitized category
+  `stage:call-activation,category:call-activation-timed-out`. In the controlled worker-log window, both attempts had
+  zero new registration, connection-retry, session-ready, tool-invocation, or cleanup-failure markers. Phone status and
+  managed preflight remained healthy after the failures. The `3,2,1` wrapper was therefore never exercised, and no
+  controlled ordering, cancellation, interruption, or requeue result is claimed. Equivalent Start retries stop here;
+  the retained Python owner must diagnose or restore post-restart LiveKit dispatch/activation and refresh the private
+  proof before Android reruns this controlled flow.
+- Routine verification expansion adds three host-only checkpoint predicates and their behavioral regressions in
+  `scripts/voice-agent-real-room-contract.py`, `scripts/voice-agent-real-room-step.sh`, and
+  `scripts/test-voice-agent-real-room-step.sh`. They require three distinct submission-ordered identities, a genuinely
+  canceled ordinal one with no result hash, a still-active ordinal two, released terminal ordinal three, strict
+  interruption/recovery epoch ordering, resumed-epoch quiet observations, final third-before-second grounded history,
+  and exact conversation-hash binding. The names deliberately describe release visibility coincident with playback,
+  not job-correlated playback: automation playback epochs carry no Hermes job identity. Likewise, absence of a grounded
+  target transcript is only a scoped best-effort history observation and does not prove acoustic absence. The focused
+  checkpoint/status/history run passed seven assertions; the full helper passed 347 assertions; Python compilation,
+  shell syntax, and `git diff --check` passed. A fresh Luna/xhigh review found and then closed stale-active and
+  older-epoch interruption fallbacks; the repaired selectors judge only the latest active playback epoch. Its final
+  affected-only verdict is `ASTRA REVIEW: ship`, with the documented playback/job-correlation and acoustic limits as
+  residual risks. Production Android source and APK bytes are unchanged.
+- The remaining actual machine gates are a successful controlled concurrent/out-of-order observation,
+  interruption/requeue observation, and cancellation/isolation observation after dispatch is restored. Normal scoped
+  history, exact pair/APK readback, unchanged-existing-conversation UI inspection, and bounded shutdown retain current
+  phone evidence. Human acoustic judgment, manager campaign acceptance, and the final human merge decision also remain
+  pending. Release assembly remains waived.
 
 After those pass:
 
