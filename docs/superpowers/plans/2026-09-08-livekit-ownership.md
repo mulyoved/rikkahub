@@ -319,6 +319,143 @@ pnpm test:e2e
   unchanged-existing-conversation and new-history confirmation, manager acceptance of the repaired combined
   audit/campaign result, and the final human merge decision.
 
+### Automated paired-call continuation, 2026-09-09
+
+- The user authorized automated foreground-service Start and debug PCM injection for this campaign before the manual
+  call. This supersedes the earlier human-only Start restriction for digital behavior acceptance, but does not replace
+  human acoustic judgment.
+- The intended pair is Android runtime `30cddf502ee56758c5845a415cfa931e9d286248` at published head
+  `d113ca2046c53449fad54c7628f9be42a650c6cd` and Python runtime
+  `b55977ff1bb8e349844ebeddf1aaee348ef0f8dc` at published head
+  `bca32f8e7563f11dbb502f440dc2398bb891439f`. The shared packet remains
+  `add066d20b216ef4d7ca28764b54a7756f7f7d4f4a47d2f28e542cb7d935e595`.
+- Do not claim this pair until the Python owner refreshes and revalidates its exact registration proof and the managed
+  phone readback matches package `me.rerere.rikkahub.debug`, version code `172`, version name `2.4.5`, and universal APK
+  SHA-256 `4bf18aa5faa617711b811391815dee01ce94f3af41490085a024e60b3446cd6c`.
+- Use `scripts/voice-agent-real-room-step.sh`; it binds the actual `livekit_experimental` service path, stages only
+  app-private fixtures, records sanitized hashes and counts, and performs bounded call finalization and owned-fixture
+  cleanup. Do not use the Direct Gemini queue runner or the retired four-scenario evidence validator.
+
+Prepare three private fixture sets as 16 kHz mono signed PCM16 without printing their prompts, answers, identifiers, or
+raw evidence. Set `VOICE_PAIR_CONVERSATION_ID` to a campaign-local test conversation. Then run from this worktree:
+
+```bash
+VOICE_PAIR_DIR="$(mktemp -d)"
+chmod 700 "$VOICE_PAIR_DIR"
+VOICE_PAIR_OWNER=f46-117-android-history
+VOICE_PAIR_PACKAGE=me.rerere.rikkahub.debug
+
+test -n "${VOICE_PAIR_CONVERSATION_ID:-}"
+for fixture in \
+  "$VOICE_PAIR_NORMAL_SLOW_PCM" "$VOICE_PAIR_NORMAL_FAST_PCM" \
+  "$VOICE_PAIR_INTERRUPT_REQUEST_PCM" "$VOICE_PAIR_INTERRUPT_PCM" \
+  "$VOICE_PAIR_ISOLATION_TARGET_PCM" "$VOICE_PAIR_ISOLATION_HEALTHY_PCM" \
+  "$VOICE_PAIR_CANCEL_PCM"; do
+  test -f "$fixture" && test ! -L "$fixture" && test -s "$fixture"
+done
+
+PAIR_COMPARISON_HASH="sha256:$(printf '%s\n' \
+  30cddf502ee56758c5845a415cfa931e9d286248 \
+  b55977ff1bb8e349844ebeddf1aaee348ef0f8dc \
+  add066d20b216ef4d7ca28764b54a7756f7f7d4f4a47d2f28e542cb7d935e595 \
+  | sha256sum | awk '{print $1}')"
+
+finish_pair_call() {
+  local label="$1"
+  local state="$VOICE_PAIR_DIR/$label-state.json"
+  scripts/voice-agent-real-room-step.sh finalize --mdev-owner "$VOICE_PAIR_OWNER" \
+    --state "$state" --finalization-output "$VOICE_PAIR_DIR/$label-finalization.json"
+  scripts/voice-agent-real-room-step.sh capture --mdev-owner "$VOICE_PAIR_OWNER" \
+    --state "$state" --finalization "$VOICE_PAIR_DIR/$label-finalization.json" \
+    --automation-output "$VOICE_PAIR_DIR/$label-automation.jsonl" \
+    --private-voice-output "$VOICE_PAIR_DIR/$label-private.ndjson" \
+    --sanitized-voice-output "$VOICE_PAIR_DIR/$label-sanitized.ndjson"
+  scripts/voice-agent-real-room-step.sh end --mdev-owner "$VOICE_PAIR_OWNER" \
+    --state "$state" --finalization "$VOICE_PAIR_DIR/$label-finalization.json" \
+    --cleanup-output "$VOICE_PAIR_DIR/$label-cleanup.json"
+}
+
+scripts/voice-agent-real-room-step.sh preflight \
+  --mdev-owner "$VOICE_PAIR_OWNER" --package "$VOICE_PAIR_PACKAGE"
+```
+
+For the normal concurrent call, use a deliberately slower first request and a faster second request:
+
+```bash
+NORMAL_RUN_HASH="sha256:$(printf '%s-normal-%s' "$PAIR_COMPARISON_HASH" "$(date +%s%N)" | sha256sum | awk '{print $1}')"
+scripts/voice-agent-real-room-step.sh start --mdev-owner "$VOICE_PAIR_OWNER" \
+  --state "$VOICE_PAIR_DIR/normal-state.json" --package "$VOICE_PAIR_PACKAGE" \
+  --conversation-id "$VOICE_PAIR_CONVERSATION_ID" --run-hash "$NORMAL_RUN_HASH" \
+  --comparison-hash "$PAIR_COMPARISON_HASH" --fixture "$VOICE_PAIR_NORMAL_SLOW_PCM"
+scripts/voice-agent-real-room-step.sh status --mdev-owner "$VOICE_PAIR_OWNER" \
+  --state "$VOICE_PAIR_DIR/normal-state.json" --expect parallel_first_pending
+scripts/voice-agent-real-room-step.sh inject --mdev-owner "$VOICE_PAIR_OWNER" \
+  --state "$VOICE_PAIR_DIR/normal-state.json" --fixture "$VOICE_PAIR_NORMAL_FAST_PCM" --role follow_up
+scripts/voice-agent-real-room-step.sh status --mdev-owner "$VOICE_PAIR_OWNER" \
+  --state "$VOICE_PAIR_DIR/normal-state.json" --expect parallel_later_completed_first
+scripts/voice-agent-real-room-step.sh status --mdev-owner "$VOICE_PAIR_OWNER" \
+  --state "$VOICE_PAIR_DIR/normal-state.json" --expect parallel_both_announced
+finish_pair_call normal
+```
+
+For interruption and priority-preserving requeue:
+
+```bash
+INTERRUPT_RUN_HASH="sha256:$(printf '%s-interrupt-%s' "$PAIR_COMPARISON_HASH" "$(date +%s%N)" | sha256sum | awk '{print $1}')"
+scripts/voice-agent-real-room-step.sh start --mdev-owner "$VOICE_PAIR_OWNER" \
+  --state "$VOICE_PAIR_DIR/interrupt-state.json" --package "$VOICE_PAIR_PACKAGE" \
+  --conversation-id "$VOICE_PAIR_CONVERSATION_ID" --run-hash "$INTERRUPT_RUN_HASH" \
+  --comparison-hash "$PAIR_COMPARISON_HASH" --fixture "$VOICE_PAIR_INTERRUPT_REQUEST_PCM"
+scripts/voice-agent-real-room-step.sh status --mdev-owner "$VOICE_PAIR_OWNER" \
+  --state "$VOICE_PAIR_DIR/interrupt-state.json" --expect interruption_delivery_active
+scripts/voice-agent-real-room-step.sh interrupt --mdev-owner "$VOICE_PAIR_OWNER" \
+  --state "$VOICE_PAIR_DIR/interrupt-state.json" --fixture "$VOICE_PAIR_INTERRUPT_PCM"
+scripts/voice-agent-real-room-step.sh status --mdev-owner "$VOICE_PAIR_OWNER" \
+  --state "$VOICE_PAIR_DIR/interrupt-state.json" --expect interruption_observed
+scripts/voice-agent-real-room-step.sh status --mdev-owner "$VOICE_PAIR_OWNER" \
+  --state "$VOICE_PAIR_DIR/interrupt-state.json" --expect interruption_recovered
+finish_pair_call interrupt
+```
+
+For cancellation and request isolation, make the first request cancellable while the second completes normally:
+
+```bash
+ISOLATION_RUN_HASH="sha256:$(printf '%s-isolation-%s' "$PAIR_COMPARISON_HASH" "$(date +%s%N)" | sha256sum | awk '{print $1}')"
+scripts/voice-agent-real-room-step.sh start --mdev-owner "$VOICE_PAIR_OWNER" \
+  --state "$VOICE_PAIR_DIR/isolation-state.json" --package "$VOICE_PAIR_PACKAGE" \
+  --conversation-id "$VOICE_PAIR_CONVERSATION_ID" --run-hash "$ISOLATION_RUN_HASH" \
+  --comparison-hash "$PAIR_COMPARISON_HASH" --fixture "$VOICE_PAIR_ISOLATION_TARGET_PCM"
+scripts/voice-agent-real-room-step.sh status --mdev-owner "$VOICE_PAIR_OWNER" \
+  --state "$VOICE_PAIR_DIR/isolation-state.json" --expect isolation_first_active
+scripts/voice-agent-real-room-step.sh inject --mdev-owner "$VOICE_PAIR_OWNER" \
+  --state "$VOICE_PAIR_DIR/isolation-state.json" --fixture "$VOICE_PAIR_ISOLATION_HEALTHY_PCM" --role follow_up
+scripts/voice-agent-real-room-step.sh status --mdev-owner "$VOICE_PAIR_OWNER" \
+  --state "$VOICE_PAIR_DIR/isolation-state.json" --expect isolation_two_distinct
+scripts/voice-agent-real-room-step.sh inject --mdev-owner "$VOICE_PAIR_OWNER" \
+  --state "$VOICE_PAIR_DIR/isolation-state.json" --fixture "$VOICE_PAIR_CANCEL_PCM" --role follow_up
+scripts/voice-agent-real-room-step.sh status --mdev-owner "$VOICE_PAIR_OWNER" \
+  --state "$VOICE_PAIR_DIR/isolation-state.json" --expect isolation_terminal_healthy
+finish_pair_call isolation
+python3 - "$VOICE_PAIR_DIR/isolation-sanitized.ndjson" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    rows = [json.loads(line) for line in stream if line.strip()]
+assert sum(row.get("kind") == "job_canceled" for row in rows) == 1
+PY
+```
+
+`finish_pair_call` finalizes, captures, and cleans each run in order. Retain private output locally; report only fixed
+pass/fail categories, revisions, hashes, counts, and bounded timing. Inspect only the campaign-local conversation through
+managed `agent-device`: confirm its generated user, assistant, and Hermes result history, then confirm one unrelated
+saved conversation is unchanged without exporting it.
+The checkpoint predicates prove digital ordering, exact-once announcements, grounding, continuous two-second quiet time,
+interruption recovery, cancellation isolation, and clean call shutdown. They do not prove acoustic intelligibility.
+Duplicate wire replay and forced fault branches that the PCM interface cannot induce remain covered by the paired
+production-decoder corpus and focused host tests; exact-once announcements are still checked in the real calls. A
+successful canary must not be generalized to the host-only cases.
+
 After those pass:
 
 - Run the packet corpus through both production decoders and compare the copied-file SHA-256.
