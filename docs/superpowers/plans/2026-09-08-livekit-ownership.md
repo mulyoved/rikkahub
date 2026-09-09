@@ -481,12 +481,14 @@ intelligibility.
   `c36f6d2b1b06bcae30ad8964dac7b59b71ef76e2d5ade51b58eb7f61b0bc065f`. A data-preserving managed-phone update
   succeeded, and package readback reported `me.rerere.rikkahub.debug`, version code `172`, version name `2.4.5`.
   Pulled installed artifacts matched both build hashes byte-for-byte.
-- Immediately before the call, the Python proof passed at published head
+- Immediately before the resumed calls, the Python proof passed at published head
   `992b470fd8581a2eda1f1761dd7bad3cafd8fa41`, runtime
   `b55977ff1bb8e349844ebeddf1aaee348ef0f8dc`, worker profile
   `sha256:a9bfa9c962cefe411df90816c04e68cdb5a3faebebaee7896facf8dac79dddf9`, one online zero-restart process, and one
   registration marker in the refreshed proof window. Both production corpus copies matched SHA-256
-  `add066d20b216ef4d7ca28764b54a7756f7f7d4f4a47d2f28e542cb7d935e595`.
+  `add066d20b216ef4d7ca28764b54a7756f7f7d4f4a47d2f28e542cb7d935e595`. Managed package readback again reported
+  `me.rerere.rikkahub.debug`, version code `172`, and version name `2.4.5`; a fresh pulled APK again matched
+  `66ad15b1b583a3373ec70ae14d61b97b0d8f417ed7367d5e852794f68b257cb2`.
 - One actual `livekit_experimental` automated canary reached the Active service state and its scoped sanitized snapshot
   observed one `complete`/`announced` Hermes record. The first request completed before the required pending checkpoint,
   so this attempt does **not** prove concurrent pending work, out-of-order completion, exact-once delivery, continuous
@@ -496,12 +498,30 @@ intelligibility.
   The sibling-present end suite passed 33 assertions, a fresh Luna/xhigh review returned `ASTRA REVIEW: ship`, and the
   idempotent cleanup retry completed. This host-only helper fix is published at evidence head
   `cb97d0cf2d9f50367cba5133ff15399aae0f3e8c`; it does not change the installed APK.
-- After cleanup, `mdev android status` still showed this caller assigned to `phone` but remote ADB unavailable. No
+- After the assigned phone route recovered, two more actual `livekit_experimental` calls ran against that exact pair.
+  The normal retry reached Active, accepted the follow-up fixture, saved five scoped transcript summaries, saved one
+  session-bound/result-grounded `complete`/`announced` Hermes record, finalized, and ended cleanly. The first record had
+  already completed before `parallel_first_pending`; the follow-up did not create a second Hermes record, so
+  `parallel_later_completed_first` and `parallel_both_announced` were not proven. The interruption retry likewise
+  reached Active, accepted the interruption fixture, saved five scoped transcript summaries and one
+  session-bound/result-grounded `complete`/`announced` record, finalized, and ended cleanly. Its target had already been
+  announced before `interruption_delivery_active`, so the interruption-observed and recovered checkpoints were not
+  proven. These are bounded negative acceptance results, not inferred passes.
+- In the private worker-log window for those two completed calls, the sanitized counts were two tool invocations, two
+  accepted submissions, two completed admissions, two announced deliveries, four final user transcripts, and 18
+  successful history publications. There were zero origin/submission/admission-closed errors, history failures/drops,
+  transcript-persistence failures, delivery failures, or worker registrations. Two delivery-gate-blocked markers show
+  that quiet-time gating engaged, but do not alone prove the required continuous two-second timing. No duplicate Hermes
+  record was observed in either scoped snapshot; wire-level exactly-once remains corpus/focused-host evidence.
+- The cancellation/isolation retry did not start: package identity readback lost the remote ADB route before the helper
+  created a state file or activated a call. A repeated managed status check reported remote ADB unavailable while this
+  caller remained assigned to `phone`. No
   takeover, reset, uninstall, clear-data, reboot, host lifecycle action, tablet, or emulator substitution was used.
-  The remaining machine gates are the documented concurrent/out-of-order, interruption/requeue, and
-  cancellation/isolation calls; normal-history and unchanged-existing-conversation UI inspection; and refreshed exact
-  pair/APK proof after the phone route returns. Human acoustic judgment, manager campaign acceptance, and the final
-  human merge decision also remain pending. Release assembly remains waived.
+  The remaining machine gates are a successful documented concurrent/out-of-order observation,
+  interruption/requeue observation, cancellation/isolation call, and unchanged-existing-conversation UI inspection.
+  Normal scoped history, exact pair/APK readback, and bounded shutdown have current phone evidence. Human acoustic
+  judgment, manager campaign acceptance, and the final human merge decision also remain pending. Release assembly
+  remains waived.
 
 After those pass:
 
