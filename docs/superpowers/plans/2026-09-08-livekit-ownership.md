@@ -592,6 +592,11 @@ intelligibility.
   history, exact pair/APK readback, unchanged-existing-conversation UI inspection, and bounded shutdown retain current
   phone evidence. Human acoustic judgment, manager campaign acceptance, and the final human merge decision also remain
   pending. Release assembly remains waived.
+- At final publication readback the retained `phone` assignment still belonged to this caller, but managed status had
+  regressed to remote-ADB unavailable/protocol-incompatible and could no longer inspect physical inventory. No takeover,
+  reset, host lifecycle action, or equivalent Start retry was attempted. This does not invalidate the exact pre-Start
+  installed-APK readback, but the next controlled call now requires both restored Python dispatch/activation and a
+  healthy compatible assigned phone route.
 
 After those pass:
 
