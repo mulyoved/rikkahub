@@ -517,8 +517,31 @@ intelligibility.
   created a state file or activated a call. A repeated managed status check reported remote ADB unavailable while this
   caller remained assigned to `phone`. No
   takeover, reset, uninstall, clear-data, reboot, host lifecycle action, tablet, or emulator substitution was used.
+- After a second route restoration, package/version and pulled-APK readback again matched the exact artifact, and the
+  Python published/runtime/profile/process/registration proof remained exact. Four further actual calls then completed
+  bounded finalization and cleanup. The first isolation run accepted two independent substantive requests and its
+  scoped snapshot contained two session-bound completed records, seven transcript summaries, and one grounded
+  announcement, but the target was already complete and no canceled record existed. A second isolation run separated
+  startup from the target and used a mechanically accelerated cancellation fixture; it again contained two
+  session-bound completed records, nine transcript summaries, and one grounded announcement at snapshot time, but no
+  canceled terminal. This proves distinct-request persistence while rejecting the cancellation claim.
+- The first separated-start parallel retry produced only one Hermes record because its short follow-up remained a
+  normal conversation turn. A final retry used the independently proven substantive follow-up and produced two
+  session-bound, result-grounded `complete`/`announced` records and eight scoped transcript summaries. The strict
+  later-request-first checkpoint still rejected the trace: both requests completed and announced in request order, not
+  out of order. No debug or production release ordering was introduced.
+- The sanitized worker window for those four calls recorded four ready sessions, seven tool invocations, seven accepted
+  submissions/admissions, six announced deliveries, 58 successful history publications, and zero registration,
+  admission, history, transcript-persistence, or cleanup failures. One ambiguous delivery attempt failed in the first
+  isolation call after its second completed record had not yet been announced; the delivery owner retired that attempt
+  instead of duplicating speech. Eight delivery-gate-blocked markers prove gate engagement, not the exact two-second
+  duration by themselves.
+- The next separated-start interruption attempt lost remote ADB during owned-fixture staging. It never activated a call
+  or created a state file, and bounded staging cleanup finished before managed preflight confirmed the phone route was
+  unavailable again. The interruption/requeue timing observation and managed UI comparison therefore remain open.
   The remaining machine gates are a successful documented concurrent/out-of-order observation,
-  interruption/requeue observation, cancellation/isolation call, and unchanged-existing-conversation UI inspection.
+  interruption/requeue observation, successful cancellation/isolation observation, and
+  unchanged-existing-conversation UI inspection.
   Normal scoped history, exact pair/APK readback, and bounded shutdown have current phone evidence. Human acoustic
   judgment, manager campaign acceptance, and the final human merge decision also remain pending. Release assembly
   remains waived.
