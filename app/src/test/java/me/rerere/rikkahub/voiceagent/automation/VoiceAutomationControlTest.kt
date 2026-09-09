@@ -8,6 +8,9 @@ import me.rerere.rikkahub.voiceagent.VoiceAgentTransport
 import me.rerere.rikkahub.voiceagent.debug.VoiceAutomationConnectivity
 import me.rerere.rikkahub.voiceagent.debug.VoiceAutomationControl
 import me.rerere.rikkahub.voiceagent.debug.VoiceAutomationControlResult
+import me.rerere.rikkahub.voiceagent.debug.VoiceAutomationHistoryRecord
+import me.rerere.rikkahub.voiceagent.debug.VoiceAutomationHistorySnapshot
+import me.rerere.rikkahub.voiceagent.debug.VoiceAutomationTranscriptRecord
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -15,6 +18,145 @@ import org.junit.Test
 import kotlin.uuid.Uuid
 
 class VoiceAutomationControlTest {
+    @Test
+    fun `history status returns only bounded sanitized state for the active run conversation`() {
+        val conversationId = Uuid.parse("11111111-1111-4111-8111-111111111111")
+        var readConversationId: Uuid? = null
+        val lifecycle = VoiceAgentCallLifecycle.Active(conversationId)
+        val control = VoiceAutomationControl(
+            runtime = RecordingRuntime(),
+            routeRequester = { false },
+            connectivityReader = {
+                VoiceAutomationConnectivity(VoiceAutomationNetwork.WIFI, true)
+            },
+            artifactFile = { null },
+            lifecycleReader = { lifecycle },
+            historyReader = {
+                readConversationId = it
+                VoiceAutomationHistorySnapshot(
+                    conversationHash = HASH_A,
+                    recordCount = 1,
+                    transcriptCount = 1,
+                    records = listOf(
+                        VoiceAutomationHistoryRecord(
+                            identityHash = HASH_B,
+                            jobHash = HASH_C,
+                            sessionHash = HASH_D,
+                            userTurnHash = null,
+                            status = "complete",
+                            announcement = "announced",
+                            requestHash = HASH_E,
+                            argumentHash = null,
+                            resultHash = HASH_F,
+                        ),
+                    ),
+                    transcripts = listOf(
+                        VoiceAutomationTranscriptRecord(
+                            role = "assistant",
+                            status = "complete",
+                            eventHash = HASH_G,
+                            sessionHash = HASH_D,
+                            groundedJobHash = HASH_C,
+                            groundedResultHash = HASH_F,
+                        ),
+                    ),
+                )
+            },
+        )
+
+        val result = control.handle(
+            VoiceAutomationControl.ACTION_HISTORY_STATUS,
+            mapOf(
+                VoiceAutomationControl.EXTRA_RUN_HASH to RUN_HASH,
+                VoiceAutomationControl.EXTRA_CONVERSATION_ID to conversationId.toString(),
+            ),
+        )
+
+        assertSuccess(result)
+        assertEquals(conversationId, readConversationId)
+        assertEquals("history_status", result.resultData.lineValue("action"))
+        val historyJson = result.resultData.lineValue("history_json")
+        assertTrue(historyJson.contains("\"recordCount\":1"))
+        assertTrue(historyJson.contains(HASH_B))
+        assertTrue(historyJson.contains("complete"))
+        assertFalse(historyJson.contains(conversationId.toString()))
+        assertFalse(historyJson.contains("prompt"))
+        assertFalse(historyJson.contains("answer"))
+    }
+
+    @Test
+    fun `history status rejects stale scope before reading conversation`() {
+        val activeConversationId = Uuid.parse("11111111-1111-4111-8111-111111111111")
+        val foreignConversationId = Uuid.parse("22222222-2222-4222-8222-222222222222")
+        var reads = 0
+        val control = VoiceAutomationControl(
+            runtime = RecordingRuntime(),
+            routeRequester = { false },
+            connectivityReader = {
+                VoiceAutomationConnectivity(VoiceAutomationNetwork.WIFI, true)
+            },
+            artifactFile = { null },
+            lifecycleReader = { VoiceAgentCallLifecycle.Active(activeConversationId) },
+            historyReader = {
+                reads += 1
+                VoiceAutomationHistorySnapshot.empty(HASH_A)
+            },
+        )
+
+        listOf(
+            mapOf(
+                VoiceAutomationControl.EXTRA_RUN_HASH to NEXT_RUN_HASH,
+                VoiceAutomationControl.EXTRA_CONVERSATION_ID to activeConversationId.toString(),
+            ),
+            mapOf(
+                VoiceAutomationControl.EXTRA_RUN_HASH to RUN_HASH,
+                VoiceAutomationControl.EXTRA_CONVERSATION_ID to foreignConversationId.toString(),
+            ),
+        ).forEach { extras ->
+            val result = control.handle(VoiceAutomationControl.ACTION_HISTORY_STATUS, extras)
+            assertEquals(VoiceAutomationControl.RESULT_ERROR, result.resultCode)
+            assertEquals("status=error\nerror=invalid_state", result.resultData)
+        }
+        assertEquals(0, reads)
+    }
+
+    @Test
+    fun `history status rejects a call or run owner change during the read`() {
+        val conversationId = Uuid.parse("11111111-1111-4111-8111-111111111111")
+        listOf("call", "run").forEach { changedOwner ->
+            val runtime = RecordingRuntime()
+            var lifecycle: VoiceAgentCallLifecycle = VoiceAgentCallLifecycle.Active(conversationId)
+            val control = VoiceAutomationControl(
+                runtime = runtime,
+                routeRequester = { false },
+                connectivityReader = {
+                    VoiceAutomationConnectivity(VoiceAutomationNetwork.WIFI, true)
+                },
+                artifactFile = { null },
+                lifecycleReader = { lifecycle },
+                historyReader = {
+                    if (changedOwner == "call") {
+                        lifecycle = VoiceAgentCallLifecycle.Active(conversationId)
+                    } else {
+                        runtime.currentStatus = runtime.currentStatus.copy(eventCount = 1)
+                    }
+                    VoiceAutomationHistorySnapshot.empty(HASH_A)
+                },
+            )
+
+            val result = control.handle(
+                VoiceAutomationControl.ACTION_HISTORY_STATUS,
+                mapOf(
+                    VoiceAutomationControl.EXTRA_RUN_HASH to RUN_HASH,
+                    VoiceAutomationControl.EXTRA_CONVERSATION_ID to conversationId.toString(),
+                ),
+            )
+
+            assertEquals(VoiceAutomationControl.RESULT_ERROR, result.resultCode)
+            assertEquals("status=error\nerror=invalid_state", result.resultData)
+        }
+    }
+
     @Test
     fun `binding returns the conversation for a starting or active call`() {
         val conversationId = "11111111-1111-4111-8111-111111111111"
@@ -735,5 +877,12 @@ class VoiceAutomationControlTest {
         const val NEXT_RUN_HASH = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
         const val COMPARISON_HASH =
             "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        const val HASH_A = "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+        const val HASH_B = "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+        const val HASH_C = "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+        const val HASH_D = "sha256:4444444444444444444444444444444444444444444444444444444444444444"
+        const val HASH_E = "sha256:5555555555555555555555555555555555555555555555555555555555555555"
+        const val HASH_F = "sha256:6666666666666666666666666666666666666666666666666666666666666666"
+        const val HASH_G = "sha256:7777777777777777777777777777777777777777777777777777777777777777"
     }
 }

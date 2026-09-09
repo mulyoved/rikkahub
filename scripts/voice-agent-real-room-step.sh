@@ -28,7 +28,6 @@ FIXTURE_TRIGGER_ACTION='me.rerere.rikkahub.debug.voiceagent.TRIGGER_CAPTURE_FIXT
 CALL_START_ACTION='me.rerere.rikkahub.voiceagent.action.START'
 CALL_END_BOUND_ACTION='me.rerere.rikkahub.voiceagent.action.END_BOUND'
 APP_ARTIFACT_ROOT='no_backup/voice-e2e'
-LATEST_TRACE_PATH="$APP_ARTIFACT_ROOT/latest-trace-id.txt"
 TRANSPORT_EXPECTED='livekit_experimental'
 FIXTURE_CHUNK_BYTES='3200'
 FIXTURE_CHUNK_DELAY_MS='100'
@@ -317,9 +316,10 @@ run_status_operation() {
   local expectation="$1"
   local status_snapshot
   local automation_snapshot
-  local voice_snapshot
+  local history_snapshot
   local boundary
   local evaluation_status
+  local started=$SECONDS
   local -a status=()
   validate_runtime
   status_snapshot="$(read_status)"
@@ -328,24 +328,88 @@ run_status_operation() {
      "${status[2]}" == "$COMPARISON_HASH" &&
      "${status[3]}" == "$TRANSPORT_EXPECTED" ]] || die 'status binding mismatch'
   read_call_service_active
-  read_checkpoint_artifact_snapshots automation_snapshot voice_snapshot
-  set +e
-  boundary="$(python3 "$REAL_ROOM_CONTRACT" --evaluate "$expectation" \
-    "$automation_snapshot" "$voice_snapshot" "$RUN_HASH" "$COMPARISON_HASH" \
-    2000000000 2>/dev/null)"
-  evaluation_status=$?
-  set -e
-  if (( evaluation_status != 0 )); then
-    [[ "$boundary" =~ ^[a-z][a-z0-9_]{0,63}$ ]] || boundary=evidence
-    die "checkpoint $boundary not proven"
-  fi
-  [[ -z "$boundary" ]] || die 'checkpoint evidence not proven'
+  while true; do
+    read_livekit_checkpoint_snapshots automation_snapshot history_snapshot
+    set +e
+    boundary="$(python3 "$REAL_ROOM_CONTRACT" --evaluate-livekit "$expectation" \
+      "$automation_snapshot" "$history_snapshot" "$RUN_HASH" "$COMPARISON_HASH" \
+      2000 2>/dev/null)"
+    evaluation_status=$?
+    set -e
+    if (( evaluation_status == 0 )); then
+      [[ -z "$boundary" ]] || die 'checkpoint evidence not proven'
+      break
+    fi
+    if (( SECONDS - started >= ${VOICE_STEP_WAIT_TIMEOUT_SECONDS:-120} )); then
+      [[ "$boundary" =~ ^[a-z][a-z0-9_]{0,63}$ ]] || boundary=evidence
+      die "checkpoint $boundary not proven"
+    fi
+    sleep "${VOICE_STEP_POLL_SECONDS:-1}"
+  done
   cleanup_local_temps || die 'cleanup failed'
   printf '%s\n' \
     'voice-step.status=ok' \
     'voice-step.operation=status' \
     "voice-step.expectation=$expectation" \
     'voice-step.expectation_met=true'
+}
+
+read_livekit_history_snapshot() {
+  local -n snapshot_out="$1"
+  local reply
+  local history_json
+  ensure_local_temp_dir
+  reply="$(ordered_broadcast_read --user "$ANDROID_USER_ID" \
+    -n "$PACKAGE/$CONTROL_RECEIVER" -a "$CONTROL_ACTION_PREFIX.HISTORY_STATUS" \
+    --es run_hash "$RUN_HASH" --es conversation_id "$CONVERSATION_ID")" ||
+    die 'history status unavailable'
+  [[ "$reply" == status=ok$'\n'action=history_status$'\n'history_json=* ]] ||
+    die 'unexpected receiver response'
+  history_json="${reply#status=ok$'\n'action=history_status$'\n'history_json=}"
+  snapshot_out="$LOCAL_TEMP_DIR/history-status.json"
+  printf '%s' "$history_json" > "$snapshot_out"
+  chmod 600 -- "$snapshot_out" 2>/dev/null || die 'history status unavailable'
+  if [[ -z "${HISTORY_STATUS_TEMP_REGISTERED:-}" ]]; then
+    register_temp_file "$snapshot_out"
+    HISTORY_STATUS_TEMP_REGISTERED=1
+  fi
+  python3 - "$snapshot_out" "$REAL_ROOM_CONTRACT" 2>/dev/null <<'PY' ||
+import importlib.util
+import sys
+
+path, module_path = sys.argv[1:]
+spec = importlib.util.spec_from_file_location("voice_agent_real_room_contract", module_path)
+contract = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(contract)
+contract.parse_history_snapshot_bytes(open(path, "rb").read())
+PY
+    die 'history status unavailable'
+}
+
+read_livekit_checkpoint_snapshots() {
+  local -n automation_snapshot_out="$1"
+  local -n history_snapshot_out="$2"
+  local automation_path
+  ensure_local_temp_dir
+  automation_path="$(app_artifact_path "$APP_ARTIFACT_ROOT/${RUN_HASH#sha256:}" automation-events.jsonl)"
+  read_stable_artifact "$automation_path" \
+    "$LOCAL_TEMP_DIR/checkpoint-automation.jsonl" automation_snapshot_out
+  read_livekit_history_snapshot history_snapshot_out
+}
+
+run_history_capture() {
+  local destination="$1"
+  local snapshot
+  validate_runtime
+  read_call_service_active
+  read_livekit_history_snapshot snapshot
+  validate_absent_destination "$destination" || die 'invalid output destination'
+  publish_owned_temp "$snapshot" "$destination"
+  cleanup_local_temps || die 'cleanup failed'
+  printf '%s\n' \
+    'voice-step.status=ok' \
+    'voice-step.operation=history' \
+    'voice-step.artifact=published'
 }
 
 complete_finalize_outcome() {
@@ -576,108 +640,6 @@ run_finalize() {
   complete_finalize_outcome "$finalization_output" complete complete true true false
 }
 
-run_capture() {
-  local finalization_path="$1"
-  local automation_output="$2"
-  local private_output="$3"
-  local sanitized_output="$4"
-  local automation_source
-  local private_source
-  local sanitized_source
-  local automation_temp
-  local private_temp
-  local sanitized_temp
-  local finalization_snapshot
-  local finalization_check
-  local finalization_values
-  local outcome
-  local call_stopped
-  local automation_finalized
-  local forced_fallback_used
-  local force_stop_status=0
-  local stopped_status
-  local quiescence_status
-  local status_before
-  local status_after
-  local -a status=()
-  local -a finalization=()
-
-  snapshot_finalization_record "$finalization_path" finalization_snapshot
-  finalization_values="$(read_finalization_values "$finalization_snapshot")" ||
-    die 'invalid finalization record'
-  mapfile -t finalization <<< "$finalization_values"
-  [[ "${#finalization[@]}" == 5 ]] || die 'invalid finalization record'
-  outcome="${finalization[0]}"
-  call_stopped="${finalization[2]}"
-  automation_finalized="${finalization[3]}"
-  forced_fallback_used="${finalization[4]}"
-  validate_runtime
-
-  case "$outcome" in
-    complete)
-      [[ "$call_stopped" == true && "$automation_finalized" == true &&
-         "$forced_fallback_used" == false ]] || die 'invalid finalization record'
-      status_before="$(read_status)"
-      mapfile -t status <<< "$status_before"
-      [[ "${status[0]}" == finalized && "${status[1]}" == "$RUN_HASH" &&
-         "${status[2]}" == "$COMPARISON_HASH" &&
-         "${status[3]}" == "$TRANSPORT_EXPECTED" ]] || die 'finalized status mismatch'
-      ;;
-    product_failure)
-      PACKAGE_FORCE_STOP_OWNED=1
-      adb_read shell cmd activity force-stop --user "$ANDROID_USER_ID" "$PACKAGE" \
-        </dev/null >/dev/null 2>&1 || force_stop_status=$?
-      (( force_stop_status == 0 )) || die 'capture quiescence not proven'
-      if read_package_stopped_state true; then
-        stopped_status=0
-      else
-        stopped_status=$?
-      fi
-      (( stopped_status == 0 )) || die 'capture quiescence not proven'
-      if prove_package_quiescence; then
-        quiescence_status=0
-      else
-        quiescence_status=$?
-      fi
-      (( quiescence_status == 0 )) || die 'capture quiescence not proven'
-      ;;
-    *) die 'capture unavailable for interrupted infrastructure' ;;
-  esac
-
-  automation_source="$(app_artifact_path "$APP_ARTIFACT_ROOT/${RUN_HASH#sha256:}" automation-events.jsonl)"
-  private_source="$(app_artifact_path "$APP_ARTIFACT_ROOT/$TRACE_ID" voice-experience-private.ndjson)"
-  sanitized_source="$(app_artifact_path "$APP_ARTIFACT_ROOT/$TRACE_ID" voice-experience-events.ndjson)"
-  read_capture_bundle_snapshots \
-    "$automation_source" "$private_source" "$sanitized_source" \
-    "$automation_output" "$private_output" "$sanitized_output" \
-    automation_temp private_temp sanitized_temp
-  python3 "$REAL_ROOM_CONTRACT" --validate-capture \
-    "$automation_temp" "$private_temp" "$sanitized_temp" \
-    "$RUN_HASH" "$COMPARISON_HASH" "$finalization_snapshot" \
-    >/dev/null 2>&1 || die 'captured evidence violates contract'
-
-  if [[ "$outcome" == complete ]]; then
-    status_after="$(read_status)"
-    [[ "$status_after" == "$status_before" ]] || die 'status changed during capture'
-  else
-    restore_force_stopped_package || die 'package restoration failed'
-  fi
-  snapshot_finalization_record "$finalization_path" finalization_check
-  cmp -s -- "$finalization_snapshot" "$finalization_check" ||
-    die 'finalization record changed'
-  validate_absent_destination "$automation_output" || die 'output destination appeared'
-  validate_absent_destination "$private_output" || die 'output destination appeared'
-  validate_absent_destination "$sanitized_output" || die 'output destination appeared'
-  publish_owned_temp "$automation_temp" "$automation_output"
-  publish_owned_temp "$private_temp" "$private_output"
-  publish_owned_temp "$sanitized_temp" "$sanitized_output"
-  cleanup_local_temps || die 'cleanup failed'
-  printf '%s\n' \
-    'voice-step.status=ok' \
-    'voice-step.operation=capture' \
-    'voice-step.artifacts=published'
-}
-
 classify_device_access() {
   local device_state
   local reachability
@@ -887,26 +849,6 @@ PY
   die 'call activation timed out'
 }
 
-wait_for_new_trace() {
-  local old_present="$1"
-  local old_value="$2"
-  local attempt=0
-  local started=$SECONDS
-  while (( attempt < ${VOICE_STEP_MAX_WAIT_ATTEMPTS:-120} )); do
-    attempt=$((attempt + 1))
-    read_trace_pointer
-    if (( TRACE_POINTER_PRESENT == 1 )) &&
-      { (( old_present == 0 )) || [[ "$TRACE_POINTER_VALUE" != "$old_value" ]]; }; then
-      TRACE_ID="$TRACE_POINTER_VALUE"
-      return 0
-    fi
-    if (( SECONDS - started >= ${VOICE_STEP_WAIT_TIMEOUT_SECONDS:-120} )); then
-      break
-    fi
-    sleep "${VOICE_STEP_POLL_SECONDS:-1}"
-  done
-  die 'trace activation timed out'
-}
 
 wait_for_pre_call_status() {
   local attempt=0
@@ -953,8 +895,6 @@ run_preflight() {
 run_start() {
   local state_path="$1"
   local fixture_path="$2"
-  local old_trace_present
-  local old_trace_value
   local reply
   local status_snapshot
   local -a status=()
@@ -984,11 +924,6 @@ run_start() {
   mapfile -t status <<< "$status_snapshot"
   [[ "${status[0]}" == idle || "${status[0]}" == finalized ]] ||
     die 'automation is not ready'
-  diagnostic_set_stage trace-read || die 'diagnostic state failed'
-  read_trace_pointer
-  old_trace_present="$TRACE_POINTER_PRESENT"
-  old_trace_value="$TRACE_POINTER_VALUE"
-
   START_CLEANUP_NEEDED=1
   diagnostic_set_stage fixture-directory || die 'diagnostic state failed'
   stage_snapshot "$REMOTE_FIXTURE_DIR" "$remote_fixture_path" \
@@ -1030,8 +965,7 @@ run_start() {
     </dev/null >/dev/null 2>&1 || die 'call start failed'
   diagnostic_set_stage call-activation || die 'diagnostic state failed'
   wait_for_call_active
-  diagnostic_set_stage trace-activation || die 'diagnostic state failed'
-  wait_for_new_trace "$old_trace_present" "$old_trace_value"
+  TRACE_ID='livekit-history-v1'
   diagnostic_set_stage state-publication || die 'diagnostic state failed'
   publish_state "$state_path"
   START_CLEANUP_NEEDED=0
@@ -1073,7 +1007,7 @@ run_with_decoded_state() {
       validate_runtime without-broadcast
       acquire_host_operation_lock
       ;;
-    inject|interrupt|status|finalize|capture|end)
+    inject|interrupt|status|history|finalize|end)
       validate_runtime
       acquire_host_operation_lock
       ;;
@@ -1083,8 +1017,8 @@ run_with_decoded_state() {
     inject) run_inject "$@" ;;
     interrupt) run_interrupt "$@" ;;
     status) run_status_operation "$@" ;;
+    history) run_history_capture "$@" ;;
     finalize) run_finalize "$@" ;;
-    capture) run_capture "$@" ;;
     end) run_end "$@" ;;
     *) die 'invalid operation' ;;
   esac
@@ -1268,6 +1202,15 @@ case "$operation" in
     run_with_decoded_state status "${PARSED[--state]}" "${PARSED[--expect]}"
     ERROR_REPORTED=0
     ;;
+  history)
+    parse_options '--mdev-owner --state --history-output' "$@"
+    require_options --mdev-owner --state --history-output
+    MDEV_OWNER="${PARSED[--mdev-owner]}"
+    prepare_mdev_owner
+    validate_absent_destination "${PARSED[--history-output]}" || die 'invalid output destination'
+    run_with_decoded_state history "${PARSED[--state]}" \
+      "${PARSED[--history-output]}"
+    ;;
   finalize)
     parse_options '--mdev-owner --state --finalization-output' "$@"
     require_options --mdev-owner --state --finalization-output
@@ -1277,24 +1220,6 @@ case "$operation" in
       die 'invalid finalization destination'
     run_with_decoded_state finalize "${PARSED[--state]}" \
       "${PARSED[--finalization-output]}"
-    ;;
-  capture)
-    parse_options '--mdev-owner --state --finalization --automation-output --private-voice-output --sanitized-voice-output' "$@"
-    require_options --mdev-owner --state --finalization --automation-output --private-voice-output --sanitized-voice-output
-    MDEV_OWNER="${PARSED[--mdev-owner]}"
-    prepare_mdev_owner
-    validate_absent_destination "${PARSED[--automation-output]}" || die 'invalid output destination'
-    validate_absent_destination "${PARSED[--private-voice-output]}" || die 'invalid output destination'
-    validate_absent_destination "${PARSED[--sanitized-voice-output]}" || die 'invalid output destination'
-    validate_distinct_destinations \
-      "${PARSED[--automation-output]}" \
-      "${PARSED[--private-voice-output]}" \
-      "${PARSED[--sanitized-voice-output]}" || die 'output destinations must be distinct'
-    run_with_decoded_state capture "${PARSED[--state]}" \
-      "${PARSED[--finalization]}" \
-      "${PARSED[--automation-output]}" \
-      "${PARSED[--private-voice-output]}" \
-      "${PARSED[--sanitized-voice-output]}"
     ;;
   end)
     parse_options '--mdev-owner --state --finalization --cleanup-output' "$@"

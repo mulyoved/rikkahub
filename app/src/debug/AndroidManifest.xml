@@ -45,6 +45,7 @@
         <action android:name="me.rerere.rikkahub.voiceagent.automation.BINDING" />
         <action android:name="me.rerere.rikkahub.voiceagent.automation.PREPARE" />
         <action android:name="me.rerere.rikkahub.voiceagent.automation.STATUS" />
+        <action android:name="me.rerere.rikkahub.voiceagent.automation.HISTORY_STATUS" />
         <action android:name="me.rerere.rikkahub.voiceagent.automation.MARK" />
         <action android:name="me.rerere.rikkahub.voiceagent.automation.ROUTE" />
         <action android:name="me.rerere.rikkahub.voiceagent.automation.ENDPOINTS" />

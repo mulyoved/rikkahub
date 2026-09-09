@@ -363,13 +363,10 @@ PAIR_COMPARISON_HASH="sha256:$(printf '%s\n' \
 finish_pair_call() {
   local label="$1"
   local state="$VOICE_PAIR_DIR/$label-state.json"
+  scripts/voice-agent-real-room-step.sh history --mdev-owner "$VOICE_PAIR_OWNER" \
+    --state "$state" --history-output "$VOICE_PAIR_DIR/$label-history.json"
   scripts/voice-agent-real-room-step.sh finalize --mdev-owner "$VOICE_PAIR_OWNER" \
     --state "$state" --finalization-output "$VOICE_PAIR_DIR/$label-finalization.json"
-  scripts/voice-agent-real-room-step.sh capture --mdev-owner "$VOICE_PAIR_OWNER" \
-    --state "$state" --finalization "$VOICE_PAIR_DIR/$label-finalization.json" \
-    --automation-output "$VOICE_PAIR_DIR/$label-automation.jsonl" \
-    --private-voice-output "$VOICE_PAIR_DIR/$label-private.ndjson" \
-    --sanitized-voice-output "$VOICE_PAIR_DIR/$label-sanitized.ndjson"
   scripts/voice-agent-real-room-step.sh end --mdev-owner "$VOICE_PAIR_OWNER" \
     --state "$state" --finalization "$VOICE_PAIR_DIR/$label-finalization.json" \
     --cleanup-output "$VOICE_PAIR_DIR/$label-cleanup.json"
@@ -436,25 +433,34 @@ scripts/voice-agent-real-room-step.sh inject --mdev-owner "$VOICE_PAIR_OWNER" \
 scripts/voice-agent-real-room-step.sh status --mdev-owner "$VOICE_PAIR_OWNER" \
   --state "$VOICE_PAIR_DIR/isolation-state.json" --expect isolation_terminal_healthy
 finish_pair_call isolation
-python3 - "$VOICE_PAIR_DIR/isolation-sanitized.ndjson" <<'PY'
+python3 - "$VOICE_PAIR_DIR/isolation-history.json" <<'PY'
 import json
 import sys
 
 with open(sys.argv[1], encoding="utf-8") as stream:
-    rows = [json.loads(line) for line in stream if line.strip()]
-assert sum(row.get("kind") == "job_canceled" for row in rows) == 1
+    snapshot = json.load(stream)
+assert sum(record.get("status") == "canceled" for record in snapshot["records"]) == 1
 PY
 ```
 
-`finish_pair_call` finalizes, captures, and cleans each run in order. Retain private output locally; report only fixed
-pass/fail categories, revisions, hashes, counts, and bounded timing. Inspect only the campaign-local conversation through
-managed `agent-device`: confirm its generated user, assistant, and Hermes result history, then confirm one unrelated
-saved conversation is unchanged without exporting it.
-The checkpoint predicates prove digital ordering, exact-once announcements, grounding, continuous two-second quiet time,
-interruption recovery, cancellation isolation, and clean call shutdown. They do not prove acoustic intelligibility.
-Duplicate wire replay and forced fault branches that the PCM interface cannot induce remain covered by the paired
-production-decoder corpus and focused host tests; exact-once announcements are still checked in the real calls. A
-successful canary must not be generalized to the host-only cases.
+`HISTORY_STATUS` is a debug-only, `android.permission.DUMP`-protected, read-only action on the existing automation
+receiver. It accepts only the active run hash and exact active call conversation ID, then returns at most 48 Hermes
+record summaries and 48 voice-transcript summaries, keeping the worst-case response below the helper's 64 KiB input
+bound. The response contains statuses, announcement states, counts, and
+SHA-256 identities only: no prompt, answer, transcript text, raw call/job/session/turn ID, or unrelated conversation is
+read or returned. This is routine verification file-map expansion in the debug manifest/receiver, receiver tests, and
+real-room helper/contract; production persistence and non-LiveKit recovery behavior are unchanged.
+
+`finish_pair_call` snapshots the sanitized campaign conversation while its exact run binding is active, then finalizes
+and cleans that run. Report only fixed pass/fail categories, revisions, hashes, counts, and bounded timing. Inspect only
+the campaign-local conversation through managed `agent-device`, then confirm one unrelated saved conversation is
+unchanged without exporting it. The successive checkpoints can prove the observed state transitions, distinct durable
+identities, one grounded transcript per announced record, continuous two-second quiet time, interruption/requeue, and
+a canceled target alongside a healthy completed request. A final snapshot alone does not prove cancellation race
+ordering, absence of target playback, transition timing, or wire-level exactly-once delivery;
+the later-completed-first and interruption claims require their earlier live checkpoints. Duplicate wire replay and
+forced fault branches remain production-decoder corpus/focused-host evidence. None of this proves acoustic
+intelligibility.
 
 After those pass:
 

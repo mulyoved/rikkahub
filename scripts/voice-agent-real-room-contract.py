@@ -28,6 +28,19 @@ class Expectation(enum.StrEnum):
     ISOLATION_TERMINAL_HEALTHY = "isolation_terminal_healthy"
 
 
+LIVEKIT_EXPECTATIONS = {
+    Expectation.PARALLEL_FIRST_PENDING,
+    Expectation.PARALLEL_LATER_COMPLETED_FIRST,
+    Expectation.PARALLEL_BOTH_ANNOUNCED,
+    Expectation.INTERRUPTION_DELIVERY_ACTIVE,
+    Expectation.INTERRUPTION_OBSERVED,
+    Expectation.INTERRUPTION_RECOVERED,
+    Expectation.ISOLATION_FIRST_ACTIVE,
+    Expectation.ISOLATION_TWO_DISTINCT,
+    Expectation.ISOLATION_TERMINAL_HEALTHY,
+}
+
+
 class ContractError(Exception):
     def __init__(self, boundary: str):
         super().__init__(boundary)
@@ -164,6 +177,31 @@ CLEANUP_KEYS = {
     "fixturesRemoved",
     "finalizationHash",
 }
+HISTORY_REQUIRED_KEYS = {
+    "conversationHash",
+    "recordCount",
+    "transcriptCount",
+    "records",
+    "transcripts",
+}
+HISTORY_RECORD_REQUIRED_KEYS = {"identityHash", "status", "announcement"}
+HISTORY_RECORD_OPTIONAL_KEYS = {
+    "jobHash",
+    "sessionHash",
+    "userTurnHash",
+    "requestHash",
+    "argumentHash",
+    "resultHash",
+}
+HISTORY_TRANSCRIPT_REQUIRED_KEYS = {"role", "status"}
+HISTORY_TRANSCRIPT_OPTIONAL_KEYS = {
+    "eventHash",
+    "sessionHash",
+    "groundedJobHash",
+    "groundedResultHash",
+}
+MAX_HISTORY_RECORDS = 48
+MAX_HISTORY_TRANSCRIPTS = 48
 FINALIZATION_REASON_TERMINALS = {
     "complete": ("complete", True, True, False),
     "bound_call_rejected": ("product_failure", False, False, False),
@@ -827,6 +865,244 @@ def evaluate_checkpoint(
     raise ContractError("expectation")
 
 
+def parse_history_snapshot_bytes(content: bytes) -> dict[str, Any]:
+    _require(bool(content) and len(content) <= 65_536 and b"\r" not in content and b"\n" not in content,
+             "history_snapshot")
+    try:
+        value = json.loads(content.decode("utf-8"))
+    except (UnicodeDecodeError, TypeError, ValueError, json.JSONDecodeError) as error:
+        raise ContractError("history_snapshot") from error
+    _require(type(value) is dict and set(value) == HISTORY_REQUIRED_KEYS, "history_snapshot")
+    _require(
+        type(value.get("conversationHash")) is str
+        and HASH.fullmatch(value["conversationHash"]) is not None
+        and type(value.get("recordCount")) is int
+        and value["recordCount"] >= 0
+        and type(value.get("transcriptCount")) is int
+        and value["transcriptCount"] >= 0
+        and type(value.get("records")) is list
+        and len(value["records"]) <= MAX_HISTORY_RECORDS
+        and value["recordCount"] >= len(value["records"])
+        and type(value.get("transcripts")) is list
+        and len(value["transcripts"]) <= MAX_HISTORY_TRANSCRIPTS
+        and value["transcriptCount"] >= len(value["transcripts"]),
+        "history_snapshot",
+    )
+    for record in value["records"]:
+        _require(
+            type(record) is dict
+            and HISTORY_RECORD_REQUIRED_KEYS <= set(record)
+            and set(record) <= HISTORY_RECORD_REQUIRED_KEYS | HISTORY_RECORD_OPTIONAL_KEYS
+            and type(record.get("identityHash")) is str
+            and HASH.fullmatch(record["identityHash"]) is not None
+            and type(record.get("status")) is str
+            and record["status"] in {
+                "pending", "queued", "running", "complete", "failed", "expired", "canceled"
+            }
+            and type(record.get("announcement")) is str
+            and record["announcement"] in {
+                "not_announced", "still_working_announced", "message_written", "announced"
+            },
+            "history_snapshot",
+        )
+        _require(
+            all(
+                type(record[key]) is str and HASH.fullmatch(record[key]) is not None
+                for key in HISTORY_RECORD_OPTIONAL_KEYS
+                if key in record
+            ),
+            "history_snapshot",
+        )
+    for transcript in value["transcripts"]:
+        _require(
+            type(transcript) is dict
+            and HISTORY_TRANSCRIPT_REQUIRED_KEYS <= set(transcript)
+            and set(transcript) <= HISTORY_TRANSCRIPT_REQUIRED_KEYS | HISTORY_TRANSCRIPT_OPTIONAL_KEYS
+            and type(transcript.get("role")) is str
+            and transcript["role"] in {"user", "assistant", "other"}
+            and type(transcript.get("status")) is str
+            and transcript["status"] in {
+                "partial", "complete", "interrupted", "session-closed-before-final", "unknown"
+            },
+            "history_snapshot",
+        )
+        _require(
+            all(
+                type(transcript[key]) is str and HASH.fullmatch(transcript[key]) is not None
+                for key in HISTORY_TRANSCRIPT_OPTIONAL_KEYS
+                if key in transcript
+            ),
+            "history_snapshot",
+        )
+    identities = [record["identityHash"] for record in value["records"]]
+    _require(len(identities) == len(set(identities)), "history_duplicate_record")
+    return value
+
+
+def _current_history_records(history: Mapping[str, Any]) -> list[dict[str, Any]]:
+    records = history["records"]
+    _require(bool(records), "history_current_session")
+    session_hash = records[-1].get("sessionHash")
+    _require(type(session_hash) is str and HASH.fullmatch(session_hash) is not None,
+             "history_current_session")
+    current = [record for record in records if record.get("sessionHash") == session_hash]
+    _require(bool(current), "history_current_session")
+    return current
+
+
+def _grounded_once(history: Mapping[str, Any], record: Mapping[str, Any]) -> bool:
+    job_hash = record.get("jobHash")
+    result_hash = record.get("resultHash")
+    session_hash = record.get("sessionHash")
+    if not all(type(value) is str and HASH.fullmatch(value) is not None
+               for value in (job_hash, result_hash, session_hash)):
+        return False
+    matches = [
+        transcript for transcript in history["transcripts"]
+        if transcript.get("role") == "assistant"
+        and transcript.get("status") == "complete"
+        and transcript.get("sessionHash") == session_hash
+        and transcript.get("groundedJobHash") == job_hash
+        and transcript.get("groundedResultHash") == result_hash
+    ]
+    return len(matches) == 1
+
+
+def _active_playback_epoch(automation: Sequence[dict[str, Any]]) -> tuple[int, int] | None:
+    terminal_by_epoch = {
+        row.get("playbackEpoch")
+        for row in automation
+        if row.get("name") in PLAYBACK_TERMINAL_NAMES
+    }
+    candidates = [
+        (index, row["playbackEpoch"])
+        for index, row in enumerate(automation)
+        if row.get("name") == "playback_active"
+        and type(row.get("playbackEpoch")) is int
+        and row["playbackEpoch"] not in terminal_by_epoch
+    ]
+    return candidates[-1] if candidates else None
+
+
+def _interrupted_playback_epoch(
+    automation: Sequence[dict[str, Any]],
+) -> tuple[int, int, int, int] | None:
+    interrupt_indices = [
+        index for index, row in enumerate(automation)
+        if row.get("name") == "interrupt_started"
+    ]
+    for interrupt_index in reversed(interrupt_indices):
+        active_candidates = [
+            (index, row["playbackEpoch"])
+            for index, row in enumerate(automation[:interrupt_index])
+            if row.get("name") == "playback_active"
+            and type(row.get("playbackEpoch")) is int
+        ]
+        for active_index, epoch in reversed(active_candidates):
+            terminal_before_interrupt = any(
+                row.get("name") in PLAYBACK_TERMINAL_NAMES
+                and row.get("playbackEpoch") == epoch
+                for row in automation[active_index + 1:interrupt_index]
+            )
+            if terminal_before_interrupt:
+                continue
+            stopped_index = ordered_event(
+                automation,
+                "playback_stopped",
+                lambda row: row.get("playbackEpoch") == epoch,
+                interrupt_index,
+            )
+            if stopped_index is not None:
+                return active_index, epoch, interrupt_index, stopped_index
+    return None
+
+
+def evaluate_livekit_checkpoint(
+    expectation: Expectation,
+    automation: Sequence[dict[str, Any]],
+    history: Mapping[str, Any],
+    quiet_ms: int,
+) -> None:
+    expectation = Expectation(expectation)
+    _require(type(quiet_ms) is int and quiet_ms >= 0, "quiet_threshold")
+    records = _current_history_records(history)
+    terminal = {"complete", "failed", "expired", "canceled"}
+
+    if expectation in {Expectation.PARALLEL_FIRST_PENDING, Expectation.ISOLATION_FIRST_ACTIVE}:
+        _require(len(records) == 1 and records[0]["status"] not in terminal,
+                 "first_request_active")
+        _require(records[0]["announcement"] != "announced", "first_request_active")
+        return
+
+    if expectation is Expectation.PARALLEL_LATER_COMPLETED_FIRST:
+        _require(len(records) == 2, "parallel_two_records")
+        first, second = records
+        _require(first["status"] not in terminal and first["announcement"] != "announced",
+                 "parallel_first_pending")
+        _require(second["status"] == "complete" and second["announcement"] == "announced",
+                 "parallel_second_announced")
+        _require(_grounded_once(history, second), "parallel_second_grounded")
+        return
+
+    if expectation is Expectation.PARALLEL_BOTH_ANNOUNCED:
+        _require(len(records) == 2, "parallel_two_records")
+        _require(all(record["status"] == "complete" and record["announcement"] == "announced"
+                     and _grounded_once(history, record) for record in records),
+                 "parallel_both_announced")
+        return
+
+    if expectation is Expectation.INTERRUPTION_DELIVERY_ACTIVE:
+        _require(len(records) == 1 and records[0]["status"] == "complete"
+                 and records[0]["announcement"] != "announced", "interruption_result_ready")
+        _require(_active_playback_epoch(automation) is not None, "interruption_active_epoch")
+        return
+
+    if expectation in {Expectation.INTERRUPTION_OBSERVED, Expectation.INTERRUPTION_RECOVERED}:
+        interrupted = _interrupted_playback_epoch(automation)
+        _require(interrupted is not None, "interruption_stopped_epoch")
+        _, active_epoch, _, stopped_index = interrupted
+        if expectation is Expectation.INTERRUPTION_OBSERVED:
+            _require(records[0]["announcement"] != "announced", "interruption_no_announcement")
+            return
+        resumed = next(
+            ((index, row) for index, row in enumerate(automation)
+             if index > stopped_index and row.get("name") == "playback_active"
+             and row.get("playbackEpoch") != active_epoch),
+            None,
+        )
+        _require(resumed is not None, "recovery_new_epoch")
+        drained = ordered_event(
+            automation,
+            "playback_drained",
+            lambda row: row.get("playbackEpoch") == resumed[1].get("playbackEpoch"),
+            resumed[0],
+        )
+        _require(drained is not None, "recovery_drained_epoch")
+        quiet_start = first_quiet_after_last_reset(automation, resumed[1].get("monotonicMs"))
+        _require(quiet_start is not None and resumed[1]["monotonicMs"] - quiet_start >= quiet_ms,
+                 "recovery_continuous_quiet")
+        _require(records[0]["status"] == "complete" and records[0]["announcement"] == "announced"
+                 and _grounded_once(history, records[0]), "recovery_announcement")
+        return
+
+    if expectation is Expectation.ISOLATION_TWO_DISTINCT:
+        _require(len(records) == 2 and records[0]["identityHash"] != records[1]["identityHash"]
+                 and records[0].get("jobHash") != records[1].get("jobHash"),
+                 "isolation_disjoint_identity")
+        return
+
+    if expectation is Expectation.ISOLATION_TERMINAL_HEALTHY:
+        _require(len(records) == 2, "isolation_two_records")
+        target, healthy = records
+        _require(target["status"] == "canceled" and target["announcement"] != "announced",
+                 "isolation_target_terminal")
+        _require(healthy["status"] == "complete" and healthy["announcement"] == "announced"
+                 and _grounded_once(history, healthy), "isolation_healthy_announced")
+        return
+
+    raise ContractError("livekit_expectation")
+
+
 def _parse_pairs(line: str) -> tuple[list[str], dict[str, Any]]:
     pairs = json.loads(line, object_pairs_hook=lambda value: value)
     if type(pairs) is not list or any(type(pair) is not tuple for pair in pairs):
@@ -1458,9 +1734,24 @@ def _main(arguments: Sequence[str]) -> int:
         return 0
     if len(arguments) == 2 and arguments[0] == "--validate-expectation":
         try:
-            Expectation(arguments[1])
+            expectation = Expectation(arguments[1])
         except ValueError:
             return 2
+        if expectation not in LIVEKIT_EXPECTATIONS:
+            return 2
+        return 0
+    if len(arguments) == 7 and arguments[0] == "--evaluate-livekit":
+        _, expectation_value, automation_path, history_path, run_hash, comparison_hash, quiet_ms = arguments
+        try:
+            expectation = Expectation(expectation_value)
+            _require(expectation in LIVEKIT_EXPECTATIONS, "livekit_expectation")
+            automation = parse_automation_bytes(_read(automation_path), run_hash, comparison_hash)
+            history = parse_history_snapshot_bytes(_read(history_path))
+            evaluate_livekit_checkpoint(expectation, automation, history, int(quiet_ms))
+        except (ValueError, ContractError) as error:
+            boundary = error.boundary if isinstance(error, ContractError) else "livekit_expectation"
+            print(boundary)
+            return 3
         return 0
     if len(arguments) == 2 and arguments[0] == "--validate-finalization":
         try:

@@ -28,7 +28,7 @@ FIXTURE_MAX_BYTES=16777216
 run_mdev_adb() {
   local status
   if timeout --signal=TERM --kill-after=2s "${VOICE_STEP_ADB_TIMEOUT_SECONDS:-10}s" \
-      "$MDEV" android adb --device phone --owner "$MDEV_OWNER" -- "$@" 2>/dev/null; then
+      "$MDEV" android adb --owner "$MDEV_OWNER" -- "$@" 2>/dev/null; then
     return 0
   else
     status=$?
@@ -1250,7 +1250,9 @@ resolve_package_identity() {
   ANDROID_USER_ID="$current_user"
 
   package_row="$(adb_read shell cmd package list packages --user "$ANDROID_USER_ID" \
-    -U --show-stopped "$PACKAGE" 2>/dev/null)" || die 'package identity readback failed'
+    -U --show-stopped "$PACKAGE" 2>/dev/null \
+    | awk -v expected="package:$PACKAGE" '$1 == expected')" ||
+    die 'package identity readback failed'
   if [[ "$package_row" =~ ^package:me\.rerere\.rikkahub\.debug\ stopped=(true|false)\ uid:([1-9][0-9]*)$ ]]; then
     PACKAGE_UID="${BASH_REMATCH[2]}"
   else
@@ -1296,39 +1298,6 @@ printf ready
   [[ "$protected_probe" == ready ]] || die 'protected path unavailable'
 }
 
-read_trace_pointer() {
-  local probe
-  local value
-  probe="$(run_as_script shell '
-: voice-step-trace-probe
-if [ -L "$1" ]; then
-  printf invalid
-elif [ -e "$1" ]; then
-  [ -f "$1" ] || { printf invalid; exit; }
-  printf present
-else
-  printf absent
-fi
-' "$LATEST_TRACE_PATH" </dev/null 2>/dev/null)" || die 'trace readback failed'
-  probe="${probe//$'\r'/}"
-  probe="${probe//$'\n'/}"
-  case "$probe" in
-    absent)
-      TRACE_POINTER_PRESENT=0
-      TRACE_POINTER_VALUE=''
-      ;;
-    present)
-      value="$(adb_read exec-out run-as "$PACKAGE" --user "$ANDROID_USER_ID" cat "$LATEST_TRACE_PATH" 2>/dev/null)" ||
-        die 'trace readback failed'
-      value="${value//$'\r'/}"
-      value="${value//$'\n'/}"
-      validate_identifier "$value" 'trace id'
-      TRACE_POINTER_PRESENT=1
-      TRACE_POINTER_VALUE="$value"
-      ;;
-    *) die 'trace readback failed' ;;
-  esac
-}
 
 compute_remote_owner_hash() {
   local owner_hash
