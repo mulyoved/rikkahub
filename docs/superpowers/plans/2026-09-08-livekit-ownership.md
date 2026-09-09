@@ -539,9 +539,29 @@ intelligibility.
 - The next separated-start interruption attempt lost remote ADB during owned-fixture staging. It never activated a call
   or created a state file, and bounded staging cleanup finished before managed preflight confirmed the phone route was
   unavailable again. The interruption/requeue timing observation and managed UI comparison therefore remain open.
-  The remaining machine gates are a successful documented concurrent/out-of-order observation,
-  interruption/requeue observation, successful cancellation/isolation observation, and
-  unchanged-existing-conversation UI inspection.
+- A third route restoration again passed exact package/version/pulled-APK and Python
+  published/runtime/profile/process/registration proof. A silence-start interruption run observed its one
+  session-bound result first as `complete`/`not_announced`, then accepted the interruption input, and later observed
+  exactly one grounded `complete`/`announced` result with five transcript summaries. The active-playback,
+  stopped-epoch, and recovered-epoch predicates still rejected the trace, so this proves eventual non-duplicate
+  delivery, not interruption/requeue.
+- The final realistic cancellation retry separated startup and mechanically shortened the unchanged target/cancel
+  speech. It produced two session-bound, grounded `complete`/`announced` records and six transcript summaries, but no
+  canceled terminal. Equivalent natural-timing attempts stop here. In this window, the sanitized worker counts were
+  two ready sessions, three tool invocations/submissions/admissions/announcements, 23 successful history publications,
+  three gate-blocked markers, and zero registration, delivery, history, transcript-persistence, or cleanup failures.
+- Managed `agent-device` selected one pre-existing saved conversation without rendering its title or messages into the
+  report. Its allowlisted app-node fingerprint before the final call was
+  `sha256:7c0886102ce2ebbea953bc8ba9b6f0a2b70adc2a991179eba97d2d9489f69128` with 23 nodes, six labels, and three values.
+  Returning through the same hashed drawer row after the call produced the identical fingerprint and counts. The
+  unchanged-existing-conversation UI gate is therefore satisfied without exporting unrelated history.
+- The remaining actual machine gates are a successful documented concurrent/out-of-order observation,
+  interruption/requeue observation, and successful cancellation/isolation observation. Natural inputs repeatedly
+  completed too quickly or in request order. Deterministic completion now requires the retained Python owner to launch
+  and re-attest the same local candidate with its existing `HERMES_LOCAL_RESULT_RELEASE_PLAN=3,2,1` plugin-visibility
+  wrapper. Android can then issue three substantive requests, cancel a held request, and interrupt an active released
+  delivery; Android must not restart or mutate that Python process itself. No production scheduler ordering changes are
+  requested.
   Normal scoped history, exact pair/APK readback, and bounded shutdown have current phone evidence. Human acoustic
   judgment, manager campaign acceptance, and the final human merge decision also remain pending. Release assembly
   remains waived.
