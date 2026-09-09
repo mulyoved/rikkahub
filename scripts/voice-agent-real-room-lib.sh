@@ -1666,7 +1666,8 @@ read_package_stopped_state() {
     opposite=true
   fi
   row="$(adb_read shell cmd package list packages --user "$ANDROID_USER_ID" \
-    -U --show-stopped "$PACKAGE" 2>/dev/null)" || return 2
+    -U --show-stopped "$PACKAGE" 2>/dev/null \
+    | awk -v expected="package:$PACKAGE" '$1 == expected')" || return 2
   row="${row//$'\r'/}"
   row="${row//$'\n'/}"
   if [[ "$row" == "package:$PACKAGE stopped=$expected uid:$PACKAGE_UID" ]]; then
