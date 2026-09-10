@@ -587,16 +587,53 @@ intelligibility.
   older-epoch interruption fallbacks; the repaired selectors judge only the latest active playback epoch. Its final
   affected-only verdict is `ASTRA REVIEW: ship`, with the documented playback/job-correlation and acoustic limits as
   residual risks. Production Android source and APK bytes are unchanged.
+- After the Python activation repair, the managed-phone controlled Start passed call activation and state publication
+  against Python published head `43e227883bb35fc4cc2f2b16149abae743bcc5c5`, runtime
+  `4d3ef1e4852630db5a54c9c9d576d57af7ce17f7`, worker-profile SHA-256
+  `aaa0491fdeed14ba7ad8658202f86c207773df3fa8b9459f64ee71ab1f1e2ecd`, and exact local release plan `3,2,1`.
+  The pre-call and post-call private proofs each bound the same online process at restart count two and unstable count
+  zero, at least one initialized child, zero initialization errors, exactly one registration marker, and zero
+  connection retries. Android neither changed nor restarted the Python process.
+- Managed readback before and after this run reported package `me.rerere.rikkahub.debug`, version code `172`, version
+  name `2.4.5`, and installed APK SHA-256
+  `66ad15b1b583a3373ec70ae14d61b97b0d8f417ed7367d5e852794f68b257cb2` with size 110,965,363 bytes. That artifact was
+  built from Android harness source `f188f6c22a985cdbd0ba142cd59a89bc025fa984`; production runtime remains
+  `30cddf502ee56758c5845a415cfa931e9d286248`, and `f188f6c..69854af` remains documentation/host automation only.
+- Three substantive requests were injected and bound by backend submission order, followed immediately by the
+  cancellation utterance. The sanitized worker window contains four `ask_hermes` tool invocations, four accepted
+  submissions, four completed admissions, and two announced deliveries; `cancel_hermes` does not emit that invocation
+  marker, so the fourth accepted submission proves that the utterance did not execute a cancellation. The live scoped
+  snapshot held three distinct session-bound records, all `complete`: ordinal one and ordinal two were announced and
+  grounded, while ordinal three was not yet announced or grounded. Ordinal two appeared before ordinal one in grounded
+  transcript order, but ordinal three had not finished presentation; this is not the required final `3,2` controlled
+  order and does not prove natural backend completion ordering. Ordinal one was already complete and announced, so the
+  cancellation/isolation gate fails rather than being inferred from the visibility wrapper.
+- The same active call recorded one playback epoch and accepted two bounded interruption inputs. Its final sanitized
+  automation artifact contains two `interrupt_started` events, one `playback_active`, 2,214 playback writes, and no
+  `playback_stopped` or `playback_drained` event. There is therefore no stopped/recovered epoch or interruption/requeue
+  proof. Playback events carry no Hermes job identity, so ordinal-three audio is not inferred from coincident active
+  playback. Finalization and end both returned complete; the artifact contains one `call_stopped` and one
+  `run_finalized`, and managed phone status remained healthy. The worker window had 29 successful history
+  publications and zero origin/submission/admission-closed, history enqueue/drop/write/close-timeout, cleanup,
+  initialization, registration, or reconnect errors.
+- Equivalent Android-only speech-timing retries stop here. The bounded next paired step belongs to the retained Python
+  owner: its local-only verification setup must keep ordinal one genuinely cancelable until `cancel_hermes` executes
+  and provide a sufficiently long, observable released-result playback window for Android's injected speech to create
+  a stopped/recovered epoch. The existing wrapper may control result visibility only; it must not manufacture a
+  canceled terminal, reorder production delivery, or be used to claim natural completion order. Once that exact proof
+  is refreshed, Android can rerun this single controlled flow without repeating unaffected component, UI/history, APK,
+  or independent-review evidence.
 - The remaining actual machine gates are a successful controlled concurrent/out-of-order observation,
-  interruption/requeue observation, and cancellation/isolation observation after dispatch is restored. Normal scoped
-  history, exact pair/APK readback, unchanged-existing-conversation UI inspection, and bounded shutdown retain current
-  phone evidence. Human acoustic judgment, manager campaign acceptance, and the final human merge decision also remain
-  pending. Release assembly remains waived.
-- At final publication readback the retained `phone` assignment still belonged to this caller, but managed status had
-  regressed to remote-ADB unavailable/protocol-incompatible and could no longer inspect physical inventory. No takeover,
-  reset, host lifecycle action, or equivalent Start retry was attempted. This does not invalidate the exact pre-Start
-  installed-APK readback, but the next controlled call now requires both restored Python dispatch/activation and a
-  healthy compatible assigned phone route.
+  interruption/requeue observation, and cancellation/isolation observation after the retained Python owner provides
+  the bounded coordination described above. Normal scoped history, exact pair/APK readback,
+  unchanged-existing-conversation UI inspection, and bounded shutdown retain current phone evidence. Human acoustic
+  judgment, manager campaign acceptance, and the final human merge decision also remain pending. Release assembly
+  remains waived.
+- A later final readback supersedes the earlier route outage: the retained `phone` assignment still belongs to this
+  caller, remote ADB is reachable and protocol-compatible, and physical-phone inventory is healthy. The optional
+  emulator remains quarantined and the tablet absent; neither blocks this phone-only gate. No takeover, reset, host
+  lifecycle action, uninstall, or clear-data operation was used. Python dispatch and activation are restored; the next
+  controlled call is bounded only by the cancellation/playback coordination above.
 
 After those pass:
 
