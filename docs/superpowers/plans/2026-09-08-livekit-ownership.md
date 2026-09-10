@@ -623,17 +623,49 @@ intelligibility.
   canceled terminal, reorder production delivery, or be used to claim natural completion order. Once that exact proof
   is refreshed, Android can rerun this single controlled flow without repeating unaffected component, UI/history, APK,
   or independent-review evidence.
+- The sharpened-routing rerun used Python published head
+  `8ba7b714b99c4659999673fb54caa4caac6595b2`, runtime
+  `49e91a9460bae7a5331180a6b171710529f78fd4`, worker-profile SHA-256
+  `3fd83458d371ba82fe68381a8a9c64b500951a53eae74fd44a6f73d6f1efe1c2`, and exact release plan `3,2,1`.
+  The private proof before Start and after the call retained one initialized child, restart count three, zero unstable
+  restarts, one registration, zero connection retries, and no initialization error. Managed preflight passed, and a
+  fresh pulled readback matched package `me.rerere.rikkahub.debug`, version `172`/`2.4.5`, size 110,965,363 bytes, and
+  APK SHA-256 `66ad15b1b583a3373ec70ae14d61b97b0d8f417ed7367d5e852794f68b257cb2`.
+- One setup call admitted request one but rejected the newly generated cancel fixture locally because its file mode was
+  `0644`, not the required private `0600`. Python had begun delivery by the time the root cause was confirmed, so the
+  call was finalized instead of treating a late retry as cancellation evidence. After correcting only the fixture mode,
+  the one valid non-equivalent rerun reached Active, admitted exactly one substantive request, and immediately injected
+  the required cancellation wording.
+- The routing repair passed its live boundary: the worker recorded exactly one `voice_hermes_tool_invoked`, one accepted
+  submission/admission, and one `voice_hermes_cancel_tool_invoked`, with no second accepted request. Cancellation still
+  lost the authoritative backend race. Android's production decoder recorded the sole request as `complete` and
+  `announced`, with a result hash; no `job_canceled` terminal existed. The fail-fast rule therefore stopped the sequence
+  before requests two and three. Ordering, interruption/requeue, quiet-time delivery, and canceled-target speech were
+  not exercised or inferred in this rerun. The sanitized worker window recorded one delivery start/announcement, nine
+  successful history publications, and zero origin, submission, admission-closed, history, cleanup, initialization,
+  registration, or reconnect errors.
+- The first complete end attempt removed the exact owned fixture directory, then a transient post-cleanup artifact read
+  failed before cleanup-record publication. The old helper rejected an idempotent retry because the directory was
+  already absent. A red regression reproduced that failure. The repaired cleanup broker first verifies the pinned
+  parent identity; an absent, non-symlink run entry is accepted as already clean, while a present entry retains the full
+  directory identity, nonce, UID, file allowlist, quiescence, and unlink checks. The focused end suite passed 35
+  assertions, the full helper passed 349 assertions, shell syntax, Python compilation, and `git diff --check` passed,
+  and the real-phone retry published `outcome=complete`.
+- One fresh Luna/xhigh read-only review returned `ASTRA REVIEW: ship` with no actionable findings. It confirmed that the
+  absent branch performs no deletion and does not weaken present-path ownership checks. Residual risk is a same-UID
+  process recreating the directory immediately after the absence observation, which could make `fixturesRemoved=true`
+  briefly stale; the helper still will not delete that recreated path without its complete ownership proof.
 - The remaining actual machine gates are a successful controlled concurrent/out-of-order observation,
-  interruption/requeue observation, and cancellation/isolation observation after the retained Python owner provides
-  the bounded coordination described above. Normal scoped history, exact pair/APK readback,
-  unchanged-existing-conversation UI inspection, and bounded shutdown retain current phone evidence. Human acoustic
-  judgment, manager campaign acceptance, and the final human merge decision also remain pending. Release assembly
-  remains waived.
-- A later final readback supersedes the earlier route outage: the retained `phone` assignment still belongs to this
-  caller, remote ADB is reachable and protocol-compatible, and physical-phone inventory is healthy. The optional
-  emulator remains quarantined and the tablet absent; neither blocks this phone-only gate. No takeover, reset, host
-  lifecycle action, uninstall, or clear-data operation was used. Python dispatch and activation are restored; the next
-  controlled call is bounded only by the cancellation/playback coordination above.
+  interruption/requeue observation, and a genuinely canceled ordinal one. The retained Python owner must provide a
+  request that stays authoritatively queued or running through the cancel-tool round trip; visibility-only holding is
+  insufficient. Normal scoped history, exact pair/APK readback, unchanged-existing-conversation UI inspection, and
+  bounded shutdown retain current phone evidence. Human acoustic judgment, manager campaign acceptance, and the final
+  human merge decision also remain pending. Release assembly remains waived.
+- The retained `phone` assignment still belongs to this caller. The route was healthy through call finalization and the
+  successful idempotent cleanup retry, then became unavailable during a later read-only automation-artifact query.
+  Python proof still validated with one registration and zero retries. This post-cleanup route loss does not invalidate
+  the exact pre-Start APK readback or the helper's bound finalization/cleanup records. No takeover, reset, host lifecycle
+  action, uninstall, or clear-data operation was used.
 
 After those pass:
 

@@ -1725,6 +1725,11 @@ identity() {
     "$(stat -Lc %u "$descriptor")" "$(stat -Lc %g "$descriptor")"
 }
 [ "$(identity /proc/$$/fd/5)" = "$expected_parent" ] || exit 1
+if [ ! -e "$name" ] && [ ! -L "$name" ]; then
+  exec 5<&-
+  printf absent
+  exit 0
+fi
 [ -d "$name" ] && [ ! -L "$name" ] || exit 1
 [ "$(identity "$name")" = "$expected_directory" ] || exit 1
 cd -- "$name" || exit 1
@@ -1763,7 +1768,7 @@ exec 5<&-
 printf removed
 ' "$remote_directory" "$FIXTURE_PARENT_IDENTITY" "$FIXTURE_DIRECTORY_IDENTITY" \
     "$FIXTURE_OWNERSHIP_NONCE" "$PACKAGE_UID" </dev/null)" || return 1
-  [[ "$result" == removed ]] || return 2
+  [[ "$result" == removed || "$result" == absent ]] || return 2
 }
 
 restore_force_stopped_package() {

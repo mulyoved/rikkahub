@@ -1087,7 +1087,7 @@ if run_as_tail is not None:
             save_state(state)
             if completed.returncode != 0:
                 raise SystemExit(1)
-            if completed.stdout != "removed" or directory.exists() or directory.is_symlink():
+            if completed.stdout not in {"removed", "absent"} or directory.exists() or directory.is_symlink():
                 raise SystemExit(1)
             state["remote_directory"] = None
             state["owner_hash"] = None
@@ -6874,6 +6874,26 @@ assert state["package_stopped"] is False
 assert state["restoration_count"] == 1
 PY
   assert_private_output_absent
+  pass
+
+  unset FAKE_ADB_FAIL_POST_CLEANUP_ARTIFACT_READ
+  run_helper end --state "$state" --finalization "$finalization" \
+    --cleanup-output "$cleanup_output"
+  assert_exact_output $'voice-step.status=ok\nvoice-step.operation=end\nvoice-step.outcome=complete'
+  python3 - "$cleanup_output" "$FAKE_STATE" <<'PY' || fail "end-post-cleanup-artifact-read-retry test: absent owned directory was not accepted"
+import json
+import sys
+
+cleanup = json.load(open(sys.argv[1], encoding="utf-8"))
+state = json.load(open(sys.argv[2], encoding="utf-8"))
+assert cleanup["outcome"] == "complete"
+assert cleanup["callStopped"] is True
+assert cleanup["automationFinalized"] is True
+assert cleanup["fixturesRemoved"] is True
+assert state["remote_directory"] is None
+assert state["package_stopped"] is False
+assert state["restoration_count"] == 2
+PY
   pass
 
   rm -f -- "$cleanup_output" "$state" "$finalization"
