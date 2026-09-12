@@ -688,3 +688,30 @@ Run the thermonuclear audit once, after both candidate revisions and paired evid
 - Both actual revisions consume the same semantic packet. Equivalent JSON is accepted; duplicate keys and invalid fields, types, versions, IDs, ownership, correlations, and hashes are rejected.
 - Recovery journals, durable backend storage, restart/disconnect reconciliation, generic retries, phone-confirmed admission, and old four-scenario evidence state are absent from the LiveKit path.
 - The final inventory shows fewer caller obligations and states, and the combined acceptance question is answered no.
+
+### Final managed-phone acceptance, 2026-09-12
+
+- The operator authorized takeover of the physical `phone` lane. Managed takeover returned
+  `takeover=complete`, `cleanup=complete`, and `lane=phone`. Package readback remained
+  `me.rerere.rikkahub.debug` version `172`/`2.4.5`; the pulled APK was 110,965,363 bytes and
+  matched SHA-256 `66ad15b1b583a3373ec70ae14d61b97b0d8f417ed7367d5e852794f68b257cb2`.
+- Python remained online with restart count three, zero unstable restarts, and the exact local
+  `3,2,1` release plan. The canonical launcher check passed from the deployed worktree, and the
+  protected backend health endpoint returned HTTP 200.
+- Two cancellation attempts each produced exactly one ask, one accepted admission, and one
+  `voice_hermes_cancel_tool_invoked`, with no second request. Both authoritative jobs completed
+  before cancellation reached the backend. The operator accepted the focused cancellation tests,
+  correct tool routing, and real completion-wins race as sufficient cancellation evidence; no
+  canceled terminal is claimed.
+- A separate controlled call admitted three distinct jobs. Android recorded three completed,
+  announced results, each grounded exactly once in strict `3,2,1` order. This proves the local
+  visibility wrapper's controlled ordering without claiming natural backend completion order.
+- In the final interruption call, Android recorded `interrupt_started`; Python recorded one
+  `voice_hermes_delivery_requeued` five seconds later and resumed delivery. All three results were
+  again grounded once in `3,2,1` order. Python did not emit `voice_interrupt_completed`, so strict
+  RPC-marker acceptance is not claimed. The operator accepted the observed interruption, requeue,
+  resume, focused RPC tests, and absence of duplicates as sufficient functional evidence.
+- Every started call returned complete finalization and cleanup, with stopped call state and owned
+  fixtures removed. Both source worktrees remained clean, the Python process remained stable, and
+  the manager retained the phone assignment. Human acoustic judgment and final merge approval remain
+  human-owned.
