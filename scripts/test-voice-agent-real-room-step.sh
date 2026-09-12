@@ -690,12 +690,12 @@ if os.environ.get("FAKE_ADB_BLOCK") == "1":
     time.sleep(10)
 state = load_state()
 expected_prefix = [
-    "android", "adb", "--device", "phone", "--owner",
+    "android", "adb", "--owner",
     os.environ["FAKE_MDEV_OWNER"], "--",
 ]
-if argv[:7] != expected_prefix or len(argv) == 7:
+if argv[:len(expected_prefix)] != expected_prefix or len(argv) == len(expected_prefix):
     raise SystemExit(64)
-command = argv[7:]
+command = argv[len(expected_prefix):]
 if (
     os.environ.get("FAKE_MDEV_REJECT_ACTION_FLAG") == "1"
     and "-a" in command
@@ -829,6 +829,11 @@ if command == [
     "shell", "cmd", "package", "list", "packages", "--user",
     str(state["android_user_id"]), "-U", "--show-stopped", EXPECTED_PACKAGE,
 ]:
+    if os.environ.get("FAKE_ADB_PREFIX_SIBLING") == "1":
+        print(
+            f"package:{EXPECTED_PACKAGE}.test stopped=false "
+            f"uid:{int(state['package_uid']) + 1}"
+        )
     if os.environ.get("FAKE_ADB_MALFORMED_STOPPED_ROW") == "1":
         print(f"package:{EXPECTED_PACKAGE} uid:{state['package_uid']}")
     else:
@@ -1082,7 +1087,7 @@ if run_as_tail is not None:
             save_state(state)
             if completed.returncode != 0:
                 raise SystemExit(1)
-            if completed.stdout != "removed" or directory.exists() or directory.is_symlink():
+            if completed.stdout not in {"removed", "absent"} or directory.exists() or directory.is_symlink():
                 raise SystemExit(1)
             state["remote_directory"] = None
             state["owner_hash"] = None
@@ -1185,6 +1190,34 @@ if command[:4] == ["shell", "am", "broadcast", "--user"]:
         raise SystemExit(0)
     if os.environ.get("FAKE_ADB_MALFORMED_BROADCAST") == action:
         print("uncontrolled malformed receiver output")
+        raise SystemExit(0)
+    if action.endswith(".HISTORY_STATUS"):
+        if (
+            values.get("run_hash") != state["run_hash"]
+            or values.get("conversation_id") != state["conversation_id"]
+            or state["automation_state"] != "active"
+        ):
+            complete(1, "status=error\nerror=invalid_state")
+            raise SystemExit(0)
+        history = {
+            "conversationHash": "sha256:" + hashlib.sha256(
+                state["conversation_id"].encode()
+            ).hexdigest(),
+            "recordCount": 1,
+            "transcriptCount": 0,
+            "records": [{
+                "identityHash": hash_value("1"),
+                "jobHash": hash_value("2"),
+                "sessionHash": hash_value("3"),
+                "status": "running",
+                "announcement": "not_announced",
+            }],
+            "transcripts": [],
+        }
+        data = "status=ok\naction=history_status\nhistory_json=" + json.dumps(
+            history, separators=(",", ":")
+        )
+        complete(0, data)
         raise SystemExit(0)
     if action.endswith(".STATUS"):
         restoring = "--include-stopped-packages" in command
@@ -1707,7 +1740,7 @@ fi
     raise SystemExit(0)
 if exec_out_run_as_tail is not None and exec_out_run_as_tail[:1] == ["cat"]:
     remote_path = exec_out_run_as_tail[1]
-    if remote_path.endswith("latest-trace-id.txt"):
+    if remote_path.endswith("automation-events.jsonl"):
         if (
             os.environ.get("FAKE_ADB_SIGNAL_ON_TRACE") == "1"
             and state.get("call_active")
@@ -1722,8 +1755,6 @@ if exec_out_run_as_tail is not None and exec_out_run_as_tail[:1] == ["cat"]:
             Path(destination).write_text("raced", encoding="utf-8")
             state["destination_created"] = True
             save_state(state)
-        print(state.get("trace_id", "trace-old"))
-        raise SystemExit(0)
     state["artifact_reads"] = state.get("artifact_reads", 0) + 1
     artifact_read = state["artifact_reads"]
     if remote_path.endswith("automation-events.jsonl"):
@@ -2613,7 +2644,7 @@ payload = {
     "fixtureParentIdentity": fake["fixture_parent_identity"] or f"1:1:40700:{uid}:{gid}",
     "fixtureDirectoryIdentity": fake["fixture_directory_identity"] or f"1:2:40700:{uid}:{gid}",
     "fixtureOwnershipNonce": "0123456789abcdef0123456789abcdef",
-    "traceId": "trace-new",
+    "traceId": "livekit-history-v1",
     "transport": "livekit_experimental",
 }
 descriptor = os.open(sys.argv[1], os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -2698,7 +2729,7 @@ run_helper() {
   for argument in "$@"; do
     [[ "$argument" == --mdev-owner ]] && has_owner=1
   done
-  if [[ "${RUN_HELPER_SKIP_OWNER:-0}" != 1 && "$has_owner" -eq 0 && "${1:-}" =~ ^(preflight|start|inject|interrupt|status|finalize|capture|end|resolve-binding|wait-automation)$ ]]; then
+  if [[ "${RUN_HELPER_SKIP_OWNER:-0}" != 1 && "$has_owner" -eq 0 && "${1:-}" =~ ^(preflight|start|inject|interrupt|status|history|finalize|end|resolve-binding|wait-automation)$ ]]; then
     invocation=("$1" --mdev-owner "$MDEV_OWNER" "${@:2}")
   fi
   for (( index = 0; index + 1 < ${#invocation[@]}; index++ )); do
@@ -2963,7 +2994,7 @@ import sys
 
 data = open(sys.argv[1], "rb").read()
 commands = [chunk.split(b"\0") for chunk in data.split(b"\0\0") if chunk]
-prefix = [b"android", b"adb", b"--device", b"phone", b"--owner", b"OWNER_SECRET_123", b"--"]
+prefix = [b"android", b"adb", b"--owner", b"OWNER_SECRET_123", b"--"]
 commands = [
     [b"-s", b"DEVICE_SECRET_123", *command[len(prefix):]]
     if command[:len(prefix)] == prefix else command
@@ -2981,7 +3012,7 @@ import sys
 
 data = open(sys.argv[1], "rb").read()
 commands = [chunk.split(b"\0") for chunk in data.split(b"\0\0") if chunk]
-prefix = [b"android", b"adb", b"--device", b"phone", b"--owner", b"OWNER_SECRET_123", b"--"]
+prefix = [b"android", b"adb", b"--owner", b"OWNER_SECRET_123", b"--"]
 expected = [value.encode() for value in sys.argv[2:]]
 matches = 0
 for command in commands:
@@ -3144,15 +3175,14 @@ run_managed_owner_contract_tests() {
   write_valid_state "$state"
   write_finalization "$finalization"
 
-  for operation in preflight start inject interrupt status finalize capture end; do
+  for operation in preflight start inject interrupt status finalize end; do
     case "$operation" in
       preflight) invocation=(preflight --package me.rerere.rikkahub.debug) ;;
       start) invocation=(start --state "$TMP_DIR/owner-missing-start.json" --package me.rerere.rikkahub.debug --conversation-id conversation-owner --run-hash "$hash_a" --comparison-hash "$hash_b" --fixture "$fixture") ;;
       inject) invocation=(inject --state "$state" --fixture "$fixture" --role request) ;;
       interrupt) invocation=(interrupt --state "$state" --fixture "$fixture") ;;
-      status) invocation=(status --state "$state" --expect single_result_announced) ;;
+      status) invocation=(status --state "$state" --expect parallel_first_pending) ;;
       finalize) invocation=(finalize --state "$state" --finalization-output "$TMP_DIR/owner-missing-finalization.json") ;;
-      capture) invocation=(capture --state "$state" --finalization "$finalization" --automation-output "$TMP_DIR/owner-missing-automation.jsonl" --private-voice-output "$TMP_DIR/owner-missing-private.ndjson" --sanitized-voice-output "$TMP_DIR/owner-missing-sanitized.ndjson") ;;
       end) invocation=(end --state "$state" --finalization "$finalization" --cleanup-output "$TMP_DIR/owner-missing-cleanup.json") ;;
     esac
     : >"$MDEV_LOG"
@@ -3163,13 +3193,12 @@ run_managed_owner_contract_tests() {
     pass
   done
 
-  for operation in inject interrupt status finalize capture end; do
+  for operation in inject interrupt status finalize end; do
     case "$operation" in
       inject) invocation=(inject --mdev-owner "$OTHER_MDEV_OWNER" --state "$state" --fixture "$fixture" --role request) ;;
       interrupt) invocation=(interrupt --mdev-owner "$OTHER_MDEV_OWNER" --state "$state" --fixture "$fixture") ;;
-      status) invocation=(status --mdev-owner "$OTHER_MDEV_OWNER" --state "$state" --expect single_result_announced) ;;
+      status) invocation=(status --mdev-owner "$OTHER_MDEV_OWNER" --state "$state" --expect parallel_first_pending) ;;
       finalize) invocation=(finalize --mdev-owner "$OTHER_MDEV_OWNER" --state "$state" --finalization-output "$TMP_DIR/wrong-owner-finalization.json") ;;
-      capture) invocation=(capture --mdev-owner "$OTHER_MDEV_OWNER" --state "$state" --finalization "$finalization" --automation-output "$TMP_DIR/wrong-owner-automation.jsonl" --private-voice-output "$TMP_DIR/wrong-owner-private.ndjson" --sanitized-voice-output "$TMP_DIR/wrong-owner-sanitized.ndjson") ;;
       end) invocation=(end --mdev-owner "$OTHER_MDEV_OWNER" --state "$state" --finalization "$finalization" --cleanup-output "$TMP_DIR/wrong-owner-cleanup.json") ;;
     esac
     : >"$MDEV_LOG"
@@ -3184,7 +3213,7 @@ run_managed_owner_contract_tests() {
   chmod 600 "$TMP_DIR/copied-owner-state.json"
   : >"$MDEV_LOG"
   run_helper status --mdev-owner "$OTHER_MDEV_OWNER" \
-    --state "$TMP_DIR/copied-owner-state.json" --expect single_result_announced
+    --state "$TMP_DIR/copied-owner-state.json" --expect parallel_first_pending
   [[ "$RUN_STATUS" -ne 0 && ! -s "$MDEV_LOG" ]] \
     || fail 'managed-owner test: copied state was reusable under another owner'
   assert_private_output_absent
@@ -3288,7 +3317,7 @@ run_general_validation_tests() {
   assert_rejected '' 'usage: voice-agent-real-room-step.sh OPERATION [options]'
   assert_rejected 'unknown' 'invalid operation'
   local operation
-  for operation in preflight start inject interrupt status finalize capture end; do
+  for operation in preflight start inject interrupt status history finalize end; do
     assert_operation_exists "$operation"
     assert_rejected "$operation --unknown-option value" 'unknown option'
   done
@@ -3300,7 +3329,6 @@ run_general_validation_tests() {
   assert_rejected 'interrupt --fixture one --fixture two' 'repeated option'
   assert_rejected 'status --state one --state two' 'repeated option'
   assert_rejected 'finalize --state one --state two' 'repeated option'
-  assert_rejected 'capture --automation-output one --automation-output two' 'repeated option'
   assert_rejected 'end --cleanup-output one --cleanup-output two' 'repeated option'
 
   reset_fake
@@ -3386,47 +3414,6 @@ BASH
     fail "state-v3-snapshot test: exact owner hash and identity receipt did not decode immutably"
   fi
   pass
-  run_helper capture --state "$state" --automation-output relative-output \
-    --private-voice-output "$TMP_DIR/private.ndjson" \
-    --sanitized-voice-output "$TMP_DIR/sanitized.ndjson"
-  [[ "$RUN_STATUS" -ne 0 ]] || fail "absolute-output test: relative capture output succeeded"
-  assert_no_adb_mutations
-  pass
-
-  run_helper capture --state "$state" --automation-output "$TMP_DIR/alias.ndjson" \
-    --private-voice-output "$TMP_DIR/alias.ndjson" \
-    --sanitized-voice-output "$TMP_DIR/sanitized-alias.ndjson"
-  [[ "$RUN_STATUS" -ne 0 ]] || fail "output-alias test: aliased destinations succeeded"
-  assert_no_adb_mutations
-  pass
-
-  local invalid_output="$TMP_DIR/invalid-output"
-  mkdir "$invalid_output"
-  run_helper capture --state "$state" --automation-output "$invalid_output" \
-    --private-voice-output "$TMP_DIR/private-directory-test.ndjson" \
-    --sanitized-voice-output "$TMP_DIR/sanitized-directory-test.ndjson"
-  [[ "$RUN_STATUS" -ne 0 ]] || fail "output-type test: directory destination succeeded"
-  assert_no_adb_mutations
-  pass
-  rmdir "$invalid_output"
-
-  mkfifo "$invalid_output"
-  run_helper capture --state "$state" --automation-output "$invalid_output" \
-    --private-voice-output "$TMP_DIR/private-fifo-test.ndjson" \
-    --sanitized-voice-output "$TMP_DIR/sanitized-fifo-test.ndjson"
-  [[ "$RUN_STATUS" -ne 0 ]] || fail "output-type test: FIFO destination succeeded"
-  assert_no_adb_mutations
-  pass
-  rm "$invalid_output"
-
-  ln -s "$TMP_DIR/not-created" "$invalid_output"
-  run_helper capture --state "$state" --automation-output "$invalid_output" \
-    --private-voice-output "$TMP_DIR/private-symlink-test.ndjson" \
-    --sanitized-voice-output "$TMP_DIR/sanitized-symlink-test.ndjson"
-  [[ "$RUN_STATUS" -ne 0 ]] || fail "output-type test: symlink destination succeeded"
-  assert_no_adb_mutations
-  pass
-  rm "$invalid_output"
 
   run_helper end --state "$state" --cleanup-output relative-cleanup
   [[ "$RUN_STATUS" -ne 0 ]] || fail "absolute-output test: relative cleanup output succeeded"
@@ -3486,21 +3473,21 @@ BASH
   local malformed="$TMP_DIR/malformed-state.json"
   printf '{not-json}\n' > "$malformed"
   chmod 600 "$malformed"
-  run_helper status --state "$malformed" --expect single_result_announced
+  run_helper status --state "$malformed" --expect parallel_first_pending
   [[ "$RUN_STATUS" -ne 0 ]] || fail "state-schema test: malformed state succeeded"
   assert_no_adb_mutations
   pass
 
   local wrong_package="$TMP_DIR/wrong-package-state.json"
   write_valid_state "$wrong_package" me.rerere.rikkahub.release
-  run_helper status --state "$wrong_package" --expect single_result_announced
+  run_helper status --state "$wrong_package" --expect parallel_first_pending
   [[ "$RUN_STATUS" -ne 0 ]] || fail "state-package test: wrong package succeeded"
   assert_no_adb_mutations
   pass
 
   local state_link="$TMP_DIR/state-link.json"
   ln -s "$state" "$state_link"
-  run_helper status --state "$state_link" --expect single_result_announced
+  run_helper status --state "$state_link" --expect parallel_first_pending
   [[ "$RUN_STATUS" -ne 0 ]] || fail "state-type test: symlink state succeeded"
   assert_no_adb_mutations
   pass
@@ -3508,7 +3495,7 @@ BASH
 
   local state_directory="$TMP_DIR/state-directory"
   mkdir "$state_directory"
-  run_helper status --state "$state_directory" --expect single_result_announced
+  run_helper status --state "$state_directory" --expect parallel_first_pending
   [[ "$RUN_STATUS" -ne 0 ]] || fail "state-type test: directory state succeeded"
   assert_no_adb_mutations
   pass
@@ -3516,14 +3503,14 @@ BASH
 
   local state_fifo="$TMP_DIR/state-fifo"
   mkfifo "$state_fifo"
-  run_helper status --state "$state_fifo" --expect single_result_announced
+  run_helper status --state "$state_fifo" --expect parallel_first_pending
   [[ "$RUN_STATUS" -ne 0 ]] || fail "state-type test: FIFO state succeeded"
   assert_no_adb_mutations
   pass
   rm "$state_fifo"
 
   chmod 644 "$state"
-  run_helper status --state "$state" --expect single_result_announced
+  run_helper status --state "$state" --expect parallel_first_pending
   [[ "$RUN_STATUS" -ne 0 ]] || fail "state-mode test: permissive state succeeded"
   assert_no_adb_mutations
   pass
@@ -3583,9 +3570,9 @@ data = open(sys.argv[1], "rb").read()
 commands = [chunk.split(b"\0") for chunk in data.split(b"\0\0") if chunk]
 bounded = [command for command in commands if b"--signal=TERM" in command]
 assert bounded
-assert bounded[0][:11] == [
+assert bounded[0][:9] == [
     b"--signal=TERM", b"--kill-after=2s", b"1s", b"mdev",
-    b"android", b"adb", b"--device", b"phone", b"--owner",
+    b"android", b"adb", b"--owner",
     b"OWNER_SECRET_123", b"--",
 ]
 PY
@@ -3628,7 +3615,7 @@ import sys
 raw = open(sys.argv[1], "rb").read()
 commands = [chunk.split(b"\0") for chunk in raw.split(b"\0\0") if chunk]
 prefix = [
-    b"android", b"adb", b"--device", b"phone", b"--owner",
+    b"android", b"adb", b"--owner",
     sys.argv[2].encode(), b"--",
 ]
 assert commands and all(command[:len(prefix)] == prefix for command in commands)
@@ -3637,6 +3624,15 @@ PY
   then
     fail "managed-transport test: preflight used raw or non-owner-scoped Android access"
   fi
+  pass
+
+  reset_fake
+  export FAKE_ADB_PREFIX_SIBLING=1
+  run_helper preflight --mdev-owner OWNER_SECRET_123 --package me.rerere.rikkahub.debug
+  [[ "$RUN_STATUS" -eq 0 ]] ||
+    fail "package-prefix test: installed instrumentation sibling hid the exact debug package"
+  assert_exact_output $'voice-step.status=ok\nvoice-step.operation=preflight\nvoice-step.device=ready\nvoice-step.package=ready\nvoice-step.automation=ready\nvoice-step.protected_path=ready'
+  unset FAKE_ADB_PREFIX_SIBLING
   pass
 
   reset_fake
@@ -3756,9 +3752,10 @@ assert state == {
     "fixtureParentIdentity": fake["fixture_parent_identity"],
     "fixtureDirectoryIdentity": fake["fixture_directory_identity"],
     "fixtureOwnershipNonce": "0123456789abcdef0123456789abcdef",
-    "traceId": "trace-new",
+    "traceId": "livekit-history-v1",
     "transport": "livekit_experimental",
 }
+
 raw = open(sys.argv[1], "rb").read()
 assert b"OWNER_SECRET_123" not in raw and b"DEVICE_SECRET_123" not in raw
 PY
@@ -3807,7 +3804,6 @@ data = open(sys.argv[1], "rb").read()
 commands = [chunk.split(b"\0") for chunk in data.split(b"\0\0") if chunk]
 expected_shell_markers = {
     "voice-step-protected-root": 1,
-    "voice-step-trace-probe": 2,
     "voice-step-create-owned-directory": 1,
     "voice-step-stage-owned-fixture": 1,
 }
@@ -3820,7 +3816,7 @@ for marker, expected_count in expected_shell_markers.items():
     assert len(matches) == expected_count
     scripts_by_marker[marker] = []
     for match in matches:
-        tail = match[7:]
+        tail = match[match.index(b"shell"):]
         assert len(tail) == 2 and tail[0] == b"shell"
         decoded = shlex.split(tail[1].decode(), posix=True)
         assert decoded[0:5] == [
@@ -3842,16 +3838,6 @@ assert b'newline=$(printf "\\nx") || exit 1' in stage_script
 assert b'newline=${newline%x}' in stage_script
 assert b'"$owner$newline"[0-9a-f]' in stage_script
 PY
-  pass
-
-  reset_fake
-  rm -f -- "$state"
-  export FAKE_ADB_TRACE_PROBE_CRLF=1
-  run_helper start --state "$state" --mdev-owner OWNER_SECRET_123 \
-    --package me.rerere.rikkahub.debug --conversation-id CONVERSATION_SECRET_123 \
-    --run-hash "sha256:$(printf 'a%.0s' {1..64})" \
-    --comparison-hash "sha256:$(printf 'b%.0s' {1..64})" --fixture "$fixture"
-  assert_exact_output $'voice-step.status=ok\nvoice-step.operation=start\nvoice-step.call=active'
   pass
 
   reset_fake
@@ -4224,6 +4210,30 @@ PY
   pass
 }
 
+run_livekit_start_tests() {
+  local fixture="$TMP_DIR/livekit-start-fixture.pcm"
+  local state="$TMP_DIR/livekit-start-state.json"
+  reset_fake
+  make_fixture "$fixture"
+
+  run_helper start --state "$state" --mdev-owner OWNER_SECRET_123 \
+    --package me.rerere.rikkahub.debug --conversation-id CONVERSATION_SECRET_123 \
+    --run-hash "sha256:$(printf 'a%.0s' {1..64})" \
+    --comparison-hash "sha256:$(printf 'b%.0s' {1..64})" --fixture "$fixture"
+
+  assert_exact_output $'voice-step.status=ok\nvoice-step.operation=start\nvoice-step.call=active'
+  python3 - "$state" "$ADB_LOG" <<'PY' || fail "livekit-start test: revised path retained trace-journal dependency"
+import json
+import sys
+
+state = json.load(open(sys.argv[1], encoding="utf-8"))
+commands = open(sys.argv[2], "rb").read()
+assert state["traceId"] == "livekit-history-v1"
+assert b"latest-trace-id.txt" not in commands
+PY
+  pass
+}
+
 run_state_publisher_tests() {
   local parent="$TMP_DIR/state-publisher-short-write-parent"
   local destination="$parent/state.json"
@@ -4446,7 +4456,6 @@ get-state:device-readiness:device-not-ready:complete
 get-current-user:package-identity:android-user-readback-failed:complete
 dumpsys package:package-contract:package-readback-failed:complete
 .STATUS:status-read:unexpected-status-response:complete
-voice-step-trace-probe:trace-read:trace-readback-failed:complete
 voice-step-create-owned-directory:fixture-directory:fixture-staging-failed:complete
 voice-step-stage-owned-fixture:fixture-stage:fixture-staging-failed:complete
 .PREPARE:automation-prepare:adb-command-failed:complete
@@ -4517,12 +4526,6 @@ EOF
   export FAKE_ADB_START_DOES_NOT_ACTIVATE=1
   assert_traced_start_failure "$fixture" "$state" "$diagnostic" \
     call-activation call-activation-timed-out 1 complete
-  pass
-
-  reset_fake
-  export FAKE_ADB_START_RETAINS_TRACE=1
-  assert_traced_start_failure "$fixture" "$state" "$diagnostic" \
-    trace-activation trace-activation-timed-out none complete
   pass
 
   reset_fake
@@ -4875,7 +4878,7 @@ def decode_remote(command):
 
 stage = decode_remote(stage[0])
 trigger = decode_remote(trigger[0])
-tail = stream[0][7:]
+tail = stream[0][stream[0].index(b"shell"):]
 assert len(tail) == 2 and tail[0] == b"shell"
 decoded = shlex.split(tail[1].decode(), posix=True)
 assert decoded[0:6] == [
@@ -5180,134 +5183,6 @@ PY
   pass
 }
 
-run_status_tests() {
-  local state="$TMP_DIR/status-state.json"
-  reset_fake
-  activate_fake_run
-  write_valid_state "$state"
-  run_helper status --state "$state" --expect single_result_announced
-  assert_exact_output $'voice-step.status=ok\nvoice-step.operation=status\nvoice-step.expectation=single_result_announced\nvoice-step.expectation_met=true'
-  [[ "$(command_count .STATUS)" == "1" && "$(command_count 'dumpsys')" == "1" &&
-     "$(command_count voice-step-artifact-presence)" == "1" ]] ||
-    fail "status-scope test: status retried or used an unrelated query"
-  [[ "$(command_count PREPARE)" == "0" && "$(command_count start-foreground-service)" == "0" ]] ||
-    fail "status-read-only test: status mutated the run"
-  pass
-
-  reset_fake
-  rm -f -- "$state"
-  activate_fake_run
-  write_valid_state "$state"
-  export FAKE_ADB_CHECKPOINT_FAILURE=single_delivery_order
-  run_helper status --state "$state" --expect single_result_announced
-  local predicate_failure_contract=0
-  local temp_cleanup_contract=0
-  if [[ "$RUN_STATUS" -ne 0 && ! -s "$STDOUT_FILE" &&
-        "$(<"$STDERR_FILE")" == 'voice-step.error=checkpoint single_delivery_order not proven' &&
-        "$(wc -l < "$STDERR_FILE")" == 1 ]]; then
-    predicate_failure_contract=1
-  fi
-  if [[ -z "$(find "$HELPER_TEMP_ROOT" -mindepth 1 -print -quit)" ]]; then
-    temp_cleanup_contract=1
-  fi
-  (( predicate_failure_contract == 1 && temp_cleanup_contract == 1 )) ||
-    fail "status predicate-routing/cleanup test: boundary=$predicate_failure_contract cleanup=$temp_cleanup_contract"
-  assert_private_output_absent
-  pass
-
-  reset_fake
-  local malformed_state="$TMP_DIR/status-malformed-state.json"
-  printf '{not-json}\n' > "$malformed_state"
-  chmod 600 "$malformed_state"
-  run_helper status --state "$malformed_state" --expect single_result_announced
-  assert_exact_checkpoint_failure
-  [[ ! -s "$ADB_LOG" ]] || fail "status malformed-state test: device access occurred"
-  pass
-
-  reset_fake
-  rm -f -- "$state"
-  activate_fake_run
-  write_valid_state "$state"
-  export VOICE_STEP_ADB_TIMEOUT_SECONDS=invalid
-  run_helper status --state "$state" --expect single_result_announced
-  export VOICE_STEP_ADB_TIMEOUT_SECONDS=10
-  assert_exact_checkpoint_failure
-  [[ ! -s "$ADB_LOG" ]] || fail "status runtime test: device access occurred"
-  pass
-
-  reset_fake
-  rm -f -- "$state"
-  activate_fake_run
-  write_valid_state "$state"
-  local lock_key
-  local lock_directory
-  local status_lock_fd
-  lock_key="$(python3 - <<'PY'
-import hashlib
-owner_hash = "sha256:" + hashlib.sha256(b"OWNER_SECRET_123").hexdigest()
-print(hashlib.sha256((owner_hash + "\0me.rerere.rikkahub.debug").encode()).hexdigest())
-PY
-)"
-  lock_directory="/tmp/rikkahub-voice-real-room-locks-${EUID}/$lock_key.lock"
-  mkdir -p -m 700 -- "$lock_directory"
-  exec {status_lock_fd}<"$lock_directory"
-  flock -n "$status_lock_fd"
-  run_helper status --state "$state" --expect single_result_announced
-  flock -u "$status_lock_fd"
-  exec {status_lock_fd}<&-
-  assert_exact_checkpoint_failure
-  [[ ! -s "$ADB_LOG" ]] || fail "status lock test: device access occurred"
-  pass
-
-  reset_fake
-  activate_fake_run
-  rm -f -- "$state"
-  write_valid_state "$state"
-  export FAKE_ADB_BAD_SANITIZED=1
-  run_helper status --state "$state" --expect single_result_announced
-  [[ "$RUN_STATUS" -ne 0 ]] || fail "status-canonical test: raw session identifier succeeded"
-  assert_private_output_absent
-  pass
-
-  reset_fake
-  activate_fake_run
-  rm -f -- "$state"
-  write_valid_state "$state"
-  export FAKE_ADB_MISSING_ARTIFACT='voice-experience-private.ndjson'
-  run_helper status --state "$state" --expect single_result_announced
-  assert_exact_checkpoint_failure
-  pass
-
-  reset_fake
-  activate_fake_run
-  rm -f -- "$state"
-  write_valid_state "$state"
-  python3 - "$FAKE_STATE" <<'PY'
-import json, sys
-path = sys.argv[1]
-state = json.load(open(path, encoding="utf-8"))
-state["run_hash"] = "sha256:" + "c" * 64
-json.dump(state, open(path, "w", encoding="utf-8"), separators=(",", ":"))
-PY
-  run_helper status --state "$state" --expect single_result_announced
-  [[ "$RUN_STATUS" -ne 0 ]] || fail "status-binding test: mismatched run hash succeeded"
-  assert_private_output_absent
-  pass
-
-  reset_fake
-  activate_fake_run
-  rm -f -- "$state"
-  write_valid_state "$state"
-  export FAKE_ADB_VALIDATED_FALSE=1
-  run_helper status --state "$state" --expect single_result_announced
-  [[ "$RUN_STATUS" -ne 0 ]] || fail "status-validation test: validated=false succeeded"
-  [[ "$(command_count .STATUS)" == "1" ]] ||
-    fail "status-validation test: validated=false was retried"
-  [[ ! -s "$STDOUT_FILE" ]] || fail "status-validation test: failed validation wrote stdout"
-  assert_private_output_absent
-  pass
-}
-
 run_checkpoint_tests() {
   python3 - "$ROOT_DIR" <<'PY' || fail "checkpoint predicate test: named checkpoint contract failed"
 import importlib.util
@@ -5453,6 +5328,9 @@ expected_values = [
     "isolation_first_active",
     "isolation_two_distinct",
     "isolation_terminal_healthy",
+    "controlled_release_visible_playback_active",
+    "controlled_release_visible_playback_interrupted",
+    "controlled_final_history_observed",
 ]
 assert [value.value for value in contract.Expectation] == expected_values
 try:
@@ -5917,6 +5795,228 @@ mutated = [
     terminal_healthy[3],
 ]
 expect_failure("isolation_terminal_healthy", [], mutated, "isolation_healthy_order")
+
+
+def history_record(number, status, announcement, *, result=True):
+    record = {
+        "identityHash": digest(str(number)),
+        "status": status,
+        "announcement": announcement,
+        "sessionHash": digest("f"),
+        "requestHash": digest(chr(96 + number)),
+        "argumentHash": digest(chr(99 + number)),
+        "jobHash": digest(str(number + 3)),
+    }
+    if result:
+        record["resultHash"] = digest(str(number + 6))
+    return record
+
+
+def grounded_transcript(record):
+    return {
+        "role": "assistant",
+        "status": "complete",
+        "sessionHash": record["sessionHash"],
+        "groundedJobHash": record["jobHash"],
+        "groundedResultHash": record["resultHash"],
+    }
+
+
+def livekit_history(records, transcripts=()):
+    return {
+        "conversationHash": digest("c"),
+        "recordCount": len(records),
+        "transcriptCount": len(transcripts),
+        "records": records,
+        "transcripts": list(transcripts),
+    }
+
+
+def expect_livekit_pass(name, automation_rows, history):
+    contract.evaluate_livekit_checkpoint(
+        contract.Expectation(name), automation_rows, history, 2000, digest("c")
+    )
+
+
+def expect_livekit_failure(name, automation_rows, history, boundary):
+    try:
+        expect_livekit_pass(name, automation_rows, history)
+    except contract.ContractError as error:
+        assert error.boundary == boundary, (name, error.boundary, boundary)
+    else:
+        raise AssertionError(f"{name} accepted its decisive mutation")
+
+
+controlled_target = history_record(1, "canceled", "not_announced", result=False)
+controlled_second = history_record(2, "running", "not_announced", result=False)
+controlled_third = history_record(3, "complete", "not_announced")
+controlled_active_history = livekit_history(
+    [controlled_target, controlled_second, controlled_third]
+)
+controlled_active_automation = [automation(10, "playback_active", 3)]
+expect_livekit_pass(
+    "controlled_release_visible_playback_active",
+    controlled_active_automation,
+    controlled_active_history,
+)
+expect_livekit_failure(
+    "controlled_release_visible_playback_active",
+    [],
+    controlled_active_history,
+    "controlled_visible_playback_active",
+)
+expect_livekit_failure(
+    "controlled_release_visible_playback_active",
+    [
+        automation(10, "playback_active", 1),
+        automation(20, "dropout_started", 1),
+        automation(30, "dropout_ended", 2),
+        automation(40, "playback_active", 2),
+        automation(50, "playback_drained", 2),
+    ],
+    controlled_active_history,
+    "controlled_visible_playback_active",
+)
+mutated_records = [dict(record) for record in controlled_active_history["records"]]
+mutated_records[0]["status"] = "complete"
+expect_livekit_failure(
+    "controlled_release_visible_playback_active",
+    controlled_active_automation,
+    livekit_history(mutated_records),
+    "controlled_target_canceled",
+)
+
+controlled_interrupted_automation = controlled_active_automation + [
+    automation(20, "interrupt_started"),
+    automation(30, "playback_stopped", 3),
+]
+expect_livekit_pass(
+    "controlled_release_visible_playback_interrupted",
+    controlled_interrupted_automation,
+    controlled_active_history,
+)
+expect_livekit_failure(
+    "controlled_release_visible_playback_interrupted",
+    controlled_active_automation + [automation(20, "interrupt_started")],
+    controlled_active_history,
+    "controlled_visible_playback_interruption",
+)
+expect_livekit_failure(
+    "controlled_release_visible_playback_interrupted",
+    [
+        automation(10, "playback_active", 3),
+        automation(20, "playback_active", 4),
+        automation(30, "interrupt_started"),
+        automation(40, "playback_stopped", 3),
+    ],
+    controlled_active_history,
+    "controlled_visible_playback_interruption",
+)
+
+controlled_second_complete = history_record(2, "complete", "announced")
+controlled_third_announced = history_record(3, "complete", "announced")
+controlled_final_history = livekit_history(
+    [controlled_target, controlled_second_complete, controlled_third_announced],
+    [
+        grounded_transcript(controlled_third_announced),
+        grounded_transcript(controlled_second_complete),
+    ],
+)
+controlled_final_automation = [
+    automation(10, "playback_active", 3),
+    automation(20, "playback_written", 3, True),
+    automation(30, "interrupt_started"),
+    automation(40, "playback_stopped", 3),
+    automation(100, "playback_written", 4, False),
+    automation(2100, "playback_active", 4),
+    automation(2200, "playback_drained", 4),
+    automation(2300, "playback_active", 5),
+    automation(2400, "playback_drained", 5),
+]
+expect_livekit_pass(
+    "controlled_final_history_observed",
+    controlled_final_automation,
+    controlled_final_history,
+)
+expect_livekit_failure(
+    "controlled_final_history_observed",
+    controlled_final_automation,
+    livekit_history(
+        controlled_final_history["records"],
+        list(reversed(controlled_final_history["transcripts"])),
+    ),
+    "controlled_delivery_order",
+)
+expect_livekit_failure(
+    "controlled_final_history_observed",
+    controlled_final_automation,
+    livekit_history(
+        controlled_final_history["records"],
+        [
+            grounded_transcript(controlled_target | {
+                "resultHash": digest("z"),
+            }),
+            *controlled_final_history["transcripts"],
+        ],
+    ),
+    "controlled_target_not_grounded",
+)
+mutated_records = [dict(record) for record in controlled_final_history["records"]]
+mutated_records[1]["identityHash"] = mutated_records[0]["identityHash"]
+expect_livekit_failure(
+    "controlled_final_history_observed",
+    controlled_final_automation,
+    livekit_history(mutated_records, controlled_final_history["transcripts"]),
+    "controlled_distinct_ordinals",
+)
+
+mutated_records = [dict(record) for record in controlled_active_history["records"]]
+mutated_records[1]["status"] = "canceled"
+expect_livekit_failure(
+    "controlled_release_visible_playback_active",
+    controlled_active_automation,
+    livekit_history(mutated_records),
+    "controlled_second_held",
+)
+
+stale_recovery_automation = [
+    automation(10, "playback_active", 3),
+    automation(20, "interrupt_started"),
+    automation(30, "playback_stopped", 3),
+    automation(100, "playback_written", 2, False),
+    automation(2100, "playback_active", 2),
+    automation(2200, "playback_drained", 2),
+]
+expect_livekit_failure(
+    "controlled_final_history_observed",
+    stale_recovery_automation,
+    controlled_final_history,
+    "controlled_recovery_epoch",
+)
+
+wrong_epoch_quiet_automation = [
+    automation(10, "playback_active", 3),
+    automation(20, "interrupt_started"),
+    automation(30, "playback_stopped", 3),
+    automation(100, "playback_written", 5, False),
+    automation(2100, "playback_active", 4),
+    automation(2200, "playback_drained", 4),
+]
+expect_livekit_failure(
+    "controlled_final_history_observed",
+    wrong_epoch_quiet_automation,
+    controlled_final_history,
+    "controlled_recovery_quiet",
+)
+
+wrong_conversation_history = dict(controlled_final_history)
+wrong_conversation_history["conversationHash"] = digest("d")
+expect_livekit_failure(
+    "controlled_final_history_observed",
+    controlled_final_automation,
+    wrong_conversation_history,
+    "history_conversation_binding",
+)
 PY
   pass
 
@@ -6425,267 +6525,6 @@ PY
   pass
 }
 
-run_capture_tests() {
-  local state="$TMP_DIR/capture-state.json"
-  local finalization="$TMP_DIR/capture-finalization.json"
-  local output_dir="$TMP_DIR/capture-output"
-  local automation="$output_dir/automation.jsonl"
-  local private="$output_dir/private.ndjson"
-  local sanitized="$output_dir/sanitized.ndjson"
-  mkdir "$output_dir"
-
-  reset_fake
-  export FAKE_MDEV_REQUIRE_SINGLE_RUN_AS_SCRIPT=1
-  finalize_fake_run false
-  write_valid_state "$state"
-  write_finalization "$finalization"
-  run_helper capture --state "$state" --finalization "$finalization" \
-    --automation-output "$automation" \
-    --private-voice-output "$private" \
-    --sanitized-voice-output "$sanitized"
-  assert_exact_output $'voice-step.status=ok\nvoice-step.operation=capture\nvoice-step.artifacts=published'
-  for output in "$automation" "$private" "$sanitized"; do
-    [[ -f "$output" && ! -L "$output" && -s "$output" && "$(stat -c '%a' "$output")" == 600 ]] ||
-      fail "capture-publication test: published artifact was not nonempty mode-0600 regular data"
-  done
-  if ! python3 - "$ADB_LOG" "$automation" "$private" "$sanitized" <<'PY'
-import json
-import shlex
-import sys
-
-data = open(sys.argv[1], "rb").read()
-commands = [chunk.split(b"\0") for chunk in data.split(b"\0\0") if chunk]
-bundles = [command for command in commands if any(b"voice-step-capture-bundle" in value for value in command)]
-assert len(bundles) == 1
-tail = bundles[0][7:]
-assert len(tail) == 2 and tail[0] == b"exec-out"
-decoded = shlex.split(tail[1].decode(), posix=True)
-assert decoded[0:6] == [
-    "run-as", "me.rerere.rikkahub.debug", "--user", "0", "sh", "-c",
-]
-assert "voice-step-capture-bundle" in decoded[6]
-assert decoded[7] == "sh"
-assert [path.rsplit("/", 1)[-1] for path in decoded[8:]] == [
-    "automation-events.jsonl",
-    "voice-experience-private.ndjson",
-    "voice-experience-events.ndjson",
-]
-bundle_script = decoded[6].encode()
-assert b"/proc/self/fd/" not in bundle_script
-for descriptor in (3, 4, 5):
-    assert f"/proc/$$/fd/{descriptor}".encode() in bundle_script
-automation = open(sys.argv[2], "rb").read()
-private = open(sys.argv[3], "rb").read()
-sanitized = open(sys.argv[4], "rb").read()
-assert automation.endswith(b"\n") and b'"name":"run_prepared"' in automation
-assert b'"voiceSessionId":"PRIVATE_TRACE"' in private
-assert b'"prompt":"PROMPT_SECRET"' in private
-assert sanitized.endswith(b"\n") and b"voiceSessionId" not in sanitized
-assert b"PRIVATE_TRACE" not in sanitized and b"PROMPT_SECRET" not in sanitized
-PY
-  then
-    fail "capture-bundle test: sources were not captured by one descriptor-bound snapshot"
-  fi
-  assert_no_capture_temps "$output_dir"
-  pass
-
-  rm -f -- "$automation" "$private" "$sanitized" "$state" "$finalization"
-  reset_fake
-  finalize_fake_run false
-  write_valid_state "$state"
-  run_helper capture --state "$state" \
-    --automation-output "$automation" \
-    --private-voice-output "$private" \
-    --sanitized-voice-output "$sanitized"
-  [[ "$RUN_STATUS" -ne 0 && ! -s "$ADB_LOG" ]] ||
-    fail "capture-parser test: missing finalization reached device access"
-  pass
-
-  rm -f -- "$automation" "$private" "$sanitized" "$state" "$finalization"
-  reset_fake
-  finalize_fake_run false
-  write_valid_state "$state"
-  write_finalization "$finalization" complete complete false true false
-  run_helper capture --state "$state" --finalization "$finalization" \
-    --automation-output "$automation" \
-    --private-voice-output "$private" \
-    --sanitized-voice-output "$sanitized"
-  [[ "$RUN_STATUS" -ne 0 && ! -s "$ADB_LOG" ]] ||
-    fail "capture-finalization test: contradictory record reached device access"
-  pass
-
-  local corruption
-  for corruption in \
-    private-reorder private-duplicate private-orphan \
-    sanitized-reorder sanitized-duplicate sanitized-orphan \
-    event-id kind timestamp private-hash forbidden-field; do
-    rm -f -- "$automation" "$private" "$sanitized" "$state" "$finalization"
-    reset_fake
-    finalize_fake_run false
-    write_valid_state "$state"
-    write_finalization "$finalization"
-    export FAKE_ADB_CAPTURE_CORRUPTION="$corruption"
-    run_helper capture --state "$state" --finalization "$finalization" \
-      --automation-output "$automation" \
-      --private-voice-output "$private" \
-      --sanitized-voice-output "$sanitized"
-    [[ "$RUN_STATUS" -ne 0 && ! -e "$automation" && ! -e "$private" && ! -e "$sanitized" ]] ||
-      fail "capture-correspondence test: $corruption published a destination"
-    assert_no_capture_temps "$output_dir"
-    assert_private_output_absent
-    pass
-  done
-
-  local crlf_source
-  for crlf_source in automation private sanitized; do
-    rm -f -- "$automation" "$private" "$sanitized" "$state" "$finalization"
-    reset_fake
-    finalize_fake_run false
-    write_valid_state "$state"
-    write_finalization "$finalization"
-    export FAKE_ADB_CAPTURE_CRLF="$crlf_source"
-    run_helper capture --state "$state" --finalization "$finalization" \
-      --automation-output "$automation" \
-      --private-voice-output "$private" \
-      --sanitized-voice-output "$sanitized"
-    [[ "$RUN_STATUS" -ne 0 && ! -e "$automation" && ! -e "$private" && ! -e "$sanitized" ]] ||
-      fail "capture-CRLF test: $crlf_source CR byte reached publication"
-    assert_no_capture_temps "$output_dir"
-    pass
-  done
-
-  local race_mode source_number
-  for race_mode in mutate replace; do
-    for source_number in 1 2 3; do
-      rm -f -- "$automation" "$private" "$sanitized" "$state" "$finalization"
-      reset_fake
-      finalize_fake_run false
-      write_valid_state "$state"
-      write_finalization "$finalization"
-      if [[ "$race_mode" == mutate ]]; then
-        export FAKE_ADB_MUTATE_CAPTURE_SOURCE_AFTER_READ="$source_number"
-      else
-        export FAKE_ADB_REPLACE_CAPTURE_SOURCE_AFTER_READ="$source_number"
-      fi
-      run_helper capture --state "$state" --finalization "$finalization" \
-        --automation-output "$automation" \
-        --private-voice-output "$private" \
-        --sanitized-voice-output "$sanitized"
-      [[ "$RUN_STATUS" -ne 0 && ! -e "$automation" && ! -e "$private" && ! -e "$sanitized" ]] ||
-        fail "capture-source-race test: $race_mode of source $source_number published a destination"
-      assert_no_capture_temps "$output_dir"
-      pass
-    done
-  done
-
-
-  for source_number in 1 2 3; do
-    rm -f -- "$automation" "$private" "$sanitized" "$state" "$finalization"
-    reset_fake
-    finalize_fake_run false
-    write_valid_state "$state"
-    write_finalization "$finalization"
-    export FAKE_ADB_PREOPEN_REPLACE_CAPTURE_SOURCE="$source_number"
-    run_helper capture --state "$state" --finalization "$finalization" \
-      --automation-output "$automation" \
-      --private-voice-output "$private" \
-      --sanitized-voice-output "$sanitized"
-    [[ "$RUN_STATUS" -ne 0 && ! -e "$automation" && ! -e "$private" && ! -e "$sanitized" ]] ||
-      fail "capture-preopen-race test: source $source_number replacement was published"
-    assert_no_capture_temps "$output_dir"
-    pass
-  done
-
-  rm -f -- "$automation" "$private" "$sanitized" "$state" "$finalization"
-  reset_fake
-  finalize_fake_run false
-  write_valid_state "$state"
-  write_finalization "$finalization"
-  export FAKE_ADB_MALFORMED_DURABLE_ENDING=event-after-finalized
-  run_helper capture --state "$state" --finalization "$finalization" \
-    --automation-output "$automation" --private-voice-output "$private" \
-    --sanitized-voice-output "$sanitized"
-  [[ "$RUN_STATUS" -ne 0 && ! -e "$automation" && ! -e "$private" && ! -e "$sanitized" ]] ||
-    fail "capture-terminal-order test: event after finalization was published"
-  pass
-
-  rm -f -- "$automation" "$private" "$sanitized" "$state" "$finalization"
-  reset_fake
-  activate_fake_run
-  write_valid_state "$state"
-  write_finalization "$finalization" product_failure forced_fallback_used false false true
-  run_helper capture --state "$state" --finalization "$finalization" \
-    --automation-output "$automation" --private-voice-output "$private" \
-    --sanitized-voice-output "$sanitized"
-  assert_exact_output $'voice-step.status=ok\nvoice-step.operation=capture\nvoice-step.artifacts=published'
-  [[ "$(command_count force-stop)" == 1 &&
-     "$(exact_command_count -s DEVICE_SECRET_123 exec-out ps -A -n -o UID,PID,PPID,STAT,NAME)" == 2 &&
-     "$(exact_command_count -s DEVICE_SECRET_123 shell cmd activity get-isolated-pids "$CURRENT_UID")" == 2 ]] ||
-    fail "capture-dirty-quiescence test: forced product capture lacked independent quiescence"
-  pass
-
-  rm -f -- "$automation" "$private" "$sanitized" "$state" "$finalization"
-  reset_fake
-  activate_fake_run
-  record_fake_call_stop
-  write_valid_state "$state"
-  write_finalization "$finalization" product_failure forced_fallback_used false false true
-  export FAKE_ADB_CALL_STOP_FAILED=1
-  run_helper capture --state "$state" --finalization "$finalization" \
-    --automation-output "$automation" --private-voice-output "$private" \
-    --sanitized-voice-output "$sanitized"
-  assert_exact_output $'voice-step.status=ok\nvoice-step.operation=capture\nvoice-step.artifacts=published'
-  pass
-
-  rm -f -- "$automation" "$private" "$sanitized" "$state" "$finalization"
-  reset_fake
-  activate_fake_run
-  record_fake_call_stop
-  write_valid_state "$state"
-  write_finalization "$finalization" product_failure forced_fallback_used false false true
-  run_helper capture --state "$state" --finalization "$finalization" \
-    --automation-output "$automation" --private-voice-output "$private" \
-    --sanitized-voice-output "$sanitized"
-  [[ "$RUN_STATUS" -ne 0 && ! -e "$automation" && ! -e "$private" && ! -e "$sanitized" ]] ||
-    fail "capture-successful-stop-fallback test: contradictory evidence was published"
-  pass
-
-  rm -f -- "$automation" "$private" "$sanitized" "$state" "$finalization"
-  reset_fake
-  activate_fake_run
-  write_valid_state "$state"
-  write_finalization "$finalization" product_failure forced_fallback_used false false true
-  export FAKE_ADB_PACKAGE_PROCESS=1
-  run_helper capture --state "$state" --finalization "$finalization" \
-    --automation-output "$automation" --private-voice-output "$private" \
-    --sanitized-voice-output "$sanitized"
-  [[ "$RUN_STATUS" -ne 0 && ! -e "$automation" && ! -e "$private" && ! -e "$sanitized" ]] ||
-    fail "capture-dirty-quiescence test: unproven quiescence published a bundle"
-  pass
-
-  local raced_destination
-  for raced_destination in "$automation" "$private" "$sanitized"; do
-    rm -f -- "$automation" "$private" "$sanitized" "$state" "$finalization"
-    reset_fake
-    finalize_fake_run false
-    write_valid_state "$state"
-    write_finalization "$finalization"
-    export FAKE_LN_RACE_DESTINATION="$raced_destination"
-    run_helper capture --state "$state" --finalization "$finalization" \
-      --automation-output "$automation" --private-voice-output "$private" \
-      --sanitized-voice-output "$sanitized"
-    [[ "$RUN_STATUS" -ne 0 && "$(<"$raced_destination")" == raced ]] ||
-      fail "capture-destination-race test: raced destination was overwritten"
-    case "$raced_destination" in
-      "$automation") [[ ! -e "$private" && ! -e "$sanitized" ]] ;;
-      "$private") [[ -s "$automation" && ! -e "$sanitized" ]] ;;
-      "$sanitized") [[ -s "$automation" && -s "$private" ]] ;;
-    esac || fail "capture-destination-race test: publication continued past a race"
-    assert_no_capture_temps "$output_dir"
-    pass
-  done
-}
-
 run_end_tests() {
   local state="$TMP_DIR/end-state.json"
   local finalization="$TMP_DIR/end-finalization.json"
@@ -6852,7 +6691,7 @@ assert len(brokers) == len(restorations) == 1
 broker_index, broker = brokers[0]
 assert artifact_reads[0] < force_stop < processes[0] < isolated[0] < processes[1] < isolated[1] < broker_index
 assert any(broker_index < index < restorations[0] for index in artifact_reads)
-tail = broker[7:]
+tail = broker[broker.index(b"shell"):]
 assert len(tail) == 2 and tail[0] == b"shell"
 decoded = shlex.split(tail[1].decode(), posix=True)
 assert decoded[0:6] == [
@@ -7037,6 +6876,26 @@ PY
   assert_private_output_absent
   pass
 
+  unset FAKE_ADB_FAIL_POST_CLEANUP_ARTIFACT_READ
+  run_helper end --state "$state" --finalization "$finalization" \
+    --cleanup-output "$cleanup_output"
+  assert_exact_output $'voice-step.status=ok\nvoice-step.operation=end\nvoice-step.outcome=complete'
+  python3 - "$cleanup_output" "$FAKE_STATE" <<'PY' || fail "end-post-cleanup-artifact-read-retry test: absent owned directory was not accepted"
+import json
+import sys
+
+cleanup = json.load(open(sys.argv[1], encoding="utf-8"))
+state = json.load(open(sys.argv[2], encoding="utf-8"))
+assert cleanup["outcome"] == "complete"
+assert cleanup["callStopped"] is True
+assert cleanup["automationFinalized"] is True
+assert cleanup["fixturesRemoved"] is True
+assert state["remote_directory"] is None
+assert state["package_stopped"] is False
+assert state["restoration_count"] == 2
+PY
+  pass
+
   rm -f -- "$cleanup_output" "$state" "$finalization"
   reset_fake
   finalize_fake_run false
@@ -7106,6 +6965,7 @@ run_binding_helper() {
     --created-before-epoch-ms "$BINDING_WINDOW_END" \
     "$@"
 }
+
 
 run_relative_binding_helper() {
   local helper_path="$1"
@@ -7177,6 +7037,7 @@ PY
   [[ "$(command_count rikka_hub-shm)" == 0 ]] ||
     fail "resolve-binding attempted to read device SHM"
 }
+
 
 run_resolve_binding_tests() {
   local output_parent destination site marker replacement started
@@ -7741,6 +7602,48 @@ run_wait_automation_tests() {
   pass
 }
 
+run_history_tests() {
+  local state="$TMP_DIR/history-state.json"
+  local output="$TMP_DIR/history.json"
+  reset_fake
+  activate_fake_run
+  rm -f -- "$state" "$output"
+  write_valid_state "$state"
+
+  run_helper history --state "$state" --history-output "$output"
+
+  assert_exact_output $'voice-step.status=ok\nvoice-step.operation=history\nvoice-step.artifact=published'
+  [[ -f "$output" && ! -L "$output" && "$(stat -c '%a' "$output")" == 600 ]] ||
+    fail "history test: sanitized snapshot was not published as a private regular file"
+  python3 - "$output" <<'PY' || fail "history test: unexpected snapshot"
+import json
+import sys
+
+value = json.load(open(sys.argv[1], encoding="utf-8"))
+assert value["recordCount"] == 1
+assert value["records"][0]["status"] == "running"
+assert "prompt" not in open(sys.argv[1], encoding="utf-8").read()
+PY
+  [[ "$(command_count .HISTORY_STATUS)" == 1 ]] ||
+    fail "history test: receiver was not queried exactly once"
+  pass
+}
+
+run_livekit_status_tests() {
+  local state="$TMP_DIR/livekit-status-state.json"
+  reset_fake
+  activate_fake_run
+  rm -f -- "$state"
+  write_valid_state "$state"
+
+  run_helper status --state "$state" --expect parallel_first_pending
+
+  assert_exact_output $'voice-step.status=ok\nvoice-step.operation=status\nvoice-step.expectation=parallel_first_pending\nvoice-step.expectation_met=true'
+  [[ "$(command_count .HISTORY_STATUS)" == 1 ]] ||
+    fail "livekit-status test: history observation was not used"
+  pass
+}
+
 SELECT_ALL=0
 SELECTED_OPERATIONS=("$@")
 if [[ "$#" -eq 0 ]]; then
@@ -7748,7 +7651,7 @@ if [[ "$#" -eq 0 ]]; then
 fi
 for requested in "${SELECTED_OPERATIONS[@]}"; do
   case "$requested" in
-    preflight|start|inject|interrupt|status|finalize|finalization|capture|end|cleanup|fixture-bounds|checkpoints|tracing|state-publisher|resolve-binding|wait-automation) ;;
+    preflight|start|livekit-start|inject|interrupt|status|livekit-status|history|finalize|finalization|end|cleanup|fixture-bounds|checkpoints|tracing|state-publisher|resolve-binding|wait-automation) ;;
     *) fail "test filter must name a real-room operation" ;;
   esac
 done
@@ -7763,6 +7666,7 @@ if [[ "$SELECT_ALL" -eq 1 ]]; then
 fi
 selected preflight && run_preflight_tests
 selected start && run_start_tests
+selected livekit-start && run_livekit_start_tests
 selected state-publisher && run_state_publisher_tests
 selected tracing && run_tracing_tests
 if selected inject; then
@@ -7771,12 +7675,14 @@ if selected inject; then
 fi
 selected fixture-bounds && run_fixture_bounds_tests
 selected interrupt && run_interrupt_tests
-selected status && run_status_tests
+if selected status || selected livekit-status; then
+  run_livekit_status_tests
+fi
+selected history && run_history_tests
 selected checkpoints && run_checkpoint_tests
 if selected finalize || selected finalization; then
   run_finalize_tests
 fi
-selected capture && run_capture_tests
 selected resolve-binding && run_resolve_binding_tests
 selected wait-automation && run_wait_automation_tests
 if selected end || selected cleanup; then

@@ -21,7 +21,9 @@ import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationRunBinding
 import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationRunState
 import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationRuntime
 import me.rerere.rikkahub.voiceagent.automation.VoiceAutomationStatus
+import me.rerere.rikkahub.service.ChatService
 import org.koin.core.context.GlobalContext
+import kotlin.uuid.Uuid
 
 class VoiceAutomationControlReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
@@ -38,6 +40,12 @@ class VoiceAutomationControlReceiver : BroadcastReceiver() {
                     connectivityReader = { connectivityManager.readAutomationConnectivity() },
                     artifactFile = { status -> context.automationArtifactFile(status) },
                     lifecycleReader = { callController.lifecycle.value },
+                    historyReader = { conversationId ->
+                        VoiceAutomationHistorySnapshot.from(
+                            conversationId = conversationId,
+                            conversation = koin.get<ChatService>().getConversationFlow(conversationId).value,
+                        )
+                    },
                 ).handle(intent.action, extras)
             } ?: VoiceAutomationControl.invalidRequest()
         }.getOrElse {
@@ -98,6 +106,9 @@ internal class VoiceAutomationControl(
     private val connectivityReader: () -> VoiceAutomationConnectivity,
     private val artifactFile: (VoiceAutomationStatus) -> File?,
     private val lifecycleReader: () -> VoiceAgentCallLifecycle,
+    private val historyReader: (Uuid) -> VoiceAutomationHistorySnapshot = {
+        throw IllegalStateException("History reader unavailable")
+    },
 ) {
     fun handle(action: String?, extras: Map<String, String>): VoiceAutomationControlResult =
         try {
@@ -105,6 +116,7 @@ internal class VoiceAutomationControl(
                 ACTION_BINDING -> binding(extras)
                 ACTION_PREPARE -> prepare(extras)
                 ACTION_STATUS -> status(extras)
+                ACTION_HISTORY_STATUS -> historyStatus(extras)
                 ACTION_MARK -> mark(extras)
                 ACTION_ROUTE -> route(extras)
                 ACTION_ENDPOINTS -> endpoints(extras)
@@ -190,6 +202,29 @@ internal class VoiceAutomationControl(
                 "network" to connectivity.network.wireName,
                 "validated" to connectivity.validated.toString(),
             ),
+        )
+    }
+
+    private fun historyStatus(extras: Map<String, String>): VoiceAutomationControlResult {
+        requireExactKeys(extras, setOf(EXTRA_RUN_HASH, EXTRA_CONVERSATION_ID))
+        val runHash = extras.getValue(EXTRA_RUN_HASH)
+        VoiceAutomationEventValidation.validateHash("runHash", runHash)
+        val conversationId = Uuid.parse(extras.getValue(EXTRA_CONVERSATION_ID))
+        val status = runtime.status()
+        check(status.state == VoiceAutomationRunState.Active && status.runHash == runHash) {
+            "Automation run owner changed"
+        }
+        val lifecycle = lifecycleReader()
+        check(lifecycle is VoiceAgentCallLifecycle.Active && lifecycle.conversationId == conversationId) {
+            "Conversation is not the active call owner"
+        }
+        val history = historyReader(conversationId)
+        check(runtime.status() === status && lifecycleReader() === lifecycle) {
+            "Call owner changed during history read"
+        }
+        return success(
+            "history_status",
+            "history_json" to history.toJson(),
         )
     }
 
@@ -334,6 +369,7 @@ internal class VoiceAutomationControl(
         const val ACTION_BINDING = "me.rerere.rikkahub.voiceagent.automation.BINDING"
         const val ACTION_PREPARE = "me.rerere.rikkahub.voiceagent.automation.PREPARE"
         const val ACTION_STATUS = "me.rerere.rikkahub.voiceagent.automation.STATUS"
+        const val ACTION_HISTORY_STATUS = "me.rerere.rikkahub.voiceagent.automation.HISTORY_STATUS"
         const val ACTION_MARK = "me.rerere.rikkahub.voiceagent.automation.MARK"
         const val ACTION_ROUTE = "me.rerere.rikkahub.voiceagent.automation.ROUTE"
         const val ACTION_ENDPOINTS = "me.rerere.rikkahub.voiceagent.automation.ENDPOINTS"
@@ -347,6 +383,7 @@ internal class VoiceAutomationControl(
         const val EXTRA_LIFECYCLE = "lifecycle"
         const val EXTRA_BOUNDARY = "boundary"
         const val EXTRA_ROUTE = "route"
+        const val EXTRA_CONVERSATION_ID = "conversation_id"
 
         const val RESULT_OK = 0
         const val RESULT_ERROR = 1

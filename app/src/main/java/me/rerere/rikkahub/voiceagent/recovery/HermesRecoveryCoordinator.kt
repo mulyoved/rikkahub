@@ -164,7 +164,7 @@ internal class DefaultHermesRecoveryCoordinator(
             notificationDispositionChangedAt = binding.acceptedAtEpochMillis,
         )
 
-        val persistenceResult = queueStore.persistLiveKitAcceptance(
+        val persistenceResult = queueStore.persistAccepted(
             callId = binding.callId,
             prompt = binding.prompt,
             jobId = binding.jobId,
@@ -174,7 +174,7 @@ internal class DefaultHermesRecoveryCoordinator(
             producer = binding.producer,
             commit = { result ->
                 if (result == HermesQueuePersistenceResult.Conflict) {
-                    error("LiveKit acceptance conflict")
+                    error("Hermes acceptance conflict")
                 }
                 val existing = ledger.find(recoveryKey)
                 if (existing == null) {

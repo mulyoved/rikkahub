@@ -11,6 +11,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -57,6 +58,7 @@ internal const val LIVEKIT_INTERRUPT_RPC = "voice.interrupt"
 internal const val LIVEKIT_END_RPC = "voice.end"
 internal const val LIVEKIT_PERSISTENCE_RPC = "voice.persist.v1"
 private const val LIVEKIT_END_RPC_TIMEOUT_MS = 2_000L
+private const val LIVEKIT_CLEANUP_DRAIN_TIMEOUT_MS = 2_000L
 
 internal class LiveKitVoiceCallSession(
     private val details: LiveKitSessionDetails,
@@ -66,8 +68,8 @@ internal class LiveKitVoiceCallSession(
     private val scope: CoroutineScope,
     private val captureSource: VoiceCaptureSource = VoiceCaptureSource.Microphone,
     rpcMethods: Map<String, suspend (LiveKitRpcInvocation) -> String> = emptyMap(),
-    persistenceHandler: (suspend (LiveKitRpcInvocation) -> String)? = null,
-    private val persistenceOwner: LiveKitPersistenceOwner? = null,
+    historyHandler: (suspend (LiveKitRpcInvocation) -> String)? = null,
+    private val historyOwner: LiveKitHistoryOwner? = null,
     private val connectTimeoutMillis: Long = DEFAULT_LIVEKIT_CONNECT_TIMEOUT_MS,
     private val readyTimeoutMillis: Long = DEFAULT_LIVEKIT_READY_TIMEOUT_MS,
     private val cleanupDispatcher: CoroutineDispatcher = Dispatchers.Default,
@@ -82,10 +84,10 @@ internal class LiveKitVoiceCallSession(
 ) : RouteOwnedManagedVoiceCallSession {
     private val registeredRpcMethods = buildMap {
         require(LIVEKIT_PERSISTENCE_RPC !in rpcMethods) {
-            "$LIVEKIT_PERSISTENCE_RPC is owned by the persistence handler"
+            "$LIVEKIT_PERSISTENCE_RPC is owned by the history handler"
         }
         putAll(rpcMethods)
-        persistenceHandler?.let { handler ->
+        historyHandler?.let { handler ->
             put(LIVEKIT_PERSISTENCE_RPC, handler)
         }
     }
@@ -118,8 +120,8 @@ internal class LiveKitVoiceCallSession(
     init {
         require(connectTimeoutMillis > 0) { "connectTimeoutMillis must be positive" }
         require(readyTimeoutMillis > 0) { "readyTimeoutMillis must be positive" }
-        require((persistenceHandler == null) == (persistenceOwner == null)) {
-            "persistenceHandler and persistenceOwner must be provided together"
+        require((historyHandler == null) == (historyOwner == null)) {
+            "historyHandler and historyOwner must be provided together"
         }
     }
 
@@ -136,7 +138,7 @@ internal class LiveKitVoiceCallSession(
         microphoneJob = { microphoneJob },
         rpcAdmission = rpcAdmission,
         rpcMethods = registeredRpcMethods.keys,
-        persistenceOwner = persistenceOwner,
+        historyOwner = historyOwner,
         room = room,
         workerParticipantIdentity = details.agentParticipantIdentity,
         automationAudioActivation = { automationAudioActivation },
@@ -557,7 +559,7 @@ private class LiveKitCleanupOperation(
     private val microphoneJob: () -> Job?,
     private val rpcAdmission: LiveKitRpcAdmission,
     rpcMethods: Set<String>,
-    private val persistenceOwner: LiveKitPersistenceOwner?,
+    private val historyOwner: LiveKitHistoryOwner?,
     private val room: LiveKitRoomFacade,
     private val workerParticipantIdentity: String,
     private val automationAudioActivation: () -> AutoCloseable?,
@@ -572,9 +574,9 @@ private class LiveKitCleanupOperation(
     private var microphoneJobCompleted = false
     private var microphonePublicationCompleted = false
     private var bluetoothLeaseCompleted = false
-    private var persistenceDrainCompleted = persistenceOwner == null
+    private var historyDrainCompleted = historyOwner == null
     private var rpcWorkCompleted = false
-    private var persistenceOwnerCompleted = persistenceOwner == null
+    private var historyOwnerCompleted = historyOwner == null
     private var automationAudioCompleted = false
     private var captureSourceCompleted = false
     private var workerEndNotificationHandled = false
@@ -613,12 +615,12 @@ private class LiveKitCleanupOperation(
                 connectionJobCompleted = cleanJob(connectionJob(), connectionJobCompleted, failures)
                 eventJobCompleted = cleanJob(eventJob(), eventJobCompleted, failures)
                 rpcWorkCompleted = cleanRpcWork(rpcWorkCompleted, failures)
-                drainPersistenceOwner(failures)
+                drainHistoryOwner(failures)
                 unregisterRpcMethods(
-                    allowed = rpcWorkCompleted && persistenceDrainCompleted,
+                    allowed = rpcWorkCompleted && historyDrainCompleted,
                     failures = failures,
                 )
-                closePersistenceOwner(failures)
+                closeHistoryOwner(failures)
                 disconnectRoom(failures)
                 closeRoom(failures)
             }
@@ -754,11 +756,21 @@ private class LiveKitCleanupOperation(
         }
     }
 
-    private suspend fun drainPersistenceOwner(failures: CleanupAttemptFailures) {
-        if (persistenceDrainCompleted || !rpcWorkCompleted) return
+    private suspend fun drainHistoryOwner(failures: CleanupAttemptFailures) {
+        if (historyDrainCompleted || !rpcWorkCompleted) return
         try {
-            persistenceOwner?.drain()
-            persistenceDrainCompleted = true
+            withTimeout(LIVEKIT_CLEANUP_DRAIN_TIMEOUT_MS) {
+                historyOwner?.drain()
+            }
+            historyDrainCompleted = true
+        } catch (error: TimeoutCancellationException) {
+            failures.add(
+                IllegalStateException(
+                    "Timed out draining LiveKit history persistence",
+                    error,
+                ),
+            )
+            historyDrainCompleted = true
         } catch (error: Throwable) {
             failures.add(error)
         }
@@ -785,7 +797,18 @@ private class LiveKitCleanupOperation(
     ): Boolean {
         if (completed) return true
         return try {
-            rpcAdmission.quiesce()
+            withTimeout(LIVEKIT_CLEANUP_DRAIN_TIMEOUT_MS) {
+                rpcAdmission.quiesce()
+            }
+            true
+        } catch (error: TimeoutCancellationException) {
+            rpcAdmission.cancelActiveWork()
+            failures.add(
+                IllegalStateException(
+                    "Timed out quiescing LiveKit RPC work",
+                    error,
+                ),
+            )
             true
         } catch (error: Throwable) {
             failures.add(error)
@@ -793,15 +816,15 @@ private class LiveKitCleanupOperation(
         }
     }
 
-    private fun closePersistenceOwner(failures: CleanupAttemptFailures) {
+    private fun closeHistoryOwner(failures: CleanupAttemptFailures) {
         if (
-            persistenceOwnerCompleted ||
+            historyOwnerCompleted ||
             !rpcWorkCompleted ||
-            !persistenceDrainCompleted
+            !historyDrainCompleted
         ) return
         try {
-            persistenceOwner?.close()
-            persistenceOwnerCompleted = true
+            historyOwner?.close()
+            historyOwnerCompleted = true
         } catch (error: Throwable) {
             failures.add(error)
         }
@@ -814,7 +837,7 @@ private class LiveKitCleanupOperation(
             !jobsCompleted() ||
             !microphonePublicationCompleted ||
             !rpcWorkCompleted ||
-            !persistenceOwnerCompleted ||
+            !historyOwnerCompleted ||
             pendingRpcMethods.isNotEmpty()
         ) return
         try {
@@ -846,9 +869,9 @@ private class LiveKitCleanupOperation(
             !routeCompleted ||
             !jobsCompleted() ||
             !microphonePublicationCompleted ||
-            !persistenceDrainCompleted ||
+            !historyDrainCompleted ||
             !rpcWorkCompleted ||
-            !persistenceOwnerCompleted ||
+            !historyOwnerCompleted ||
             pendingRpcMethods.isNotEmpty() ||
             !disconnectCompleted ||
             !closeCompleted
@@ -897,7 +920,10 @@ private class LiveKitRpcAdmission {
     }
 
     suspend fun <T> runInbound(block: suspend () -> T): T {
-        val work = LiveKitRpcWork.Inbound(CompletableDeferred())
+        val work = LiveKitRpcWork.Inbound(
+            job = currentCoroutineContext()[Job],
+            completion = CompletableDeferred(),
+        )
         synchronized(lock) {
             if (!accepting) throw LiveKitRpcAdmissionClosedException()
             activeWork += work
@@ -926,6 +952,19 @@ private class LiveKitRpcAdmission {
         }
     }
 
+    fun cancelActiveWork() {
+        val admittedWork = synchronized(lock) {
+            accepting = false
+            activeWork.toList().also { activeWork.clear() }
+        }
+        admittedWork.forEach { work ->
+            when (work) {
+                is LiveKitRpcWork.Outbound -> work.job.cancel()
+                is LiveKitRpcWork.Inbound -> work.job?.cancel()
+            }
+        }
+    }
+
     private fun complete(work: LiveKitRpcWork) {
         synchronized(lock) {
             activeWork.remove(work)
@@ -935,7 +974,10 @@ private class LiveKitRpcAdmission {
 
 private sealed interface LiveKitRpcWork {
     class Outbound(val job: Job) : LiveKitRpcWork
-    class Inbound(val completion: CompletableDeferred<Unit>) : LiveKitRpcWork
+    class Inbound(
+        val job: Job?,
+        val completion: CompletableDeferred<Unit>,
+    ) : LiveKitRpcWork
 }
 
 private class LiveKitRpcAdmissionClosedException :
